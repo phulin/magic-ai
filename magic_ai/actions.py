@@ -10,15 +10,12 @@ import torch
 from torch import Tensor, nn
 
 from magic_ai.game_state import (
-    ZONE_SPECS,
     GameCardState,
     GameStateEncoder,
     GameStateSnapshot,
     PendingOptionState,
     PendingState,
     PlayerState,
-    TargetState,
-    _zone_cards,
 )
 
 DEFAULT_MAX_OPTIONS = 64
@@ -233,11 +230,13 @@ class ActionOptionsEncoder(nn.Module):
         pending: PendingState | None = None,
         *,
         perspective_player_idx: int | None = None,
+        precomputed_object_vectors: dict[str, Tensor] | None = None,
     ) -> EncodedActionOptions:
         return self.encode_pending(
             state,
             pending,
             perspective_player_idx=perspective_player_idx,
+            precomputed_object_vectors=precomputed_object_vectors,
         )
 
     def encode_pending(
@@ -246,6 +245,7 @@ class ActionOptionsEncoder(nn.Module):
         pending: PendingState | None = None,
         *,
         perspective_player_idx: int | None = None,
+        precomputed_object_vectors: dict[str, Tensor] | None = None,
     ) -> EncodedActionOptions:
         pending = pending if pending is not None else state.get("pending")
         if pending is None:
@@ -256,7 +256,12 @@ class ActionOptionsEncoder(nn.Module):
             state,
             perspective_player_idx,
         )
-        object_vectors, player_vectors = self._build_reference_vectors(state, player_idx)
+
+        if precomputed_object_vectors is not None:
+            object_vectors = precomputed_object_vectors
+            player_vectors = self._build_player_vectors(state, player_idx)
+        else:
+            object_vectors, player_vectors = self._build_reference_vectors(state, player_idx)
 
         pending_kind_id = torch.tensor(
             _index_or_unknown(PENDING_KINDS, pending.get("kind", "")),
@@ -264,144 +269,123 @@ class ActionOptionsEncoder(nn.Module):
         )
         pending_vector = self.pending_kind_embedding(pending_kind_id)
 
-        option_vectors: list[Tensor] = []
-        target_vectors_by_option: list[list[Tensor]] = []
-        option_mask: list[float] = []
-        target_mask_rows: list[list[float]] = []
-        target_overflow: list[float] = []
-
         options = pending.get("options", [])
-        for option_idx in range(self.max_options):
-            option = options[option_idx] if option_idx < len(options) else None
-            is_present = option is not None
-            option_mask.append(float(is_present))
+        num_present = min(len(options), self.max_options)
 
-            if option is None:
-                option_vectors.append(self.empty_option_vector)
-                target_vectors_by_option.append(
-                    [self.empty_target_vector] * self.max_targets_per_option
-                )
-                target_mask_rows.append([0.0] * self.max_targets_per_option)
-                target_overflow.append(0.0)
-                continue
+        # --- Batch encode present options ---
+        option_vectors_t = (
+            self.empty_option_vector.unsqueeze(0).expand(self.max_options, -1).clone()
+        )
 
-            targets = option.get("valid_targets", [])
-            overflow_count = max(0, len(targets) - self.max_targets_per_option)
-            target_overflow.append(_clip_norm(overflow_count, MAX_TARGET_OVERFLOW))
-
-            option_vectors.append(
+        if num_present > 0:
+            kind_ids = torch.tensor(
+                [
+                    _index_or_unknown(ACTION_KINDS, options[i].get("kind", "unknown"))
+                    for i in range(num_present)
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+            all_scalars = torch.tensor(
+                [
+                    _option_scalars(
+                        options[i],
+                        pending=pending,
+                        option_idx=i,
+                        max_options=self.max_options,
+                        max_targets_per_option=self.max_targets_per_option,
+                    )
+                    for i in range(num_present)
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
+            ref_vecs = torch.stack(
+                [
+                    self._option_reference_vector(options[i], object_vectors)
+                    for i in range(num_present)
+                ]
+            )
+            option_vectors_t[:num_present] = (
                 pending_vector
-                + self._encode_option(
-                    option,
-                    pending=pending,
-                    option_idx=option_idx,
-                    object_vectors=object_vectors,
-                )
+                + self.option_kind_embedding(kind_ids)
+                + ref_vecs
+                + self.option_scalar_projection(all_scalars)
             )
 
-            target_vectors: list[Tensor] = []
-            target_mask: list[float] = []
-            for target_idx in range(self.max_targets_per_option):
-                target = targets[target_idx] if target_idx < len(targets) else None
-                target_mask.append(float(target is not None))
-                target_vectors.append(
-                    self._encode_target(
-                        target,
-                        target_idx=target_idx,
-                        object_vectors=object_vectors,
-                        player_vectors=player_vectors,
-                    )
-                    if target is not None
-                    else self.empty_target_vector
-                )
-            target_vectors_by_option.append(target_vectors)
-            target_mask_rows.append(target_mask)
+        option_mask = torch.zeros(self.max_options, dtype=torch.float32, device=device)
+        option_mask[:num_present] = 1.0
+
+        # --- Batch encode targets ---
+        tgt_opt_indices: list[int] = []
+        tgt_slot_indices: list[int] = []
+        tgt_type_ids: list[int] = []
+        tgt_scalars_list: list[list[float]] = []
+        tgt_refs: list[Tensor] = []
+        target_overflow = torch.zeros(self.max_options, dtype=torch.float32, device=device)
+        target_mask = torch.zeros(
+            self.max_options, self.max_targets_per_option, dtype=torch.float32, device=device
+        )
+        max_tgt_scalar = max(1.0, float(self.max_targets_per_option - 1))
+
+        for opt_i in range(num_present):
+            targets = options[opt_i].get("valid_targets", [])
+            overflow_count = max(0, len(targets) - self.max_targets_per_option)
+            target_overflow[opt_i] = _clip_norm(overflow_count, MAX_TARGET_OVERFLOW)
+
+            for tgt_j in range(min(len(targets), self.max_targets_per_option)):
+                target = targets[tgt_j]
+                target_mask[opt_i, tgt_j] = 1.0
+                tgt_opt_indices.append(opt_i)
+                tgt_slot_indices.append(tgt_j)
+
+                target_id = target.get("id", "")
+                if target_id in player_vectors:
+                    tgt_type_ids.append(_index_or_unknown(TARGET_TYPES, "player"))
+                    tgt_refs.append(player_vectors[target_id])
+                elif target_id in object_vectors:
+                    tgt_type_ids.append(_index_or_unknown(TARGET_TYPES, "permanent"))
+                    tgt_refs.append(object_vectors[target_id])
+                else:
+                    tgt_type_ids.append(_index_or_unknown(TARGET_TYPES, "unknown"))
+                    tgt_refs.append(torch.zeros(self.d_action, device=device))
+
+                tgt_scalars_list.append([_clip_norm(tgt_j, max_tgt_scalar), 1.0])
+
+        target_vectors_t = (
+            self.empty_target_vector.unsqueeze(0)
+            .unsqueeze(0)
+            .expand(self.max_options, self.max_targets_per_option, -1)
+            .clone()
+        )
+
+        if tgt_opt_indices:
+            tgt_type_ids_t = torch.tensor(tgt_type_ids, dtype=torch.long, device=device)
+            tgt_scalars_t = torch.tensor(tgt_scalars_list, dtype=torch.float32, device=device)
+            tgt_refs_t = torch.stack(tgt_refs)
+
+            encoded_targets = (
+                self.target_type_embedding(tgt_type_ids_t)
+                + tgt_refs_t
+                + self.target_scalar_projection(tgt_scalars_t)
+            )
+
+            opt_idx_t = torch.tensor(tgt_opt_indices, dtype=torch.long, device=device)
+            slot_idx_t = torch.tensor(tgt_slot_indices, dtype=torch.long, device=device)
+            target_vectors_t[opt_idx_t, slot_idx_t] = encoded_targets
 
         return {
             "pending_vector": pending_vector,
-            "option_vectors": torch.stack(option_vectors, dim=0),
-            "option_mask": torch.tensor(option_mask, dtype=torch.float32, device=device),
-            "target_vectors": torch.stack(
-                [torch.stack(row, dim=0) for row in target_vectors_by_option],
-                dim=0,
-            ),
-            "target_mask": torch.tensor(
-                target_mask_rows,
-                dtype=torch.float32,
-                device=device,
-            ),
-            "target_overflow": torch.tensor(
-                target_overflow,
-                dtype=torch.float32,
-                device=device,
-            ),
+            "option_vectors": option_vectors_t,
+            "option_mask": option_mask,
+            "target_vectors": target_vectors_t,
+            "target_mask": target_mask,
+            "target_overflow": target_overflow,
             "priority_candidates": build_priority_candidates(
                 pending,
                 max_targets_per_option=self.max_targets_per_option,
             ),
         }
-
-    def _encode_option(
-        self,
-        option: PendingOptionState,
-        *,
-        pending: PendingState,
-        option_idx: int,
-        object_vectors: dict[str, Tensor],
-    ) -> Tensor:
-        device = self.empty_option_vector.device
-        kind = option.get("kind", "unknown")
-        kind_id = torch.tensor(_index_or_unknown(ACTION_KINDS, kind), device=device)
-        reference_vector = self._option_reference_vector(option, object_vectors)
-        scalars = torch.tensor(
-            _option_scalars(
-                option,
-                pending=pending,
-                option_idx=option_idx,
-                max_options=self.max_options,
-                max_targets_per_option=self.max_targets_per_option,
-            ),
-            dtype=torch.float32,
-            device=device,
-        )
-        return (
-            self.option_kind_embedding(kind_id)
-            + reference_vector
-            + self.option_scalar_projection(scalars)
-        )
-
-    def _encode_target(
-        self,
-        target: TargetState,
-        *,
-        target_idx: int,
-        object_vectors: dict[str, Tensor],
-        player_vectors: dict[str, Tensor],
-    ) -> Tensor:
-        device = self.empty_option_vector.device
-        target_id = target.get("id", "")
-        if target_id in player_vectors:
-            target_type = "player"
-            reference = player_vectors[target_id]
-        elif target_id in object_vectors:
-            target_type = "permanent"
-            reference = object_vectors[target_id]
-        else:
-            target_type = "unknown"
-            reference = torch.zeros(self.d_action, device=device)
-
-        type_id = torch.tensor(_index_or_unknown(TARGET_TYPES, target_type), device=device)
-        scalars = torch.tensor(
-            [
-                _clip_norm(target_idx, max(1.0, float(self.max_targets_per_option - 1))),
-                1.0,
-            ],
-            dtype=torch.float32,
-            device=device,
-        )
-        return (
-            self.target_type_embedding(type_id) + reference + self.target_scalar_projection(scalars)
-        )
 
     def _option_reference_vector(
         self,
@@ -428,26 +412,26 @@ class ActionOptionsEncoder(nn.Module):
         state: GameStateSnapshot,
         perspective_player_idx: int,
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-        players = state["players"]
-        player = players[perspective_player_idx]
-        opponent = players[1 - perspective_player_idx] if len(players) == 2 else None
+        all_cards = self.game_state_encoder._collect_slot_cards(state, perspective_player_idx)
+        slot_vectors = self.game_state_encoder._encode_slots_batched(all_cards)
 
         object_vectors: dict[str, Tensor] = {}
-        for zone_idx, (_zone_name, zone, owner) in enumerate(ZONE_SPECS):
-            zone_player = player if owner == "self" else opponent
-            for slot_idx, card in enumerate(_zone_cards(zone_player, zone)):
+        for i, card in enumerate(all_cards):
+            if card is not None:
                 card_id = card.get("ID")
-                if not card_id:
-                    continue
-                object_vectors[card_id] = self.game_state_encoder._encode_slot(
-                    card,
-                    zone_idx=zone_idx,
-                    slot_idx=slot_idx,
-                    is_occupied=True,
-                )
+                if card_id:
+                    object_vectors[card_id] = slot_vectors[i]
 
+        player_vectors = self._build_player_vectors(state, perspective_player_idx)
+        return object_vectors, player_vectors
+
+    def _build_player_vectors(
+        self,
+        state: GameStateSnapshot,
+        perspective_player_idx: int,
+    ) -> dict[str, Tensor]:
         player_vectors: dict[str, Tensor] = {}
-        for idx, state_player in enumerate(players):
+        for idx, state_player in enumerate(state["players"]):
             player_id = state_player.get("ID")
             if not player_id:
                 continue
@@ -455,7 +439,7 @@ class ActionOptionsEncoder(nn.Module):
                 state_player,
                 is_self=idx == perspective_player_idx,
             )
-        return object_vectors, player_vectors
+        return player_vectors
 
     def _player_target_vector(self, player: PlayerState, *, is_self: bool) -> Tensor:
         device = self.empty_option_vector.device

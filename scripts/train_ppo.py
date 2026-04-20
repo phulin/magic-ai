@@ -27,6 +27,7 @@ from magic_ai.ppo import (
     RolloutStep,
     merge_pending_into_state,
     ppo_update,
+    ppo_update_cached,
     rollout_step_from_policy,
     terminal_returns,
 )
@@ -47,29 +48,54 @@ class TranscriptAction:
     action: ActionRequest
 
 
+@dataclass
+class LiveGame:
+    game: Any
+    episode_idx: int
+    episode_steps: list[RolloutStep]
+    episode_transcript: list[TranscriptAction]
+    action_count: int = 0
+
+
 def main() -> None:
     args = parse_args()
     if args.torch_threads is not None:
         torch.set_num_threads(args.torch_threads)
 
-    device = torch.device(args.device)
+    update_device = torch.device(args.device)
+    rollout_device = resolve_rollout_device(args.rollout_device, update_device)
     game_state_encoder = GameStateEncoder.from_embedding_json(args.embeddings, d_model=args.d_model)
     policy = PPOPolicy(
         game_state_encoder,
         hidden_dim=args.hidden_dim,
         max_options=args.max_options,
         max_targets_per_option=args.max_targets_per_option,
-    ).to(device)
+    ).to(rollout_device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
 
     if args.checkpoint and args.checkpoint.exists():
-        checkpoint = torch.load(args.checkpoint, map_location=device)
+        checkpoint = torch.load(args.checkpoint, map_location=rollout_device)
         policy.load_state_dict(checkpoint["policy"])
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
 
     mage = importlib.import_module("mage")
     deck_a, deck_b = load_decks(args.deck_json)
+    if args.num_envs > 1:
+        train_batched_envs(
+            args,
+            mage,
+            deck_a,
+            deck_b,
+            policy,
+            optimizer,
+            update_device=update_device,
+            rollout_device=rollout_device,
+        )
+        save_checkpoint(args.output, policy, optimizer, args)
+        print(f"saved checkpoint -> {args.output}")
+        return
+
     pending_steps: list[RolloutStep] = []
     pending_returns: list[torch.Tensor] = []
     last_sample_transcript: list[TranscriptAction] = []
@@ -133,11 +159,14 @@ def main() -> None:
         completed_games += 1
 
         if len(pending_steps) >= args.rollout_steps:
-            stats = ppo_update(
+            stats = run_ppo_update(
                 policy,
                 optimizer,
                 pending_steps,
                 torch.cat(pending_returns),
+                use_cache=not args.uncached_ppo,
+                update_device=update_device,
+                rollout_device=rollout_device,
                 epochs=args.ppo_epochs,
                 minibatch_size=args.minibatch_size,
                 clip_epsilon=args.clip_epsilon,
@@ -171,11 +200,14 @@ def main() -> None:
             save_checkpoint(args.output, policy, optimizer, args)
 
     if pending_steps:
-        stats = ppo_update(
+        stats = run_ppo_update(
             policy,
             optimizer,
             pending_steps,
             torch.cat(pending_returns),
+            use_cache=not args.uncached_ppo,
+            update_device=update_device,
+            rollout_device=rollout_device,
             epochs=args.ppo_epochs,
             minibatch_size=args.minibatch_size,
             clip_epsilon=args.clip_epsilon,
@@ -210,6 +242,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--deck-json", type=Path, default=None)
     parser.add_argument("--episodes", type=int, default=100)
+    parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--rollout-steps", type=int, default=512)
     parser.add_argument("--max-steps-per-game", type=int, default=400)
     parser.add_argument("--seed", type=int, default=1)
@@ -219,6 +252,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-shuffle", action="store_true")
     parser.add_argument("--deterministic-rollout", action="store_true")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--rollout-device",
+        default="auto",
+        help="device for rollout action selection; auto uses cpu when --device is cuda",
+    )
     parser.add_argument("--torch-threads", type=int, default=None)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=512)
@@ -227,12 +265,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--ppo-epochs", type=int, default=4)
-    parser.add_argument("--minibatch-size", type=int, default=64)
+    parser.add_argument("--minibatch-size", type=int, default=256)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--save-every", type=int, default=10)
+    parser.add_argument(
+        "--uncached-ppo",
+        action="store_true",
+        help="recompute encoders during PPO updates; slower, but trains encoder parameters",
+    )
     parser.add_argument(
         "--sample-actions",
         type=int,
@@ -240,6 +283,256 @@ def parse_args() -> argparse.Namespace:
         help="maximum actions to print from a sample rollout game at each PPO update",
     )
     return parser.parse_args()
+
+
+def resolve_rollout_device(value: str, update_device: torch.device) -> torch.device:
+    if value != "auto":
+        return torch.device(value)
+    if update_device.type == "cuda":
+        return torch.device("cpu")
+    return update_device
+
+
+def run_ppo_update(
+    policy: PPOPolicy,
+    optimizer: torch.optim.Optimizer,
+    steps: list[RolloutStep],
+    returns: torch.Tensor,
+    *,
+    use_cache: bool,
+    update_device: torch.device,
+    rollout_device: torch.device,
+    epochs: int,
+    minibatch_size: int,
+    clip_epsilon: float,
+    value_coef: float,
+    entropy_coef: float,
+    max_grad_norm: float,
+):
+    update = ppo_update_cached if use_cache else ppo_update
+    policy.to(update_device)
+    move_optimizer_state(optimizer, update_device)
+    stats = update(
+        policy,
+        optimizer,
+        steps,
+        returns,
+        epochs=epochs,
+        minibatch_size=minibatch_size,
+        clip_epsilon=clip_epsilon,
+        value_coef=value_coef,
+        entropy_coef=entropy_coef,
+        max_grad_norm=max_grad_norm,
+    )
+    policy.to(rollout_device)
+    return stats
+
+
+def move_optimizer_state(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def train_batched_envs(
+    args: argparse.Namespace,
+    mage: Any,
+    deck_a: dict[str, Any],
+    deck_b: dict[str, Any],
+    policy: PPOPolicy,
+    optimizer: torch.optim.Optimizer,
+    *,
+    update_device: torch.device,
+    rollout_device: torch.device,
+) -> None:
+    pending_steps: list[RolloutStep] = []
+    pending_returns: list[torch.Tensor] = []
+    last_sample_transcript: list[TranscriptAction] = []
+    completed_games = 0
+    last_saved_games = 0
+    next_episode_idx = 0
+    live_games: list[LiveGame] = []
+
+    def start_game(episode_idx: int) -> LiveGame:
+        return LiveGame(
+            game=mage.new_game(
+                deck_a,
+                deck_b,
+                name_a=args.name_a,
+                name_b=args.name_b,
+                seed=args.seed + episode_idx,
+                shuffle=not args.no_shuffle,
+                hand_size=args.hand_size,
+            ),
+            episode_idx=episode_idx,
+            episode_steps=[],
+            episode_transcript=[],
+        )
+
+    def maybe_start_games() -> None:
+        nonlocal next_episode_idx
+        while len(live_games) < args.num_envs and next_episode_idx < args.episodes:
+            live_games.append(start_game(next_episode_idx))
+            next_episode_idx += 1
+
+    def finish_game(env: LiveGame, winner: str) -> None:
+        nonlocal completed_games, last_sample_transcript
+        env.game.close()
+        if env.episode_steps:
+            returns = terminal_returns(env.episode_steps, winner=winner, gamma=args.gamma)
+            pending_steps.extend(env.episode_steps)
+            pending_returns.append(returns)
+            last_sample_transcript = env.episode_transcript
+        completed_games += 1
+
+    maybe_start_games()
+    while live_games:
+        ready: list[tuple[LiveGame, GameStateSnapshot, PendingState]] = []
+        remaining_games: list[LiveGame] = []
+        for env in live_games:
+            pending = env.game.pending or env.game.legal()
+            if env.game.is_over:
+                finish_game(env, str(env.game.winner))
+                continue
+            if env.action_count >= args.max_steps_per_game:
+                finish_game(env, "")
+                continue
+            if pending is None:
+                env.game.refresh_state()
+                remaining_games.append(env)
+                continue
+            state = merge_pending_into_state(env.game.state, pending)
+            ready.append((env, state, cast(PendingState, pending)))
+            remaining_games.append(env)
+
+        live_games = remaining_games
+        if ready:
+            prepared = [
+                policy.prepare_action_input(
+                    state,
+                    pending,
+                    perspective_player_idx=int(pending.get("player_idx", 0)),
+                )
+                for _env, state, pending in ready
+            ]
+            with torch.no_grad():
+                policy_steps = policy.act_prepared_batch(
+                    prepared,
+                    deterministic=args.deterministic_rollout,
+                )
+            for (env, state, pending), policy_step in zip(ready, policy_steps, strict=True):
+                player_idx = int(pending.get("player_idx", 0))
+                player = state["players"][player_idx]
+                env.episode_steps.append(
+                    RolloutStep(
+                        state=state,
+                        pending=pending,
+                        perspective_player_idx=player_idx,
+                        player_id=player.get("ID", ""),
+                        player_name=player.get("Name", ""),
+                        trace=policy_step.trace,
+                        old_log_prob=float(policy_step.log_prob.detach().cpu()),
+                        value=float(policy_step.value.detach().cpu()),
+                        cache=policy_step.cache,
+                    )
+                )
+                env.episode_transcript.append(
+                    TranscriptAction(
+                        state=state,
+                        pending=pending,
+                        action=policy_step.action,
+                    )
+                )
+                env.action_count += 1
+                env.game.step(cast(dict[Any, Any], policy_step.action))
+
+        still_live: list[LiveGame] = []
+        for env in live_games:
+            if env.game.is_over:
+                finish_game(env, str(env.game.winner))
+            else:
+                still_live.append(env)
+        live_games = still_live
+
+        if len(pending_steps) >= args.rollout_steps:
+            stats = run_ppo_update(
+                policy,
+                optimizer,
+                pending_steps,
+                torch.cat(pending_returns),
+                use_cache=not args.uncached_ppo,
+                update_device=update_device,
+                rollout_device=rollout_device,
+                epochs=args.ppo_epochs,
+                minibatch_size=args.minibatch_size,
+                clip_epsilon=args.clip_epsilon,
+                value_coef=args.value_coef,
+                entropy_coef=args.entropy_coef,
+                max_grad_norm=args.max_grad_norm,
+            )
+            print_sample_game(
+                last_sample_transcript,
+                winner="",
+                max_actions=args.sample_actions,
+            )
+            print(
+                "update",
+                f"games={completed_games}",
+                f"steps={len(pending_steps)}",
+                f"loss={stats.loss:.4f}",
+                f"policy={stats.policy_loss:.4f}",
+                f"value={stats.value_loss:.4f}",
+                f"entropy={stats.entropy:.4f}",
+                f"kl={stats.approx_kl:.4f}",
+                f"clip={stats.clip_fraction:.3f}",
+                flush=True,
+            )
+            pending_steps.clear()
+            pending_returns.clear()
+
+        if (
+            args.save_every
+            and completed_games > 0
+            and completed_games % args.save_every == 0
+            and completed_games != last_saved_games
+        ):
+            save_checkpoint(args.output, policy, optimizer, args)
+            last_saved_games = completed_games
+
+        maybe_start_games()
+
+    if pending_steps:
+        stats = run_ppo_update(
+            policy,
+            optimizer,
+            pending_steps,
+            torch.cat(pending_returns),
+            use_cache=not args.uncached_ppo,
+            update_device=update_device,
+            rollout_device=rollout_device,
+            epochs=args.ppo_epochs,
+            minibatch_size=args.minibatch_size,
+            clip_epsilon=args.clip_epsilon,
+            value_coef=args.value_coef,
+            entropy_coef=args.entropy_coef,
+            max_grad_norm=args.max_grad_norm,
+        )
+        print_sample_game(
+            last_sample_transcript,
+            winner="",
+            max_actions=args.sample_actions,
+        )
+        print(
+            "final_update",
+            f"games={completed_games}",
+            f"steps={len(pending_steps)}",
+            f"loss={stats.loss:.4f}",
+            f"policy={stats.policy_loss:.4f}",
+            f"value={stats.value_loss:.4f}",
+            f"entropy={stats.entropy:.4f}",
+            flush=True,
+        )
 
 
 def load_decks(path: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:

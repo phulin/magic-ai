@@ -184,6 +184,28 @@ class GameStateEncoder(nn.Module):
         self.tapped_vector = nn.Parameter(torch.randn(d_model) * 0.02)
         self.register_buffer("unknown_card_vector", torch.zeros(self.raw_embedding_dim))
 
+        # Pre-computed index tensors for batched slot encoding.
+        zone_ids: list[int] = []
+        slot_ids: list[int] = []
+        is_bf: list[float] = []
+        for _zone_idx in range(ZONE_COUNT):
+            for _slot_idx in range(max_cards_per_zone):
+                zone_ids.append(_zone_idx)
+                slot_ids.append(_slot_idx)
+                is_bf.append(float(ZONE_SPECS[_zone_idx][1] == "battlefield"))
+        self._zone_ids: Tensor
+        self.register_buffer(
+            "_zone_ids", torch.tensor(zone_ids, dtype=torch.long), persistent=False
+        )
+        self._slot_ids: Tensor
+        self.register_buffer(
+            "_slot_ids", torch.tensor(slot_ids, dtype=torch.long), persistent=False
+        )
+        self._is_battlefield: Tensor
+        self.register_buffer(
+            "_is_battlefield", torch.tensor(is_bf, dtype=torch.float32), persistent=False
+        )
+
         self._card_embeddings = _normalize_card_embedding_map(
             card_embeddings,
             raw_embedding_dim=self.raw_embedding_dim,
@@ -249,67 +271,113 @@ class GameStateEncoder(nn.Module):
         state: GameStateSnapshot,
         perspective_player_idx: int | None = None,
     ) -> Tensor:
+        state_vector, _ = self.encode_state_with_references(state, perspective_player_idx)
+        return state_vector
+
+    def encode_state_with_references(
+        self,
+        state: GameStateSnapshot,
+        perspective_player_idx: int | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Encode a state and return per-card reference vectors for reuse.
+
+        Returns ``(state_vector, object_vectors)`` where *object_vectors* maps
+        card IDs to their slot vectors, suitable for passing directly to
+        ``ActionOptionsEncoder.encode_pending`` as
+        ``precomputed_object_vectors``.
+        """
+
         device = self.empty_slot_vector.device
         player_idx = self._resolve_perspective_player_idx(state, perspective_player_idx)
         players = state["players"]
         if not 0 <= player_idx < len(players):
             raise IndexError(f"player index {player_idx} outside players list")
 
-        slot_vectors: list[Tensor] = []
-        occupied: list[float] = []
-        player = players[player_idx]
+        all_cards = self._collect_slot_cards(state, player_idx)
+        slot_vectors = self._encode_slots_batched(all_cards)
+        occupied = [float(card is not None) for card in all_cards]
 
-        opponent = players[1 - player_idx] if len(players) == 2 else None
+        # Build card_id -> slot_vector reference map.
+        object_vectors: dict[str, Tensor] = {}
+        for i, card in enumerate(all_cards):
+            if card is not None:
+                card_id = card.get("ID")
+                if card_id:
+                    object_vectors[card_id] = slot_vectors[i]
 
-        for zone_idx, (_zone_name, zone, owner) in enumerate(ZONE_SPECS):
-            zone_player = player if owner == "self" else opponent
-            cards = _zone_cards(zone_player, zone)
-            for slot_idx in range(self.max_cards_per_zone):
-                card = cards[slot_idx] if slot_idx < len(cards) else None
-                is_occupied = card is not None
-                occupied.append(float(is_occupied))
-                slot_vectors.append(
-                    self._encode_slot(
-                        card,
-                        zone_idx=zone_idx,
-                        slot_idx=slot_idx,
-                        is_occupied=is_occupied,
-                    )
-                )
-
-        card_features = torch.stack(slot_vectors, dim=0).flatten()
+        card_features = slot_vectors.flatten()
         game_info = self._build_game_info(
             state,
             perspective_player_idx=player_idx,
             occupied=occupied,
             device=device,
         )
-        return torch.cat([card_features, game_info], dim=0)
+        state_vector = torch.cat([card_features, game_info], dim=0)
+        return state_vector, object_vectors
 
-    def _encode_slot(
+    def _collect_slot_cards(
         self,
-        card: GameCardState | None,
-        *,
-        zone_idx: int,
-        slot_idx: int,
-        is_occupied: bool,
-    ) -> Tensor:
+        state: GameStateSnapshot,
+        perspective_player_idx: int,
+    ) -> list[GameCardState | None]:
+        """Gather the card (or None) for every zone-slot in spec order."""
+
+        players = state["players"]
+        player = players[perspective_player_idx]
+        opponent = players[1 - perspective_player_idx] if len(players) == 2 else None
+        all_cards: list[GameCardState | None] = []
+        for _zone_name, zone, owner in ZONE_SPECS:
+            zone_player = player if owner == "self" else opponent
+            cards = _zone_cards(zone_player, zone)
+            for slot_idx in range(self.max_cards_per_zone):
+                all_cards.append(cards[slot_idx] if slot_idx < len(cards) else None)
+        return all_cards
+
+    def _encode_slots_batched(self, all_cards: list[GameCardState | None]) -> Tensor:
+        """Encode all zone-slots in one batched pass.
+
+        Instead of calling ``card_projection`` per slot, this gathers raw
+        embeddings for occupied slots, runs a single batched projection, and
+        applies zone/slot/tapped vectors with tensor ops.
+        """
+
         device = self.empty_slot_vector.device
-        if is_occupied and card is not None:
-            raw_embedding = self._lookup_card_embedding(card)
-            slot_vector = self.card_projection(raw_embedding)
-        else:
-            slot_vector = self.empty_slot_vector
+        n = len(all_cards)
 
-        zone_id = torch.tensor(zone_idx, device=device)
-        slot_id = torch.tensor(slot_idx, device=device)
-        slot_vector = slot_vector + self.zone_embedding(zone_id) + self.slot_embedding(slot_id)
+        occupied_indices: list[int] = []
+        raw_embeddings: list[Tensor] = []
+        tapped_values: list[float] = []
 
-        if is_occupied and ZONE_SPECS[zone_idx][1] == "battlefield" and card is not None:
-            tapped = 1.0 if card.get("Tapped", False) else 0.0
-            slot_vector = slot_vector + self.tapped_vector * tapped
+        for i, card in enumerate(all_cards):
+            if card is not None:
+                occupied_indices.append(i)
+                raw_embeddings.append(self._lookup_card_embedding(card))
+                tapped_values.append(1.0 if card.get("Tapped", False) else 0.0)
 
-        return slot_vector
+        # Start with empty_slot_vector for every slot.
+        slot_vectors = self.empty_slot_vector.unsqueeze(0).expand(n, -1).clone()
+
+        if occupied_indices:
+            idx = torch.tensor(occupied_indices, dtype=torch.long, device=device)
+
+            # Single batched projection for all occupied cards.
+            raw_batch = torch.stack(raw_embeddings)
+            projected = self.card_projection(raw_batch)
+
+            # Tapped contribution (battlefield slots only).
+            tapped_t = torch.tensor(tapped_values, dtype=torch.float32, device=device)
+            bf_mask = self._is_battlefield[idx]
+            tapped_contribution = (tapped_t * bf_mask).unsqueeze(-1) * self.tapped_vector
+
+            slot_vectors[idx] = projected + tapped_contribution
+
+        # Single batched zone + slot embedding addition for all slots.
+        slot_vectors = (
+            slot_vectors
+            + self.zone_embedding(self._zone_ids[:n])
+            + self.slot_embedding(self._slot_ids[:n])
+        )
+        return slot_vectors
 
     def _lookup_card_embedding(self, card: GameCardState) -> Tensor:
         name = card.get("Name", "")
