@@ -26,10 +26,20 @@ from magic_ai.game_state import (
     PendingState,
     PlayerState,
 )
+from magic_ai.model import ActionTrace, PolicyStep, PPOPolicy
+from magic_ai.ppo import (
+    PPOStats,
+    RolloutStep,
+    merge_pending_into_state,
+    ppo_update,
+    rollout_step_from_policy,
+    terminal_returns,
+)
 
 __all__ = [
     "ActionOptionsEncoder",
     "ActionRequest",
+    "ActionTrace",
     "EncodedActionOptions",
     "EncodedSelectedAction",
     "GameCardState",
@@ -37,9 +47,13 @@ __all__ = [
     "GameStateSnapshot",
     "LegalActionCandidate",
     "ManaPoolState",
+    "PPOPolicy",
+    "PPOStats",
     "PendingOptionState",
     "PendingState",
     "PlayerState",
+    "PolicyStep",
+    "RolloutStep",
     "SelectedActionEncoder",
     "action_from_attackers",
     "action_from_blockers",
@@ -49,5 +63,9 @@ __all__ = [
     "action_from_choice_index",
     "action_from_priority_candidate",
     "build_priority_candidates",
+    "merge_pending_into_state",
+    "ppo_update",
+    "rollout_step_from_policy",
     "selected_priority_candidate_index",
+    "terminal_returns",
 ]
