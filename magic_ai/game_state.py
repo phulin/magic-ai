@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, NotRequired, TypedDict, cast
+from typing import Literal, NotRequired, TypedDict, cast
 
 import torch
 from torch import Tensor, nn
@@ -73,43 +74,29 @@ class ManaPoolState(TypedDict):
 class GameCardState(TypedDict, total=False):
     ID: str
     Name: str
-    ManaCost: str
-    IsLand: bool
-    Types: str
-    SubTypes: str
-    Power: int | float | str | None
-    Toughness: int | float | str | None
-    RulesText: str
-    Tapped: bool
-    SummonSick: bool
-    IsCreature: bool
-    IsArtifact: bool
-    Attacking: bool
-    Blocking: str
-    Counters: Any
-    Keywords: Any
-    AttachedTo: str
+    Tapped: NotRequired[bool]
 
 
 class PlayerState(TypedDict):
     ID: str
     Name: str
     Life: int | float
-    HandCount: int
-    Hand: list[GameCardState] | None
-    Battlefield: list[GameCardState] | None
-    Graveyard: list[GameCardState] | None
-    GraveyardCount: int
-    ManaPool: ManaPoolState
-    LibraryCount: int
+    HandCount: NotRequired[int]
+    GraveyardCount: NotRequired[int]
+    LibraryCount: NotRequired[int]
+    Hand: NotRequired[list[GameCardState]]
+    Graveyard: NotRequired[list[GameCardState]]
+    Battlefield: NotRequired[list[GameCardState]]
+    ManaPool: NotRequired[ManaPoolState]
 
 
 class TargetState(TypedDict):
     id: str
-    label: str
+    label: NotRequired[str]
 
 
 class PendingOptionState(TypedDict, total=False):
+    id: str
     kind: str
     label: str
     card_id: str
@@ -117,46 +104,62 @@ class PendingOptionState(TypedDict, total=False):
     permanent_id: str
     ability_index: int
     mana_cost: str
-    valid_targets: list[TargetState]
-    id: str
     color: str
+    valid_targets: list[TargetState]
 
 
 class PendingState(TypedDict):
     kind: str
     player_idx: int
     options: list[PendingOptionState]
-    reason: NotRequired[str]
     amount: NotRequired[int]
 
 
 class StackObjectState(TypedDict, total=False):
-    ID: str
-    Name: str
-    controller: str
-    targets: list[TargetState]
+    id: str
+    name: str
 
 
 class GameStateSnapshot(TypedDict):
     turn: int
-    step: str
     active_player: str
+    step: str
     players: list[PlayerState]
-    stack: list[StackObjectState] | None
-    pending: NotRequired[PendingState | None]
+    pending: NotRequired[PendingState]
+    stack: NotRequired[list[StackObjectState]]
 
 
-CardEmbeddingInput = Mapping[str, Sequence[float] | Tensor]
+type CardEmbeddingInput = Mapping[str, Sequence[float] | Tensor]
+
+
+@dataclass(frozen=True)
+class ParsedGameState:
+    """Non-differentiable parsed representation of a game state.
+
+    All tensor fields are integer/float index tables — no trainable embeddings
+    have been applied yet. Produced by ``GameStateEncoder.parse_state`` and
+    consumed by ``GameStateEncoder.embed_slot_vectors``.
+    """
+
+    slot_card_rows: (
+        Tensor  # Long[ZONE_SLOT_COUNT] — row in card_embedding_table (0 = empty/unknown)
+    )
+    slot_occupied: Tensor  # Float[ZONE_SLOT_COUNT] — 1.0 if slot has a card
+    slot_tapped: Tensor  # Float[ZONE_SLOT_COUNT] — 1.0 only where occupied+battlefield+tapped
+    game_info: Tensor  # Float[GAME_INFO_DIM]
+    card_id_to_slot: dict[str, int]  # Python-only: used by ActionOptionsEncoder parsing
 
 
 class GameStateEncoder(nn.Module):
     """Encode one engine game-state snapshot into a fixed MLP-ready vector.
 
-    Card embeddings are treated as frozen inputs. The trainable parts are the
-    projection into `d_model`, positional/zone vectors, the empty slot vector,
-    and the tapped vector. Hidden information is perspective-based: only the
-    perspective player's hand is encoded, while both players' graveyards and
-    battlefields are encoded.
+    Raw card embeddings live on the module's device as a single
+    ``card_embedding_table`` buffer (row 0 is the unknown/zero vector). All
+    per-step parsing produces integer indices into that table; the actual
+    vector lookup and projection happens on-device inside
+    ``embed_slot_vectors`` so trainable parameters (``card_projection``,
+    zone/slot embeddings, ``empty_slot_vector``, ``tapped_vector``) see
+    gradients during PPO updates.
     """
 
     game_info_dim = GAME_INFO_DIM
@@ -182,7 +185,14 @@ class GameStateEncoder(nn.Module):
         self.slot_embedding = nn.Embedding(max_cards_per_zone, d_model)
         self.empty_slot_vector = nn.Parameter(torch.zeros(d_model))
         self.tapped_vector = nn.Parameter(torch.randn(d_model) * 0.02)
-        self.register_buffer("unknown_card_vector", torch.zeros(self.raw_embedding_dim))
+
+        table, name_to_row = _build_card_embedding_table(
+            card_embeddings,
+            raw_embedding_dim=self.raw_embedding_dim,
+        )
+        self.card_embedding_table: Tensor
+        self.register_buffer("card_embedding_table", table)
+        self._card_name_to_row = name_to_row
 
         # Pre-computed index tensors for batched slot encoding.
         zone_ids: list[int] = []
@@ -206,14 +216,13 @@ class GameStateEncoder(nn.Module):
             "_is_battlefield", torch.tensor(is_bf, dtype=torch.float32), persistent=False
         )
 
-        self._card_embeddings = _normalize_card_embedding_map(
-            card_embeddings,
-            raw_embedding_dim=self.raw_embedding_dim,
-        )
-
     @property
     def output_dim(self) -> int:
         return ZONE_SLOT_COUNT * self.d_model + GAME_INFO_DIM
+
+    @property
+    def device(self) -> torch.device:
+        return self.empty_slot_vector.device
 
     @classmethod
     def from_embedding_json(
@@ -233,87 +242,93 @@ class GameStateEncoder(nn.Module):
                 embeddings[name] = embedding
         return cls(embeddings, d_model=d_model)
 
-    def forward(
-        self,
-        states: GameStateSnapshot | Sequence[GameStateSnapshot],
-        *,
-        perspective_player_idx: int | Sequence[int] | None = None,
-    ) -> Tensor:
-        """Encode a single state or a batch of states.
-
-        If `perspective_player_idx` is omitted, the encoder uses
-        `state["pending"]["player_idx"]` when available, otherwise the active
-        player, otherwise player 0.
-        """
-
-        if isinstance(states, Mapping):
-            idx = cast(int | None, perspective_player_idx)
-            return self.encode_state(cast(GameStateSnapshot, states), idx)
-
-        batch_states = list(states)
-        if perspective_player_idx is None:
-            indices: list[int | None] = [None] * len(batch_states)
-        elif isinstance(perspective_player_idx, int):
-            indices = [perspective_player_idx] * len(batch_states)
-        else:
-            indices = list(perspective_player_idx)
-            if len(indices) != len(batch_states):
-                raise ValueError("perspective_player_idx length must match states length")
-
-        encoded = [
-            self.encode_state(state, player_idx)
-            for state, player_idx in zip(batch_states, indices, strict=True)
-        ]
-        return torch.stack(encoded, dim=0)
-
-    def encode_state(
+    def parse_state(
         self,
         state: GameStateSnapshot,
         perspective_player_idx: int | None = None,
-    ) -> Tensor:
-        state_vector, _ = self.encode_state_with_references(state, perspective_player_idx)
-        return state_vector
+    ) -> ParsedGameState:
+        """Parse a state dict into integer/float index tensors.
 
-    def encode_state_with_references(
-        self,
-        state: GameStateSnapshot,
-        perspective_player_idx: int | None = None,
-    ) -> tuple[Tensor, dict[str, Tensor]]:
-        """Encode a state and return per-card reference vectors for reuse.
-
-        Returns ``(state_vector, object_vectors)`` where *object_vectors* maps
-        card IDs to their slot vectors, suitable for passing directly to
-        ``ActionOptionsEncoder.encode_pending`` as
-        ``precomputed_object_vectors``.
+        Pure Python + dict traversal. Produces device-resident tensors so
+        downstream embedding ops stay on-GPU. No trainable parameters are
+        touched here.
         """
 
-        device = self.empty_slot_vector.device
+        device = self.device
         player_idx = self._resolve_perspective_player_idx(state, perspective_player_idx)
         players = state["players"]
         if not 0 <= player_idx < len(players):
             raise IndexError(f"player index {player_idx} outside players list")
 
         all_cards = self._collect_slot_cards(state, player_idx)
-        slot_vectors = self._encode_slots_batched(all_cards)
-        occupied = [float(card is not None) for card in all_cards]
+        card_rows: list[int] = []
+        occupied: list[float] = []
+        tapped: list[float] = []
+        card_id_to_slot: dict[str, int] = {}
 
-        # Build card_id -> slot_vector reference map.
-        object_vectors: dict[str, Tensor] = {}
-        for i, card in enumerate(all_cards):
-            if card is not None:
-                card_id = card.get("ID")
-                if card_id:
-                    object_vectors[card_id] = slot_vectors[i]
+        for slot_idx, card in enumerate(all_cards):
+            if card is None:
+                card_rows.append(0)
+                occupied.append(0.0)
+                tapped.append(0.0)
+                continue
+            name = card.get("Name", "")
+            card_rows.append(self._card_name_to_row.get(_card_key(name), 0))
+            occupied.append(1.0)
+            is_bf = float(ZONE_SPECS[slot_idx // self.max_cards_per_zone][1] == "battlefield")
+            tapped.append(1.0 if (card.get("Tapped", False) and is_bf) else 0.0)
+            card_id = card.get("ID")
+            if card_id:
+                card_id_to_slot[card_id] = slot_idx
 
-        card_features = slot_vectors.flatten()
+        occupied_t = torch.tensor(occupied, dtype=torch.float32, device=device)
         game_info = self._build_game_info(
             state,
             perspective_player_idx=player_idx,
             occupied=occupied,
             device=device,
         )
-        state_vector = torch.cat([card_features, game_info], dim=0)
-        return state_vector, object_vectors
+        return ParsedGameState(
+            slot_card_rows=torch.tensor(card_rows, dtype=torch.long, device=device),
+            slot_occupied=occupied_t,
+            slot_tapped=torch.tensor(tapped, dtype=torch.float32, device=device),
+            game_info=game_info,
+            card_id_to_slot=card_id_to_slot,
+        )
+
+    def embed_slot_vectors(
+        self,
+        slot_card_rows: Tensor,
+        slot_occupied: Tensor,
+        slot_tapped: Tensor,
+    ) -> Tensor:
+        """Compute slot vectors from parsed indices.
+
+        Accepts ``[..., ZONE_SLOT_COUNT]`` index tensors and returns
+        ``[..., ZONE_SLOT_COUNT, d_model]``. All trainable params on this path
+        (``card_projection``, zone/slot embeddings, ``empty_slot_vector``,
+        ``tapped_vector``) receive gradients.
+        """
+
+        raw = self.card_embedding_table[slot_card_rows]
+        projected = self.card_projection(raw)
+        occupied_mask = slot_occupied.unsqueeze(-1) > 0
+        empty = self.empty_slot_vector.expand_as(projected)
+        slot_vectors = torch.where(occupied_mask, projected, empty)
+        slot_vectors = slot_vectors + slot_tapped.unsqueeze(-1) * self.tapped_vector
+        position = self.zone_embedding(self._zone_ids) + self.slot_embedding(self._slot_ids)
+        return slot_vectors + position
+
+    def state_vector_from_slots(self, slot_vectors: Tensor, game_info: Tensor) -> Tensor:
+        """Flatten slot vectors and concatenate with the parsed scalar game info."""
+
+        card_features = slot_vectors.flatten(-2, -1)
+        return torch.cat([card_features, game_info], dim=-1)
+
+    def lookup_card_row(self, name: str) -> int:
+        """Return the card_embedding_table row for a card name (0 if unknown)."""
+
+        return self._card_name_to_row.get(_card_key(name), 0)
 
     def _collect_slot_cards(
         self,
@@ -332,59 +347,6 @@ class GameStateEncoder(nn.Module):
             for slot_idx in range(self.max_cards_per_zone):
                 all_cards.append(cards[slot_idx] if slot_idx < len(cards) else None)
         return all_cards
-
-    def _encode_slots_batched(self, all_cards: list[GameCardState | None]) -> Tensor:
-        """Encode all zone-slots in one batched pass.
-
-        Instead of calling ``card_projection`` per slot, this gathers raw
-        embeddings for occupied slots, runs a single batched projection, and
-        applies zone/slot/tapped vectors with tensor ops.
-        """
-
-        device = self.empty_slot_vector.device
-        n = len(all_cards)
-
-        occupied_indices: list[int] = []
-        raw_embeddings: list[Tensor] = []
-        tapped_values: list[float] = []
-
-        for i, card in enumerate(all_cards):
-            if card is not None:
-                occupied_indices.append(i)
-                raw_embeddings.append(self._lookup_card_embedding(card))
-                tapped_values.append(1.0 if card.get("Tapped", False) else 0.0)
-
-        # Start with empty_slot_vector for every slot.
-        slot_vectors = self.empty_slot_vector.unsqueeze(0).expand(n, -1).clone()
-
-        if occupied_indices:
-            idx = torch.tensor(occupied_indices, dtype=torch.long, device=device)
-
-            # Single batched projection for all occupied cards.
-            raw_batch = torch.stack(raw_embeddings)
-            projected = self.card_projection(raw_batch)
-
-            # Tapped contribution (battlefield slots only).
-            tapped_t = torch.tensor(tapped_values, dtype=torch.float32, device=device)
-            bf_mask = self._is_battlefield[idx]
-            tapped_contribution = (tapped_t * bf_mask).unsqueeze(-1) * self.tapped_vector
-
-            slot_vectors[idx] = projected + tapped_contribution
-
-        # Single batched zone + slot embedding addition for all slots.
-        slot_vectors = (
-            slot_vectors
-            + self.zone_embedding(self._zone_ids[:n])
-            + self.slot_embedding(self._slot_ids[:n])
-        )
-        return slot_vectors
-
-    def _lookup_card_embedding(self, card: GameCardState) -> Tensor:
-        name = card.get("Name", "")
-        embedding = self._card_embeddings.get(_card_key(name))
-        if embedding is None:
-            return cast(Tensor, self.unknown_card_vector)
-        return embedding.to(self.empty_slot_vector.device)
 
     def _resolve_perspective_player_idx(
         self,
@@ -448,12 +410,19 @@ class GameStateEncoder(nn.Module):
         return torch.tensor(values, dtype=torch.float32, device=device)
 
 
-def _normalize_card_embedding_map(
+def _build_card_embedding_table(
     card_embeddings: CardEmbeddingInput,
     *,
     raw_embedding_dim: int,
-) -> dict[str, Tensor]:
-    normalized: dict[str, Tensor] = {}
+) -> tuple[Tensor, dict[str, int]]:
+    """Pack all frozen card embeddings into one dense table.
+
+    Row 0 is the zero / unknown-card vector. Cards get rows 1..N in the order
+    they appear in ``card_embeddings``.
+    """
+
+    rows: list[Tensor] = [torch.zeros(raw_embedding_dim, dtype=torch.float32)]
+    name_to_row: dict[str, int] = {}
     for name, embedding in card_embeddings.items():
         tensor = torch.as_tensor(embedding, dtype=torch.float32).detach()
         if tensor.ndim != 1:
@@ -462,8 +431,10 @@ def _normalize_card_embedding_map(
             raise ValueError(
                 f"embedding for {name!r} has dim {tensor.shape[0]}, expected {raw_embedding_dim}"
             )
-        normalized[_card_key(name)] = tensor
-    return normalized
+        name_to_row[_card_key(name)] = len(rows)
+        rows.append(tensor)
+    table = torch.stack(rows, dim=0)
+    return table, name_to_row
 
 
 def _infer_embedding_dim(card_embeddings: CardEmbeddingInput) -> int:

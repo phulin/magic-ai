@@ -33,7 +33,6 @@ from magic_ai.ppo import (  # noqa: E402
     RolloutStep,
     merge_pending_into_state,
     ppo_update,
-    ppo_update_cached,
     rollout_step_from_policy,
     terminal_returns,
 )
@@ -75,19 +74,18 @@ def main() -> None:
             config=vars(args),
         )
 
-    update_device = torch.device(args.device)
-    rollout_device = resolve_rollout_device(args.rollout_device, update_device)
+    device = torch.device(args.device)
     game_state_encoder = GameStateEncoder.from_embedding_json(args.embeddings, d_model=args.d_model)
     policy = PPOPolicy(
         game_state_encoder,
         hidden_dim=args.hidden_dim,
         max_options=args.max_options,
         max_targets_per_option=args.max_targets_per_option,
-    ).to(rollout_device)
+    ).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
 
     if args.checkpoint and args.checkpoint.exists():
-        checkpoint = torch.load(args.checkpoint, map_location=rollout_device)
+        checkpoint = torch.load(args.checkpoint, map_location=device)
         policy.load_state_dict(checkpoint["policy"])
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -95,16 +93,7 @@ def main() -> None:
     mage = importlib.import_module("mage")
     deck_a, deck_b = load_decks(args.deck_json)
     if args.num_envs > 1:
-        train_batched_envs(
-            args,
-            mage,
-            deck_a,
-            deck_b,
-            policy,
-            optimizer,
-            update_device=update_device,
-            rollout_device=rollout_device,
-        )
+        train_batched_envs(args, mage, deck_a, deck_b, policy, optimizer)
         save_checkpoint(args.output, policy, optimizer, args)
         print(f"saved checkpoint -> {args.output}")
         return
@@ -172,14 +161,11 @@ def main() -> None:
         completed_games += 1
 
         if len(pending_steps) >= args.rollout_steps:
-            stats = run_ppo_update(
+            stats = ppo_update(
                 policy,
                 optimizer,
                 pending_steps,
                 torch.cat(pending_returns),
-                use_cache=not args.uncached_ppo,
-                update_device=update_device,
-                rollout_device=rollout_device,
                 epochs=args.ppo_epochs,
                 minibatch_size=args.minibatch_size,
                 clip_epsilon=args.clip_epsilon,
@@ -219,14 +205,11 @@ def main() -> None:
             save_checkpoint(args.output, policy, optimizer, args)
 
     if pending_steps:
-        stats = run_ppo_update(
+        stats = ppo_update(
             policy,
             optimizer,
             pending_steps,
             torch.cat(pending_returns),
-            use_cache=not args.uncached_ppo,
-            update_device=update_device,
-            rollout_device=rollout_device,
             epochs=args.ppo_epochs,
             minibatch_size=args.minibatch_size,
             clip_epsilon=args.clip_epsilon,
@@ -273,11 +256,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-shuffle", action="store_true")
     parser.add_argument("--deterministic-rollout", action="store_true")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument(
-        "--rollout-device",
-        default="auto",
-        help="device for rollout action selection; auto uses cpu when --device is cuda",
-    )
     parser.add_argument("--torch-threads", type=int, default=None)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=512)
@@ -293,11 +271,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument(
-        "--uncached-ppo",
-        action="store_true",
-        help="recompute encoders during PPO updates; slower, but trains encoder parameters",
-    )
-    parser.add_argument(
         "--sample-actions",
         type=int,
         default=80,
@@ -307,56 +280,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     return parser.parse_args()
-
-
-def resolve_rollout_device(value: str, update_device: torch.device) -> torch.device:
-    if value != "auto":
-        return torch.device(value)
-    if update_device.type == "cuda":
-        return torch.device("cpu")
-    return update_device
-
-
-def run_ppo_update(
-    policy: PPOPolicy,
-    optimizer: torch.optim.Optimizer,
-    steps: list[RolloutStep],
-    returns: torch.Tensor,
-    *,
-    use_cache: bool,
-    update_device: torch.device,
-    rollout_device: torch.device,
-    epochs: int,
-    minibatch_size: int,
-    clip_epsilon: float,
-    value_coef: float,
-    entropy_coef: float,
-    max_grad_norm: float,
-):
-    update = ppo_update_cached if use_cache else ppo_update
-    policy.to(update_device)
-    move_optimizer_state(optimizer, update_device)
-    stats = update(
-        policy,
-        optimizer,
-        steps,
-        returns,
-        epochs=epochs,
-        minibatch_size=minibatch_size,
-        clip_epsilon=clip_epsilon,
-        value_coef=value_coef,
-        entropy_coef=entropy_coef,
-        max_grad_norm=max_grad_norm,
-    )
-    policy.to(rollout_device)
-    return stats
-
-
-def move_optimizer_state(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
-    for state in optimizer.state.values():
-        for key, value in list(state.items()):
-            if isinstance(value, torch.Tensor):
-                state[key] = value.to(device)
 
 
 def log_ppo_stats(
@@ -390,9 +313,6 @@ def train_batched_envs(
     deck_b: dict[str, Any],
     policy: PPOPolicy,
     optimizer: torch.optim.Optimizer,
-    *,
-    update_device: torch.device,
-    rollout_device: torch.device,
 ) -> None:
     pending_steps: list[RolloutStep] = []
     pending_returns: list[torch.Tensor] = []
@@ -456,8 +376,8 @@ def train_batched_envs(
 
         live_games = remaining_games
         if ready:
-            prepared = [
-                policy.prepare_action_input(
+            cached_inputs = [
+                policy.parse_inputs(
                     state,
                     pending,
                     perspective_player_idx=int(pending.get("player_idx", 0)),
@@ -465,8 +385,8 @@ def train_batched_envs(
                 for _env, state, pending in ready
             ]
             with torch.no_grad():
-                policy_steps = policy.act_prepared_batch(
-                    prepared,
+                policy_steps = policy.act_batch(
+                    cached_inputs,
                     deterministic=args.deterministic_rollout,
                 )
             for (env, state, pending), policy_step in zip(ready, policy_steps, strict=True):
@@ -504,14 +424,11 @@ def train_batched_envs(
         live_games = still_live
 
         if len(pending_steps) >= args.rollout_steps:
-            stats = run_ppo_update(
+            stats = ppo_update(
                 policy,
                 optimizer,
                 pending_steps,
                 torch.cat(pending_returns),
-                use_cache=not args.uncached_ppo,
-                update_device=update_device,
-                rollout_device=rollout_device,
                 epochs=args.ppo_epochs,
                 minibatch_size=args.minibatch_size,
                 clip_epsilon=args.clip_epsilon,
@@ -556,14 +473,11 @@ def train_batched_envs(
         maybe_start_games()
 
     if pending_steps:
-        stats = run_ppo_update(
+        stats = ppo_update(
             policy,
             optimizer,
             pending_steps,
             torch.cat(pending_returns),
-            use_cache=not args.uncached_ppo,
-            update_device=update_device,
-            rollout_device=rollout_device,
             epochs=args.ppo_epochs,
             minibatch_size=args.minibatch_size,
             clip_epsilon=args.clip_epsilon,

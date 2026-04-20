@@ -10,12 +10,10 @@ import torch
 from torch import Tensor, nn
 
 from magic_ai.game_state import (
-    GameCardState,
     GameStateEncoder,
     GameStateSnapshot,
     PendingOptionState,
     PendingState,
-    PlayerState,
 )
 
 DEFAULT_MAX_OPTIONS = 64
@@ -52,6 +50,10 @@ COLORS = ("white", "blue", "black", "red", "green", "colorless")
 OPTION_SCALAR_DIM = 14
 TARGET_SCALAR_DIM = 2
 
+PLAYER_TARGET_TYPE_ID = TARGET_TYPES.index("player")
+PERMANENT_TARGET_TYPE_ID = TARGET_TYPES.index("permanent")
+UNKNOWN_TARGET_TYPE_ID = TARGET_TYPES.index("unknown")
+
 
 class BlockerAssignState(TypedDict):
     blocker: str
@@ -76,16 +78,6 @@ class ActionRequest(TypedDict, total=False):
 class OptionTargetState(TypedDict):
     id: str
     label: str
-
-
-class EncodedActionOptions(TypedDict):
-    pending_vector: Tensor
-    option_vectors: Tensor
-    option_mask: Tensor
-    target_vectors: Tensor
-    target_mask: Tensor
-    target_overflow: Tensor
-    priority_candidates: list[LegalActionCandidate]
 
 
 class EncodedSelectedAction(TypedDict):
@@ -115,12 +107,40 @@ class LegalActionCandidate:
         return _copy_action_request(self.payload)
 
 
+@dataclass(frozen=True)
+class ParsedActionInputs:
+    """Non-differentiable parsed representation of a pending action request.
+
+    Fields are padded to ``max_options`` / ``max_targets_per_option``. Invalid
+    entries are masked out by ``option_mask`` / ``target_mask``. Reference
+    fields use ``-1`` to mean "no reference of this kind"; the embedder uses
+    those sentinels to choose among slot-vector, card-table, player, or zero
+    refs.
+    """
+
+    pending_kind_id: Tensor  # Long []
+    num_present_options: int
+    option_kind_ids: Tensor  # Long [max_options]
+    option_scalars: Tensor  # Float [max_options, OPTION_SCALAR_DIM]
+    option_mask: Tensor  # Float [max_options]
+    option_ref_slot_idx: Tensor  # Long [max_options] (-1 if none)
+    option_ref_card_row: Tensor  # Long [max_options] (-1 if none)
+    target_mask: Tensor  # Float [max_options, max_targets]
+    target_type_ids: Tensor  # Long [max_options, max_targets]
+    target_scalars: Tensor  # Float [max_options, max_targets, TARGET_SCALAR_DIM]
+    target_overflow: Tensor  # Float [max_options]
+    target_ref_slot_idx: Tensor  # Long [max_options, max_targets] (-1 if not permanent)
+    target_ref_is_player: Tensor  # Bool [max_options, max_targets]
+    target_ref_is_self: Tensor  # Bool [max_options, max_targets]
+    priority_candidates: list[LegalActionCandidate]
+
+
 class SelectedActionEncoder:
     """Encode a selected MageStep action into supervised labels.
 
-    The labels line up with `ActionOptionsEncoder`'s option/target dimensions.
-    Irrelevant scalar labels use -100 so they can be passed to PyTorch losses
-    with `ignore_index=-100`.
+    Label dimensions line up with ``ActionOptionsEncoder``'s option/target
+    dimensions. Irrelevant scalar labels use -100 so they can be passed to
+    PyTorch losses with ``ignore_index=-100``.
     """
 
     def __init__(
@@ -196,11 +216,14 @@ class SelectedActionEncoder:
 
 
 class ActionOptionsEncoder(nn.Module):
-    """Encode mage-go `pending` action options into fixed tensors.
+    """Parse + embed legal action options for mage-go ``pending`` requests.
 
-    This encoder does not generate arbitrary action JSON. It encodes legal
-    options and target choices, and helper decoders turn selected indices back
-    into the exact action-request format expected by MageStep.
+    Parsing (``parse_pending``) builds integer/scalar index tensors describing
+    the pending request; it does not apply any trainable operations. Embedding
+    (``embed_from_parsed``) consumes those index tensors together with
+    precomputed slot vectors from ``GameStateEncoder.embed_slot_vectors`` and
+    produces the differentiable option/target/pending tensors used by the
+    policy trunk and action heads.
     """
 
     def __init__(
@@ -224,232 +247,234 @@ class ActionOptionsEncoder(nn.Module):
         self.empty_option_vector = nn.Parameter(torch.zeros(self.d_action))
         self.empty_target_vector = nn.Parameter(torch.zeros(self.d_action))
 
-    def forward(
+    def parse_pending(
         self,
         state: GameStateSnapshot,
-        pending: PendingState | None = None,
+        pending: PendingState,
         *,
-        perspective_player_idx: int | None = None,
-        precomputed_object_vectors: dict[str, Tensor] | None = None,
-    ) -> EncodedActionOptions:
-        return self.encode_pending(
-            state,
-            pending,
-            perspective_player_idx=perspective_player_idx,
-            precomputed_object_vectors=precomputed_object_vectors,
-        )
-
-    def encode_pending(
-        self,
-        state: GameStateSnapshot,
-        pending: PendingState | None = None,
-        *,
-        perspective_player_idx: int | None = None,
-        precomputed_object_vectors: dict[str, Tensor] | None = None,
-    ) -> EncodedActionOptions:
-        pending = pending if pending is not None else state.get("pending")
-        if pending is None:
-            raise ValueError("state has no pending action request")
-
-        device = self.empty_option_vector.device
-        player_idx = self.game_state_encoder._resolve_perspective_player_idx(
-            state,
-            perspective_player_idx,
-        )
-
-        if precomputed_object_vectors is not None:
-            object_vectors = precomputed_object_vectors
-            player_vectors = self._build_player_vectors(state, player_idx)
-        else:
-            object_vectors, player_vectors = self._build_reference_vectors(state, player_idx)
-
-        pending_kind_id = torch.tensor(
-            _index_or_unknown(PENDING_KINDS, pending.get("kind", "")),
-            device=device,
-        )
-        pending_vector = self.pending_kind_embedding(pending_kind_id)
-
+        perspective_player_idx: int,
+        card_id_to_slot: dict[str, int],
+    ) -> ParsedActionInputs:
+        device = self.game_state_encoder.device
         options = pending.get("options", [])
         num_present = min(len(options), self.max_options)
 
-        # --- Batch encode present options ---
-        option_vectors_t = (
-            self.empty_option_vector.unsqueeze(0).expand(self.max_options, -1).clone()
+        pending_kind_id = torch.tensor(
+            _index_or_unknown(PENDING_KINDS, pending.get("kind", "")),
+            dtype=torch.long,
+            device=device,
         )
 
-        if num_present > 0:
-            kind_ids = torch.tensor(
-                [
-                    _index_or_unknown(ACTION_KINDS, options[i].get("kind", "unknown"))
-                    for i in range(num_present)
-                ],
-                dtype=torch.long,
-                device=device,
-            )
-            all_scalars = torch.tensor(
-                [
-                    _option_scalars(
-                        options[i],
-                        pending=pending,
-                        option_idx=i,
-                        max_options=self.max_options,
-                        max_targets_per_option=self.max_targets_per_option,
-                    )
-                    for i in range(num_present)
-                ],
-                dtype=torch.float32,
-                device=device,
-            )
-            ref_vecs = torch.stack(
-                [
-                    self._option_reference_vector(options[i], object_vectors)
-                    for i in range(num_present)
-                ]
-            )
-            option_vectors_t[:num_present] = (
-                pending_vector
-                + self.option_kind_embedding(kind_ids)
-                + ref_vecs
-                + self.option_scalar_projection(all_scalars)
-            )
-
+        option_kind_ids = torch.zeros(self.max_options, dtype=torch.long, device=device)
+        option_scalars = torch.zeros(
+            self.max_options, OPTION_SCALAR_DIM, dtype=torch.float32, device=device
+        )
         option_mask = torch.zeros(self.max_options, dtype=torch.float32, device=device)
-        option_mask[:num_present] = 1.0
+        option_ref_slot_idx = torch.full((self.max_options,), -1, dtype=torch.long, device=device)
+        option_ref_card_row = torch.full((self.max_options,), -1, dtype=torch.long, device=device)
 
-        # --- Batch encode targets ---
-        tgt_opt_indices: list[int] = []
-        tgt_slot_indices: list[int] = []
-        tgt_type_ids: list[int] = []
-        tgt_scalars_list: list[list[float]] = []
-        tgt_refs: list[Tensor] = []
-        target_overflow = torch.zeros(self.max_options, dtype=torch.float32, device=device)
         target_mask = torch.zeros(
-            self.max_options, self.max_targets_per_option, dtype=torch.float32, device=device
+            self.max_options,
+            self.max_targets_per_option,
+            dtype=torch.float32,
+            device=device,
         )
+        target_type_ids = torch.full(
+            (self.max_options, self.max_targets_per_option),
+            UNKNOWN_TARGET_TYPE_ID,
+            dtype=torch.long,
+            device=device,
+        )
+        target_scalars = torch.zeros(
+            self.max_options,
+            self.max_targets_per_option,
+            TARGET_SCALAR_DIM,
+            dtype=torch.float32,
+            device=device,
+        )
+        target_overflow = torch.zeros(self.max_options, dtype=torch.float32, device=device)
+        target_ref_slot_idx = torch.full(
+            (self.max_options, self.max_targets_per_option),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+        target_ref_is_player = torch.zeros(
+            self.max_options, self.max_targets_per_option, dtype=torch.bool, device=device
+        )
+        target_ref_is_self = torch.zeros(
+            self.max_options, self.max_targets_per_option, dtype=torch.bool, device=device
+        )
+
+        player_self_id, player_opp_id = _player_ids(state, perspective_player_idx)
         max_tgt_scalar = max(1.0, float(self.max_targets_per_option - 1))
 
         for opt_i in range(num_present):
-            targets = options[opt_i].get("valid_targets", [])
+            option = options[opt_i]
+            option_kind_ids[opt_i] = _index_or_unknown(ACTION_KINDS, option.get("kind", "unknown"))
+            option_scalars[opt_i] = torch.tensor(
+                _option_scalars(
+                    option,
+                    pending=pending,
+                    option_idx=opt_i,
+                    max_options=self.max_options,
+                    max_targets_per_option=self.max_targets_per_option,
+                ),
+                dtype=torch.float32,
+                device=device,
+            )
+            option_mask[opt_i] = 1.0
+
+            slot_idx, card_row = _resolve_option_reference(
+                option,
+                card_id_to_slot=card_id_to_slot,
+                name_to_row=self.game_state_encoder._card_name_to_row,
+            )
+            if slot_idx is not None:
+                option_ref_slot_idx[opt_i] = slot_idx
+            elif card_row is not None:
+                option_ref_card_row[opt_i] = card_row
+
+            targets = option.get("valid_targets", [])
             overflow_count = max(0, len(targets) - self.max_targets_per_option)
             target_overflow[opt_i] = _clip_norm(overflow_count, MAX_TARGET_OVERFLOW)
 
             for tgt_j in range(min(len(targets), self.max_targets_per_option)):
                 target = targets[tgt_j]
                 target_mask[opt_i, tgt_j] = 1.0
-                tgt_opt_indices.append(opt_i)
-                tgt_slot_indices.append(tgt_j)
+                target_scalars[opt_i, tgt_j] = torch.tensor(
+                    [_clip_norm(tgt_j, max_tgt_scalar), 1.0],
+                    dtype=torch.float32,
+                    device=device,
+                )
 
                 target_id = target.get("id", "")
-                if target_id in player_vectors:
-                    tgt_type_ids.append(_index_or_unknown(TARGET_TYPES, "player"))
-                    tgt_refs.append(player_vectors[target_id])
-                elif target_id in object_vectors:
-                    tgt_type_ids.append(_index_or_unknown(TARGET_TYPES, "permanent"))
-                    tgt_refs.append(object_vectors[target_id])
+                if target_id in (player_self_id, player_opp_id) and target_id:
+                    target_type_ids[opt_i, tgt_j] = PLAYER_TARGET_TYPE_ID
+                    target_ref_is_player[opt_i, tgt_j] = True
+                    target_ref_is_self[opt_i, tgt_j] = target_id == player_self_id
+                elif target_id in card_id_to_slot:
+                    target_type_ids[opt_i, tgt_j] = PERMANENT_TARGET_TYPE_ID
+                    target_ref_slot_idx[opt_i, tgt_j] = card_id_to_slot[target_id]
                 else:
-                    tgt_type_ids.append(_index_or_unknown(TARGET_TYPES, "unknown"))
-                    tgt_refs.append(torch.zeros(self.d_action, device=device))
+                    target_type_ids[opt_i, tgt_j] = UNKNOWN_TARGET_TYPE_ID
 
-                tgt_scalars_list.append([_clip_norm(tgt_j, max_tgt_scalar), 1.0])
-
-        target_vectors_t = (
-            self.empty_target_vector.unsqueeze(0)
-            .unsqueeze(0)
-            .expand(self.max_options, self.max_targets_per_option, -1)
-            .clone()
+        priority_candidates = build_priority_candidates(
+            pending,
+            max_targets_per_option=self.max_targets_per_option,
         )
 
-        if tgt_opt_indices:
-            tgt_type_ids_t = torch.tensor(tgt_type_ids, dtype=torch.long, device=device)
-            tgt_scalars_t = torch.tensor(tgt_scalars_list, dtype=torch.float32, device=device)
-            tgt_refs_t = torch.stack(tgt_refs)
-
-            encoded_targets = (
-                self.target_type_embedding(tgt_type_ids_t)
-                + tgt_refs_t
-                + self.target_scalar_projection(tgt_scalars_t)
-            )
-
-            opt_idx_t = torch.tensor(tgt_opt_indices, dtype=torch.long, device=device)
-            slot_idx_t = torch.tensor(tgt_slot_indices, dtype=torch.long, device=device)
-            target_vectors_t[opt_idx_t, slot_idx_t] = encoded_targets
-
-        return {
-            "pending_vector": pending_vector,
-            "option_vectors": option_vectors_t,
-            "option_mask": option_mask,
-            "target_vectors": target_vectors_t,
-            "target_mask": target_mask,
-            "target_overflow": target_overflow,
-            "priority_candidates": build_priority_candidates(
-                pending,
-                max_targets_per_option=self.max_targets_per_option,
-            ),
-        }
-
-    def _option_reference_vector(
-        self,
-        option: PendingOptionState,
-        object_vectors: dict[str, Tensor],
-    ) -> Tensor:
-        device = self.empty_option_vector.device
-        for key in ("card_id", "permanent_id", "id"):
-            value = option.get(key)
-            if value and value in object_vectors:
-                return object_vectors[value]
-
-        card_name = option.get("card_name")
-        if card_name:
-            raw = self.game_state_encoder._lookup_card_embedding(
-                cast(GameCardState, {"Name": card_name})
-            )
-            return self.game_state_encoder.card_projection(raw.to(device))
-
-        return torch.zeros(self.d_action, device=device)
-
-    def _build_reference_vectors(
-        self,
-        state: GameStateSnapshot,
-        perspective_player_idx: int,
-    ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
-        all_cards = self.game_state_encoder._collect_slot_cards(state, perspective_player_idx)
-        slot_vectors = self.game_state_encoder._encode_slots_batched(all_cards)
-
-        object_vectors: dict[str, Tensor] = {}
-        for i, card in enumerate(all_cards):
-            if card is not None:
-                card_id = card.get("ID")
-                if card_id:
-                    object_vectors[card_id] = slot_vectors[i]
-
-        player_vectors = self._build_player_vectors(state, perspective_player_idx)
-        return object_vectors, player_vectors
-
-    def _build_player_vectors(
-        self,
-        state: GameStateSnapshot,
-        perspective_player_idx: int,
-    ) -> dict[str, Tensor]:
-        player_vectors: dict[str, Tensor] = {}
-        for idx, state_player in enumerate(state["players"]):
-            player_id = state_player.get("ID")
-            if not player_id:
-                continue
-            player_vectors[player_id] = self._player_target_vector(
-                state_player,
-                is_self=idx == perspective_player_idx,
-            )
-        return player_vectors
-
-    def _player_target_vector(self, player: PlayerState, *, is_self: bool) -> Tensor:
-        device = self.empty_option_vector.device
-        type_id = torch.tensor(_index_or_unknown(TARGET_TYPES, "player"), device=device)
-        scalars = torch.tensor(
-            [1.0 if is_self else 0.0, 1.0],
-            dtype=torch.float32,
-            device=device,
+        return ParsedActionInputs(
+            pending_kind_id=pending_kind_id,
+            num_present_options=num_present,
+            option_kind_ids=option_kind_ids,
+            option_scalars=option_scalars,
+            option_mask=option_mask,
+            option_ref_slot_idx=option_ref_slot_idx,
+            option_ref_card_row=option_ref_card_row,
+            target_mask=target_mask,
+            target_type_ids=target_type_ids,
+            target_scalars=target_scalars,
+            target_overflow=target_overflow,
+            target_ref_slot_idx=target_ref_slot_idx,
+            target_ref_is_player=target_ref_is_player,
+            target_ref_is_self=target_ref_is_self,
+            priority_candidates=priority_candidates,
         )
-        return self.target_type_embedding(type_id) + self.target_scalar_projection(scalars)
+
+    def embed_from_parsed(
+        self,
+        *,
+        slot_vectors: Tensor,
+        pending_kind_id: Tensor,
+        option_kind_ids: Tensor,
+        option_scalars: Tensor,
+        option_mask: Tensor,
+        option_ref_slot_idx: Tensor,
+        option_ref_card_row: Tensor,
+        target_mask: Tensor,
+        target_type_ids: Tensor,
+        target_scalars: Tensor,
+        target_ref_slot_idx: Tensor,
+        target_ref_is_player: Tensor,
+        target_ref_is_self: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return ``(pending_vector, option_vectors, target_vectors)``.
+
+        Accepts batched inputs with a leading batch dimension ``[N, ...]``.
+        ``slot_vectors`` is ``[N, ZONE_SLOT_COUNT, d_model]``; outputs are
+        ``[N, d_model]`` for pending, ``[N, max_options, d_model]`` for
+        options, and ``[N, max_options, max_targets, d_model]`` for targets.
+        """
+
+        d_model = self.d_action
+        n = slot_vectors.shape[0]
+        max_options = option_kind_ids.shape[-1]
+        max_targets = target_mask.shape[-1]
+
+        pending_vector = self.pending_kind_embedding(pending_kind_id)  # [N, d]
+
+        option_slot_idx = option_ref_slot_idx.clamp_min(0)
+        option_slot_ref = torch.gather(
+            slot_vectors,
+            dim=1,
+            index=option_slot_idx.unsqueeze(-1).expand(-1, -1, d_model),
+        )  # [N, max_options, d]
+        option_card_row = option_ref_card_row.clamp_min(0)
+        option_card_raw = self.game_state_encoder.card_embedding_table[option_card_row]
+        option_card_ref = self.game_state_encoder.card_projection(option_card_raw)
+        option_slot_mask = (option_ref_slot_idx >= 0).unsqueeze(-1)
+        option_card_mask = (option_ref_card_row >= 0).unsqueeze(-1)
+        zero_ref = torch.zeros_like(option_slot_ref)
+        option_ref = torch.where(
+            option_slot_mask,
+            option_slot_ref,
+            torch.where(option_card_mask, option_card_ref, zero_ref),
+        )
+        option_kind_emb = self.option_kind_embedding(option_kind_ids)
+        option_scalar_proj = self.option_scalar_projection(option_scalars)
+        option_present = (
+            pending_vector.unsqueeze(1) + option_kind_emb + option_ref + option_scalar_proj
+        )
+        empty_option = self.empty_option_vector.view(1, 1, -1).expand(n, max_options, d_model)
+        option_vectors = torch.where(option_mask.unsqueeze(-1) > 0, option_present, empty_option)
+
+        target_slot_idx = target_ref_slot_idx.clamp_min(0)
+        flat_slot_idx = target_slot_idx.view(n, max_options * max_targets)
+        flat_slot_ref = torch.gather(
+            slot_vectors,
+            dim=1,
+            index=flat_slot_idx.unsqueeze(-1).expand(-1, -1, d_model),
+        )
+        target_slot_ref = flat_slot_ref.view(n, max_options, max_targets, d_model)
+
+        player_type_id = torch.tensor(
+            PLAYER_TARGET_TYPE_ID, dtype=torch.long, device=slot_vectors.device
+        )
+        player_type_emb = self.target_type_embedding(player_type_id)
+        is_self_f = target_ref_is_self.to(torch.float32)
+        player_scalar_input = torch.stack([is_self_f, torch.ones_like(is_self_f)], dim=-1)
+        player_scalar_proj = self.target_scalar_projection(player_scalar_input)
+        player_ref = player_type_emb + player_scalar_proj
+
+        target_slot_mask = (target_ref_slot_idx >= 0).unsqueeze(-1)
+        target_player_mask = target_ref_is_player.unsqueeze(-1)
+        zero_target = torch.zeros_like(target_slot_ref)
+        target_ref = torch.where(
+            target_player_mask,
+            player_ref,
+            torch.where(target_slot_mask, target_slot_ref, zero_target),
+        )
+
+        target_type_emb = self.target_type_embedding(target_type_ids)
+        target_scalar_proj = self.target_scalar_projection(target_scalars)
+        target_present = target_type_emb + target_ref + target_scalar_proj
+        empty_target = self.empty_target_vector.view(1, 1, 1, -1).expand(
+            n, max_options, max_targets, d_model
+        )
+        target_vectors = torch.where(target_mask.unsqueeze(-1) > 0, target_present, empty_target)
+
+        return pending_vector, option_vectors, target_vectors
 
 
 def build_priority_candidates(
@@ -576,6 +601,43 @@ def action_from_choice_color(color: str) -> ActionRequest:
 
 def action_from_choice_accepted(accepted: bool) -> ActionRequest:
     return cast(ActionRequest, {"accepted": bool(accepted)})
+
+
+def selected_option_id(pending: PendingState, selected_idx: int) -> str:
+    options = pending.get("options", [])
+    if not 0 <= selected_idx < len(options):
+        return ""
+    option = options[selected_idx]
+    return option.get("id", "") or option.get("card_id", "") or option.get("permanent_id", "")
+
+
+def _resolve_option_reference(
+    option: PendingOptionState,
+    *,
+    card_id_to_slot: dict[str, int],
+    name_to_row: dict[str, int],
+) -> tuple[int | None, int | None]:
+    for key in ("card_id", "permanent_id", "id"):
+        value = option.get(key)
+        if value and value in card_id_to_slot:
+            return card_id_to_slot[value], None
+
+    card_name = option.get("card_name")
+    if card_name:
+        from magic_ai.game_state import _card_key as _ck
+
+        row = name_to_row.get(_ck(card_name), 0)
+        return None, row
+
+    return None, None
+
+
+def _player_ids(state: GameStateSnapshot, perspective_player_idx: int) -> tuple[str, str]:
+    players = state["players"]
+    self_id = players[perspective_player_idx].get("ID", "") if players else ""
+    opp_idx = 1 - perspective_player_idx
+    opp_id = players[opp_idx].get("ID", "") if len(players) == 2 else ""
+    return self_id, opp_id
 
 
 def _priority_payload(

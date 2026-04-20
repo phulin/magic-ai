@@ -47,102 +47,18 @@ def ppo_update(
     returns: Tensor,
     *,
     epochs: int = 4,
-    minibatch_size: int = 64,
-    clip_epsilon: float = 0.2,
-    value_coef: float = 0.5,
-    entropy_coef: float = 0.01,
-    max_grad_norm: float = 0.5,
-) -> PPOStats:
-    if not steps:
-        raise ValueError("cannot update PPO with an empty rollout")
-    if returns.numel() != len(steps):
-        raise ValueError("returns length must match rollout length")
-
-    device = next(policy.parameters()).device
-    returns = returns.to(device=device, dtype=torch.float32)
-    old_log_probs = torch.tensor(
-        [step.old_log_prob for step in steps],
-        dtype=torch.float32,
-        device=device,
-    )
-    old_values = torch.tensor([step.value for step in steps], dtype=torch.float32, device=device)
-    advantages = returns - old_values
-    if advantages.numel() > 1:
-        advantages = (advantages - advantages.mean()) / advantages.std(
-            unbiased=False,
-        ).clamp_min(1e-8)
-
-    last_stats: PPOStats | None = None
-    indices = list(range(len(steps)))
-    for _ in range(epochs):
-        random.shuffle(indices)
-        for start in range(0, len(indices), minibatch_size):
-            batch_indices = indices[start : start + minibatch_size]
-            log_probs: list[Tensor] = []
-            entropies: list[Tensor] = []
-            values: list[Tensor] = []
-            for idx in batch_indices:
-                log_prob, entropy, value = policy.evaluate_rollout_step(steps[idx])
-                log_probs.append(log_prob)
-                entropies.append(entropy)
-                values.append(value)
-
-            batch_log_probs = torch.stack(log_probs)
-            batch_entropies = torch.stack(entropies)
-            batch_values = torch.stack(values)
-            batch_old_log_probs = old_log_probs[batch_indices]
-            batch_returns = returns[batch_indices]
-            batch_advantages = advantages[batch_indices]
-
-            ratio = (batch_log_probs - batch_old_log_probs).exp()
-            unclipped = ratio * batch_advantages
-            clipped = ratio.clamp(1.0 - clip_epsilon, 1.0 + clip_epsilon) * batch_advantages
-            policy_loss = -torch.minimum(unclipped, clipped).mean()
-            value_loss = F.mse_loss(batch_values, batch_returns)
-            entropy = batch_entropies.mean()
-            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
-            optimizer.step()
-
-            with torch.no_grad():
-                approx_kl = (batch_old_log_probs - batch_log_probs).mean()
-                clip_fraction = ((ratio - 1.0).abs() > clip_epsilon).float().mean()
-            last_stats = PPOStats(
-                loss=float(loss.detach().cpu()),
-                policy_loss=float(policy_loss.detach().cpu()),
-                value_loss=float(value_loss.detach().cpu()),
-                entropy=float(entropy.detach().cpu()),
-                approx_kl=float(approx_kl.detach().cpu()),
-                clip_fraction=float(clip_fraction.detach().cpu()),
-            )
-
-    if last_stats is None:
-        raise RuntimeError("PPO update did not run any minibatches")
-    return last_stats
-
-
-def ppo_update_cached(
-    policy: PPOPolicy,
-    optimizer: torch.optim.Optimizer,
-    steps: Sequence[RolloutStep],
-    returns: Tensor,
-    *,
-    epochs: int = 4,
     minibatch_size: int = 256,
     clip_epsilon: float = 0.2,
     value_coef: float = 0.5,
     entropy_coef: float = 0.01,
     max_grad_norm: float = 0.5,
 ) -> PPOStats:
-    """Run PPO over cached encoder outputs.
+    """Run PPO over cached policy inputs.
 
-    This is the fast training path. It batches trunk/head evaluation and avoids
-    rebuilding Python dict based state/action encodings during each PPO epoch.
-    Encoder outputs are detached, so this updates the policy trunk and heads,
-    but not the state/action encoder parameters.
+    Each rollout step must carry a ``CachedPolicyInput`` produced at sample
+    time. The cache stores only parsed integer/scalar tensors and decision
+    layouts; the encoder stack is re-run on every minibatch so all encoder,
+    trunk, and head parameters receive gradients.
     """
 
     if not steps:
@@ -206,7 +122,7 @@ def ppo_update_cached(
             )
 
     if last_stats is None:
-        raise RuntimeError("cached PPO update did not run any minibatches")
+        raise RuntimeError("PPO update did not run any minibatches")
     return last_stats
 
 
