@@ -111,14 +111,20 @@ class PendingOptionState(TypedDict, total=False):
     label: str
     card_id: str
     card_name: str
+    permanent_id: str
+    ability_index: int
     mana_cost: str
     valid_targets: list[TargetState]
+    id: str
+    color: str
 
 
 class PendingState(TypedDict):
     kind: str
     player_idx: int
     options: list[PendingOptionState]
+    reason: NotRequired[str]
+    amount: NotRequired[int]
 
 
 class StackObjectState(TypedDict, total=False):

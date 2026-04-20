@@ -1,5 +1,22 @@
 """Utilities for Magic AI experiments."""
 
+from magic_ai.actions import (
+    ActionOptionsEncoder,
+    ActionRequest,
+    EncodedActionOptions,
+    EncodedSelectedAction,
+    LegalActionCandidate,
+    SelectedActionEncoder,
+    action_from_attackers,
+    action_from_blockers,
+    action_from_choice_accepted,
+    action_from_choice_color,
+    action_from_choice_ids,
+    action_from_choice_index,
+    action_from_priority_candidate,
+    build_priority_candidates,
+    selected_priority_candidate_index,
+)
 from magic_ai.game_state import (
     GameCardState,
     GameStateEncoder,
@@ -11,11 +28,26 @@ from magic_ai.game_state import (
 )
 
 __all__ = [
+    "ActionOptionsEncoder",
+    "ActionRequest",
+    "EncodedActionOptions",
+    "EncodedSelectedAction",
     "GameCardState",
     "GameStateEncoder",
     "GameStateSnapshot",
+    "LegalActionCandidate",
     "ManaPoolState",
     "PendingOptionState",
     "PendingState",
     "PlayerState",
+    "SelectedActionEncoder",
+    "action_from_attackers",
+    "action_from_blockers",
+    "action_from_choice_accepted",
+    "action_from_choice_color",
+    "action_from_choice_ids",
+    "action_from_choice_index",
+    "action_from_priority_candidate",
+    "build_priority_candidates",
+    "selected_priority_candidate_index",
 ]
