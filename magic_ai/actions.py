@@ -10,6 +10,7 @@ import torch
 from torch import Tensor, nn
 
 from magic_ai.game_state import (
+    ZONE_SPECS,
     GameCardState,
     GameStateEncoder,
     GameStateSnapshot,
@@ -17,10 +18,8 @@ from magic_ai.game_state import (
     PendingState,
     PlayerState,
     TargetState,
-    ZONE_SPECS,
     _zone_cards,
 )
-
 
 DEFAULT_MAX_OPTIONS = 64
 DEFAULT_MAX_TARGETS_PER_OPTION = 4
@@ -89,7 +88,7 @@ class EncodedActionOptions(TypedDict):
     target_vectors: Tensor
     target_mask: Tensor
     target_overflow: Tensor
-    priority_candidates: list["LegalActionCandidate"]
+    priority_candidates: list[LegalActionCandidate]
 
 
 class EncodedSelectedAction(TypedDict):
@@ -401,9 +400,7 @@ class ActionOptionsEncoder(nn.Module):
             device=device,
         )
         return (
-            self.target_type_embedding(type_id)
-            + reference
-            + self.target_scalar_projection(scalars)
+            self.target_type_embedding(type_id) + reference + self.target_scalar_projection(scalars)
         )
 
     def _option_reference_vector(
@@ -546,7 +543,9 @@ def action_from_attackers(
 ) -> ActionRequest:
     ids: list[str] = []
     for option, is_selected in zip(pending.get("options", []), selected, strict=False):
-        selected_bool = bool(is_selected.item()) if isinstance(is_selected, Tensor) else bool(is_selected)
+        selected_bool = (
+            bool(is_selected.item()) if isinstance(is_selected, Tensor) else bool(is_selected)
+        )
         if selected_bool and option.get("permanent_id"):
             ids.append(option["permanent_id"])
     return cast(ActionRequest, {"attackers": ids})
@@ -562,7 +561,11 @@ def action_from_blockers(
         selected_target_indices,
         strict=False,
     ):
-        target_idx = int(raw_target_idx.item()) if isinstance(raw_target_idx, Tensor) else int(raw_target_idx)
+        target_idx = (
+            int(raw_target_idx.item())
+            if isinstance(raw_target_idx, Tensor)
+            else int(raw_target_idx)
+        )
         if target_idx < 0:
             continue
         targets = option.get("valid_targets", [])
@@ -600,7 +603,7 @@ def _priority_payload(
     if kind == "cast_spell":
         payload: ActionRequest = {"kind": kind, "card_id": option.get("card_id", "")}
     else:
-        payload = {
+        payload: ActionRequest = {
             "kind": kind,
             "permanent_id": option.get("permanent_id", ""),
             "ability_index": int(option.get("ability_index", 0)),

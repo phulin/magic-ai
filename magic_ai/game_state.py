@@ -10,9 +10,12 @@ from typing import Any, Literal, NotRequired, TypedDict, cast
 import torch
 from torch import Tensor, nn
 
-
 MAX_CARDS_PER_ZONE = 10
-ZONE_SPECS = (
+type ZoneName = Literal["hand", "graveyard", "battlefield"]
+type ZoneOwner = Literal["self", "opponent"]
+type ZoneSpec = tuple[str, ZoneName, ZoneOwner]
+
+ZONE_SPECS: tuple[ZoneSpec, ...] = (
     ("self_hand", "hand", "self"),
     ("self_graveyard", "graveyard", "self"),
     ("opponent_graveyard", "graveyard", "opponent"),
@@ -168,9 +171,7 @@ class GameStateEncoder(nn.Module):
     ) -> None:
         super().__init__()
         if max_cards_per_zone != MAX_CARDS_PER_ZONE:
-            raise ValueError(
-                f"only max_cards_per_zone={MAX_CARDS_PER_ZONE} is currently supported"
-            )
+            raise ValueError(f"only max_cards_per_zone={MAX_CARDS_PER_ZONE} is currently supported")
 
         self.d_model = d_model
         self.max_cards_per_zone = max_cards_per_zone
@@ -302,17 +303,9 @@ class GameStateEncoder(nn.Module):
 
         zone_id = torch.tensor(zone_idx, device=device)
         slot_id = torch.tensor(slot_idx, device=device)
-        slot_vector = (
-            slot_vector
-            + self.zone_embedding(zone_id)
-            + self.slot_embedding(slot_id)
-        )
+        slot_vector = slot_vector + self.zone_embedding(zone_id) + self.slot_embedding(slot_id)
 
-        if (
-            is_occupied
-            and ZONE_SPECS[zone_idx][1] == "battlefield"
-            and card is not None
-        ):
+        if is_occupied and ZONE_SPECS[zone_idx][1] == "battlefield" and card is not None:
             tapped = 1.0 if card.get("Tapped", False) else 0.0
             slot_vector = slot_vector + self.tapped_vector * tapped
 
@@ -322,7 +315,7 @@ class GameStateEncoder(nn.Module):
         name = card.get("Name", "")
         embedding = self._card_embeddings.get(_card_key(name))
         if embedding is None:
-            return self.unknown_card_vector
+            return cast(Tensor, self.unknown_card_vector)
         return embedding.to(self.empty_slot_vector.device)
 
     def _resolve_perspective_player_idx(
@@ -371,7 +364,8 @@ class GameStateEncoder(nn.Module):
             values.extend(_mana_pool_features(player))
 
         option_count = len(pending.get("options", [])) if pending is not None else 0
-        stack_count = len(state["stack"]) if state.get("stack") else 0
+        stack = state.get("stack") or []
+        stack_count = len(stack)
         values.extend(
             [
                 _clip_norm(option_count, MAX_PENDING_OPTIONS),
@@ -416,7 +410,7 @@ def _card_key(name: str) -> str:
 
 def _zone_cards(
     player: PlayerState | None,
-    zone: Literal["hand", "graveyard", "battlefield"],
+    zone: ZoneName,
 ) -> list[GameCardState]:
     if player is None:
         return []

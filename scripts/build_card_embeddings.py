@@ -15,10 +15,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
-
+from typing import Any, cast
 
 SCRYFALL_API = "https://api.scryfall.com"
 DEFAULT_SET_CODE = "jmp"
@@ -88,7 +88,10 @@ def parse_args() -> argparse.Namespace:
         "--card",
         action="append",
         default=[],
-        help='additional exact card name; repeat for multiple cards, e.g. --card Mountain --card "Lightning Bolt"',
+        help=(
+            "additional exact card name; repeat for multiple cards, "
+            'e.g. --card Mountain --card "Lightning Bolt"'
+        ),
     )
     parser.add_argument(
         "--no-fixed-list",
@@ -203,7 +206,7 @@ def build_card_embedding_file(
 
     payload = {
         "metadata": {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": datetime.now(UTC).isoformat(),
             "source": "Scryfall API",
             "source_urls": source_urls,
             "fixed_card_names": FIXED_CARD_NAMES if include_fixed_list else [],
@@ -398,9 +401,14 @@ def build_plain_embedding_text(
 
 
 def mask_card_name(text: str, name: str) -> str:
-    names = [part.strip() for part in name.split("//")]
-    names.append(name)
-    for candidate in sorted(set(names), key=len, reverse=True):
+    seen: set[str] = set()
+    names: list[str] = []
+    for candidate in [*(part.strip() for part in name.split("//")), name]:
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            names.append(candidate)
+    for candidate_raw in sorted(names, key=len, reverse=True):
+        candidate = cast(str, candidate_raw)
         if candidate:
             text = text.replace(candidate, "CARDNAME")
     return text
@@ -479,7 +487,10 @@ def add_transformers_embeddings(
         ) from exc
 
     resolved_device = resolve_torch_device(device, torch)
-    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
+    tokenizer = cast(
+        Callable[..., Any],
+        AutoTokenizer.from_pretrained(model_name, padding_side="left"),
+    )
     model_kwargs: dict[str, Any] = {"torch_dtype": resolve_torch_dtype(dtype, torch)}
     model = AutoModel.from_pretrained(model_name, **model_kwargs)
     model.to(resolved_device)
