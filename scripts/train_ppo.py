@@ -12,18 +12,24 @@ from pathlib import Path
 from typing import Any, cast
 
 import torch
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import wandb  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from magic_ai.actions import ActionRequest
-from magic_ai.game_state import (
+from magic_ai.actions import ActionRequest  # noqa: E402
+from magic_ai.game_state import (  # noqa: E402
     GameStateEncoder,
     GameStateSnapshot,
     PendingOptionState,
     PendingState,
 )
-from magic_ai.model import PPOPolicy
-from magic_ai.ppo import (
+from magic_ai.model import PPOPolicy  # noqa: E402
+from magic_ai.ppo import (  # noqa: E402
+    PPOStats,
     RolloutStep,
     merge_pending_into_state,
     ppo_update,
@@ -61,6 +67,13 @@ def main() -> None:
     args = parse_args()
     if args.torch_threads is not None:
         torch.set_num_threads(args.torch_threads)
+
+    if not args.no_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+        )
 
     update_device = torch.device(args.device)
     rollout_device = resolve_rollout_device(args.rollout_device, update_device)
@@ -193,6 +206,12 @@ def main() -> None:
                 f"clip={stats.clip_fraction:.3f}",
                 flush=True,
             )
+            log_ppo_stats(
+                stats,
+                games=completed_games,
+                steps=len(pending_steps),
+                winner=winner,
+            )
             pending_steps.clear()
             pending_returns.clear()
 
@@ -230,9 +249,11 @@ def main() -> None:
             f"entropy={stats.entropy:.4f}",
             flush=True,
         )
+        log_ppo_stats(stats, games=completed_games, steps=len(pending_steps))
 
     save_checkpoint(args.output, policy, optimizer, args)
     print(f"saved checkpoint -> {args.output}")
+    wandb.finish()
 
 
 def parse_args() -> argparse.Namespace:
@@ -282,6 +303,9 @@ def parse_args() -> argparse.Namespace:
         default=80,
         help="maximum actions to print from a sample rollout game at each PPO update",
     )
+    parser.add_argument("--wandb-project", default="magic-ai")
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     return parser.parse_args()
 
 
@@ -333,6 +357,30 @@ def move_optimizer_state(optimizer: torch.optim.Optimizer, device: torch.device)
         for key, value in list(state.items()):
             if isinstance(value, torch.Tensor):
                 state[key] = value.to(device)
+
+
+def log_ppo_stats(
+    stats: PPOStats,
+    *,
+    games: int,
+    steps: int,
+    winner: str = "",
+) -> None:
+    """Log PPO update metrics to wandb (if active)."""
+    if wandb.run is None:
+        return
+    wandb.log(
+        {
+            "loss": stats.loss,
+            "policy_loss": stats.policy_loss,
+            "value_loss": stats.value_loss,
+            "entropy": stats.entropy,
+            "approx_kl": stats.approx_kl,
+            "clip_fraction": stats.clip_fraction,
+            "games": games,
+            "rollout_steps": steps,
+        }
+    )
 
 
 def train_batched_envs(
@@ -488,6 +536,11 @@ def train_batched_envs(
                 f"clip={stats.clip_fraction:.3f}",
                 flush=True,
             )
+            log_ppo_stats(
+                stats,
+                games=completed_games,
+                steps=len(pending_steps),
+            )
             pending_steps.clear()
             pending_returns.clear()
 
@@ -533,6 +586,7 @@ def train_batched_envs(
             f"entropy={stats.entropy:.4f}",
             flush=True,
         )
+        log_ppo_stats(stats, games=completed_games, steps=len(pending_steps))
 
 
 def load_decks(path: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:
