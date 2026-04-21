@@ -739,7 +739,7 @@ def _card_name_for_id(pending: PendingState, object_id: str) -> str:
     for option in pending.get("options", []):
         if _option_ids(option) & {object_id}:
             return option.get("card_name") or option.get("label") or object_id
-        for target in option.get("valid_targets", []):
+        for target in option.get("valid_targets") or []:
             if target.get("id") == object_id:
                 return target.get("label") or object_id
     return object_id
@@ -776,7 +776,7 @@ def _card_label_for_id(item: TranscriptAction, object_id: str) -> str:
 def _state_card_for_id(state: GameStateSnapshot, object_id: str) -> dict[str, Any] | None:
     for player in state.get("players", []):
         for zone_name in ("Battlefield", "Hand", "Graveyard"):
-            for card in player.get(zone_name, []):
+            for card in player.get(zone_name) or []:
                 if card.get("ID") == object_id:
                     return cast(dict[str, Any], card)
     return None
