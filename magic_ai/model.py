@@ -616,9 +616,20 @@ class PPOPolicy(nn.Module):
             scored_option_idx = option_idx[scored_groups, scored_cols]
             scored_target_idx = target_idx[scored_groups, scored_cols]
 
-            scored_option_vectors = option_vectors[scored_steps, scored_option_idx]
+            scored_option_vectors = torch.zeros(
+                (scored_groups.shape[0], option_vectors.shape[-1]),
+                dtype=query.dtype,
+                device=device,
+            )
+            has_option = scored_option_idx >= 0
+            if has_option.any():
+                scored_option_vectors[has_option] = option_vectors[
+                    scored_steps[has_option],
+                    scored_option_idx[has_option],
+                ]
+
             scored_target_vectors = torch.zeros_like(scored_option_vectors)
-            has_target = scored_target_idx >= 0
+            has_target = has_option & (scored_target_idx >= 0)
             if has_target.any():
                 scored_target_vectors[has_target] = target_vectors[
                     scored_steps[has_target],
