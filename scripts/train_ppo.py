@@ -62,6 +62,42 @@ class LiveGame:
     action_count: int = 0
 
 
+@dataclass
+class WinFractionStats:
+    p1_wins: int = 0
+    p2_wins: int = 0
+    draws: int = 0
+
+    def record(self, bucket: str) -> None:
+        if bucket == "p1":
+            self.p1_wins += 1
+        elif bucket == "p2":
+            self.p2_wins += 1
+        else:
+            self.draws += 1
+
+    @property
+    def total_games(self) -> int:
+        return self.p1_wins + self.p2_wins + self.draws
+
+    def as_wandb_metrics(self) -> dict[str, float]:
+        total = self.total_games
+        if total == 0:
+            return {}
+        denom = float(total)
+        return {
+            "p1_win_fraction": self.p1_wins / denom,
+            "p2_win_fraction": self.p2_wins / denom,
+            "draw_fraction": self.draws / denom,
+            "window_games": float(total),
+        }
+
+    def reset(self) -> None:
+        self.p1_wins = 0
+        self.p2_wins = 0
+        self.draws = 0
+
+
 def main() -> None:
     args = parse_args()
     if args.torch_threads is not None:
@@ -104,6 +140,7 @@ def main() -> None:
     pending_returns: list[torch.Tensor] = []
     last_sample_transcript: list[TranscriptAction] = []
     completed_games = 0
+    win_stats = WinFractionStats()
 
     for episode_idx in range(args.episodes):
         seed = args.seed + episode_idx
@@ -161,6 +198,14 @@ def main() -> None:
         pending_returns.append(returns)
         last_sample_transcript = episode_transcript
         completed_games += 1
+        win_stats.record(
+            classify_winner(
+                cast(GameStateSnapshot, game.state),
+                winner,
+                args.name_a,
+                args.name_b,
+            )
+        )
 
         if len(pending_steps) >= args.rollout_steps:
             stats = ppo_update(
@@ -198,11 +243,12 @@ def main() -> None:
                 stats,
                 games=completed_games,
                 steps=len(pending_steps),
-                winner=winner,
+                win_stats=win_stats,
             )
             pending_steps.clear()
             pending_returns.clear()
             policy.reset_rollout_buffer()
+            win_stats.reset()
 
         if args.save_every and (episode_idx + 1) % args.save_every == 0:
             save_checkpoint(args.output, policy, optimizer, args)
@@ -235,7 +281,7 @@ def main() -> None:
             f"entropy={stats.entropy:.4f}",
             flush=True,
         )
-        log_ppo_stats(stats, games=completed_games, steps=len(pending_steps))
+        log_ppo_stats(stats, games=completed_games, steps=len(pending_steps), win_stats=win_stats)
 
     save_checkpoint(args.output, policy, optimizer, args)
     print(f"saved checkpoint -> {args.output}")
@@ -296,23 +342,51 @@ def log_ppo_stats(
     *,
     games: int,
     steps: int,
-    winner: str = "",
+    win_stats: WinFractionStats | None = None,
 ) -> None:
     """Log PPO update metrics to wandb (if active)."""
     if wandb.run is None:
         return
-    wandb.log(
-        {
-            "loss": stats.loss,
-            "policy_loss": stats.policy_loss,
-            "value_loss": stats.value_loss,
-            "entropy": stats.entropy,
-            "approx_kl": stats.approx_kl,
-            "clip_fraction": stats.clip_fraction,
-            "games": games,
-            "rollout_steps": steps,
-        }
-    )
+    payload = {
+        "loss": stats.loss,
+        "policy_loss": stats.policy_loss,
+        "value_loss": stats.value_loss,
+        "entropy": stats.entropy,
+        "approx_kl": stats.approx_kl,
+        "clip_fraction": stats.clip_fraction,
+        "games": games,
+        "rollout_steps": steps,
+    }
+    if win_stats is not None:
+        payload.update(win_stats.as_wandb_metrics())
+    wandb.log(payload)
+
+
+def classify_winner(
+    state: GameStateSnapshot,
+    winner: str,
+    name_a: str,
+    name_b: str,
+) -> str:
+    if not winner:
+        return "draw"
+
+    players = state.get("players", [])
+    if players:
+        player_a = players[0]
+        player_b = players[1] if len(players) > 1 else {}
+        p1_ids = {str(player_a.get("ID", "")), str(player_a.get("Name", "")), name_a}
+        p2_ids = {str(player_b.get("ID", "")), str(player_b.get("Name", "")), name_b}
+        if winner in p1_ids:
+            return "p1"
+        if winner in p2_ids:
+            return "p2"
+
+    if winner == name_a:
+        return "p1"
+    if winner == name_b:
+        return "p2"
+    return "draw"
 
 
 def train_batched_envs(
@@ -330,6 +404,7 @@ def train_batched_envs(
     last_saved_games = 0
     next_episode_idx = 0
     live_games: list[LiveGame] = []
+    win_stats = WinFractionStats()
 
     def start_game(episode_idx: int) -> LiveGame:
         return LiveGame(
@@ -355,6 +430,14 @@ def train_batched_envs(
 
     def finish_game(env: LiveGame, winner: str) -> None:
         nonlocal completed_games, last_sample_transcript
+        win_stats.record(
+            classify_winner(
+                cast(GameStateSnapshot, env.game.state),
+                winner,
+                args.name_a,
+                args.name_b,
+            )
+        )
         env.game.close()
         if env.episode_steps:
             returns = terminal_returns(env.episode_steps, winner=winner, gamma=args.gamma)
@@ -466,10 +549,12 @@ def train_batched_envs(
                 stats,
                 games=completed_games,
                 steps=len(pending_steps),
+                win_stats=win_stats,
             )
             pending_steps.clear()
             pending_returns.clear()
             policy.reset_rollout_buffer()
+            win_stats.reset()
 
         if (
             args.save_every
@@ -510,7 +595,7 @@ def train_batched_envs(
             f"entropy={stats.entropy:.4f}",
             flush=True,
         )
-        log_ppo_stats(stats, games=completed_games, steps=len(pending_steps))
+        log_ppo_stats(stats, games=completed_games, steps=len(pending_steps), win_stats=win_stats)
 
 
 def load_decks(path: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:
