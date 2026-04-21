@@ -700,7 +700,7 @@ def describe_action(item: TranscriptAction) -> str:
     if "blockers" in action:
         assignments = []
         for assignment in action["blockers"]:
-            blocker = _card_name_for_id(pending, assignment.get("blocker", ""))
+            blocker = _card_label_for_id(item, assignment.get("blocker", ""))
             attacker = _target_label_for_id(item, assignment.get("attacker", ""))
             assignments.append(f"{blocker} blocks {attacker}")
         if not assignments:
@@ -751,8 +751,35 @@ def _target_label_for_id(item: TranscriptAction, target_id: str) -> str:
     for player_idx, player in enumerate(item.state.get("players", [])):
         if target_id in {player.get("ID"), player.get("Name")}:
             return f"Player{player_idx + 1}"
+    state_label = _card_label_for_id(item, target_id)
+    if state_label != target_id:
+        return state_label
     label = _card_name_for_id(item.pending, target_id)
     return label if label != target_id else target_id
+
+
+def _card_label_for_id(item: TranscriptAction, object_id: str) -> str:
+    if not object_id:
+        return "unknown"
+    card = _state_card_for_id(item.state, object_id)
+    if card is None:
+        return object_id
+
+    name = str(card.get("Name") or object_id)
+    power = card.get("Power", card.get("power"))
+    toughness = card.get("Toughness", card.get("toughness"))
+    if power is not None and toughness is not None:
+        return f"{name} {power}/{toughness}"
+    return name
+
+
+def _state_card_for_id(state: GameStateSnapshot, object_id: str) -> dict[str, Any] | None:
+    for player in state.get("players", []):
+        for zone_name in ("Battlefield", "Hand", "Graveyard"):
+            for card in player.get(zone_name, []):
+                if card.get("ID") == object_id:
+                    return cast(dict[str, Any], card)
+    return None
 
 
 def _option_label(pending: PendingState, idx: int) -> str:
