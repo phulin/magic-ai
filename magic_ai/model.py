@@ -8,7 +8,7 @@ from typing import Literal, cast
 
 import torch
 from torch import Tensor, nn
-from torch.distributions import Bernoulli, Categorical
+from torch.distributions import Bernoulli
 
 from magic_ai.actions import (
     COLORS,
@@ -275,28 +275,30 @@ class PPOPolicy(nn.Module):
             masks = rb.decision_mask[idx_t]
             uses_none = rb.uses_none_head[idx_t]
 
-            logits = self._decision_logits(
-                step_positions=pos_t,
-                option_idx=option_idx,
-                target_idx=target_idx,
-                masks=masks,
-                uses_none=uses_none,
-                option_vectors=forward.option_vectors,
-                target_vectors=forward.target_vectors,
-                query=forward.query,
-                none_logits=forward.none_logits,
+            group_idx, choice_cols, flat_logits, flat_log_probs, group_entropies = (
+                self._flat_decision_distribution(
+                    step_positions=pos_t,
+                    option_idx=option_idx,
+                    target_idx=target_idx,
+                    masks=masks,
+                    uses_none=uses_none,
+                    option_vectors=forward.option_vectors,
+                    target_vectors=forward.target_vectors,
+                    query=forward.query,
+                    none_logits=forward.none_logits,
+                )
             )
-            dist = Categorical(logits=logits)
-            if deterministic:
-                decision_selected = torch.argmax(logits, dim=-1)
-            else:
-                decision_selected = dist.sample()
-            decision_log_probs = dist.log_prob(decision_selected)
-            decision_entropies = dist.entropy()
+            decision_selected, decision_log_probs = self._sample_flat_decisions(
+                group_idx=group_idx,
+                choice_cols=choice_cols,
+                flat_logits=flat_logits,
+                flat_log_probs=flat_log_probs,
+                deterministic=deterministic,
+            )
             per_step_log_prob_sum = torch.zeros(n, dtype=forward.values.dtype, device=device)
             per_step_entropy_sum = torch.zeros(n, dtype=forward.values.dtype, device=device)
             per_step_log_prob_sum.scatter_add_(0, pos_t, decision_log_probs)
-            per_step_entropy_sum.scatter_add_(0, pos_t, decision_entropies)
+            per_step_entropy_sum.scatter_add_(0, pos_t, group_entropies)
             decision_selected_cpu = decision_selected.detach().cpu().tolist()
             rb.selected_indices[idx_t] = decision_selected
 
@@ -416,20 +418,27 @@ class PPOPolicy(nn.Module):
             uses_none = rb.uses_none_head[idx_t]
             selected = rb.selected_indices[idx_t]
 
-            logits = self._decision_logits(
-                step_positions=pos_t,
-                option_idx=option_idx,
-                target_idx=target_idx,
-                masks=masks,
-                uses_none=uses_none,
-                option_vectors=forward.option_vectors,
-                target_vectors=forward.target_vectors,
-                query=forward.query,
-                none_logits=forward.none_logits,
+            group_idx, choice_cols, _flat_logits, flat_log_probs, group_entropies = (
+                self._flat_decision_distribution(
+                    step_positions=pos_t,
+                    option_idx=option_idx,
+                    target_idx=target_idx,
+                    masks=masks,
+                    uses_none=uses_none,
+                    option_vectors=forward.option_vectors,
+                    target_vectors=forward.target_vectors,
+                    query=forward.query,
+                    none_logits=forward.none_logits,
+                )
             )
-            dist = Categorical(logits=logits)
-            group_log_probs = dist.log_prob(selected)
-            group_entropies = dist.entropy()
+            selected_mask = choice_cols == selected[group_idx]
+            selected_flat_log_probs = torch.where(
+                selected_mask,
+                flat_log_probs,
+                torch.zeros_like(flat_log_probs),
+            )
+            group_log_probs = torch.zeros_like(group_entropies)
+            group_log_probs.scatter_add_(0, group_idx, selected_flat_log_probs)
             log_probs.scatter_add_(0, pos_t, group_log_probs)
             entropies.scatter_add_(0, pos_t, group_entropies)
 
@@ -497,6 +506,31 @@ class PPOPolicy(nn.Module):
         query: Tensor,
         none_logits: Tensor,
     ) -> Tensor:
+        return self._decision_logits_reference(
+            step_positions=step_positions,
+            option_idx=option_idx,
+            target_idx=target_idx,
+            masks=masks,
+            uses_none=uses_none,
+            option_vectors=option_vectors,
+            target_vectors=target_vectors,
+            query=query,
+            none_logits=none_logits,
+        )
+
+    def _decision_logits_reference(
+        self,
+        *,
+        step_positions: Tensor,
+        option_idx: Tensor,
+        target_idx: Tensor,
+        masks: Tensor,
+        uses_none: Tensor,
+        option_vectors: Tensor,
+        target_vectors: Tensor,
+        query: Tensor,
+        none_logits: Tensor,
+    ) -> Tensor:
         """Compute masked logits for a concatenated set of decision groups.
 
         ``step_positions`` maps each of the ``total_groups`` rows to its
@@ -543,6 +577,143 @@ class PPOPolicy(nn.Module):
             logits[uses_none, 0] = none_for_groups
 
         return logits.masked_fill(~masks, -torch.inf)
+
+    def _flat_decision_distribution(
+        self,
+        *,
+        step_positions: Tensor,
+        option_idx: Tensor,
+        target_idx: Tensor,
+        masks: Tensor,
+        uses_none: Tensor,
+        option_vectors: Tensor,
+        target_vectors: Tensor,
+        query: Tensor,
+        none_logits: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Return flat valid-choice logits plus grouped log-probs/entropies."""
+
+        valid = masks.nonzero(as_tuple=False)
+        if valid.numel() == 0:
+            raise ValueError("decision groups must include at least one valid choice")
+
+        device = masks.device
+        group_idx = valid[:, 0]
+        choice_cols = valid[:, 1]
+        flat_step_positions = step_positions[group_idx]
+        flat_logits = torch.empty(valid.shape[0], dtype=query.dtype, device=device)
+
+        is_none = uses_none[group_idx] & (choice_cols == 0)
+        if is_none.any():
+            flat_logits[is_none] = none_logits[flat_step_positions[is_none]]
+
+        is_scored = ~is_none
+        if is_scored.any():
+            scored_groups = group_idx[is_scored]
+            scored_steps = flat_step_positions[is_scored]
+            scored_cols = choice_cols[is_scored]
+
+            scored_option_idx = option_idx[scored_groups, scored_cols]
+            scored_target_idx = target_idx[scored_groups, scored_cols]
+
+            scored_option_vectors = option_vectors[scored_steps, scored_option_idx]
+            scored_target_vectors = torch.zeros_like(scored_option_vectors)
+            has_target = scored_target_idx >= 0
+            if has_target.any():
+                scored_target_vectors[has_target] = target_vectors[
+                    scored_steps[has_target],
+                    scored_option_idx[has_target],
+                    scored_target_idx[has_target],
+                ]
+
+            decision_vectors = scored_option_vectors + scored_target_vectors
+            flat_logits[is_scored] = (decision_vectors * query[scored_steps]).sum(dim=-1)
+
+        group_count = step_positions.shape[0]
+        group_max = torch.full((group_count,), -torch.inf, dtype=query.dtype, device=device)
+        group_max.scatter_reduce_(0, group_idx, flat_logits, reduce="amax", include_self=True)
+
+        stabilized = flat_logits - group_max[group_idx]
+        exp_logits = stabilized.exp()
+        group_exp_sum = torch.zeros(group_count, dtype=query.dtype, device=device)
+        group_exp_sum.scatter_add_(0, group_idx, exp_logits)
+        flat_log_probs = stabilized - group_exp_sum[group_idx].log()
+
+        probs = flat_log_probs.exp()
+        group_entropies = torch.zeros(group_count, dtype=query.dtype, device=device)
+        group_entropies.scatter_add_(0, group_idx, -(probs * flat_log_probs))
+
+        return group_idx, choice_cols, flat_logits, flat_log_probs, group_entropies
+
+    def _sample_flat_decisions(
+        self,
+        *,
+        group_idx: Tensor,
+        choice_cols: Tensor,
+        flat_logits: Tensor,
+        flat_log_probs: Tensor,
+        deterministic: bool,
+    ) -> tuple[Tensor, Tensor]:
+        """Sample one valid choice per decision group."""
+
+        device = flat_logits.device
+        group_count = int(group_idx.max().item()) + 1
+        choice_count = flat_logits.shape[0]
+        flat_positions = torch.arange(choice_count, dtype=torch.long, device=device)
+
+        counts = torch.bincount(group_idx, minlength=group_count)
+        group_offsets = torch.zeros(group_count, dtype=torch.long, device=device)
+        if group_count > 1:
+            group_offsets[1:] = counts.cumsum(dim=0)[:-1]
+        group_last = group_offsets + counts - 1
+
+        if deterministic:
+            group_max = torch.full(
+                (group_count,),
+                -torch.inf,
+                dtype=flat_logits.dtype,
+                device=device,
+            )
+            group_max.scatter_reduce_(0, group_idx, flat_logits, reduce="amax", include_self=True)
+            sentinel = torch.full((choice_count,), choice_count, dtype=torch.long, device=device)
+            first_best = torch.where(flat_logits == group_max[group_idx], flat_positions, sentinel)
+            selected_flat = torch.full(
+                (group_count,), choice_count, dtype=torch.long, device=device
+            )
+            selected_flat.scatter_reduce_(
+                0,
+                group_idx,
+                first_best,
+                reduce="amin",
+                include_self=True,
+            )
+        else:
+            probs = flat_log_probs.exp()
+            flat_cumsum = probs.cumsum(dim=0)
+            group_cumsum_offsets = torch.zeros(group_count, dtype=flat_logits.dtype, device=device)
+            if group_count > 1:
+                group_cumsum_offsets[1:] = flat_cumsum[group_last[:-1]]
+            local_cumsum = flat_cumsum - group_cumsum_offsets[group_idx]
+            thresholds = torch.rand(group_count, dtype=flat_logits.dtype, device=device)
+            sentinel = torch.full((choice_count,), choice_count, dtype=torch.long, device=device)
+            first_over = torch.where(
+                local_cumsum >= thresholds[group_idx], flat_positions, sentinel
+            )
+            selected_flat = torch.full(
+                (group_count,), choice_count, dtype=torch.long, device=device
+            )
+            selected_flat.scatter_reduce_(
+                0,
+                group_idx,
+                first_over,
+                reduce="amin",
+                include_self=True,
+            )
+            selected_flat = torch.where(selected_flat == choice_count, group_last, selected_flat)
+
+        selected_cols = choice_cols[selected_flat]
+        selected_log_probs = flat_log_probs[selected_flat]
+        return selected_cols, selected_log_probs
 
     def _decode_action(
         self,
