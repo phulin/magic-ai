@@ -136,18 +136,17 @@ type CardEmbeddingInput = Mapping[str, Sequence[float] | Tensor]
 class ParsedGameState:
     """Non-differentiable parsed representation of a game state.
 
-    All tensor fields are integer/float index tables — no trainable embeddings
-    have been applied yet. Produced by ``GameStateEncoder.parse_state`` and
-    consumed by ``GameStateEncoder.embed_slot_vectors``.
+    Fields are Python lists of integer/float indices — no tensors are allocated
+    here. ``RolloutBuffer.ingest_batch`` does the bulk CPU→GPU copy into
+    preallocated buffers; ``GameStateEncoder.embed_slot_vectors`` then consumes
+    the gathered tensors on-device.
     """
 
-    slot_card_rows: (
-        Tensor  # Long[ZONE_SLOT_COUNT] — row in card_embedding_table (0 = empty/unknown)
-    )
-    slot_occupied: Tensor  # Float[ZONE_SLOT_COUNT] — 1.0 if slot has a card
-    slot_tapped: Tensor  # Float[ZONE_SLOT_COUNT] — 1.0 only where occupied+battlefield+tapped
-    game_info: Tensor  # Float[GAME_INFO_DIM]
-    card_id_to_slot: dict[str, int]  # Python-only: used by ActionOptionsEncoder parsing
+    slot_card_rows: list[int]  # length ZONE_SLOT_COUNT — row in card_embedding_table
+    slot_occupied: list[float]  # length ZONE_SLOT_COUNT — 1.0 if slot has a card
+    slot_tapped: list[float]  # length ZONE_SLOT_COUNT — 1.0 if occupied+battlefield+tapped
+    game_info: list[float]  # length GAME_INFO_DIM
+    card_id_to_slot: dict[str, int]  # used by ActionOptionsEncoder parsing
 
 
 class GameStateEncoder(nn.Module):
@@ -247,14 +246,12 @@ class GameStateEncoder(nn.Module):
         state: GameStateSnapshot,
         perspective_player_idx: int | None = None,
     ) -> ParsedGameState:
-        """Parse a state dict into integer/float index tensors.
+        """Parse a state dict into Python-native index lists.
 
-        Pure Python + dict traversal. Produces device-resident tensors so
-        downstream embedding ops stay on-GPU. No trainable parameters are
-        touched here.
+        Pure Python + dict traversal. No tensors are allocated — downstream
+        bulk ingest into ``RolloutBuffer`` handles the CPU→GPU copy.
         """
 
-        device = self.device
         player_idx = self._resolve_perspective_player_idx(state, perspective_player_idx)
         players = state["players"]
         if not 0 <= player_idx < len(players):
@@ -281,17 +278,15 @@ class GameStateEncoder(nn.Module):
             if card_id:
                 card_id_to_slot[card_id] = slot_idx
 
-        occupied_t = torch.tensor(occupied, dtype=torch.float32, device=device)
         game_info = self._build_game_info(
             state,
             perspective_player_idx=player_idx,
             occupied=occupied,
-            device=device,
         )
         return ParsedGameState(
-            slot_card_rows=torch.tensor(card_rows, dtype=torch.long, device=device),
-            slot_occupied=occupied_t,
-            slot_tapped=torch.tensor(tapped, dtype=torch.float32, device=device),
+            slot_card_rows=card_rows,
+            slot_occupied=occupied,
+            slot_tapped=tapped,
             game_info=game_info,
             card_id_to_slot=card_id_to_slot,
         )
@@ -372,8 +367,7 @@ class GameStateEncoder(nn.Module):
         *,
         perspective_player_idx: int,
         occupied: Sequence[float],
-        device: torch.device,
-    ) -> Tensor:
+    ) -> list[float]:
         players = state["players"]
         self_player = players[perspective_player_idx]
         opponent = players[1 - perspective_player_idx] if len(players) == 2 else None
@@ -407,7 +401,7 @@ class GameStateEncoder(nn.Module):
 
         if len(values) != GAME_INFO_DIM:
             raise RuntimeError(f"game_info dim {len(values)} != {GAME_INFO_DIM}")
-        return torch.tensor(values, dtype=torch.float32, device=device)
+        return values
 
 
 def _build_card_embedding_table(

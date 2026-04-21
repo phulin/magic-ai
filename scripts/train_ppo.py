@@ -76,11 +76,13 @@ def main() -> None:
 
     device = torch.device(args.device)
     game_state_encoder = GameStateEncoder.from_embedding_json(args.embeddings, d_model=args.d_model)
+    rollout_capacity = args.rollout_buffer_capacity or max(4096, args.rollout_steps * 2)
     policy = PPOPolicy(
         game_state_encoder,
         hidden_dim=args.hidden_dim,
         max_options=args.max_options,
         max_targets_per_option=args.max_targets_per_option,
+        rollout_capacity=rollout_capacity,
     ).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
 
@@ -200,6 +202,7 @@ def main() -> None:
             )
             pending_steps.clear()
             pending_returns.clear()
+            policy.reset_rollout_buffer()
 
         if args.save_every and (episode_idx + 1) % args.save_every == 0:
             save_checkpoint(args.output, policy, optimizer, args)
@@ -248,6 +251,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--rollout-steps", type=int, default=512)
+    parser.add_argument(
+        "--rollout-buffer-capacity",
+        type=int,
+        default=None,
+        help="rows in the rollout GPU buffer; default max(4096, 2*rollout-steps)",
+    )
     parser.add_argument("--max-steps-per-game", type=int, default=400)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--hand-size", type=int, default=7)
@@ -460,6 +469,7 @@ def train_batched_envs(
             )
             pending_steps.clear()
             pending_returns.clear()
+            policy.reset_rollout_buffer()
 
         if (
             args.save_every

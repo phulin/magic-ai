@@ -111,27 +111,27 @@ class LegalActionCandidate:
 class ParsedActionInputs:
     """Non-differentiable parsed representation of a pending action request.
 
-    Fields are padded to ``max_options`` / ``max_targets_per_option``. Invalid
-    entries are masked out by ``option_mask`` / ``target_mask``. Reference
-    fields use ``-1`` to mean "no reference of this kind"; the embedder uses
-    those sentinels to choose among slot-vector, card-table, player, or zero
-    refs.
+    Fields are Python lists padded to ``max_options`` / ``max_targets_per_option``.
+    Invalid entries are masked out by ``option_mask`` / ``target_mask``.
+    Reference fields use ``-1`` to mean "no reference of this kind". No tensors
+    are allocated here — ``RolloutBuffer.ingest_batch`` does the bulk CPU→GPU
+    copy into preallocated buffers.
     """
 
-    pending_kind_id: Tensor  # Long []
+    pending_kind_id: int
     num_present_options: int
-    option_kind_ids: Tensor  # Long [max_options]
-    option_scalars: Tensor  # Float [max_options, OPTION_SCALAR_DIM]
-    option_mask: Tensor  # Float [max_options]
-    option_ref_slot_idx: Tensor  # Long [max_options] (-1 if none)
-    option_ref_card_row: Tensor  # Long [max_options] (-1 if none)
-    target_mask: Tensor  # Float [max_options, max_targets]
-    target_type_ids: Tensor  # Long [max_options, max_targets]
-    target_scalars: Tensor  # Float [max_options, max_targets, TARGET_SCALAR_DIM]
-    target_overflow: Tensor  # Float [max_options]
-    target_ref_slot_idx: Tensor  # Long [max_options, max_targets] (-1 if not permanent)
-    target_ref_is_player: Tensor  # Bool [max_options, max_targets]
-    target_ref_is_self: Tensor  # Bool [max_options, max_targets]
+    option_kind_ids: list[int]  # length max_options
+    option_scalars: list[list[float]]  # [max_options, OPTION_SCALAR_DIM]
+    option_mask: list[float]  # length max_options
+    option_ref_slot_idx: list[int]  # length max_options (-1 if none)
+    option_ref_card_row: list[int]  # length max_options (-1 if none)
+    target_mask: list[list[float]]  # [max_options, max_targets]
+    target_type_ids: list[list[int]]  # [max_options, max_targets]
+    target_scalars: list[list[list[float]]]  # [max_options, max_targets, TARGET_SCALAR_DIM]
+    target_overflow: list[float]  # length max_options
+    target_ref_slot_idx: list[list[int]]  # [max_options, max_targets] (-1 if not permanent)
+    target_ref_is_player: list[list[bool]]  # [max_options, max_targets]
+    target_ref_is_self: list[list[bool]]  # [max_options, max_targets]
     priority_candidates: list[LegalActionCandidate]
 
 
@@ -255,80 +255,49 @@ class ActionOptionsEncoder(nn.Module):
         perspective_player_idx: int,
         card_id_to_slot: dict[str, int],
     ) -> ParsedActionInputs:
-        device = self.game_state_encoder.device
         options = pending.get("options", [])
-        num_present = min(len(options), self.max_options)
+        max_opt = self.max_options
+        max_tgt = self.max_targets_per_option
+        num_present = min(len(options), max_opt)
 
-        pending_kind_id = torch.tensor(
-            _index_or_unknown(PENDING_KINDS, pending.get("kind", "")),
-            dtype=torch.long,
-            device=device,
-        )
+        option_kind_ids: list[int] = [0] * max_opt
+        option_scalars: list[list[float]] = [[0.0] * OPTION_SCALAR_DIM for _ in range(max_opt)]
+        option_mask: list[float] = [0.0] * max_opt
+        option_ref_slot_idx: list[int] = [-1] * max_opt
+        option_ref_card_row: list[int] = [-1] * max_opt
 
-        option_kind_ids = torch.zeros(self.max_options, dtype=torch.long, device=device)
-        option_scalars = torch.zeros(
-            self.max_options, OPTION_SCALAR_DIM, dtype=torch.float32, device=device
-        )
-        option_mask = torch.zeros(self.max_options, dtype=torch.float32, device=device)
-        option_ref_slot_idx = torch.full((self.max_options,), -1, dtype=torch.long, device=device)
-        option_ref_card_row = torch.full((self.max_options,), -1, dtype=torch.long, device=device)
-
-        target_mask = torch.zeros(
-            self.max_options,
-            self.max_targets_per_option,
-            dtype=torch.float32,
-            device=device,
-        )
-        target_type_ids = torch.full(
-            (self.max_options, self.max_targets_per_option),
-            UNKNOWN_TARGET_TYPE_ID,
-            dtype=torch.long,
-            device=device,
-        )
-        target_scalars = torch.zeros(
-            self.max_options,
-            self.max_targets_per_option,
-            TARGET_SCALAR_DIM,
-            dtype=torch.float32,
-            device=device,
-        )
-        target_overflow = torch.zeros(self.max_options, dtype=torch.float32, device=device)
-        target_ref_slot_idx = torch.full(
-            (self.max_options, self.max_targets_per_option),
-            -1,
-            dtype=torch.long,
-            device=device,
-        )
-        target_ref_is_player = torch.zeros(
-            self.max_options, self.max_targets_per_option, dtype=torch.bool, device=device
-        )
-        target_ref_is_self = torch.zeros(
-            self.max_options, self.max_targets_per_option, dtype=torch.bool, device=device
-        )
+        target_mask: list[list[float]] = [[0.0] * max_tgt for _ in range(max_opt)]
+        target_type_ids: list[list[int]] = [
+            [UNKNOWN_TARGET_TYPE_ID] * max_tgt for _ in range(max_opt)
+        ]
+        target_scalars: list[list[list[float]]] = [
+            [[0.0] * TARGET_SCALAR_DIM for _ in range(max_tgt)] for _ in range(max_opt)
+        ]
+        target_overflow: list[float] = [0.0] * max_opt
+        target_ref_slot_idx: list[list[int]] = [[-1] * max_tgt for _ in range(max_opt)]
+        target_ref_is_player: list[list[bool]] = [[False] * max_tgt for _ in range(max_opt)]
+        target_ref_is_self: list[list[bool]] = [[False] * max_tgt for _ in range(max_opt)]
 
         player_self_id, player_opp_id = _player_ids(state, perspective_player_idx)
-        max_tgt_scalar = max(1.0, float(self.max_targets_per_option - 1))
+        max_tgt_scalar = max(1.0, float(max_tgt - 1))
+        name_to_row = self.game_state_encoder._card_name_to_row
 
         for opt_i in range(num_present):
             option = options[opt_i]
             option_kind_ids[opt_i] = _index_or_unknown(ACTION_KINDS, option.get("kind", "unknown"))
-            option_scalars[opt_i] = torch.tensor(
-                _option_scalars(
-                    option,
-                    pending=pending,
-                    option_idx=opt_i,
-                    max_options=self.max_options,
-                    max_targets_per_option=self.max_targets_per_option,
-                ),
-                dtype=torch.float32,
-                device=device,
+            option_scalars[opt_i] = _option_scalars(
+                option,
+                pending=pending,
+                option_idx=opt_i,
+                max_options=max_opt,
+                max_targets_per_option=max_tgt,
             )
             option_mask[opt_i] = 1.0
 
             slot_idx, card_row = _resolve_option_reference(
                 option,
                 card_id_to_slot=card_id_to_slot,
-                name_to_row=self.game_state_encoder._card_name_to_row,
+                name_to_row=name_to_row,
             )
             if slot_idx is not None:
                 option_ref_slot_idx[opt_i] = slot_idx
@@ -336,36 +305,36 @@ class ActionOptionsEncoder(nn.Module):
                 option_ref_card_row[opt_i] = card_row
 
             targets = option.get("valid_targets", [])
-            overflow_count = max(0, len(targets) - self.max_targets_per_option)
+            overflow_count = max(0, len(targets) - max_tgt)
             target_overflow[opt_i] = _clip_norm(overflow_count, MAX_TARGET_OVERFLOW)
 
-            for tgt_j in range(min(len(targets), self.max_targets_per_option)):
+            row_mask = target_mask[opt_i]
+            row_types = target_type_ids[opt_i]
+            row_scalars = target_scalars[opt_i]
+            row_ref_slot = target_ref_slot_idx[opt_i]
+            row_ref_player = target_ref_is_player[opt_i]
+            row_ref_self = target_ref_is_self[opt_i]
+            for tgt_j in range(min(len(targets), max_tgt)):
                 target = targets[tgt_j]
-                target_mask[opt_i, tgt_j] = 1.0
-                target_scalars[opt_i, tgt_j] = torch.tensor(
-                    [_clip_norm(tgt_j, max_tgt_scalar), 1.0],
-                    dtype=torch.float32,
-                    device=device,
-                )
+                row_mask[tgt_j] = 1.0
+                row_scalars[tgt_j] = [_clip_norm(tgt_j, max_tgt_scalar), 1.0]
 
                 target_id = target.get("id", "")
-                if target_id in (player_self_id, player_opp_id) and target_id:
-                    target_type_ids[opt_i, tgt_j] = PLAYER_TARGET_TYPE_ID
-                    target_ref_is_player[opt_i, tgt_j] = True
-                    target_ref_is_self[opt_i, tgt_j] = target_id == player_self_id
+                if target_id and target_id in (player_self_id, player_opp_id):
+                    row_types[tgt_j] = PLAYER_TARGET_TYPE_ID
+                    row_ref_player[tgt_j] = True
+                    row_ref_self[tgt_j] = target_id == player_self_id
                 elif target_id in card_id_to_slot:
-                    target_type_ids[opt_i, tgt_j] = PERMANENT_TARGET_TYPE_ID
-                    target_ref_slot_idx[opt_i, tgt_j] = card_id_to_slot[target_id]
-                else:
-                    target_type_ids[opt_i, tgt_j] = UNKNOWN_TARGET_TYPE_ID
+                    row_types[tgt_j] = PERMANENT_TARGET_TYPE_ID
+                    row_ref_slot[tgt_j] = card_id_to_slot[target_id]
 
         priority_candidates = build_priority_candidates(
             pending,
-            max_targets_per_option=self.max_targets_per_option,
+            max_targets_per_option=max_tgt,
         )
 
         return ParsedActionInputs(
-            pending_kind_id=pending_kind_id,
+            pending_kind_id=_index_or_unknown(PENDING_KINDS, pending.get("kind", "")),
             num_present_options=num_present,
             option_kind_ids=option_kind_ids,
             option_scalars=option_scalars,

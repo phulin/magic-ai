@@ -17,6 +17,7 @@ from magic_ai.actions import (
     build_priority_candidates,
     selected_priority_candidate_index,
 )
+from magic_ai.buffer import RolloutBuffer
 from magic_ai.game_state import (
     GameCardState,
     GameStateEncoder,
@@ -30,6 +31,7 @@ from magic_ai.game_state import (
 from magic_ai.model import (
     ActionTrace,
     CachedPolicyInput,
+    ParsedStep,
     PolicyStep,
     PPOPolicy,
 )
@@ -57,6 +59,8 @@ __all__ = [
     "PPOStats",
     "ParsedActionInputs",
     "ParsedGameState",
+    "ParsedStep",
+    "RolloutBuffer",
     "PendingOptionState",
     "PendingState",
     "PlayerState",
