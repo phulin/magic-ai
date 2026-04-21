@@ -157,6 +157,15 @@ class PPOPolicy(nn.Module):
     def reset_rollout_buffer(self) -> None:
         self.rollout_buffer.reset()
 
+    def release_cached_steps(self, cached_steps: list[CachedPolicyInput]) -> None:
+        if not cached_steps:
+            return
+        self.rollout_buffer.release(
+            step_indices=[step.buffer_idx for step in cached_steps],
+            decision_starts=[step.decision_start for step in cached_steps],
+            decision_counts=[step.decision_count for step in cached_steps],
+        )
+
     def parse_inputs(
         self,
         state: GameStateSnapshot,
@@ -616,20 +625,9 @@ class PPOPolicy(nn.Module):
             scored_option_idx = option_idx[scored_groups, scored_cols]
             scored_target_idx = target_idx[scored_groups, scored_cols]
 
-            scored_option_vectors = torch.zeros(
-                (scored_groups.shape[0], option_vectors.shape[-1]),
-                dtype=query.dtype,
-                device=device,
-            )
-            has_option = scored_option_idx >= 0
-            if has_option.any():
-                scored_option_vectors[has_option] = option_vectors[
-                    scored_steps[has_option],
-                    scored_option_idx[has_option],
-                ]
-
+            scored_option_vectors = option_vectors[scored_steps, scored_option_idx]
             scored_target_vectors = torch.zeros_like(scored_option_vectors)
-            has_target = has_option & (scored_target_idx >= 0)
+            has_target = scored_target_idx >= 0
             if has_target.any():
                 scored_target_vectors[has_target] = target_vectors[
                     scored_steps[has_target],

@@ -248,9 +248,11 @@ def main() -> None:
                 steps=len(pending_steps),
                 win_stats=win_stats,
             )
+            policy.release_cached_steps(
+                [step.cache for step in pending_steps if step.cache is not None]
+            )
             pending_steps.clear()
             pending_returns.clear()
-            policy.reset_rollout_buffer()
             win_stats.reset()
 
         if args.save_every and (episode_idx + 1) % args.save_every == 0:
@@ -567,9 +569,11 @@ def train_batched_envs(
                 steps=len(pending_steps),
                 win_stats=win_stats,
             )
+            policy.release_cached_steps(
+                [step.cache for step in pending_steps if step.cache is not None]
+            )
             pending_steps.clear()
             pending_returns.clear()
-            policy.reset_rollout_buffer()
             win_stats.reset()
 
         if (
@@ -612,6 +616,9 @@ def train_batched_envs(
             flush=True,
         )
         log_ppo_stats(stats, games=completed_games, steps=len(pending_steps), win_stats=win_stats)
+        policy.release_cached_steps(
+            [step.cache for step in pending_steps if step.cache is not None]
+        )
 
 
 def load_decks(path: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:
