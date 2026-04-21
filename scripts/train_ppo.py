@@ -100,6 +100,7 @@ class WinFractionStats:
 
 def main() -> None:
     args = parse_args()
+    validate_args(args)
     if args.torch_threads is not None:
         torch.set_num_threads(args.torch_threads)
 
@@ -112,7 +113,9 @@ def main() -> None:
 
     device = torch.device(args.device)
     game_state_encoder = GameStateEncoder.from_embedding_json(args.embeddings, d_model=args.d_model)
-    rollout_capacity = args.rollout_buffer_capacity or max(4096, args.rollout_steps * 2)
+    rollout_capacity = args.rollout_buffer_capacity or max(
+        4096, args.rollout_steps + 400 * args.num_envs
+    )
     policy = PPOPolicy(
         game_state_encoder,
         hidden_dim=args.hidden_dim,
@@ -301,7 +304,7 @@ def parse_args() -> argparse.Namespace:
         "--rollout-buffer-capacity",
         type=int,
         default=None,
-        help="rows in the rollout GPU buffer; default max(4096, 2*rollout-steps)",
+        help="rows in the rollout GPU buffer; default max(4096, rollout-steps + 400*num-envs)",
     )
     parser.add_argument("--max-steps-per-game", type=int, default=400)
     parser.add_argument("--seed", type=int, default=1)
@@ -335,6 +338,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     return parser.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.episodes < 1:
+        raise ValueError("--episodes must be at least 1")
+    if args.num_envs < 1:
+        raise ValueError("--num-envs must be at least 1")
+    if args.rollout_steps < 1:
+        raise ValueError("--rollout-steps must be at least 1")
+    if args.max_steps_per_game < 1:
+        raise ValueError("--max-steps-per-game must be at least 1")
+    if args.minibatch_size < 1:
+        raise ValueError("--minibatch-size must be at least 1")
 
 
 def log_ppo_stats(
