@@ -128,7 +128,9 @@ def main() -> None:
         max_options=args.max_options,
         max_targets_per_option=args.max_targets_per_option,
         rollout_capacity=rollout_capacity,
+        use_lstm=args.lstm,
     ).to(device)
+    policy.init_lstm_env_states(args.num_envs)
     if device.type == "cuda":
         # Force cuBLAS handle creation before rollout ingestion creates temporary
         # CUDA copy tensors that PyTorch may hold in its caching allocator.
@@ -151,6 +153,8 @@ def main() -> None:
         game_info_dim=policy.rollout_buffer.game_info.shape[1],
         option_scalar_dim=policy.rollout_buffer.option_scalars.shape[2],
         target_scalar_dim=policy.rollout_buffer.target_scalars.shape[3],
+        recurrent_layers=policy.hidden_layers if policy.use_lstm else 0,
+        recurrent_hidden_dim=policy.hidden_dim if policy.use_lstm else 0,
     ).to(device)
 
     if args.checkpoint and args.checkpoint.exists():
@@ -209,6 +213,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--hidden-layers", type=int, default=2)
+    parser.add_argument("--lstm", action="store_true", help="use an LSTM policy core")
     parser.add_argument("--max-options", type=int, default=64)
     parser.add_argument("--max-targets-per-option", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -298,6 +303,7 @@ def train_native_batched_envs(
 
     def start_game(slot_idx: int, episode_idx: int) -> LiveGame:
         staging_buffer.reset_env(slot_idx)
+        policy.reset_lstm_env_states([slot_idx])
         seed = args.seed + episode_idx
         return LiveGame(
             game=mage.new_game(
@@ -414,13 +420,16 @@ def train_native_batched_envs(
         finish_games(finished_games)
 
         if ready_envs:
+            ready_env_indices = [env.slot_idx for env in ready_envs]
             parsed_batch = native_encoder.encode_handles(
                 [env.game for env in ready_envs],
                 perspective_player_indices=ready_players,
             )
+            lstm_state_inputs = policy.lstm_env_state_inputs(ready_env_indices)
             with torch.no_grad():
                 policy_steps = policy.sample_native_batch(
                     parsed_batch,
+                    env_indices=ready_env_indices,
                     deterministic=args.deterministic_rollout,
                 )
             log_probs = torch.stack([policy_step.log_prob for policy_step in policy_steps])
@@ -472,13 +481,15 @@ def train_native_batched_envs(
             )
 
             staging_buffer.stage_batch(
-                [env.slot_idx for env in ready_envs],
+                ready_env_indices,
                 parsed_batch,
                 selected_choice_cols_flat=selected_choice_cols_flat,
                 may_selected=may_selected,
                 old_log_probs=log_probs,
                 values=values,
                 perspective_player_indices=ready_players,
+                lstm_h_in=lstm_state_inputs[0] if lstm_state_inputs is not None else None,
+                lstm_c_in=lstm_state_inputs[1] if lstm_state_inputs is not None else None,
             )
 
             native_rollout.step_by_choice(

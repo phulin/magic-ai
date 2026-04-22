@@ -4,8 +4,9 @@ import unittest
 from typing import cast
 
 import torch
+from magic_ai.buffer import NativeTrajectoryBuffer
 from magic_ai.game_state import GameStateEncoder, GameStateSnapshot, PendingState
-from magic_ai.model import PPOPolicy
+from magic_ai.model import ParsedBatch, PPOPolicy
 from magic_ai.native_encoder import (
     NativeBatchEncoder,
     NativeEncodedBatch,
@@ -67,6 +68,40 @@ class _LibWithoutEncode:
     MageFreeString = None
 
 
+def _native_batch_from_parsed(parsed: ParsedBatch, pending: PendingState) -> NativeEncodedBatch:
+    return NativeEncodedBatch(
+        trace_kind_id=parsed.trace_kind_ids,
+        slot_card_rows=parsed.parsed_state.slot_card_rows,
+        slot_occupied=parsed.parsed_state.slot_occupied,
+        slot_tapped=parsed.parsed_state.slot_tapped,
+        game_info=parsed.parsed_state.game_info,
+        pending_kind_id=parsed.parsed_action.pending_kind_id,
+        num_present_options=parsed.parsed_action.num_present_options,
+        option_kind_ids=parsed.parsed_action.option_kind_ids,
+        option_scalars=parsed.parsed_action.option_scalars,
+        option_mask=parsed.parsed_action.option_mask,
+        option_ref_slot_idx=parsed.parsed_action.option_ref_slot_idx,
+        option_ref_card_row=parsed.parsed_action.option_ref_card_row,
+        target_mask=parsed.parsed_action.target_mask,
+        target_type_ids=parsed.parsed_action.target_type_ids,
+        target_scalars=parsed.parsed_action.target_scalars,
+        target_overflow=parsed.parsed_action.target_overflow,
+        target_ref_slot_idx=parsed.parsed_action.target_ref_slot_idx,
+        target_ref_is_player=parsed.parsed_action.target_ref_is_player,
+        target_ref_is_self=parsed.parsed_action.target_ref_is_self,
+        may_mask=parsed.trace_kind_ids == 6,
+        decision_start=torch.tensor(parsed.decision_starts, dtype=torch.int64),
+        decision_count=torch.tensor(parsed.decision_counts, dtype=torch.int64),
+        decision_option_idx=parsed.decision_option_idx,
+        decision_target_idx=parsed.decision_target_idx,
+        decision_mask=parsed.decision_mask,
+        uses_none_head=parsed.uses_none_head,
+        decision_rows_written=parsed.decision_option_idx.shape[0],
+        pendings=[pending for _ in parsed.trace_kinds],
+        trace_kinds=list(parsed.trace_kinds),
+    )
+
+
 class NativeEncoderTests(unittest.TestCase):
     def test_native_encoder_reports_unavailable_without_symbol(self) -> None:
         encoder = NativeBatchEncoder(
@@ -95,37 +130,7 @@ class NativeEncoderTests(unittest.TestCase):
             [pending],
             perspective_player_indices=[0],
         )
-        native_batch = NativeEncodedBatch(
-            trace_kind_id=parsed.trace_kind_ids,
-            slot_card_rows=parsed.parsed_state.slot_card_rows,
-            slot_occupied=parsed.parsed_state.slot_occupied,
-            slot_tapped=parsed.parsed_state.slot_tapped,
-            game_info=parsed.parsed_state.game_info,
-            pending_kind_id=parsed.parsed_action.pending_kind_id,
-            num_present_options=parsed.parsed_action.num_present_options,
-            option_kind_ids=parsed.parsed_action.option_kind_ids,
-            option_scalars=parsed.parsed_action.option_scalars,
-            option_mask=parsed.parsed_action.option_mask,
-            option_ref_slot_idx=parsed.parsed_action.option_ref_slot_idx,
-            option_ref_card_row=parsed.parsed_action.option_ref_card_row,
-            target_mask=parsed.parsed_action.target_mask,
-            target_type_ids=parsed.parsed_action.target_type_ids,
-            target_scalars=parsed.parsed_action.target_scalars,
-            target_overflow=parsed.parsed_action.target_overflow,
-            target_ref_slot_idx=parsed.parsed_action.target_ref_slot_idx,
-            target_ref_is_player=parsed.parsed_action.target_ref_is_player,
-            target_ref_is_self=parsed.parsed_action.target_ref_is_self,
-            may_mask=torch.zeros((1,), dtype=torch.bool),
-            decision_start=torch.tensor(parsed.decision_starts, dtype=torch.int64),
-            decision_count=torch.tensor(parsed.decision_counts, dtype=torch.int64),
-            decision_option_idx=parsed.decision_option_idx,
-            decision_target_idx=parsed.decision_target_idx,
-            decision_mask=parsed.decision_mask,
-            uses_none_head=parsed.uses_none_head,
-            decision_rows_written=parsed.decision_option_idx.shape[0],
-            pendings=[pending],
-            trace_kinds=list(parsed.trace_kinds),
-        )
+        native_batch = _native_batch_from_parsed(parsed, pending)
 
         with torch.no_grad():
             parsed_step = policy.act_parsed_batch(parsed, deterministic=True)[0]
@@ -135,6 +140,79 @@ class NativeEncoderTests(unittest.TestCase):
         self.assertEqual(parsed_step.trace, native_step.trace)
         self.assertAlmostEqual(float(parsed_step.log_prob), float(native_step.log_prob), places=6)
         self.assertAlmostEqual(float(parsed_step.value), float(native_step.value), places=6)
+
+    def test_lstm_native_rollout_stores_replay_state_inputs(self) -> None:
+        state = cast(GameStateSnapshot, _sample_state())
+        pending: PendingState = state["pending"]
+        encoder = GameStateEncoder({"Mountain": [0.1, 0.2, 0.3]}, d_model=8)
+        policy = PPOPolicy(
+            encoder,
+            hidden_dim=16,
+            hidden_layers=1,
+            max_options=4,
+            max_targets_per_option=2,
+            rollout_capacity=16,
+            use_lstm=True,
+        )
+        policy.init_lstm_env_states(2)
+        parsed = policy.parse_inputs_batch(
+            [state, state],
+            [pending, pending],
+            perspective_player_indices=[0, 0],
+        )
+        native_batch = _native_batch_from_parsed(parsed, pending)
+        env_indices = [0, 1]
+        state_inputs = policy.lstm_env_state_inputs(env_indices)
+        assert state_inputs is not None
+
+        with torch.no_grad():
+            policy_steps = policy.sample_native_batch(
+                native_batch,
+                env_indices=env_indices,
+                deterministic=True,
+            )
+
+        self.assertFalse(torch.equal(policy.live_lstm_h, torch.zeros_like(policy.live_lstm_h)))
+        selected_cols = [
+            col for policy_step in policy_steps for col in policy_step.selected_choice_cols
+        ]
+        staging = NativeTrajectoryBuffer(
+            num_envs=2,
+            max_steps_per_trajectory=4,
+            decision_capacity_per_env=8,
+            max_options=4,
+            max_targets_per_option=2,
+            max_cached_choices=policy.max_cached_choices,
+            zone_slot_count=policy.rollout_buffer.slot_card_rows.shape[1],
+            game_info_dim=policy.rollout_buffer.game_info.shape[1],
+            option_scalar_dim=policy.rollout_buffer.option_scalars.shape[2],
+            target_scalar_dim=policy.rollout_buffer.target_scalars.shape[3],
+            recurrent_layers=policy.hidden_layers,
+            recurrent_hidden_dim=policy.hidden_dim,
+        )
+        staging.stage_batch(
+            env_indices,
+            native_batch,
+            selected_choice_cols_flat=torch.tensor(selected_cols, dtype=torch.long),
+            may_selected=[policy_step.may_selected for policy_step in policy_steps],
+            old_log_probs=torch.stack([policy_step.log_prob for policy_step in policy_steps]),
+            values=torch.stack([policy_step.value for policy_step in policy_steps]),
+            perspective_player_indices=[0, 0],
+            lstm_h_in=state_inputs[0],
+            lstm_c_in=state_inputs[1],
+        )
+        self.assertTrue(torch.equal(staging.lstm_h_in[0, 0], state_inputs[0][0]))
+
+        write = policy.rollout_buffer.ingest_staged_episodes(staging, env_indices)
+        self.assertTrue(
+            torch.equal(policy.rollout_buffer.lstm_h_in[write.step_indices[0]], state_inputs[0][0])
+        )
+        log_probs, entropies, values = policy.evaluate_replay_batch(
+            [int(idx) for idx in write.step_indices.detach().cpu().tolist()]
+        )
+        self.assertEqual(tuple(log_probs.shape), (2,))
+        self.assertEqual(tuple(entropies.shape), (2,))
+        self.assertEqual(tuple(values.shape), (2,))
 
     def test_native_decision_validation_rejects_out_of_range_option(self) -> None:
         with self.assertRaisesRegex(NativeEncodingError, "outside \\[0, 4\\)"):

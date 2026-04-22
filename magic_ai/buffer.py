@@ -46,11 +46,15 @@ class NativeTrajectoryBuffer(nn.Module):
         game_info_dim: int,
         option_scalar_dim: int,
         target_scalar_dim: int,
+        recurrent_layers: int = 0,
+        recurrent_hidden_dim: int = 0,
     ) -> None:
         super().__init__()
         self.num_envs = num_envs
         self.max_steps_per_trajectory = max_steps_per_trajectory
         self.decision_capacity_per_env = decision_capacity_per_env
+        self.recurrent_layers = recurrent_layers
+        self.recurrent_hidden_dim = recurrent_hidden_dim
 
         def _reg(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> None:
             self.register_buffer(name, torch.zeros(shape, dtype=dtype), persistent=False)
@@ -92,6 +96,9 @@ class NativeTrajectoryBuffer(nn.Module):
         _reg("old_log_prob", step_shape, torch.float32)
         _reg("value", step_shape, torch.float32)
         _reg("perspective_player_idx", step_shape, torch.long)
+        recurrent_shape = step_shape + (recurrent_layers, recurrent_hidden_dim)
+        _reg("lstm_h_in", recurrent_shape, torch.float32)
+        _reg("lstm_c_in", recurrent_shape, torch.float32)
 
         decision_shape = (num_envs, decision_capacity_per_env)
         _reg("decision_option_idx", decision_shape + (max_cached_choices,), torch.long)
@@ -127,6 +134,8 @@ class NativeTrajectoryBuffer(nn.Module):
     old_log_prob: Tensor
     value: Tensor
     perspective_player_idx: Tensor
+    lstm_h_in: Tensor
+    lstm_c_in: Tensor
     decision_option_idx: Tensor
     decision_target_idx: Tensor
     decision_mask: Tensor
@@ -156,6 +165,8 @@ class NativeTrajectoryBuffer(nn.Module):
         old_log_probs: Tensor,
         values: Tensor,
         perspective_player_indices: list[int],
+        lstm_h_in: Tensor | None = None,
+        lstm_c_in: Tensor | None = None,
     ) -> None:
         if int(native_batch.trace_kind_id.shape[0]) != len(env_indices):
             raise ValueError("env_indices length must match native batch length")
@@ -225,6 +236,21 @@ class NativeTrajectoryBuffer(nn.Module):
         self.old_log_prob[env_idx_t, step_idx_t] = old_log_probs.to(device)
         self.value[env_idx_t, step_idx_t] = values.to(device)
         self.perspective_player_idx[env_idx_t, step_idx_t] = player_idx_t
+        if self.recurrent_layers and self.recurrent_hidden_dim:
+            if lstm_h_in is None or lstm_c_in is None:
+                raise ValueError("lstm_h_in and lstm_c_in are required for recurrent staging")
+            expected_shape = (
+                len(env_indices),
+                self.recurrent_layers,
+                self.recurrent_hidden_dim,
+            )
+            if tuple(lstm_h_in.shape) != expected_shape or tuple(lstm_c_in.shape) != expected_shape:
+                raise ValueError(
+                    "lstm_h_in/lstm_c_in shape must be "
+                    f"{expected_shape}, got {tuple(lstm_h_in.shape)} and {tuple(lstm_c_in.shape)}"
+                )
+            self.lstm_h_in[env_idx_t, step_idx_t] = lstm_h_in.to(device)
+            self.lstm_c_in[env_idx_t, step_idx_t] = lstm_c_in.to(device)
         self.decision_start[env_idx_t, step_idx_t] = starts_t
         self.decision_count[env_idx_t, step_idx_t] = counts_t
 
@@ -276,10 +302,14 @@ class RolloutBuffer(nn.Module):
         game_info_dim: int,
         option_scalar_dim: int,
         target_scalar_dim: int,
+        recurrent_layers: int = 0,
+        recurrent_hidden_dim: int = 0,
     ) -> None:
         super().__init__()
         self.capacity = capacity
         self.decision_capacity = decision_capacity
+        self.recurrent_layers = recurrent_layers
+        self.recurrent_hidden_dim = recurrent_hidden_dim
 
         def _reg(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> None:
             self.register_buffer(name, torch.zeros(shape, dtype=dtype), persistent=False)
@@ -329,6 +359,16 @@ class RolloutBuffer(nn.Module):
             torch.bool,
         )
         _reg("may_selected", (capacity,), torch.float32)
+        _reg(
+            "lstm_h_in",
+            (capacity, recurrent_layers, recurrent_hidden_dim),
+            torch.float32,
+        )
+        _reg(
+            "lstm_c_in",
+            (capacity, recurrent_layers, recurrent_hidden_dim),
+            torch.float32,
+        )
 
         _reg(
             "decision_option_idx",
@@ -373,6 +413,8 @@ class RolloutBuffer(nn.Module):
     target_ref_is_player: Tensor
     target_ref_is_self: Tensor
     may_selected: Tensor
+    lstm_h_in: Tensor
+    lstm_c_in: Tensor
     decision_option_idx: Tensor
     decision_target_idx: Tensor
     decision_mask: Tensor
@@ -627,6 +669,8 @@ class RolloutBuffer(nn.Module):
         self.target_ref_is_player[step_indices] = staging.target_ref_is_player[src_env, src_step]
         self.target_ref_is_self[step_indices] = staging.target_ref_is_self[src_env, src_step]
         self.may_selected[step_indices] = staging.may_selected[src_env, src_step]
+        self.lstm_h_in[step_indices] = staging.lstm_h_in[src_env, src_step]
+        self.lstm_c_in[step_indices] = staging.lstm_c_in[src_env, src_step]
 
         decision_counts_t = staging.decision_count[src_env, src_step].to(dtype=torch.long)
         source_starts_t = staging.decision_start[src_env, src_step].to(dtype=torch.long)

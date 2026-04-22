@@ -134,6 +134,7 @@ class PPOPolicy(nn.Module):
         max_targets_per_option: int = 4,
         rollout_capacity: int = 4096,
         decision_capacity: int | None = None,
+        use_lstm: bool = False,
     ) -> None:
         super().__init__()
         self.game_state_encoder = game_state_encoder
@@ -149,12 +150,34 @@ class PPOPolicy(nn.Module):
         input_dim = game_state_encoder.output_dim + game_state_encoder.d_model * 2
         if hidden_layers < 1:
             raise ValueError("hidden_layers must be at least 1")
-        trunk_layers: list[nn.Module] = []
-        in_dim = input_dim
-        for _ in range(hidden_layers):
-            trunk_layers.extend((nn.Linear(in_dim, hidden_dim), nn.GELU()))
-            in_dim = hidden_dim
-        self.trunk = nn.Sequential(*trunk_layers)
+        self.use_lstm = use_lstm
+        self.hidden_dim = hidden_dim
+        self.hidden_layers = hidden_layers
+        if use_lstm:
+            self.feature_projection = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.GELU())
+            self.lstm = nn.LSTM(
+                input_size=hidden_dim,
+                hidden_size=hidden_dim,
+                num_layers=hidden_layers,
+                batch_first=True,
+            )
+            self.register_buffer(
+                "live_lstm_h",
+                torch.zeros(hidden_layers, 0, hidden_dim),
+                persistent=False,
+            )
+            self.register_buffer(
+                "live_lstm_c",
+                torch.zeros(hidden_layers, 0, hidden_dim),
+                persistent=False,
+            )
+        else:
+            trunk_layers: list[nn.Module] = []
+            in_dim = input_dim
+            for _ in range(hidden_layers):
+                trunk_layers.extend((nn.Linear(in_dim, hidden_dim), nn.GELU()))
+                in_dim = hidden_dim
+            self.trunk = nn.Sequential(*trunk_layers)
         self.action_query = nn.Linear(hidden_dim, game_state_encoder.d_model)
         self.value_head = nn.Linear(hidden_dim, 1)
         self.none_blocker_head = nn.Linear(hidden_dim, 1)
@@ -173,6 +196,8 @@ class PPOPolicy(nn.Module):
             game_info_dim=GAME_INFO_DIM,
             option_scalar_dim=OPTION_SCALAR_DIM,
             target_scalar_dim=TARGET_SCALAR_DIM,
+            recurrent_layers=hidden_layers if use_lstm else 0,
+            recurrent_hidden_dim=hidden_dim if use_lstm else 0,
         )
 
     @property
@@ -181,6 +206,41 @@ class PPOPolicy(nn.Module):
 
     def reset_rollout_buffer(self) -> None:
         self.rollout_buffer.reset()
+
+    def init_lstm_env_states(self, num_envs: int) -> None:
+        if not self.use_lstm:
+            return
+        if num_envs < 1:
+            raise ValueError("num_envs must be at least 1")
+        device = self.device
+        self.live_lstm_h = torch.zeros(
+            self.hidden_layers,
+            num_envs,
+            self.hidden_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        self.live_lstm_c = torch.zeros_like(self.live_lstm_h)
+
+    def reset_lstm_env_states(self, env_indices: list[int]) -> None:
+        if not self.use_lstm:
+            return
+        if self.live_lstm_h.shape[1] == 0:
+            raise RuntimeError("LSTM env states have not been initialized")
+        idx_t = torch.tensor(env_indices, dtype=torch.long, device=self.device)
+        self.live_lstm_h[:, idx_t] = 0
+        self.live_lstm_c[:, idx_t] = 0
+
+    def lstm_env_state_inputs(self, env_indices: list[int]) -> tuple[Tensor, Tensor] | None:
+        if not self.use_lstm:
+            return None
+        if self.live_lstm_h.shape[1] == 0:
+            raise RuntimeError("LSTM env states have not been initialized")
+        idx_t = torch.tensor(env_indices, dtype=torch.long, device=self.device)
+        return (
+            self.live_lstm_h[:, idx_t].permute(1, 0, 2).contiguous().detach(),
+            self.live_lstm_c[:, idx_t].permute(1, 0, 2).contiguous().detach(),
+        )
 
     def release_replay_rows(self, replay_rows: list[int]) -> None:
         return
@@ -437,6 +497,7 @@ class PPOPolicy(nn.Module):
         self,
         native_batch: NativeEncodedBatch,
         *,
+        env_indices: list[int] | None = None,
         deterministic: bool = False,
     ) -> list[PolicyStep]:
         n = int(native_batch.trace_kind_id.shape[0])
@@ -444,7 +505,7 @@ class PPOPolicy(nn.Module):
             return []
 
         device = self.device
-        forward = self._forward_native_batch(native_batch)
+        forward = self._forward_native_batch(native_batch, env_indices=env_indices)
         may_positions = native_batch.may_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
         decision_starts = native_batch.decision_start.detach().cpu().tolist()
         decision_counts = native_batch.decision_count.detach().cpu().tolist()
@@ -971,6 +1032,44 @@ class PPOPolicy(nn.Module):
 
         return log_probs, entropies, forward.values
 
+    def _apply_policy_core(
+        self,
+        features: Tensor,
+        *,
+        lstm_state: tuple[Tensor, Tensor] | None = None,
+        env_indices: list[int] | None = None,
+    ) -> Tensor:
+        if not self.use_lstm:
+            return self.trunk(features)
+
+        projected = self.feature_projection(features).unsqueeze(1)
+        if lstm_state is None:
+            if env_indices is None:
+                batch_size = int(features.shape[0])
+                h_in = torch.zeros(
+                    self.hidden_layers,
+                    batch_size,
+                    self.hidden_dim,
+                    dtype=features.dtype,
+                    device=features.device,
+                )
+                c_in = torch.zeros_like(h_in)
+            else:
+                if self.live_lstm_h.shape[1] == 0:
+                    raise RuntimeError("LSTM env states have not been initialized")
+                env_idx_t = torch.tensor(env_indices, dtype=torch.long, device=features.device)
+                h_in = self.live_lstm_h[:, env_idx_t].to(dtype=features.dtype)
+                c_in = self.live_lstm_c[:, env_idx_t].to(dtype=features.dtype)
+        else:
+            h_in, c_in = lstm_state
+
+        output, (h_next, c_next) = self.lstm(projected, (h_in.contiguous(), c_in.contiguous()))
+        if env_indices is not None:
+            env_idx_t = torch.tensor(env_indices, dtype=torch.long, device=features.device)
+            self.live_lstm_h[:, env_idx_t] = h_next.detach()
+            self.live_lstm_c[:, env_idx_t] = c_next.detach()
+        return output[:, 0, :]
+
     def _forward_batch(self, step_indices: Tensor) -> _ForwardBatch:
         rb = self.rollout_buffer
         slot_card_rows = rb.slot_card_rows[step_indices]
@@ -1008,7 +1107,13 @@ class PPOPolicy(nn.Module):
         pooled = (option_vectors * option_mask_f).sum(dim=1) / option_count
 
         features = torch.cat([state_vector, pending_vector, pooled], dim=-1)
-        hidden = self.trunk(features)
+        lstm_state: tuple[Tensor, Tensor] | None = None
+        if self.use_lstm:
+            lstm_state = (
+                rb.lstm_h_in[step_indices].permute(1, 0, 2).contiguous(),
+                rb.lstm_c_in[step_indices].permute(1, 0, 2).contiguous(),
+            )
+        hidden = self._apply_policy_core(features, lstm_state=lstm_state)
         query = self.action_query(hidden) / math.sqrt(float(self.game_state_encoder.d_model))
         values = self.value_head(hidden).squeeze(-1)
         none_logits = self.none_blocker_head(hidden).squeeze(-1)
@@ -1023,7 +1128,12 @@ class PPOPolicy(nn.Module):
             target_vectors=target_vectors,
         )
 
-    def _forward_native_batch(self, native_batch: NativeEncodedBatch) -> _ForwardBatch:
+    def _forward_native_batch(
+        self,
+        native_batch: NativeEncodedBatch,
+        *,
+        env_indices: list[int] | None = None,
+    ) -> _ForwardBatch:
         device = self.device
         slot_card_rows = native_batch.slot_card_rows.to(device)
         slot_occupied = native_batch.slot_occupied.to(device)
@@ -1076,7 +1186,12 @@ class PPOPolicy(nn.Module):
         option_count = option_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
         pooled = (option_vectors * option_mask_f).sum(dim=1) / option_count
         features = torch.cat([state_vector, pending_vector, pooled], dim=-1)
-        hidden = self.trunk(features)
+        if self.use_lstm:
+            if env_indices is None:
+                raise ValueError("env_indices are required for LSTM native rollout")
+            if len(env_indices) != int(features.shape[0]):
+                raise ValueError("env_indices length must match native batch length")
+        hidden = self._apply_policy_core(features, env_indices=env_indices)
         query = self.action_query(hidden) / math.sqrt(float(self.game_state_encoder.d_model))
         values = self.value_head(hidden).squeeze(-1)
         none_logits = self.none_blocker_head(hidden).squeeze(-1)
