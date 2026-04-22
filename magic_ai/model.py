@@ -38,6 +38,7 @@ from magic_ai.game_state import (
     ParsedGameState,
     ParsedGameStateBatch,
 )
+from magic_ai.native_encoder import NativeEncodedBatch
 
 TraceKind = Literal[
     "priority",
@@ -399,7 +400,7 @@ class PPOPolicy(nn.Module):
 
     def act_parsed_batch(
         self,
-        parsed_batch: ParsedBatch,
+        parsed_batch: ParsedBatch | NativeEncodedBatch,
         *,
         deterministic: bool = False,
     ) -> list[PolicyStep]:
@@ -407,7 +408,7 @@ class PPOPolicy(nn.Module):
 
     def act_batch(
         self,
-        parsed_steps: list[ParsedStep] | ParsedBatch,
+        parsed_steps: list[ParsedStep] | ParsedBatch | NativeEncodedBatch,
         *,
         deterministic: bool = False,
     ) -> list[PolicyStep]:
@@ -419,7 +420,9 @@ class PPOPolicy(nn.Module):
         probs from integer handles alone.
         """
 
-        if isinstance(parsed_steps, ParsedBatch):
+        if isinstance(parsed_steps, NativeEncodedBatch):
+            parsed_batch = self._parsed_batch_from_native(parsed_steps)
+        elif isinstance(parsed_steps, ParsedBatch):
             parsed_batch = parsed_steps
         else:
             if not parsed_steps:
@@ -683,6 +686,43 @@ class PPOPolicy(nn.Module):
             uses_none_head=uses_none_head,
             decision_starts=decision_starts,
             decision_counts=decision_counts,
+        )
+
+    def _parsed_batch_from_native(self, native_batch: NativeEncodedBatch) -> ParsedBatch:
+        return ParsedBatch(
+            parsed_state=ParsedGameStateBatch(
+                slot_card_rows=native_batch.slot_card_rows,
+                slot_occupied=native_batch.slot_occupied,
+                slot_tapped=native_batch.slot_tapped,
+                game_info=native_batch.game_info,
+                card_id_to_slots=[{} for _ in native_batch.pendings],
+            ),
+            parsed_action=ParsedActionBatch(
+                pending_kind_id=native_batch.pending_kind_id,
+                num_present_options=native_batch.num_present_options,
+                option_kind_ids=native_batch.option_kind_ids,
+                option_scalars=native_batch.option_scalars,
+                option_mask=native_batch.option_mask,
+                option_ref_slot_idx=native_batch.option_ref_slot_idx,
+                option_ref_card_row=native_batch.option_ref_card_row,
+                target_mask=native_batch.target_mask,
+                target_type_ids=native_batch.target_type_ids,
+                target_scalars=native_batch.target_scalars,
+                target_overflow=native_batch.target_overflow,
+                target_ref_slot_idx=native_batch.target_ref_slot_idx,
+                target_ref_is_player=native_batch.target_ref_is_player,
+                target_ref_is_self=native_batch.target_ref_is_self,
+                priority_candidates=[[] for _ in native_batch.pendings],
+            ),
+            trace_kinds=[cast(TraceKind, trace_kind) for trace_kind in native_batch.trace_kinds],
+            trace_kind_ids=native_batch.trace_kind_id,
+            pendings=native_batch.pendings,
+            decision_option_idx=native_batch.decision_option_idx,
+            decision_target_idx=native_batch.decision_target_idx,
+            decision_mask=native_batch.decision_mask,
+            uses_none_head=native_batch.uses_none_head,
+            decision_starts=native_batch.decision_start.detach().cpu().tolist(),
+            decision_counts=native_batch.decision_count.detach().cpu().tolist(),
         )
 
     def evaluate_replay_batch(

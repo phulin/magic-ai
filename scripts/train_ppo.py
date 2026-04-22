@@ -28,6 +28,11 @@ from magic_ai.game_state import (  # noqa: E402
     PendingState,
 )
 from magic_ai.model import PPOPolicy  # noqa: E402
+from magic_ai.native_encoder import (  # noqa: E402
+    NativeBatchEncoder,
+    NativeEncodedBatch,
+    NativeEncodingError,
+)
 from magic_ai.ppo import (  # noqa: E402
     PPOStats,
     RolloutStep,
@@ -124,6 +129,7 @@ def main() -> None:
         max_targets_per_option=args.max_targets_per_option,
         rollout_capacity=rollout_capacity,
     ).to(device)
+    native_encoder = NativeBatchEncoder.for_policy(policy)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
 
     if args.checkpoint and args.checkpoint.exists():
@@ -135,7 +141,7 @@ def main() -> None:
     mage = importlib.import_module("mage")
     deck_a, deck_b = load_decks(args.deck_json)
     if args.num_envs > 1:
-        train_batched_envs(args, mage, deck_a, deck_b, policy, optimizer)
+        train_batched_envs(args, mage, deck_a, deck_b, policy, native_encoder, optimizer)
         save_checkpoint(args.output, policy, optimizer, args)
         print(f"saved checkpoint -> {args.output}")
         return
@@ -417,6 +423,7 @@ def train_batched_envs(
     deck_a: dict[str, Any],
     deck_b: dict[str, Any],
     policy: PPOPolicy,
+    native_encoder: NativeBatchEncoder,
     optimizer: torch.optim.Optimizer,
 ) -> None:
     pending_steps: list[RolloutStep] = []
@@ -490,16 +497,30 @@ def train_batched_envs(
 
         live_games = remaining_games
         if ready:
-            states = [state for _env, state, _pending in ready]
             pendings = [pending for _env, _state, pending in ready]
-            perspective_player_indices: list[int | None] = [
+            perspective_player_indices: list[int] = [
                 int(pending.get("player_idx", 0)) for pending in pendings
             ]
-            parsed_batch = policy.parse_inputs_batch(
-                states,
-                pendings,
-                perspective_player_indices=perspective_player_indices,
-            )
+            parsed_batch: NativeEncodedBatch | Any
+            try:
+                if native_encoder.is_available:
+                    parsed_batch = native_encoder.encode_batch(
+                        [env.game for env, _state, _pending in ready],
+                        pendings,
+                        perspective_player_indices=perspective_player_indices,
+                    )
+                else:
+                    raise NativeEncodingError("MageEncodeBatch is unavailable")
+            except NativeEncodingError:
+                states = [state for _env, state, _pending in ready]
+                fallback_perspective_player_indices = cast(
+                    list[int | None], perspective_player_indices
+                )
+                parsed_batch = policy.parse_inputs_batch(
+                    states,
+                    pendings,
+                    perspective_player_indices=fallback_perspective_player_indices,
+                )
             with torch.no_grad():
                 policy_steps = policy.act_parsed_batch(
                     parsed_batch,

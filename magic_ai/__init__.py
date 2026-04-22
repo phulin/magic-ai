@@ -34,6 +34,7 @@ from magic_ai.model import (
     PolicyStep,
     PPOPolicy,
 )
+from magic_ai.native_encoder import NativeBatchEncoder, NativeEncodedBatch, NativeEncodingError
 from magic_ai.ppo import (
     PPOStats,
     RolloutStep,
@@ -53,6 +54,9 @@ __all__ = [
     "GameStateSnapshot",
     "LegalActionCandidate",
     "ManaPoolState",
+    "NativeBatchEncoder",
+    "NativeEncodedBatch",
+    "NativeEncodingError",
     "PPOPolicy",
     "PPOStats",
     "ParsedActionInputs",
