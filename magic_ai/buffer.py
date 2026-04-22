@@ -10,7 +10,6 @@ in checkpoints.
 
 from __future__ import annotations
 
-from bisect import bisect_left
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -19,6 +18,7 @@ from torch import Tensor, nn
 
 if TYPE_CHECKING:
     from magic_ai.model import ParsedBatch, ParsedStep
+    from magic_ai.native_encoder import NativeEncodedBatch
 
 
 @dataclass(frozen=True)
@@ -117,8 +117,8 @@ class RolloutBuffer(nn.Module):
         _reg("uses_none_head", (decision_capacity,), torch.bool)
         _reg("selected_indices", (decision_capacity,), torch.long)
 
-        self._free_step_rows = list(range(capacity - 1, -1, -1))
-        self._free_decision_ranges: list[tuple[int, int]] = [(0, decision_capacity)]
+        self._step_cursor = 0
+        self._decision_cursor = 0
 
     # Declared so type checkers see buffer Tensors as Tensors.
     slot_card_rows: Tensor
@@ -153,70 +153,37 @@ class RolloutBuffer(nn.Module):
         return self.slot_card_rows.device
 
     def reset(self) -> None:
-        self._free_step_rows = list(range(self.capacity - 1, -1, -1))
-        self._free_decision_ranges = [(0, self.decision_capacity)]
+        self._step_cursor = 0
+        self._decision_cursor = 0
 
     @property
     def active_step_count(self) -> int:
-        return self.capacity - len(self._free_step_rows)
+        return self._step_cursor
 
     def _allocate_step_rows(self, count: int) -> list[int]:
-        if count > len(self._free_step_rows):
+        if self._step_cursor + count > self.capacity:
             raise RuntimeError(
                 f"rollout buffer capacity {self.capacity} exceeded "
                 f"(active={self.active_step_count}, add={count})"
             )
-        return [self._free_step_rows.pop() for _ in range(count)]
+        start = self._step_cursor
+        self._step_cursor += count
+        return list(range(start, start + count))
 
     def _allocate_decision_range(self, count: int) -> int:
         if count == 0:
             return 0
-        for idx, (start, length) in enumerate(self._free_decision_ranges):
-            if length < count:
-                continue
-            alloc_start = start
-            remaining = length - count
-            if remaining == 0:
-                del self._free_decision_ranges[idx]
-            else:
-                self._free_decision_ranges[idx] = (start + count, remaining)
-            return alloc_start
-        active = self.decision_capacity - sum(length for _, length in self._free_decision_ranges)
-        raise RuntimeError(
-            f"decision buffer capacity {self.decision_capacity} exceeded "
-            f"(active={active}, add={count})"
-        )
-
-    def _free_decision_range(self, start: int, count: int) -> None:
-        if count == 0:
-            return
-        starts = [range_start for range_start, _ in self._free_decision_ranges]
-        insert_at = bisect_left(starts, start)
-        self._free_decision_ranges.insert(insert_at, (start, count))
-
-        merged: list[tuple[int, int]] = []
-        for range_start, range_len in self._free_decision_ranges:
-            if not merged:
-                merged.append((range_start, range_len))
-                continue
-            prev_start, prev_len = merged[-1]
-            prev_end = prev_start + prev_len
-            if range_start <= prev_end:
-                merged[-1] = (prev_start, max(prev_end, range_start + range_len) - prev_start)
-            else:
-                merged.append((range_start, range_len))
-        self._free_decision_ranges = merged
+        if self._decision_cursor + count > self.decision_capacity:
+            raise RuntimeError(
+                f"decision buffer capacity {self.decision_capacity} exceeded "
+                f"(active={self._decision_cursor}, add={count})"
+            )
+        start = self._decision_cursor
+        self._decision_cursor += count
+        return start
 
     def release_steps(self, step_indices: list[int]) -> None:
-        if not step_indices:
-            return
-        idx_t = torch.tensor(step_indices, dtype=torch.long, device=self.device)
-        decision_starts = self.decision_start[idx_t].detach().cpu().tolist()
-        decision_counts = self.decision_count[idx_t].detach().cpu().tolist()
-        for step_idx in step_indices:
-            self._free_step_rows.append(step_idx)
-        for start, count in zip(decision_starts, decision_counts, strict=True):
-            self._free_decision_range(int(start), int(count))
+        return
 
     def ingest_batch(self, parsed_steps: list[ParsedStep]) -> BufferWrite:
         return self.ingest_batch_legacy(parsed_steps)
@@ -283,6 +250,75 @@ class RolloutBuffer(nn.Module):
                 device
             )
             self.uses_none_head[start:end] = parsed_batch.uses_none_head[flat_cursor:flat_end].to(
+                device
+            )
+            flat_cursor = flat_end
+
+        self.decision_start[step_indices] = torch.tensor(
+            decision_starts, dtype=torch.long, device=device
+        )
+        self.decision_count[step_indices] = torch.tensor(
+            decision_counts, dtype=torch.long, device=device
+        )
+
+        return BufferWrite(
+            step_indices=step_indices,
+            decision_starts=decision_starts,
+            decision_counts=decision_counts,
+        )
+
+    def ingest_native_batch(self, native_batch: NativeEncodedBatch) -> BufferWrite:
+        n = int(native_batch.trace_kind_id.shape[0])
+        device = self.device
+        if n == 0:
+            return BufferWrite(
+                step_indices=torch.zeros(0, dtype=torch.long, device=device),
+                decision_starts=[],
+                decision_counts=[],
+            )
+
+        step_rows = self._allocate_step_rows(n)
+        step_indices = torch.tensor(step_rows, dtype=torch.long, device=device)
+
+        self.slot_card_rows[step_indices] = native_batch.slot_card_rows.to(device)
+        self.slot_occupied[step_indices] = native_batch.slot_occupied.to(device)
+        self.slot_tapped[step_indices] = native_batch.slot_tapped.to(device)
+        self.game_info[step_indices] = native_batch.game_info.to(device)
+        self.trace_kind_id[step_indices] = native_batch.trace_kind_id.to(device)
+        self.pending_kind_id[step_indices] = native_batch.pending_kind_id.to(device)
+        self.option_kind_ids[step_indices] = native_batch.option_kind_ids.to(device)
+        self.option_scalars[step_indices] = native_batch.option_scalars.to(device)
+        self.option_mask[step_indices] = native_batch.option_mask.to(device)
+        self.option_ref_slot_idx[step_indices] = native_batch.option_ref_slot_idx.to(device)
+        self.option_ref_card_row[step_indices] = native_batch.option_ref_card_row.to(device)
+        self.target_mask[step_indices] = native_batch.target_mask.to(device)
+        self.target_type_ids[step_indices] = native_batch.target_type_ids.to(device)
+        self.target_scalars[step_indices] = native_batch.target_scalars.to(device)
+        self.target_overflow[step_indices] = native_batch.target_overflow.to(device)
+        self.target_ref_slot_idx[step_indices] = native_batch.target_ref_slot_idx.to(device)
+        self.target_ref_is_player[step_indices] = native_batch.target_ref_is_player.to(device)
+        self.target_ref_is_self[step_indices] = native_batch.target_ref_is_self.to(device)
+
+        decision_counts = native_batch.decision_count.detach().cpu().tolist()
+        decision_starts: list[int] = []
+        flat_cursor = 0
+        for count in decision_counts:
+            start = self._allocate_decision_range(count)
+            decision_starts.append(start)
+            if count == 0:
+                continue
+            end = start + count
+            flat_end = flat_cursor + count
+            self.decision_option_idx[start:end] = native_batch.decision_option_idx[
+                flat_cursor:flat_end
+            ].to(device)
+            self.decision_target_idx[start:end] = native_batch.decision_target_idx[
+                flat_cursor:flat_end
+            ].to(device)
+            self.decision_mask[start:end] = native_batch.decision_mask[flat_cursor:flat_end].to(
+                device
+            )
+            self.uses_none_head[start:end] = native_batch.uses_none_head[flat_cursor:flat_end].to(
                 device
             )
             flat_cursor = flat_end

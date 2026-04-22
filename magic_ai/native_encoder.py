@@ -49,6 +49,90 @@ class NativeEncodedBatch:
     trace_kinds: list[str]
 
 
+def slice_native_encoded_batch(batch: NativeEncodedBatch, index: int) -> NativeEncodedBatch:
+    decision_start = int(batch.decision_start[index].item())
+    decision_count = int(batch.decision_count[index].item())
+    decision_end = decision_start + decision_count
+    pending = batch.pendings[index] if index < len(batch.pendings) else cast(PendingState, {})
+    trace_kind = batch.trace_kinds[index] if index < len(batch.trace_kinds) else ""
+    return NativeEncodedBatch(
+        trace_kind_id=batch.trace_kind_id[index : index + 1],
+        slot_card_rows=batch.slot_card_rows[index : index + 1],
+        slot_occupied=batch.slot_occupied[index : index + 1],
+        slot_tapped=batch.slot_tapped[index : index + 1],
+        game_info=batch.game_info[index : index + 1],
+        pending_kind_id=batch.pending_kind_id[index : index + 1],
+        num_present_options=batch.num_present_options[index : index + 1],
+        option_kind_ids=batch.option_kind_ids[index : index + 1],
+        option_scalars=batch.option_scalars[index : index + 1],
+        option_mask=batch.option_mask[index : index + 1],
+        option_ref_slot_idx=batch.option_ref_slot_idx[index : index + 1],
+        option_ref_card_row=batch.option_ref_card_row[index : index + 1],
+        target_mask=batch.target_mask[index : index + 1],
+        target_type_ids=batch.target_type_ids[index : index + 1],
+        target_scalars=batch.target_scalars[index : index + 1],
+        target_overflow=batch.target_overflow[index : index + 1],
+        target_ref_slot_idx=batch.target_ref_slot_idx[index : index + 1],
+        target_ref_is_player=batch.target_ref_is_player[index : index + 1],
+        target_ref_is_self=batch.target_ref_is_self[index : index + 1],
+        may_mask=batch.may_mask[index : index + 1],
+        decision_start=torch.tensor([0], dtype=torch.int64, device=batch.trace_kind_id.device),
+        decision_count=batch.decision_count[index : index + 1],
+        decision_option_idx=batch.decision_option_idx[decision_start:decision_end],
+        decision_target_idx=batch.decision_target_idx[decision_start:decision_end],
+        decision_mask=batch.decision_mask[decision_start:decision_end],
+        uses_none_head=batch.uses_none_head[decision_start:decision_end],
+        decision_rows_written=decision_count,
+        pendings=[pending],
+        trace_kinds=[trace_kind],
+    )
+
+
+def cat_native_encoded_batches(batches: list[NativeEncodedBatch]) -> NativeEncodedBatch:
+    if not batches:
+        raise NativeEncodingError("cannot concatenate an empty native batch list")
+
+    device = batches[0].trace_kind_id.device
+    decision_counts = [int(batch.decision_count[0].item()) for batch in batches]
+    decision_starts: list[int] = []
+    cursor = 0
+    for count in decision_counts:
+        decision_starts.append(cursor)
+        cursor += count
+
+    return NativeEncodedBatch(
+        trace_kind_id=torch.cat([batch.trace_kind_id for batch in batches], dim=0),
+        slot_card_rows=torch.cat([batch.slot_card_rows for batch in batches], dim=0),
+        slot_occupied=torch.cat([batch.slot_occupied for batch in batches], dim=0),
+        slot_tapped=torch.cat([batch.slot_tapped for batch in batches], dim=0),
+        game_info=torch.cat([batch.game_info for batch in batches], dim=0),
+        pending_kind_id=torch.cat([batch.pending_kind_id for batch in batches], dim=0),
+        num_present_options=torch.cat([batch.num_present_options for batch in batches], dim=0),
+        option_kind_ids=torch.cat([batch.option_kind_ids for batch in batches], dim=0),
+        option_scalars=torch.cat([batch.option_scalars for batch in batches], dim=0),
+        option_mask=torch.cat([batch.option_mask for batch in batches], dim=0),
+        option_ref_slot_idx=torch.cat([batch.option_ref_slot_idx for batch in batches], dim=0),
+        option_ref_card_row=torch.cat([batch.option_ref_card_row for batch in batches], dim=0),
+        target_mask=torch.cat([batch.target_mask for batch in batches], dim=0),
+        target_type_ids=torch.cat([batch.target_type_ids for batch in batches], dim=0),
+        target_scalars=torch.cat([batch.target_scalars for batch in batches], dim=0),
+        target_overflow=torch.cat([batch.target_overflow for batch in batches], dim=0),
+        target_ref_slot_idx=torch.cat([batch.target_ref_slot_idx for batch in batches], dim=0),
+        target_ref_is_player=torch.cat([batch.target_ref_is_player for batch in batches], dim=0),
+        target_ref_is_self=torch.cat([batch.target_ref_is_self for batch in batches], dim=0),
+        may_mask=torch.cat([batch.may_mask for batch in batches], dim=0),
+        decision_start=torch.tensor(decision_starts, dtype=torch.int64, device=device),
+        decision_count=torch.tensor(decision_counts, dtype=torch.int64, device=device),
+        decision_option_idx=torch.cat([batch.decision_option_idx for batch in batches], dim=0),
+        decision_target_idx=torch.cat([batch.decision_target_idx for batch in batches], dim=0),
+        decision_mask=torch.cat([batch.decision_mask for batch in batches], dim=0),
+        uses_none_head=torch.cat([batch.uses_none_head for batch in batches], dim=0),
+        decision_rows_written=cursor,
+        pendings=[pending for batch in batches for pending in batch.pendings],
+        trace_kinds=[trace_kind for batch in batches for trace_kind in batch.trace_kinds],
+    )
+
+
 class _MageBatchRequest(ctypes.Structure):
     _fields_ = [
         ("n", ctypes.c_int64),

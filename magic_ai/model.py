@@ -183,9 +183,45 @@ class PPOPolicy(nn.Module):
         self.rollout_buffer.reset()
 
     def release_replay_rows(self, replay_rows: list[int]) -> None:
-        if not replay_rows:
-            return
-        self.rollout_buffer.release_steps(replay_rows)
+        return
+
+    def append_native_batch_to_rollout(
+        self,
+        native_batch: NativeEncodedBatch,
+        *,
+        selected_choice_cols: list[tuple[int, ...]],
+        may_selected: list[int],
+    ) -> list[int]:
+        if int(native_batch.trace_kind_id.shape[0]) != len(selected_choice_cols):
+            raise ValueError("selected_choice_cols length must match native batch length")
+        if int(native_batch.trace_kind_id.shape[0]) != len(may_selected):
+            raise ValueError("may_selected length must match native batch length")
+
+        write = self.rollout_buffer.ingest_native_batch(native_batch)
+        replay_rows = [int(row) for row in write.step_indices.detach().cpu().tolist()]
+
+        if may_selected:
+            may_t = torch.tensor(
+                may_selected,
+                dtype=self.rollout_buffer.may_selected.dtype,
+                device=self.rollout_buffer.device,
+            )
+            self.rollout_buffer.may_selected[write.step_indices] = may_t
+
+        for step_idx, cols in enumerate(selected_choice_cols):
+            count = write.decision_counts[step_idx]
+            if count == 0:
+                continue
+            if len(cols) != count:
+                raise ValueError("selected_choice_cols entry must match decision_count")
+            start = write.decision_starts[step_idx]
+            end = start + count
+            self.rollout_buffer.selected_indices[start:end] = torch.tensor(
+                cols,
+                dtype=torch.long,
+                device=self.rollout_buffer.device,
+            )
+        return replay_rows
 
     def parse_inputs(
         self,
@@ -407,6 +443,140 @@ class PPOPolicy(nn.Module):
         deterministic: bool = False,
     ) -> list[PolicyStep]:
         return self.act_batch(parsed_batch, deterministic=deterministic)
+
+    def sample_native_batch(
+        self,
+        native_batch: NativeEncodedBatch,
+        *,
+        deterministic: bool = False,
+    ) -> list[PolicyStep]:
+        n = int(native_batch.trace_kind_id.shape[0])
+        if n == 0:
+            return []
+
+        device = self.device
+        forward = self._forward_native_batch(native_batch)
+        may_positions = native_batch.may_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
+        decision_starts = native_batch.decision_start.detach().cpu().tolist()
+        decision_counts = native_batch.decision_count.detach().cpu().tolist()
+        group_step_positions: list[int] = []
+        group_decision_indices: list[int] = []
+        trace_kind_ids = native_batch.trace_kind_id.detach().cpu().tolist()
+        for step_idx, trace_kind_id in enumerate(trace_kind_ids):
+            if trace_kind_id == TRACE_KIND_TO_ID["may"]:
+                continue
+            count = decision_counts[step_idx]
+            start = decision_starts[step_idx]
+            for k in range(count):
+                group_step_positions.append(step_idx)
+                group_decision_indices.append(start + k)
+
+        may_log_probs: Tensor | None = None
+        may_entropies: Tensor | None = None
+        may_selected_cpu: list[float] = []
+        if may_positions:
+            may_pos_t = torch.tensor(may_positions, dtype=torch.long, device=device)
+            may_logits = forward.may_logits[may_pos_t]
+            may_dist = Bernoulli(logits=may_logits)
+            if deterministic:
+                may_sel = (may_logits >= 0).to(dtype=forward.values.dtype)
+            else:
+                may_sel = may_dist.sample()
+            may_log_probs = may_dist.log_prob(may_sel)
+            may_entropies = may_dist.entropy()
+            may_selected_cpu = may_sel.detach().cpu().tolist()
+
+        per_step_log_prob_sum: Tensor | None = None
+        per_step_entropy_sum: Tensor | None = None
+        decision_selected_cpu: list[int] = []
+        if group_step_positions:
+            pos_t = torch.tensor(group_step_positions, dtype=torch.long, device=device)
+            idx_t = torch.tensor(group_decision_indices, dtype=torch.long, device=device)
+            option_idx = native_batch.decision_option_idx[idx_t]
+            target_idx = native_batch.decision_target_idx[idx_t]
+            masks = native_batch.decision_mask[idx_t]
+            uses_none = native_batch.uses_none_head[idx_t]
+            group_idx, choice_cols, flat_logits, flat_log_probs, group_entropies = (
+                self._flat_decision_distribution(
+                    step_positions=pos_t,
+                    option_idx=option_idx,
+                    target_idx=target_idx,
+                    masks=masks,
+                    uses_none=uses_none,
+                    option_vectors=forward.option_vectors,
+                    target_vectors=forward.target_vectors,
+                    query=forward.query,
+                    none_logits=forward.none_logits,
+                )
+            )
+            decision_selected, decision_log_probs = self._sample_flat_decisions(
+                group_idx=group_idx,
+                choice_cols=choice_cols,
+                flat_logits=flat_logits,
+                flat_log_probs=flat_log_probs,
+                deterministic=deterministic,
+            )
+            per_step_log_prob_sum = torch.zeros(n, dtype=forward.values.dtype, device=device)
+            per_step_entropy_sum = torch.zeros(n, dtype=forward.values.dtype, device=device)
+            per_step_log_prob_sum.scatter_add_(0, pos_t, decision_log_probs)
+            per_step_entropy_sum.scatter_add_(0, pos_t, group_entropies)
+            decision_selected_cpu = decision_selected.detach().cpu().tolist()
+
+        may_lookup = {step_idx: pos for pos, step_idx in enumerate(may_positions)}
+        results: list[PolicyStep] = []
+        offset = 0
+        for step_idx, trace_kind_id in enumerate(trace_kind_ids):
+            trace_kind = TRACE_KIND_VALUES[trace_kind_id]
+            value = forward.values[step_idx]
+            decision_count = decision_counts[step_idx]
+
+            if trace_kind == "may":
+                pos = may_lookup[step_idx]
+                assert may_log_probs is not None and may_entropies is not None
+                sel_scalar = may_selected_cpu[pos]
+                results.append(
+                    PolicyStep(
+                        action=action_from_choice_accepted(bool(sel_scalar >= 0.5)),
+                        trace=ActionTrace("may", binary=(float(sel_scalar),)),
+                        log_prob=may_log_probs[pos],
+                        value=value,
+                        entropy=may_entropies[pos],
+                        replay_idx=None,
+                        may_selected=int(sel_scalar >= 0.5),
+                    )
+                )
+                continue
+
+            if decision_count == 0:
+                zero = torch.zeros((), device=device)
+                results.append(
+                    PolicyStep(
+                        action=cast(ActionRequest, {}),
+                        trace=ActionTrace(trace_kind, indices=(0,)),
+                        log_prob=zero,
+                        value=value,
+                        entropy=zero,
+                        replay_idx=None,
+                    )
+                )
+                continue
+
+            assert per_step_log_prob_sum is not None and per_step_entropy_sum is not None
+            step_selected = decision_selected_cpu[offset : offset + decision_count]
+            offset += decision_count
+            trace, action = self._trace_action_without_pending(trace_kind, step_selected)
+            results.append(
+                PolicyStep(
+                    action=action,
+                    trace=trace,
+                    log_prob=per_step_log_prob_sum[step_idx],
+                    value=value,
+                    entropy=per_step_entropy_sum[step_idx],
+                    replay_idx=None,
+                    selected_choice_cols=tuple(step_selected),
+                )
+            )
+        return results
 
     def act_batch(
         self,
@@ -844,6 +1014,56 @@ class PPOPolicy(nn.Module):
         option_count = option_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
         pooled = (option_vectors * option_mask_f).sum(dim=1) / option_count
 
+        features = torch.cat([state_vector, pending_vector, pooled], dim=-1)
+        hidden = self.trunk(features)
+        query = self.action_query(hidden) / math.sqrt(float(self.game_state_encoder.d_model))
+        values = self.value_head(hidden).squeeze(-1)
+        none_logits = self.none_blocker_head(hidden).squeeze(-1)
+        may_logits = self.may_head(hidden).squeeze(-1)
+
+        return _ForwardBatch(
+            query=query,
+            values=values,
+            none_logits=none_logits,
+            may_logits=may_logits,
+            option_vectors=option_vectors,
+            target_vectors=target_vectors,
+        )
+
+    def _forward_native_batch(self, native_batch: NativeEncodedBatch) -> _ForwardBatch:
+        self._validate_slot_card_rows(
+            native_batch.slot_card_rows,
+            self.game_state_encoder.card_embedding_table.shape[0],
+        )
+        slot_vectors = self.game_state_encoder.embed_slot_vectors(
+            native_batch.slot_card_rows,
+            native_batch.slot_occupied,
+            native_batch.slot_tapped,
+        )
+        state_vector = self.game_state_encoder.state_vector_from_slots(
+            slot_vectors,
+            native_batch.game_info,
+        )
+
+        pending_vector, option_vectors, target_vectors = self.action_encoder.embed_from_parsed(
+            slot_vectors=slot_vectors,
+            pending_kind_id=native_batch.pending_kind_id,
+            option_kind_ids=native_batch.option_kind_ids,
+            option_scalars=native_batch.option_scalars,
+            option_mask=native_batch.option_mask,
+            option_ref_slot_idx=native_batch.option_ref_slot_idx,
+            option_ref_card_row=native_batch.option_ref_card_row,
+            target_mask=native_batch.target_mask,
+            target_type_ids=native_batch.target_type_ids,
+            target_scalars=native_batch.target_scalars,
+            target_ref_slot_idx=native_batch.target_ref_slot_idx,
+            target_ref_is_player=native_batch.target_ref_is_player,
+            target_ref_is_self=native_batch.target_ref_is_self,
+        )
+
+        option_mask_f = native_batch.option_mask.unsqueeze(-1)
+        option_count = native_batch.option_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        pooled = (option_vectors * option_mask_f).sum(dim=1) / option_count
         features = torch.cat([state_vector, pending_vector, pooled], dim=-1)
         hidden = self.trunk(features)
         query = self.action_query(hidden) / math.sqrt(float(self.game_state_encoder.d_model))
