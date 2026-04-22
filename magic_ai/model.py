@@ -29,7 +29,7 @@ from magic_ai.actions import (
     action_from_priority_candidate,
     selected_option_id,
 )
-from magic_ai.buffer import RolloutBuffer
+from magic_ai.buffer import NativeTrajectoryBuffer, RolloutBuffer
 from magic_ai.game_state import (
     GAME_INFO_DIM,
     ZONE_SLOT_COUNT,
@@ -185,43 +185,13 @@ class PPOPolicy(nn.Module):
     def release_replay_rows(self, replay_rows: list[int]) -> None:
         return
 
-    def append_native_batch_to_rollout(
+    def append_staged_episode_to_rollout(
         self,
-        native_batch: NativeEncodedBatch,
-        *,
-        selected_choice_cols: list[tuple[int, ...]],
-        may_selected: list[int],
+        staging: NativeTrajectoryBuffer,
+        env_idx: int,
     ) -> list[int]:
-        if int(native_batch.trace_kind_id.shape[0]) != len(selected_choice_cols):
-            raise ValueError("selected_choice_cols length must match native batch length")
-        if int(native_batch.trace_kind_id.shape[0]) != len(may_selected):
-            raise ValueError("may_selected length must match native batch length")
-
-        write = self.rollout_buffer.ingest_native_batch(native_batch)
-        replay_rows = [int(row) for row in write.step_indices.detach().cpu().tolist()]
-
-        if may_selected:
-            may_t = torch.tensor(
-                may_selected,
-                dtype=self.rollout_buffer.may_selected.dtype,
-                device=self.rollout_buffer.device,
-            )
-            self.rollout_buffer.may_selected[write.step_indices] = may_t
-
-        for step_idx, cols in enumerate(selected_choice_cols):
-            count = write.decision_counts[step_idx]
-            if count == 0:
-                continue
-            if len(cols) != count:
-                raise ValueError("selected_choice_cols entry must match decision_count")
-            start = write.decision_starts[step_idx]
-            end = start + count
-            self.rollout_buffer.selected_indices[start:end] = torch.tensor(
-                cols,
-                dtype=torch.long,
-                device=self.rollout_buffer.device,
-            )
-        return replay_rows
+        write = self.rollout_buffer.ingest_staged_episode(staging, env_idx)
+        return [int(row) for row in write.step_indices.detach().cpu().tolist()]
 
     def parse_inputs(
         self,

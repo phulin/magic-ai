@@ -30,6 +30,241 @@ class BufferWrite:
     decision_counts: list[int]  # per-step number of decision rows
 
 
+class NativeTrajectoryBuffer(nn.Module):
+    """GPU staging storage for live native-rollout trajectories."""
+
+    def __init__(
+        self,
+        *,
+        num_envs: int,
+        max_steps_per_trajectory: int,
+        decision_capacity_per_env: int,
+        max_options: int,
+        max_targets_per_option: int,
+        max_cached_choices: int,
+        zone_slot_count: int,
+        game_info_dim: int,
+        option_scalar_dim: int,
+        target_scalar_dim: int,
+    ) -> None:
+        super().__init__()
+        self.num_envs = num_envs
+        self.max_steps_per_trajectory = max_steps_per_trajectory
+        self.decision_capacity_per_env = decision_capacity_per_env
+
+        def _reg(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> None:
+            self.register_buffer(name, torch.zeros(shape, dtype=dtype), persistent=False)
+
+        step_shape = (num_envs, max_steps_per_trajectory)
+        _reg("slot_card_rows", step_shape + (zone_slot_count,), torch.long)
+        _reg("slot_occupied", step_shape + (zone_slot_count,), torch.float32)
+        _reg("slot_tapped", step_shape + (zone_slot_count,), torch.float32)
+        _reg("game_info", step_shape + (game_info_dim,), torch.float32)
+        _reg("trace_kind_id", step_shape, torch.long)
+        _reg("decision_start", step_shape, torch.long)
+        _reg("decision_count", step_shape, torch.long)
+        _reg("pending_kind_id", step_shape, torch.long)
+        _reg("option_kind_ids", step_shape + (max_options,), torch.long)
+        _reg("option_scalars", step_shape + (max_options, option_scalar_dim), torch.float32)
+        _reg("option_mask", step_shape + (max_options,), torch.float32)
+        _reg("option_ref_slot_idx", step_shape + (max_options,), torch.long)
+        _reg("option_ref_card_row", step_shape + (max_options,), torch.long)
+        _reg("target_mask", step_shape + (max_options, max_targets_per_option), torch.float32)
+        _reg("target_type_ids", step_shape + (max_options, max_targets_per_option), torch.long)
+        _reg(
+            "target_scalars",
+            step_shape + (max_options, max_targets_per_option, target_scalar_dim),
+            torch.float32,
+        )
+        _reg("target_overflow", step_shape + (max_options,), torch.float32)
+        _reg("target_ref_slot_idx", step_shape + (max_options, max_targets_per_option), torch.long)
+        _reg(
+            "target_ref_is_player",
+            step_shape + (max_options, max_targets_per_option),
+            torch.bool,
+        )
+        _reg(
+            "target_ref_is_self",
+            step_shape + (max_options, max_targets_per_option),
+            torch.bool,
+        )
+        _reg("may_selected", step_shape, torch.float32)
+        _reg("old_log_prob", step_shape, torch.float32)
+        _reg("value", step_shape, torch.float32)
+        _reg("perspective_player_idx", step_shape, torch.long)
+
+        decision_shape = (num_envs, decision_capacity_per_env)
+        _reg("decision_option_idx", decision_shape + (max_cached_choices,), torch.long)
+        _reg("decision_target_idx", decision_shape + (max_cached_choices,), torch.long)
+        _reg("decision_mask", decision_shape + (max_cached_choices,), torch.bool)
+        _reg("uses_none_head", decision_shape, torch.bool)
+        _reg("selected_indices", decision_shape, torch.long)
+
+        _reg("step_count", (num_envs,), torch.long)
+        _reg("decision_cursor", (num_envs,), torch.long)
+
+    slot_card_rows: Tensor
+    slot_occupied: Tensor
+    slot_tapped: Tensor
+    game_info: Tensor
+    trace_kind_id: Tensor
+    decision_start: Tensor
+    decision_count: Tensor
+    pending_kind_id: Tensor
+    option_kind_ids: Tensor
+    option_scalars: Tensor
+    option_mask: Tensor
+    option_ref_slot_idx: Tensor
+    option_ref_card_row: Tensor
+    target_mask: Tensor
+    target_type_ids: Tensor
+    target_scalars: Tensor
+    target_overflow: Tensor
+    target_ref_slot_idx: Tensor
+    target_ref_is_player: Tensor
+    target_ref_is_self: Tensor
+    may_selected: Tensor
+    old_log_prob: Tensor
+    value: Tensor
+    perspective_player_idx: Tensor
+    decision_option_idx: Tensor
+    decision_target_idx: Tensor
+    decision_mask: Tensor
+    uses_none_head: Tensor
+    selected_indices: Tensor
+    step_count: Tensor
+    decision_cursor: Tensor
+
+    @property
+    def device(self) -> torch.device:
+        return self.slot_card_rows.device
+
+    def active_step_count(self, env_idx: int) -> int:
+        return int(self.step_count[env_idx].item())
+
+    def reset_env(self, env_idx: int) -> None:
+        self.step_count[env_idx] = 0
+        self.decision_cursor[env_idx] = 0
+
+    def stage_batch(
+        self,
+        env_indices: list[int],
+        native_batch: NativeEncodedBatch,
+        *,
+        selected_choice_cols: list[tuple[int, ...]],
+        may_selected: list[int],
+        old_log_probs: Tensor,
+        values: Tensor,
+        perspective_player_indices: list[int],
+    ) -> None:
+        if int(native_batch.trace_kind_id.shape[0]) != len(env_indices):
+            raise ValueError("env_indices length must match native batch length")
+        if len(env_indices) != len(selected_choice_cols):
+            raise ValueError("selected_choice_cols length must match native batch length")
+        if len(env_indices) != len(may_selected):
+            raise ValueError("may_selected length must match native batch length")
+        if int(old_log_probs.numel()) != len(env_indices):
+            raise ValueError("old_log_probs length must match native batch length")
+        if int(values.numel()) != len(env_indices):
+            raise ValueError("values length must match native batch length")
+        if len(env_indices) != len(perspective_player_indices):
+            raise ValueError("perspective_player_indices length must match native batch length")
+
+        device = self.device
+        player_idx_t = torch.tensor(perspective_player_indices, dtype=torch.long, device=device)
+
+        for batch_idx, env_idx in enumerate(env_indices):
+            step_idx = int(self.step_count[env_idx].item())
+            if step_idx >= self.max_steps_per_trajectory:
+                raise RuntimeError(
+                    "staging step capacity "
+                    f"{self.max_steps_per_trajectory} exceeded for env {env_idx}"
+                )
+
+            self.slot_card_rows[env_idx, step_idx] = native_batch.slot_card_rows[batch_idx].to(
+                device
+            )
+            self.slot_occupied[env_idx, step_idx] = native_batch.slot_occupied[batch_idx].to(device)
+            self.slot_tapped[env_idx, step_idx] = native_batch.slot_tapped[batch_idx].to(device)
+            self.game_info[env_idx, step_idx] = native_batch.game_info[batch_idx].to(device)
+            self.trace_kind_id[env_idx, step_idx] = native_batch.trace_kind_id[batch_idx].to(device)
+            self.pending_kind_id[env_idx, step_idx] = native_batch.pending_kind_id[batch_idx].to(
+                device
+            )
+            self.option_kind_ids[env_idx, step_idx] = native_batch.option_kind_ids[batch_idx].to(
+                device
+            )
+            self.option_scalars[env_idx, step_idx] = native_batch.option_scalars[batch_idx].to(
+                device
+            )
+            self.option_mask[env_idx, step_idx] = native_batch.option_mask[batch_idx].to(device)
+            self.option_ref_slot_idx[env_idx, step_idx] = native_batch.option_ref_slot_idx[
+                batch_idx
+            ].to(device)
+            self.option_ref_card_row[env_idx, step_idx] = native_batch.option_ref_card_row[
+                batch_idx
+            ].to(device)
+            self.target_mask[env_idx, step_idx] = native_batch.target_mask[batch_idx].to(device)
+            self.target_type_ids[env_idx, step_idx] = native_batch.target_type_ids[batch_idx].to(
+                device
+            )
+            self.target_scalars[env_idx, step_idx] = native_batch.target_scalars[batch_idx].to(
+                device
+            )
+            self.target_overflow[env_idx, step_idx] = native_batch.target_overflow[batch_idx].to(
+                device
+            )
+            self.target_ref_slot_idx[env_idx, step_idx] = native_batch.target_ref_slot_idx[
+                batch_idx
+            ].to(device)
+            self.target_ref_is_player[env_idx, step_idx] = native_batch.target_ref_is_player[
+                batch_idx
+            ].to(device)
+            self.target_ref_is_self[env_idx, step_idx] = native_batch.target_ref_is_self[
+                batch_idx
+            ].to(device)
+            self.may_selected[env_idx, step_idx] = may_selected[batch_idx]
+            self.old_log_prob[env_idx, step_idx] = old_log_probs[batch_idx].to(device)
+            self.value[env_idx, step_idx] = values[batch_idx].to(device)
+            self.perspective_player_idx[env_idx, step_idx] = player_idx_t[batch_idx]
+
+            count = int(native_batch.decision_count[batch_idx].item())
+            start = int(self.decision_cursor[env_idx].item())
+            if start + count > self.decision_capacity_per_env:
+                raise RuntimeError(
+                    "staging decision capacity "
+                    f"{self.decision_capacity_per_env} exceeded for env {env_idx}"
+                )
+            self.decision_start[env_idx, step_idx] = start
+            self.decision_count[env_idx, step_idx] = count
+            if count:
+                source_start = int(native_batch.decision_start[batch_idx].item())
+                source_end = source_start + count
+                dest_end = start + count
+                self.decision_option_idx[env_idx, start:dest_end] = (
+                    native_batch.decision_option_idx[source_start:source_end].to(device)
+                )
+                self.decision_target_idx[env_idx, start:dest_end] = (
+                    native_batch.decision_target_idx[source_start:source_end].to(device)
+                )
+                self.decision_mask[env_idx, start:dest_end] = native_batch.decision_mask[
+                    source_start:source_end
+                ].to(device)
+                self.uses_none_head[env_idx, start:dest_end] = native_batch.uses_none_head[
+                    source_start:source_end
+                ].to(device)
+                cols = selected_choice_cols[batch_idx]
+                if len(cols) != count:
+                    raise ValueError("selected_choice_cols entry must match decision_count")
+                self.selected_indices[env_idx, start:dest_end] = torch.tensor(
+                    cols,
+                    dtype=torch.long,
+                    device=device,
+                )
+            self.step_count[env_idx] = step_idx + 1
+            self.decision_cursor[env_idx] = start + count
+
+
 class RolloutBuffer(nn.Module):
     """Preallocated GPU storage for a rollout's parsed policy inputs."""
 
@@ -322,6 +557,84 @@ class RolloutBuffer(nn.Module):
                 device
             )
             flat_cursor = flat_end
+
+        self.decision_start[step_indices] = torch.tensor(
+            decision_starts, dtype=torch.long, device=device
+        )
+        self.decision_count[step_indices] = torch.tensor(
+            decision_counts, dtype=torch.long, device=device
+        )
+
+        return BufferWrite(
+            step_indices=step_indices,
+            decision_starts=decision_starts,
+            decision_counts=decision_counts,
+        )
+
+    def ingest_staged_episode(
+        self,
+        staging: NativeTrajectoryBuffer,
+        env_idx: int,
+    ) -> BufferWrite:
+        n = staging.active_step_count(env_idx)
+        device = self.device
+        if n == 0:
+            return BufferWrite(
+                step_indices=torch.zeros(0, dtype=torch.long, device=device),
+                decision_starts=[],
+                decision_counts=[],
+            )
+
+        step_rows = self._allocate_step_rows(n)
+        step_indices = torch.tensor(step_rows, dtype=torch.long, device=device)
+
+        self.slot_card_rows[step_indices] = staging.slot_card_rows[env_idx, :n].to(device)
+        self.slot_occupied[step_indices] = staging.slot_occupied[env_idx, :n].to(device)
+        self.slot_tapped[step_indices] = staging.slot_tapped[env_idx, :n].to(device)
+        self.game_info[step_indices] = staging.game_info[env_idx, :n].to(device)
+        self.trace_kind_id[step_indices] = staging.trace_kind_id[env_idx, :n].to(device)
+        self.pending_kind_id[step_indices] = staging.pending_kind_id[env_idx, :n].to(device)
+        self.option_kind_ids[step_indices] = staging.option_kind_ids[env_idx, :n].to(device)
+        self.option_scalars[step_indices] = staging.option_scalars[env_idx, :n].to(device)
+        self.option_mask[step_indices] = staging.option_mask[env_idx, :n].to(device)
+        self.option_ref_slot_idx[step_indices] = staging.option_ref_slot_idx[env_idx, :n].to(device)
+        self.option_ref_card_row[step_indices] = staging.option_ref_card_row[env_idx, :n].to(device)
+        self.target_mask[step_indices] = staging.target_mask[env_idx, :n].to(device)
+        self.target_type_ids[step_indices] = staging.target_type_ids[env_idx, :n].to(device)
+        self.target_scalars[step_indices] = staging.target_scalars[env_idx, :n].to(device)
+        self.target_overflow[step_indices] = staging.target_overflow[env_idx, :n].to(device)
+        self.target_ref_slot_idx[step_indices] = staging.target_ref_slot_idx[env_idx, :n].to(device)
+        self.target_ref_is_player[step_indices] = staging.target_ref_is_player[env_idx, :n].to(
+            device
+        )
+        self.target_ref_is_self[step_indices] = staging.target_ref_is_self[env_idx, :n].to(device)
+        self.may_selected[step_indices] = staging.may_selected[env_idx, :n].to(device)
+
+        decision_counts = staging.decision_count[env_idx, :n].detach().cpu().tolist()
+        source_starts = staging.decision_start[env_idx, :n].detach().cpu().tolist()
+        decision_starts: list[int] = []
+        for source_start, count in zip(source_starts, decision_counts, strict=True):
+            start = self._allocate_decision_range(int(count))
+            decision_starts.append(start)
+            if count == 0:
+                continue
+            source_end = int(source_start) + int(count)
+            end = start + int(count)
+            self.decision_option_idx[start:end] = staging.decision_option_idx[
+                env_idx, int(source_start) : source_end
+            ].to(device)
+            self.decision_target_idx[start:end] = staging.decision_target_idx[
+                env_idx, int(source_start) : source_end
+            ].to(device)
+            self.decision_mask[start:end] = staging.decision_mask[
+                env_idx, int(source_start) : source_end
+            ].to(device)
+            self.uses_none_head[start:end] = staging.uses_none_head[
+                env_idx, int(source_start) : source_end
+            ].to(device)
+            self.selected_indices[start:end] = staging.selected_indices[
+                env_idx, int(source_start) : source_end
+            ].to(device)
 
         self.decision_start[step_indices] = torch.tensor(
             decision_starts, dtype=torch.long, device=device

@@ -7,7 +7,7 @@ import argparse
 import importlib
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,14 +20,10 @@ import wandb  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from magic_ai.game_state import GameStateEncoder, GameStateSnapshot, PendingState  # noqa: E402
+from magic_ai.buffer import NativeTrajectoryBuffer  # noqa: E402
+from magic_ai.game_state import GameStateEncoder  # noqa: E402
 from magic_ai.model import PPOPolicy  # noqa: E402
-from magic_ai.native_encoder import (  # noqa: E402
-    NativeBatchEncoder,
-    NativeEncodedBatch,
-    cat_native_encoded_batches,
-    slice_native_encoded_batch,
-)
+from magic_ai.native_encoder import NativeBatchEncoder  # noqa: E402
 from magic_ai.native_rollout import (  # noqa: E402
     NativeRolloutDriver,
     NativeRolloutUnavailable,
@@ -43,19 +39,12 @@ DEFAULT_DECK = {
 }
 
 
-@dataclass(frozen=True)
-class NativeStagedStep:
-    encoded: NativeEncodedBatch
-    policy_step: Any
-    player_idx: int
-
-
 @dataclass
 class LiveGame:
     game: Any
+    slot_idx: int
     episode_idx: int
     episode_steps: list[RolloutStep]
-    staged_steps: list[NativeStagedStep] = field(default_factory=list)
     action_count: int = 0
 
 
@@ -129,6 +118,23 @@ def main() -> None:
         _ = torch.empty((1, 1), device=device) @ torch.empty((1, 1), device=device)
     native_encoder = NativeBatchEncoder.for_policy(policy)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
+    staging_decision_capacity_per_env = max(
+        1,
+        (policy.rollout_buffer.decision_capacity // max(1, policy.rollout_buffer.capacity))
+        * args.max_steps_per_game,
+    )
+    staging_buffer = NativeTrajectoryBuffer(
+        num_envs=args.num_envs,
+        max_steps_per_trajectory=args.max_steps_per_game,
+        decision_capacity_per_env=staging_decision_capacity_per_env,
+        max_options=args.max_options,
+        max_targets_per_option=args.max_targets_per_option,
+        max_cached_choices=policy.max_cached_choices,
+        zone_slot_count=policy.rollout_buffer.slot_card_rows.shape[1],
+        game_info_dim=policy.rollout_buffer.game_info.shape[1],
+        option_scalar_dim=policy.rollout_buffer.option_scalars.shape[2],
+        target_scalar_dim=policy.rollout_buffer.target_scalars.shape[3],
+    ).to(device)
 
     if args.checkpoint and args.checkpoint.exists():
         checkpoint = torch.load(args.checkpoint, map_location=device)
@@ -151,6 +157,7 @@ def main() -> None:
         native_encoder,
         optimizer,
         native_rollout,
+        staging_buffer,
     )
 
     save_checkpoint(args.output, policy, optimizer, args)
@@ -257,6 +264,7 @@ def train_native_batched_envs(
     native_encoder: NativeBatchEncoder,
     optimizer: torch.optim.Optimizer,
     native_rollout: NativeRolloutDriver,
+    staging_buffer: NativeTrajectoryBuffer,
 ) -> None:
     if not native_encoder.is_available:
         raise SystemExit("native rollout requires MageEncodeBatch")
@@ -267,10 +275,12 @@ def train_native_batched_envs(
     last_saved_games = 0
     next_episode_idx = 0
     live_games: list[LiveGame] = []
+    free_slots = list(range(args.num_envs - 1, -1, -1))
     win_stats = WinFractionStats()
     policy.reset_rollout_buffer()
 
-    def start_game(episode_idx: int) -> LiveGame:
+    def start_game(slot_idx: int, episode_idx: int) -> LiveGame:
+        staging_buffer.reset_env(slot_idx)
         return LiveGame(
             game=mage.new_game(
                 deck_a,
@@ -281,48 +291,50 @@ def train_native_batched_envs(
                 shuffle=not args.no_shuffle,
                 hand_size=args.hand_size,
             ),
+            slot_idx=slot_idx,
             episode_idx=episode_idx,
             episode_steps=[],
         )
 
     def maybe_start_games() -> None:
         nonlocal next_episode_idx
-        while len(live_games) < args.num_envs and next_episode_idx < args.episodes:
-            live_games.append(start_game(next_episode_idx))
+        while free_slots and next_episode_idx < args.episodes:
+            live_games.append(start_game(free_slots.pop(), next_episode_idx))
             next_episode_idx += 1
 
     def finish_game(env: LiveGame, winner_idx: int) -> None:
         nonlocal completed_games
         env.game.close()
-        winner = str(winner_idx) if winner_idx >= 0 else ""
-        if env.staged_steps:
-            promoted_batch = cat_native_encoded_batches([item.encoded for item in env.staged_steps])
-            replay_rows = policy.append_native_batch_to_rollout(
-                promoted_batch,
-                selected_choice_cols=[
-                    tuple(item.policy_step.selected_choice_cols) for item in env.staged_steps
-                ],
-                may_selected=[item.policy_step.may_selected for item in env.staged_steps],
+        step_count = staging_buffer.active_step_count(env.slot_idx)
+        if step_count:
+            replay_rows = policy.append_staged_episode_to_rollout(staging_buffer, env.slot_idx)
+            player_indices = (
+                staging_buffer.perspective_player_idx[env.slot_idx, :step_count]
+                .detach()
+                .cpu()
+                .tolist()
             )
+            old_log_probs = (
+                staging_buffer.old_log_prob[env.slot_idx, :step_count].detach().cpu().tolist()
+            )
+            values = staging_buffer.value[env.slot_idx, :step_count].detach().cpu().tolist()
             env.episode_steps = [
                 RolloutStep(
-                    state=cast(GameStateSnapshot, {}),
-                    pending=cast(PendingState, {}),
-                    perspective_player_idx=item.player_idx,
-                    player_id=str(item.player_idx),
-                    player_name=str(item.player_idx),
-                    trace=item.policy_step.trace,
-                    old_log_prob=float(item.policy_step.log_prob.detach().cpu()),
-                    value=float(item.policy_step.value.detach().cpu()),
+                    perspective_player_idx=int(player_idx),
+                    old_log_prob=float(old_log_prob),
+                    value=float(value),
                     replay_idx=replay_idx,
                 )
-                for item, replay_idx in zip(env.staged_steps, replay_rows, strict=True)
+                for player_idx, old_log_prob, value, replay_idx in zip(
+                    player_indices, old_log_probs, values, replay_rows, strict=True
+                )
             ]
-            env.staged_steps.clear()
         if env.episode_steps:
-            returns = terminal_returns(env.episode_steps, winner=winner, gamma=args.gamma)
+            returns = terminal_returns(env.episode_steps, winner_idx=winner_idx, gamma=args.gamma)
             pending_steps.extend(env.episode_steps)
             pending_returns.append(returns)
+        staging_buffer.reset_env(env.slot_idx)
+        free_slots.append(env.slot_idx)
         if winner_idx == 0:
             win_stats.p1_wins += 1
         elif winner_idx == 1:
@@ -357,29 +369,36 @@ def train_native_batched_envs(
                     parsed_batch,
                     deterministic=args.deterministic_rollout,
                 )
+            log_probs = torch.stack([policy_step.log_prob for policy_step in policy_steps])
+            values = torch.stack([policy_step.value for policy_step in policy_steps])
 
             starts: list[int] = []
             counts: list[int] = []
             selected_cols: list[int] = []
             may_selected: list[int] = []
+            selected_choice_cols: list[tuple[int, ...]] = []
             cursor = 0
-            for batch_idx, (env, player_idx, policy_step) in enumerate(
-                zip(ready_envs, ready_players, policy_steps, strict=True)
+            for env, player_idx, policy_step in zip(
+                ready_envs, ready_players, policy_steps, strict=True
             ):
                 cols = list(policy_step.selected_choice_cols)
                 starts.append(cursor)
                 counts.append(len(cols))
                 selected_cols.extend(cols)
                 may_selected.append(policy_step.may_selected)
+                selected_choice_cols.append(tuple(policy_step.selected_choice_cols))
                 cursor += len(cols)
-                env.staged_steps.append(
-                    NativeStagedStep(
-                        encoded=slice_native_encoded_batch(parsed_batch, batch_idx),
-                        policy_step=policy_step,
-                        player_idx=player_idx,
-                    )
-                )
                 env.action_count += 1
+
+            staging_buffer.stage_batch(
+                [env.slot_idx for env in ready_envs],
+                parsed_batch,
+                selected_choice_cols=selected_choice_cols,
+                may_selected=may_selected,
+                old_log_probs=log_probs,
+                values=values,
+                perspective_player_indices=ready_players,
+            )
 
             native_rollout.step_by_choice(
                 [env.game for env in ready_envs],

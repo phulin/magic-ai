@@ -1,4 +1,4 @@
-"""PPO update and rollout helpers for mage-go self-play."""
+"""PPO update helpers for mage-go self-play."""
 
 from __future__ import annotations
 
@@ -11,19 +11,12 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from magic_ai.actions import ActionRequest, PendingState
-from magic_ai.game_state import GameStateSnapshot
-from magic_ai.model import ActionTrace, PPOPolicy
+from magic_ai.model import PPOPolicy
 
 
 @dataclass(frozen=True)
 class RolloutStep:
-    state: GameStateSnapshot
-    pending: PendingState
     perspective_player_idx: int
-    player_id: str
-    player_name: str
-    trace: ActionTrace
     old_log_prob: float
     value: float
     reward: float = 0.0
@@ -128,7 +121,7 @@ def ppo_update(
 def terminal_returns(
     steps: Sequence[RolloutStep],
     *,
-    winner: str,
+    winner_idx: int,
     gamma: float = 1.0,
 ) -> Tensor:
     """Assign final game outcome from each acting player's perspective."""
@@ -136,48 +129,11 @@ def terminal_returns(
     values: list[float] = []
     total = len(steps)
     for idx, step in enumerate(steps):
-        if not winner:
+        if winner_idx < 0:
             outcome = 0.0
-        elif winner in {step.player_id, step.player_name}:
+        elif winner_idx == step.perspective_player_idx:
             outcome = 1.0
         else:
             outcome = -1.0
         values.append(outcome * (gamma ** max(0, total - idx - 1)))
     return torch.tensor(values, dtype=torch.float32)
-
-
-def merge_pending_into_state(state: dict, pending: dict | None) -> GameStateSnapshot:
-    snapshot = dict(state)
-    if pending is not None:
-        snapshot["pending"] = pending
-    return cast(GameStateSnapshot, snapshot)
-
-
-def rollout_step_from_policy(
-    policy: PPOPolicy,
-    state: GameStateSnapshot,
-    pending: PendingState,
-    *,
-    deterministic: bool = False,
-) -> tuple[ActionRequest, RolloutStep]:
-    player_idx = int(pending.get("player_idx", 0))
-    player = state["players"][player_idx]
-    with torch.no_grad():
-        policy_step = policy.act(
-            state,
-            pending,
-            perspective_player_idx=player_idx,
-            deterministic=deterministic,
-        )
-    rollout_step = RolloutStep(
-        state=state,
-        pending=pending,
-        perspective_player_idx=player_idx,
-        player_id=player.get("ID", ""),
-        player_name=player.get("Name", ""),
-        trace=policy_step.trace,
-        old_log_prob=float(policy_step.log_prob.detach().cpu()),
-        value=float(policy_step.value.detach().cpu()),
-        replay_idx=policy_step.replay_idx,
-    )
-    return policy_step.action, rollout_step

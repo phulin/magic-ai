@@ -17,7 +17,7 @@ from magic_ai.actions import (
     build_priority_candidates,
     selected_priority_candidate_index,
 )
-from magic_ai.buffer import RolloutBuffer
+from magic_ai.buffer import NativeTrajectoryBuffer, RolloutBuffer
 from magic_ai.game_state import (
     GameCardState,
     GameStateEncoder,
@@ -38,9 +38,7 @@ from magic_ai.native_encoder import NativeBatchEncoder, NativeEncodedBatch, Nati
 from magic_ai.ppo import (
     PPOStats,
     RolloutStep,
-    merge_pending_into_state,
     ppo_update,
-    rollout_step_from_policy,
     terminal_returns,
 )
 
@@ -57,6 +55,7 @@ __all__ = [
     "NativeBatchEncoder",
     "NativeEncodedBatch",
     "NativeEncodingError",
+    "NativeTrajectoryBuffer",
     "PPOPolicy",
     "PPOStats",
     "ParsedActionInputs",
@@ -77,9 +76,7 @@ __all__ = [
     "action_from_choice_index",
     "action_from_priority_candidate",
     "build_priority_candidates",
-    "merge_pending_into_state",
     "ppo_update",
-    "rollout_step_from_policy",
     "selected_priority_candidate_index",
     "terminal_returns",
 ]
