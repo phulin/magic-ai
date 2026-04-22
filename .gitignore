@@ -11,6 +11,8 @@ wheels/
 
 .codex
 /data/
+/decks/
 /checkpoints/
 /wandb/
+tea_debug.log
 .env

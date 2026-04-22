@@ -26,6 +26,10 @@ DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
 DEFAULT_EMBEDDING_DIMENSIONS = 4096
 DEFAULT_MAX_LENGTH = 8192
 DEFAULT_USER_AGENT = "magic-ai/0.1.0"
+DEFAULT_DECK_DIR = Path("decks")
+DEFAULT_CARD_CACHE = Path("data/cards.json")
+SCRYFALL_REQUESTS_PER_SECOND = 1.0
+SCRYFALL_REQUEST_INTERVAL = 1.0 / SCRYFALL_REQUESTS_PER_SECOND
 EMBEDDING_TEXT_FORMATS = ("json", "tagged", "plain")
 
 # Edit this list for the project-local baseline cards that should always be
@@ -47,7 +51,9 @@ def main() -> None:
     args = parse_args()
     payload = build_card_embedding_file(
         output=args.output,
+        card_cache=args.card_cache,
         include_fixed_list=not args.no_fixed_list,
+        deck_dirs=[] if args.no_decks else args.deck_dir,
         include_jumpstart=args.include_jumpstart,
         additional_card_names=args.card,
         set_code=args.set_code,
@@ -78,6 +84,24 @@ def parse_args() -> argparse.Namespace:
         "--include-jumpstart",
         action="store_true",
         help="include every print from original Jumpstart via Scryfall set code jmp",
+    )
+    parser.add_argument(
+        "--card-cache",
+        type=Path,
+        default=DEFAULT_CARD_CACHE,
+        help="local Scryfall card JSON cache consulted before API requests",
+    )
+    parser.add_argument(
+        "--deck-dir",
+        type=Path,
+        action="append",
+        default=[DEFAULT_DECK_DIR],
+        help="directory of deck JSON files whose card names are included by default",
+    )
+    parser.add_argument(
+        "--no-decks",
+        action="store_true",
+        help="do not include card names from deck JSON files",
     )
     parser.add_argument(
         "--set-code",
@@ -153,7 +177,9 @@ def parse_args() -> argparse.Namespace:
 def build_card_embedding_file(
     *,
     output: Path,
+    card_cache: Path,
     include_fixed_list: bool,
+    deck_dirs: list[Path],
     include_jumpstart: bool,
     additional_card_names: list[str],
     set_code: str,
@@ -169,22 +195,35 @@ def build_card_embedding_file(
 ) -> dict[str, Any]:
     cards: list[dict[str, Any]] = []
     source_urls: list[str] = []
+    cached_cards = load_card_cache(card_cache)
+    cache_dirty = False
 
     fixed_names = FIXED_CARD_NAMES if include_fixed_list else []
-    requested_names = normalize_card_names([*fixed_names, *additional_card_names])
+    deck_names = load_deck_card_names(deck_dirs)
+    requested_names = normalize_card_names([*fixed_names, *deck_names, *additional_card_names])
     for name in requested_names:
-        cards.append(fetch_named_card(name, user_agent=user_agent))
-        time.sleep(0.12)
+        card, fetched = fetch_named_card_cached(
+            name,
+            cached_cards=cached_cards,
+            user_agent=user_agent,
+        )
+        cards.append(card)
+        cache_dirty = cache_dirty or fetched
+        if fetched:
+            time.sleep(SCRYFALL_REQUEST_INTERVAL)
 
     if include_jumpstart:
         jumpstart_cards = fetch_set_cards(set_code, user_agent=user_agent)
         cards.extend(jumpstart_cards)
+        cache_dirty = update_card_cache(cached_cards, jumpstart_cards) or cache_dirty
         source_urls.append(scryfall_search_url(set_code))
 
     if not cards:
         raise ValueError(
             "no cards requested; use --include-jumpstart, --card, or populate FIXED_CARD_NAMES"
         )
+    if cache_dirty:
+        save_card_cache(card_cache, cached_cards)
 
     records = [
         card_to_record(card, embedding_text_format=embedding_text_format)
@@ -209,7 +248,10 @@ def build_card_embedding_file(
             "generated_at": datetime.now(UTC).isoformat(),
             "source": "Scryfall API",
             "source_urls": source_urls,
+            "card_cache": str(card_cache),
             "fixed_card_names": FIXED_CARD_NAMES if include_fixed_list else [],
+            "deck_dirs": [str(path) for path in deck_dirs],
+            "deck_card_names": deck_names,
             "additional_card_names": additional_card_names,
             "jumpstart_included": include_jumpstart,
             "jumpstart_set_code": set_code if include_jumpstart else None,
@@ -247,6 +289,97 @@ def normalize_card_names(names: list[str]) -> list[str]:
     return normalized
 
 
+def load_deck_card_names(deck_dirs: list[Path]) -> list[str]:
+    names: list[str] = []
+    for deck_dir in deck_dirs:
+        if not deck_dir.exists():
+            continue
+        for deck_path in sorted(deck_dir.glob("*.json")):
+            names.extend(card_names_from_deck_json(deck_path))
+    return normalize_card_names(names)
+
+
+def card_names_from_deck_json(path: Path) -> list[str]:
+    payload = json.loads(path.read_text())
+    names: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            raw_name = value.get("name")
+            if isinstance(raw_name, str) and "count" in value:
+                names.append(raw_name)
+            for child in value.values():
+                visit(child)
+            return
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(payload)
+    return names
+
+
+def load_card_cache(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text())
+    raw_cards = payload.get("cards", [])
+    if not isinstance(raw_cards, list):
+        raise ValueError(f"{path} must contain a cards list")
+    cards: dict[str, dict[str, Any]] = {}
+    update_card_cache(cards, [card for card in raw_cards if isinstance(card, dict)])
+    return cards
+
+
+def save_card_cache(path: Path, cards: dict[str, dict[str, Any]]) -> None:
+    records = sorted(cards.values(), key=lambda card: str(card.get("name", "")).casefold())
+    payload = {
+        "metadata": {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "source": "Scryfall API card cache",
+            "card_count": len(records),
+        },
+        "cards": records,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def update_card_cache(
+    cached_cards: dict[str, dict[str, Any]],
+    cards: list[dict[str, Any]],
+) -> bool:
+    changed = False
+    for card in cards:
+        name = card.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        key = card_name_key(name)
+        if cached_cards.get(key) != card:
+            cached_cards[key] = card
+            changed = True
+    return changed
+
+
+def fetch_named_card_cached(
+    name: str,
+    *,
+    cached_cards: dict[str, dict[str, Any]],
+    user_agent: str,
+) -> tuple[dict[str, Any], bool]:
+    cached = cached_cards.get(card_name_key(name))
+    if cached is not None:
+        return cached, False
+    print(f"Fetching {name}...")
+    card = fetch_named_card(name, user_agent=user_agent)
+    update_card_cache(cached_cards, [card])
+    return card, True
+
+
+def card_name_key(name: str) -> str:
+    return " ".join(name.split()).casefold()
+
+
 def fetch_named_card(name: str, *, user_agent: str) -> dict[str, Any]:
     query = urllib.parse.urlencode({"exact": name})
     url = f"{SCRYFALL_API}/cards/named?{query}"
@@ -262,8 +395,7 @@ def fetch_set_cards(set_code: str, *, user_agent: str) -> list[dict[str, Any]]:
         cards.extend(page.get("data", []))
         url = page.get("next_page") if page.get("has_more") else None
         if url:
-            # Scryfall asks clients to stay under 10 requests per second.
-            time.sleep(0.12)
+            time.sleep(SCRYFALL_REQUEST_INTERVAL)
 
     cards.sort(key=lambda card: _collector_sort_key(card.get("collector_number", "")))
     return cards
