@@ -390,7 +390,6 @@ def train_native_batched_envs(
             counts: list[int] = []
             selected_cols: list[int] = []
             may_selected: list[int] = []
-            selected_choice_cols: list[tuple[int, ...]] = []
             cursor = 0
             for env, player_idx, policy_step in zip(
                 ready_envs, ready_players, policy_steps, strict=True
@@ -400,14 +399,19 @@ def train_native_batched_envs(
                 counts.append(len(cols))
                 selected_cols.extend(cols)
                 may_selected.append(policy_step.may_selected)
-                selected_choice_cols.append(tuple(policy_step.selected_choice_cols))
                 cursor += len(cols)
                 env.action_count += 1
+
+            selected_choice_cols_flat = torch.tensor(
+                selected_cols,
+                dtype=torch.long,
+                device=policy.device,
+            )
 
             staging_buffer.stage_batch(
                 [env.slot_idx for env in ready_envs],
                 parsed_batch,
-                selected_choice_cols=selected_choice_cols,
+                selected_choice_cols_flat=selected_choice_cols_flat,
                 may_selected=may_selected,
                 old_log_probs=log_probs,
                 values=values,

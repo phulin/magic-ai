@@ -151,7 +151,7 @@ class NativeTrajectoryBuffer(nn.Module):
         env_indices: list[int],
         native_batch: NativeEncodedBatch,
         *,
-        selected_choice_cols: list[tuple[int, ...]],
+        selected_choice_cols_flat: Tensor,
         may_selected: list[int],
         old_log_probs: Tensor,
         values: Tensor,
@@ -159,8 +159,6 @@ class NativeTrajectoryBuffer(nn.Module):
     ) -> None:
         if int(native_batch.trace_kind_id.shape[0]) != len(env_indices):
             raise ValueError("env_indices length must match native batch length")
-        if len(env_indices) != len(selected_choice_cols):
-            raise ValueError("selected_choice_cols length must match native batch length")
         if len(env_indices) != len(may_selected):
             raise ValueError("may_selected length must match native batch length")
         if int(old_log_probs.numel()) != len(env_indices):
@@ -185,6 +183,9 @@ class NativeTrajectoryBuffer(nn.Module):
         may_selected_t = torch.tensor(may_selected, dtype=torch.float32, device=device)
         counts_t = native_batch.decision_count.to(device=device, dtype=torch.long)
         starts_t = self.decision_cursor[env_idx_t]
+        selected_choice_cols_flat = selected_choice_cols_flat.to(device=device, dtype=torch.long)
+        if int(selected_choice_cols_flat.numel()) != int(counts_t.sum().item()):
+            raise ValueError("selected_choice_cols_flat length must match total decision_count")
         if bool(((starts_t + counts_t) > self.decision_capacity_per_env).any()):
             bad_env = env_indices[
                 int((((starts_t + counts_t) > self.decision_capacity_per_env).nonzero())[0].item())
@@ -228,34 +229,33 @@ class NativeTrajectoryBuffer(nn.Module):
         self.decision_count[env_idx_t, step_idx_t] = counts_t
 
         source_starts_t = native_batch.decision_start.to(device=device, dtype=torch.long)
-        for batch_idx, count in enumerate(counts_t.detach().cpu().tolist()):
-            if count == 0:
-                continue
-            cols = selected_choice_cols[batch_idx]
-            if len(cols) != count:
-                raise ValueError("selected_choice_cols entry must match decision_count")
-            env_idx = env_indices[batch_idx]
-            start = int(starts_t[batch_idx].item())
-            source_start = int(source_starts_t[batch_idx].item())
-            source_end = source_start + count
-            dest_end = start + count
-            self.decision_option_idx[env_idx, start:dest_end] = native_batch.decision_option_idx[
-                source_start:source_end
-            ].to(device)
-            self.decision_target_idx[env_idx, start:dest_end] = native_batch.decision_target_idx[
-                source_start:source_end
-            ].to(device)
-            self.decision_mask[env_idx, start:dest_end] = native_batch.decision_mask[
-                source_start:source_end
-            ].to(device)
-            self.uses_none_head[env_idx, start:dest_end] = native_batch.uses_none_head[
-                source_start:source_end
-            ].to(device)
-            self.selected_indices[env_idx, start:dest_end] = torch.tensor(
-                cols,
-                dtype=torch.long,
-                device=device,
+        total_decisions = int(counts_t.sum().item())
+        if total_decisions:
+            max_decisions = int(counts_t.max().item())
+            decision_pos = torch.arange(max_decisions, device=device).expand(
+                len(env_indices), max_decisions
             )
+            valid_decision_mask = decision_pos < counts_t[:, None]
+            decision_env = env_idx_t[:, None].expand(len(env_indices), max_decisions)[
+                valid_decision_mask
+            ]
+            source_rows = (source_starts_t[:, None] + decision_pos)[valid_decision_mask]
+            dest_rows = (starts_t[:, None] + decision_pos)[valid_decision_mask]
+
+            native_decision_option_idx = native_batch.decision_option_idx.to(device)
+            native_decision_target_idx = native_batch.decision_target_idx.to(device)
+            native_decision_mask = native_batch.decision_mask.to(device)
+            native_uses_none_head = native_batch.uses_none_head.to(device)
+
+            self.decision_option_idx[decision_env, dest_rows] = native_decision_option_idx[
+                source_rows
+            ]
+            self.decision_target_idx[decision_env, dest_rows] = native_decision_target_idx[
+                source_rows
+            ]
+            self.decision_mask[decision_env, dest_rows] = native_decision_mask[source_rows]
+            self.uses_none_head[decision_env, dest_rows] = native_uses_none_head[source_rows]
+            self.selected_indices[decision_env, dest_rows] = selected_choice_cols_flat
 
         self.step_count[env_idx_t] = step_idx_t + 1
         self.decision_cursor[env_idx_t] = starts_t + counts_t
