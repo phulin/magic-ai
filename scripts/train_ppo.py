@@ -302,46 +302,58 @@ def train_native_batched_envs(
             live_games.append(start_game(free_slots.pop(), next_episode_idx))
             next_episode_idx += 1
 
-    def finish_game(env: LiveGame, winner_idx: int) -> None:
+    def finish_games(finished: list[tuple[LiveGame, int]]) -> None:
         nonlocal completed_games
-        env.game.close()
-        step_count = staging_buffer.active_step_count(env.slot_idx)
-        if step_count:
-            replay_rows = policy.append_staged_episode_to_rollout(staging_buffer, env.slot_idx)
-            player_indices = (
-                staging_buffer.perspective_player_idx[env.slot_idx, :step_count]
-                .detach()
-                .cpu()
-                .tolist()
-            )
-            old_log_probs = (
-                staging_buffer.old_log_prob[env.slot_idx, :step_count].detach().cpu().tolist()
-            )
-            values = staging_buffer.value[env.slot_idx, :step_count].detach().cpu().tolist()
-            env.episode_steps = [
-                RolloutStep(
-                    perspective_player_idx=int(player_idx),
-                    old_log_prob=float(old_log_prob),
-                    value=float(value),
-                    replay_idx=replay_idx,
+        if not finished:
+            return
+
+        envs = [env for env, _ in finished]
+        replay_rows_by_env = policy.append_staged_episodes_to_rollout(
+            staging_buffer,
+            [env.slot_idx for env in envs],
+        )
+        for (env, winner_idx), replay_rows in zip(finished, replay_rows_by_env, strict=True):
+            env.game.close()
+            step_count = staging_buffer.active_step_count(env.slot_idx)
+            if step_count:
+                player_indices = (
+                    staging_buffer.perspective_player_idx[env.slot_idx, :step_count]
+                    .detach()
+                    .cpu()
+                    .tolist()
                 )
-                for player_idx, old_log_prob, value, replay_idx in zip(
-                    player_indices, old_log_probs, values, replay_rows, strict=True
+                old_log_probs = (
+                    staging_buffer.old_log_prob[env.slot_idx, :step_count].detach().cpu().tolist()
                 )
-            ]
-        if env.episode_steps:
-            returns = terminal_returns(env.episode_steps, winner_idx=winner_idx, gamma=args.gamma)
-            pending_steps.extend(env.episode_steps)
-            pending_returns.append(returns)
-        staging_buffer.reset_env(env.slot_idx)
-        free_slots.append(env.slot_idx)
-        if winner_idx == 0:
-            win_stats.p1_wins += 1
-        elif winner_idx == 1:
-            win_stats.p2_wins += 1
-        else:
-            win_stats.draws += 1
-        completed_games += 1
+                values = staging_buffer.value[env.slot_idx, :step_count].detach().cpu().tolist()
+                env.episode_steps = [
+                    RolloutStep(
+                        perspective_player_idx=int(player_idx),
+                        old_log_prob=float(old_log_prob),
+                        value=float(value),
+                        replay_idx=replay_idx,
+                    )
+                    for player_idx, old_log_prob, value, replay_idx in zip(
+                        player_indices, old_log_probs, values, replay_rows, strict=True
+                    )
+                ]
+            if env.episode_steps:
+                returns = terminal_returns(
+                    env.episode_steps,
+                    winner_idx=winner_idx,
+                    gamma=args.gamma,
+                )
+                pending_steps.extend(env.episode_steps)
+                pending_returns.append(returns)
+            staging_buffer.reset_env(env.slot_idx)
+            free_slots.append(env.slot_idx)
+            if winner_idx == 0:
+                win_stats.p1_wins += 1
+            elif winner_idx == 1:
+                win_stats.p2_wins += 1
+            else:
+                win_stats.draws += 1
+            completed_games += 1
 
     maybe_start_games()
     while live_games:
@@ -349,15 +361,17 @@ def train_native_batched_envs(
         ready_envs: list[LiveGame] = []
         ready_players: list[int] = []
         still_live: list[LiveGame] = []
+        finished_games: list[tuple[LiveGame, int]] = []
         for idx, env in enumerate(live_games):
             if int(over_t[idx]) or env.action_count >= args.max_steps_per_game:
-                finish_game(env, int(winner_t[idx]) if int(over_t[idx]) else -1)
+                finished_games.append((env, int(winner_t[idx]) if int(over_t[idx]) else -1))
                 continue
             still_live.append(env)
             if int(ready_t[idx]):
                 ready_envs.append(env)
                 ready_players.append(int(player_t[idx]))
         live_games = still_live
+        finish_games(finished_games)
 
         if ready_envs:
             parsed_batch = native_encoder.encode_handles(

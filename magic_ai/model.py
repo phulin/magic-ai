@@ -190,8 +190,27 @@ class PPOPolicy(nn.Module):
         staging: NativeTrajectoryBuffer,
         env_idx: int,
     ) -> list[int]:
-        write = self.rollout_buffer.ingest_staged_episode(staging, env_idx)
-        return [int(row) for row in write.step_indices.detach().cpu().tolist()]
+        return self.append_staged_episodes_to_rollout(staging, [env_idx])[0]
+
+    def append_staged_episodes_to_rollout(
+        self,
+        staging: NativeTrajectoryBuffer,
+        env_indices: list[int],
+    ) -> list[list[int]]:
+        active_envs = [env_idx for env_idx in env_indices if staging.active_step_count(env_idx) > 0]
+        if not active_envs:
+            return [[] for _ in env_indices]
+
+        step_counts = [staging.active_step_count(env_idx) for env_idx in active_envs]
+        write = self.rollout_buffer.ingest_staged_episodes(staging, active_envs)
+        flat_rows = [int(row) for row in write.step_indices.detach().cpu().tolist()]
+
+        grouped_rows: dict[int, list[int]] = {}
+        cursor = 0
+        for env_idx, count in zip(active_envs, step_counts, strict=True):
+            grouped_rows[env_idx] = flat_rows[cursor : cursor + count]
+            cursor += count
+        return [grouped_rows.get(env_idx, []) for env_idx in env_indices]
 
     def parse_inputs(
         self,
@@ -429,6 +448,10 @@ class PPOPolicy(nn.Module):
         may_positions = native_batch.may_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
         decision_starts = native_batch.decision_start.detach().cpu().tolist()
         decision_counts = native_batch.decision_count.detach().cpu().tolist()
+        decision_option_idx = native_batch.decision_option_idx.to(device)
+        decision_target_idx = native_batch.decision_target_idx.to(device)
+        decision_mask = native_batch.decision_mask.to(device)
+        uses_none_head = native_batch.uses_none_head.to(device)
         group_step_positions: list[int] = []
         group_decision_indices: list[int] = []
         trace_kind_ids = native_batch.trace_kind_id.detach().cpu().tolist()
@@ -462,10 +485,10 @@ class PPOPolicy(nn.Module):
         if group_step_positions:
             pos_t = torch.tensor(group_step_positions, dtype=torch.long, device=device)
             idx_t = torch.tensor(group_decision_indices, dtype=torch.long, device=device)
-            option_idx = native_batch.decision_option_idx[idx_t]
-            target_idx = native_batch.decision_target_idx[idx_t]
-            masks = native_batch.decision_mask[idx_t]
-            uses_none = native_batch.uses_none_head[idx_t]
+            option_idx = decision_option_idx[idx_t]
+            target_idx = decision_target_idx[idx_t]
+            masks = decision_mask[idx_t]
+            uses_none = uses_none_head[idx_t]
             group_idx, choice_cols, flat_logits, flat_log_probs, group_entropies = (
                 self._flat_decision_distribution(
                     step_positions=pos_t,
@@ -1001,38 +1024,56 @@ class PPOPolicy(nn.Module):
         )
 
     def _forward_native_batch(self, native_batch: NativeEncodedBatch) -> _ForwardBatch:
+        device = self.device
+        slot_card_rows = native_batch.slot_card_rows.to(device)
+        slot_occupied = native_batch.slot_occupied.to(device)
+        slot_tapped = native_batch.slot_tapped.to(device)
+        game_info = native_batch.game_info.to(device)
+        pending_kind_id = native_batch.pending_kind_id.to(device)
+        option_kind_ids = native_batch.option_kind_ids.to(device)
+        option_scalars = native_batch.option_scalars.to(device)
+        option_mask = native_batch.option_mask.to(device)
+        option_ref_slot_idx = native_batch.option_ref_slot_idx.to(device)
+        option_ref_card_row = native_batch.option_ref_card_row.to(device)
+        target_mask = native_batch.target_mask.to(device)
+        target_type_ids = native_batch.target_type_ids.to(device)
+        target_scalars = native_batch.target_scalars.to(device)
+        target_ref_slot_idx = native_batch.target_ref_slot_idx.to(device)
+        target_ref_is_player = native_batch.target_ref_is_player.to(device)
+        target_ref_is_self = native_batch.target_ref_is_self.to(device)
+
         self._validate_slot_card_rows(
-            native_batch.slot_card_rows,
+            slot_card_rows,
             self.game_state_encoder.card_embedding_table.shape[0],
         )
         slot_vectors = self.game_state_encoder.embed_slot_vectors(
-            native_batch.slot_card_rows,
-            native_batch.slot_occupied,
-            native_batch.slot_tapped,
+            slot_card_rows,
+            slot_occupied,
+            slot_tapped,
         )
         state_vector = self.game_state_encoder.state_vector_from_slots(
             slot_vectors,
-            native_batch.game_info,
+            game_info,
         )
 
         pending_vector, option_vectors, target_vectors = self.action_encoder.embed_from_parsed(
             slot_vectors=slot_vectors,
-            pending_kind_id=native_batch.pending_kind_id,
-            option_kind_ids=native_batch.option_kind_ids,
-            option_scalars=native_batch.option_scalars,
-            option_mask=native_batch.option_mask,
-            option_ref_slot_idx=native_batch.option_ref_slot_idx,
-            option_ref_card_row=native_batch.option_ref_card_row,
-            target_mask=native_batch.target_mask,
-            target_type_ids=native_batch.target_type_ids,
-            target_scalars=native_batch.target_scalars,
-            target_ref_slot_idx=native_batch.target_ref_slot_idx,
-            target_ref_is_player=native_batch.target_ref_is_player,
-            target_ref_is_self=native_batch.target_ref_is_self,
+            pending_kind_id=pending_kind_id,
+            option_kind_ids=option_kind_ids,
+            option_scalars=option_scalars,
+            option_mask=option_mask,
+            option_ref_slot_idx=option_ref_slot_idx,
+            option_ref_card_row=option_ref_card_row,
+            target_mask=target_mask,
+            target_type_ids=target_type_ids,
+            target_scalars=target_scalars,
+            target_ref_slot_idx=target_ref_slot_idx,
+            target_ref_is_player=target_ref_is_player,
+            target_ref_is_self=target_ref_is_self,
         )
 
-        option_mask_f = native_batch.option_mask.unsqueeze(-1)
-        option_count = native_batch.option_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        option_mask_f = option_mask.unsqueeze(-1)
+        option_count = option_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
         pooled = (option_vectors * option_mask_f).sum(dim=1) / option_count
         features = torch.cat([state_vector, pending_vector, pooled], dim=-1)
         hidden = self.trunk(features)
