@@ -46,6 +46,19 @@ TraceKind = Literal[
     "may",
 ]
 
+TRACE_KIND_VALUES: tuple[TraceKind, ...] = (
+    "priority",
+    "attackers",
+    "blockers",
+    "choice_index",
+    "choice_ids",
+    "choice_color",
+    "may",
+)
+TRACE_KIND_TO_ID: dict[TraceKind, int] = {
+    trace_kind: idx for idx, trace_kind in enumerate(TRACE_KIND_VALUES)
+}
+
 
 @dataclass(frozen=True)
 class ActionTrace:
@@ -67,26 +80,12 @@ class ParsedStep:
     parsed_state: ParsedGameState
     parsed_action: ParsedActionInputs
     trace_kind: TraceKind
+    trace_kind_id: int
     decision_option_idx: list[list[int]]  # [G, C]
     decision_target_idx: list[list[int]]  # [G, C]
     decision_mask: list[list[bool]]  # [G, C]
     uses_none_head: list[bool]  # [G]
     pending: PendingState
-
-
-@dataclass(frozen=True)
-class CachedPolicyInput:
-    """Slim handle into the rollout buffer for one sampled step.
-
-    The actual parsed tensors live in ``PPOPolicy.rollout_buffer``; this record
-    only stores the indices needed to gather them back during PPO evaluation.
-    """
-
-    buffer_idx: int
-    decision_start: int
-    decision_count: int
-    trace_kind: TraceKind
-    pending: PendingState | None
 
 
 @dataclass(frozen=True)
@@ -96,7 +95,7 @@ class PolicyStep:
     log_prob: Tensor
     value: Tensor
     entropy: Tensor
-    cache: CachedPolicyInput | None = None
+    replay_idx: int | None = None
 
 
 class PPOPolicy(nn.Module):
@@ -157,14 +156,10 @@ class PPOPolicy(nn.Module):
     def reset_rollout_buffer(self) -> None:
         self.rollout_buffer.reset()
 
-    def release_cached_steps(self, cached_steps: list[CachedPolicyInput]) -> None:
-        if not cached_steps:
+    def release_replay_rows(self, replay_rows: list[int]) -> None:
+        if not replay_rows:
             return
-        self.rollout_buffer.release(
-            step_indices=[step.buffer_idx for step in cached_steps],
-            decision_starts=[step.decision_start for step in cached_steps],
-            decision_counts=[step.decision_count for step in cached_steps],
-        )
+        self.rollout_buffer.release_steps(replay_rows)
 
     def parse_inputs(
         self,
@@ -197,6 +192,7 @@ class PPOPolicy(nn.Module):
             parsed_state=parsed_state,
             parsed_action=parsed_action,
             trace_kind=trace_kind,
+            trace_kind_id=TRACE_KIND_TO_ID[trace_kind],
             decision_option_idx=option_idx,
             decision_target_idx=target_idx,
             decision_mask=mask,
@@ -316,16 +312,8 @@ class PPOPolicy(nn.Module):
         offset = 0
         for step_idx, parsed in enumerate(parsed_steps):
             value = forward.values[step_idx]
-            buffer_idx = int(write.step_indices[step_idx])
-            decision_start = write.decision_starts[step_idx]
+            replay_idx = int(write.step_indices[step_idx])
             decision_count = write.decision_counts[step_idx]
-            cache = CachedPolicyInput(
-                buffer_idx=buffer_idx,
-                decision_start=decision_start,
-                decision_count=decision_count,
-                trace_kind=parsed.trace_kind,
-                pending=parsed.pending,
-            )
 
             if parsed.trace_kind == "may":
                 pos = may_lookup[step_idx]
@@ -339,7 +327,7 @@ class PPOPolicy(nn.Module):
                         log_prob=may_log_probs[pos],
                         value=value,
                         entropy=may_entropies[pos],
-                        cache=cache,
+                        replay_idx=replay_idx,
                     )
                 )
                 continue
@@ -353,7 +341,7 @@ class PPOPolicy(nn.Module):
                         log_prob=zero,
                         value=value,
                         entropy=zero,
-                        cache=cache,
+                        replay_idx=replay_idx,
                     )
                 )
                 continue
@@ -369,58 +357,51 @@ class PPOPolicy(nn.Module):
                     log_prob=per_step_log_prob_sum[step_idx],
                     value=value,
                     entropy=per_step_entropy_sum[step_idx],
-                    cache=cache,
+                    replay_idx=replay_idx,
                 )
             )
         return results
 
-    def evaluate_cached_batch(
+    def evaluate_replay_batch(
         self,
-        cached_steps: list[CachedPolicyInput],
+        replay_rows: list[int],
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """Replay log-probs/entropies/values from buffer handles with gradients."""
+        """Replay log-probs/entropies/values from replay rows with gradients."""
 
-        if not cached_steps:
-            raise ValueError("cached_steps must not be empty")
+        if not replay_rows:
+            raise ValueError("replay_rows must not be empty")
 
         device = self.device
         rb = self.rollout_buffer
-        n = len(cached_steps)
-
-        step_indices = torch.tensor(
-            [c.buffer_idx for c in cached_steps], dtype=torch.long, device=device
-        )
+        step_indices = torch.tensor(replay_rows, dtype=torch.long, device=device)
+        n = int(step_indices.numel())
         forward = self._forward_batch(step_indices)
         log_probs = torch.zeros(n, dtype=forward.values.dtype, device=device)
         entropies = torch.zeros(n, dtype=forward.values.dtype, device=device)
 
-        may_step_positions: list[int] = []
-        may_buffer_indices: list[int] = []
-        for step_idx, cached in enumerate(cached_steps):
-            if cached.trace_kind == "may":
-                may_step_positions.append(step_idx)
-                may_buffer_indices.append(cached.buffer_idx)
-        if may_step_positions:
-            may_pos_t = torch.tensor(may_step_positions, dtype=torch.long, device=device)
-            may_buf_t = torch.tensor(may_buffer_indices, dtype=torch.long, device=device)
+        trace_kind_ids = rb.trace_kind_id[step_indices]
+        may_mask = trace_kind_ids == TRACE_KIND_TO_ID["may"]
+        if may_mask.any():
+            may_pos_t = may_mask.nonzero(as_tuple=False).squeeze(-1)
+            may_buf_t = step_indices[may_pos_t]
             may_logits = forward.may_logits[may_pos_t]
             may_selected_t = rb.may_selected[may_buf_t].to(dtype=forward.values.dtype)
             may_dist = Bernoulli(logits=may_logits)
             log_probs[may_pos_t] = may_dist.log_prob(may_selected_t)
             entropies[may_pos_t] = may_dist.entropy()
 
-        group_step_positions: list[int] = []
-        group_decision_indices: list[int] = []
-        for step_idx, cached in enumerate(cached_steps):
-            if cached.decision_count == 0:
-                continue
-            for k in range(cached.decision_count):
-                group_step_positions.append(step_idx)
-                group_decision_indices.append(cached.decision_start + k)
-
-        if group_step_positions:
-            pos_t = torch.tensor(group_step_positions, dtype=torch.long, device=device)
-            idx_t = torch.tensor(group_decision_indices, dtype=torch.long, device=device)
+        decision_starts = rb.decision_start[step_indices]
+        decision_counts = rb.decision_count[step_indices]
+        active_mask = decision_counts > 0
+        if active_mask.any():
+            pos_t = active_mask.nonzero(as_tuple=False).squeeze(-1)
+            active_counts = decision_counts[pos_t]
+            max_count = int(active_counts.max().item())
+            offsets = torch.arange(max_count, dtype=torch.long, device=device).unsqueeze(0)
+            expanded_offsets = offsets.expand(pos_t.shape[0], -1)
+            valid_offsets = expanded_offsets < active_counts.unsqueeze(1)
+            idx_t = (decision_starts[pos_t].unsqueeze(1) + expanded_offsets)[valid_offsets]
+            pos_t = torch.repeat_interleave(pos_t, active_counts)
             option_idx = rb.decision_option_idx[idx_t]
             target_idx = rb.decision_target_idx[idx_t]
             masks = rb.decision_mask[idx_t]

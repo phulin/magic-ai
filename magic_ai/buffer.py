@@ -57,6 +57,9 @@ class RolloutBuffer(nn.Module):
         _reg("slot_occupied", (capacity, zone_slot_count), torch.float32)
         _reg("slot_tapped", (capacity, zone_slot_count), torch.float32)
         _reg("game_info", (capacity, game_info_dim), torch.float32)
+        _reg("trace_kind_id", (capacity,), torch.long)
+        _reg("decision_start", (capacity,), torch.long)
+        _reg("decision_count", (capacity,), torch.long)
         _reg("pending_kind_id", (capacity,), torch.long)
         _reg("option_kind_ids", (capacity, max_options), torch.long)
         _reg("option_scalars", (capacity, max_options, option_scalar_dim), torch.float32)
@@ -122,6 +125,9 @@ class RolloutBuffer(nn.Module):
     slot_occupied: Tensor
     slot_tapped: Tensor
     game_info: Tensor
+    trace_kind_id: Tensor
+    decision_start: Tensor
+    decision_count: Tensor
     pending_kind_id: Tensor
     option_kind_ids: Tensor
     option_scalars: Tensor
@@ -201,13 +207,16 @@ class RolloutBuffer(nn.Module):
                 merged.append((range_start, range_len))
         self._free_decision_ranges = merged
 
-    def release(
-        self, *, step_indices: list[int], decision_starts: list[int], decision_counts: list[int]
-    ) -> None:
+    def release_steps(self, step_indices: list[int]) -> None:
+        if not step_indices:
+            return
+        idx_t = torch.tensor(step_indices, dtype=torch.long, device=self.device)
+        decision_starts = self.decision_start[idx_t].detach().cpu().tolist()
+        decision_counts = self.decision_count[idx_t].detach().cpu().tolist()
         for step_idx in step_indices:
             self._free_step_rows.append(step_idx)
         for start, count in zip(decision_starts, decision_counts, strict=True):
-            self._free_decision_range(start, count)
+            self._free_decision_range(int(start), int(count))
 
     def ingest_batch(self, parsed_steps: list[ParsedStep]) -> BufferWrite:
         n = len(parsed_steps)
@@ -240,6 +249,11 @@ class RolloutBuffer(nn.Module):
         self.game_info[step_indices] = torch.tensor(
             [p.parsed_state.game_info for p in parsed_steps],
             dtype=torch.float32,
+            device=device,
+        )
+        self.trace_kind_id[step_indices] = torch.tensor(
+            [p.trace_kind_id for p in parsed_steps],
+            dtype=torch.long,
             device=device,
         )
         self.pending_kind_id[step_indices] = torch.tensor(
@@ -328,6 +342,17 @@ class RolloutBuffer(nn.Module):
             self.uses_none_head[start:end] = torch.tensor(
                 parsed.uses_none_head, dtype=torch.bool, device=device
             )
+
+        self.decision_start[step_indices] = torch.tensor(
+            decision_starts,
+            dtype=torch.long,
+            device=device,
+        )
+        self.decision_count[step_indices] = torch.tensor(
+            decision_counts,
+            dtype=torch.long,
+            device=device,
+        )
 
         return BufferWrite(
             step_indices=step_indices,

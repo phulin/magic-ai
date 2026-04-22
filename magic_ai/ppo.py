@@ -13,7 +13,7 @@ from torch.nn import functional as F
 
 from magic_ai.actions import ActionRequest, PendingState
 from magic_ai.game_state import GameStateSnapshot
-from magic_ai.model import ActionTrace, CachedPolicyInput, PPOPolicy
+from magic_ai.model import ActionTrace, PPOPolicy
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ class RolloutStep:
     old_log_prob: float
     value: float
     reward: float = 0.0
-    cache: CachedPolicyInput | None = None
+    replay_idx: int | None = None
 
 
 @dataclass(frozen=True)
@@ -55,18 +55,17 @@ def ppo_update(
 ) -> PPOStats:
     """Run PPO over cached policy inputs.
 
-    Each rollout step must carry a ``CachedPolicyInput`` produced at sample
-    time. The cache stores only parsed integer/scalar tensors and decision
-    layouts; the encoder stack is re-run on every minibatch so all encoder,
-    trunk, and head parameters receive gradients.
+    Each rollout step must carry a replay row index produced at sample time.
+    The encoder stack is re-run on every minibatch so all encoder, trunk, and
+    head parameters receive gradients.
     """
 
     if not steps:
         raise ValueError("cannot update PPO with an empty rollout")
     if returns.numel() != len(steps):
         raise ValueError("returns length must match rollout length")
-    if any(step.cache is None for step in steps):
-        raise ValueError("all rollout steps must include cached policy inputs")
+    if any(step.replay_idx is None for step in steps):
+        raise ValueError("all rollout steps must include replay rows")
 
     device = next(policy.parameters()).device
     returns = returns.to(device=device, dtype=torch.float32)
@@ -88,9 +87,9 @@ def ppo_update(
         random.shuffle(indices)
         for start in range(0, len(indices), minibatch_size):
             batch_indices = indices[start : start + minibatch_size]
-            cached_steps = [cast(CachedPolicyInput, steps[idx].cache) for idx in batch_indices]
-            batch_log_probs, batch_entropies, batch_values = policy.evaluate_cached_batch(
-                cached_steps
+            replay_rows = [cast(int, steps[idx].replay_idx) for idx in batch_indices]
+            batch_log_probs, batch_entropies, batch_values = policy.evaluate_replay_batch(
+                replay_rows
             )
             batch_old_log_probs = old_log_probs[batch_indices]
             batch_returns = returns[batch_indices]
@@ -179,6 +178,6 @@ def rollout_step_from_policy(
         trace=policy_step.trace,
         old_log_prob=float(policy_step.log_prob.detach().cpu()),
         value=float(policy_step.value.detach().cpu()),
-        cache=policy_step.cache,
+        replay_idx=policy_step.replay_idx,
     )
     return policy_step.action, rollout_step

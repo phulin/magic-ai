@@ -248,8 +248,8 @@ def main() -> None:
                 steps=len(pending_steps),
                 win_stats=win_stats,
             )
-            policy.release_cached_steps(
-                [step.cache for step in pending_steps if step.cache is not None]
+            policy.release_replay_rows(
+                [step.replay_idx for step in pending_steps if step.replay_idx is not None]
             )
             pending_steps.clear()
             pending_returns.clear()
@@ -512,7 +512,7 @@ def train_batched_envs(
                         trace=policy_step.trace,
                         old_log_prob=float(policy_step.log_prob.detach().cpu()),
                         value=float(policy_step.value.detach().cpu()),
-                        cache=policy_step.cache,
+                        replay_idx=policy_step.replay_idx,
                     )
                 )
                 env.episode_transcript.append(
@@ -569,8 +569,8 @@ def train_batched_envs(
                 steps=len(pending_steps),
                 win_stats=win_stats,
             )
-            policy.release_cached_steps(
-                [step.cache for step in pending_steps if step.cache is not None]
+            policy.release_replay_rows(
+                [step.replay_idx for step in pending_steps if step.replay_idx is not None]
             )
             pending_steps.clear()
             pending_returns.clear()
@@ -616,8 +616,8 @@ def train_batched_envs(
             flush=True,
         )
         log_ppo_stats(stats, games=completed_games, steps=len(pending_steps), win_stats=win_stats)
-        policy.release_cached_steps(
-            [step.cache for step in pending_steps if step.cache is not None]
+        policy.release_replay_rows(
+            [step.replay_idx for step in pending_steps if step.replay_idx is not None]
         )
 
 
