@@ -117,6 +117,8 @@ class PolicyStep:
     value: Tensor
     entropy: Tensor
     replay_idx: int | None = None
+    selected_choice_cols: tuple[int, ...] = ()
+    may_selected: int = 0
 
 
 class PPOPolicy(nn.Module):
@@ -429,13 +431,13 @@ class PPOPolicy(nn.Module):
                 return []
             parsed_batch = self._parsed_batch_from_steps(parsed_steps)
 
-        if not parsed_batch.pendings:
+        n = int(parsed_batch.trace_kind_ids.shape[0])
+        if n == 0:
             return []
 
         device = self.device
         rb = self.rollout_buffer
         write = rb.ingest_parsed_batch(parsed_batch)
-        n = len(parsed_batch.pendings)
 
         forward = self._forward_batch(write.step_indices)
 
@@ -510,9 +512,12 @@ class PPOPolicy(nn.Module):
         may_lookup = {step_idx: pos for pos, step_idx in enumerate(may_positions)}
         results: list[PolicyStep] = []
         offset = 0
-        for step_idx, (trace_kind, pending) in enumerate(
-            zip(parsed_batch.trace_kinds, parsed_batch.pendings, strict=True)
-        ):
+        for step_idx, trace_kind in enumerate(parsed_batch.trace_kinds):
+            pending = (
+                parsed_batch.pendings[step_idx]
+                if step_idx < len(parsed_batch.pendings)
+                else cast(PendingState, {})
+            )
             value = forward.values[step_idx]
             replay_idx = int(write.step_indices[step_idx])
             decision_count = write.decision_counts[step_idx]
@@ -530,6 +535,7 @@ class PPOPolicy(nn.Module):
                         value=value,
                         entropy=may_entropies[pos],
                         replay_idx=replay_idx,
+                        may_selected=int(sel_scalar >= 0.5),
                     )
                 )
                 continue
@@ -544,6 +550,7 @@ class PPOPolicy(nn.Module):
                         value=value,
                         entropy=zero,
                         replay_idx=replay_idx,
+                        selected_choice_cols=(),
                     )
                 )
                 continue
@@ -551,7 +558,10 @@ class PPOPolicy(nn.Module):
             assert per_step_log_prob_sum is not None and per_step_entropy_sum is not None
             step_selected = decision_selected_cpu[offset : offset + decision_count]
             offset += decision_count
-            trace, action = self._decode_action(trace_kind, pending, step_selected)
+            if pending:
+                trace, action = self._decode_action(trace_kind, pending, step_selected)
+            else:
+                trace, action = self._trace_action_without_pending(trace_kind, step_selected)
             results.append(
                 PolicyStep(
                     action=action,
@@ -560,6 +570,7 @@ class PPOPolicy(nn.Module):
                     value=value,
                     entropy=per_step_entropy_sum[step_idx],
                     replay_idx=replay_idx,
+                    selected_choice_cols=tuple(step_selected),
                 )
             )
         return results
@@ -1226,6 +1237,26 @@ class PPOPolicy(nn.Module):
             ActionTrace("choice_index", indices=(selected_idx,)),
             action_from_choice_index(selected_idx),
         )
+
+    def _trace_action_without_pending(
+        self,
+        trace_kind: TraceKind,
+        selected: list[int],
+    ) -> tuple[ActionTrace, ActionRequest]:
+        if trace_kind == "attackers":
+            binary = tuple(float(v == 1) for v in selected)
+            return ActionTrace("attackers", binary=binary), cast(ActionRequest, {})
+        if trace_kind == "blockers":
+            indices = tuple(v - 1 for v in selected)
+            return ActionTrace("blockers", indices=indices), cast(ActionRequest, {})
+        if trace_kind == "choice_color":
+            selected_idx = selected[0]
+            return ActionTrace("choice_color", indices=(selected_idx,)), cast(ActionRequest, {})
+        if trace_kind == "choice_ids":
+            selected_idx = selected[0]
+            return ActionTrace("choice_ids", indices=(selected_idx,)), cast(ActionRequest, {})
+        selected_idx = selected[0] if selected else 0
+        return ActionTrace("priority", indices=(selected_idx,)), cast(ActionRequest, {})
 
     def _build_decision_layout(
         self,

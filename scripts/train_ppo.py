@@ -33,6 +33,11 @@ from magic_ai.native_encoder import (  # noqa: E402
     NativeEncodedBatch,
     NativeEncodingError,
 )
+from magic_ai.native_rollout import (  # noqa: E402
+    NativeMageStatus,
+    NativeRolloutDriver,
+    NativeRolloutUnavailable,
+)
 from magic_ai.ppo import (  # noqa: E402
     PPOStats,
     RolloutStep,
@@ -145,8 +150,36 @@ def main() -> None:
             optimizer.load_state_dict(checkpoint["optimizer"])
 
     mage = importlib.import_module("mage")
+    native_status = NativeMageStatus.for_mage(mage)
+    if args.native_rollout:
+        try:
+            native_rollout = NativeRolloutDriver.for_mage(mage)
+        except NativeRolloutUnavailable as exc:
+            raise SystemExit(f"--native-rollout is unavailable: {exc}") from exc
+        train_native_batched_envs(
+            args,
+            mage,
+            deck_a,
+            deck_b,
+            policy,
+            native_encoder,
+            optimizer,
+            native_rollout,
+        )
+        save_checkpoint(args.output, policy, optimizer, args)
+        print(f"saved checkpoint -> {args.output}")
+        return
     if args.num_envs > 1:
-        train_batched_envs(args, mage, deck_a, deck_b, policy, native_encoder, optimizer)
+        train_batched_envs(
+            args,
+            mage,
+            deck_a,
+            deck_b,
+            policy,
+            native_encoder,
+            optimizer,
+            native_status=native_status,
+        )
         save_checkpoint(args.output, policy, optimizer, args)
         print(f"saved checkpoint -> {args.output}")
         return
@@ -174,8 +207,8 @@ def main() -> None:
         try:
             for _ in range(args.max_steps_per_game):
                 pending = game.pending or game.legal()
-                if game.is_over:
-                    winner = str(game.winner)
+                if _game_is_over(game, native_status):
+                    winner = _game_winner(game, native_status)
                     break
                 if pending is None:
                     game.refresh_state()
@@ -198,8 +231,8 @@ def main() -> None:
                 )
                 game.step(cast(dict[Any, Any], action))
 
-            if game.is_over:
-                winner = str(game.winner)
+            if _game_is_over(game, native_status):
+                winner = _game_winner(game, native_status)
             elif not winner:
                 winner = ""
         finally:
@@ -349,6 +382,11 @@ def parse_args() -> argparse.Namespace:
         default=80,
         help="maximum actions to print from a sample rollout game at each PPO update",
     )
+    parser.add_argument(
+        "--native-rollout",
+        action="store_true",
+        help="require the no-JSON native rollout API instead of the JSON Game facade",
+    )
     parser.add_argument("--wandb-project", default="magic-ai")
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
@@ -422,6 +460,32 @@ def classify_winner(
     return "draw"
 
 
+def _game_state(game: Any) -> GameStateSnapshot:
+    return cast(GameStateSnapshot, game.state)
+
+
+def _game_is_over(game: Any, native_status: NativeMageStatus | None) -> bool:
+    if native_status is None:
+        return bool(game.is_over)
+    return native_status.is_over(game)
+
+
+def _game_winner(game: Any, native_status: NativeMageStatus | None) -> str:
+    if native_status is None:
+        return str(game.winner)
+    return native_status.winner(game)
+
+
+def _pending_player_idx(
+    game: Any,
+    pending: PendingState,
+    native_status: NativeMageStatus | None,
+) -> int:
+    if native_status is None:
+        return int(pending.get("player_idx", 0))
+    return native_status.pending_player(game)
+
+
 def train_batched_envs(
     args: argparse.Namespace,
     mage: Any,
@@ -430,6 +494,8 @@ def train_batched_envs(
     policy: PPOPolicy,
     native_encoder: NativeBatchEncoder,
     optimizer: torch.optim.Optimizer,
+    *,
+    native_status: NativeMageStatus | None = None,
 ) -> None:
     pending_steps: list[RolloutStep] = []
     pending_returns: list[torch.Tensor] = []
@@ -466,7 +532,7 @@ def train_batched_envs(
         nonlocal completed_games, last_sample_transcript
         win_stats.record(
             classify_winner(
-                cast(GameStateSnapshot, env.game.state),
+                _game_state(env.game),
                 winner,
                 args.name_a,
                 args.name_b,
@@ -486,8 +552,8 @@ def train_batched_envs(
         remaining_games: list[LiveGame] = []
         for env in live_games:
             pending = env.game.pending or env.game.legal()
-            if env.game.is_over:
-                finish_game(env, str(env.game.winner))
+            if _game_is_over(env.game, native_status):
+                finish_game(env, _game_winner(env.game, native_status))
                 continue
             if env.action_count >= args.max_steps_per_game:
                 finish_game(env, "")
@@ -504,7 +570,8 @@ def train_batched_envs(
         if ready:
             pendings = [pending for _env, _state, pending in ready]
             perspective_player_indices: list[int] = [
-                int(pending.get("player_idx", 0)) for pending in pendings
+                _pending_player_idx(env.game, pending, native_status)
+                for env, _state, pending in ready
             ]
             parsed_batch: NativeEncodedBatch | Any
             try:
@@ -532,7 +599,7 @@ def train_batched_envs(
                     deterministic=args.deterministic_rollout,
                 )
             for (env, state, pending), policy_step in zip(ready, policy_steps, strict=True):
-                player_idx = int(pending.get("player_idx", 0))
+                player_idx = _pending_player_idx(env.game, pending, native_status)
                 player = state["players"][player_idx]
                 env.episode_steps.append(
                     RolloutStep(
@@ -559,8 +626,8 @@ def train_batched_envs(
 
         still_live: list[LiveGame] = []
         for env in live_games:
-            if env.game.is_over:
-                finish_game(env, str(env.game.winner))
+            if _game_is_over(env.game, native_status):
+                finish_game(env, _game_winner(env.game, native_status))
             else:
                 still_live.append(env)
         live_games = still_live
@@ -636,6 +703,209 @@ def train_batched_envs(
             last_sample_transcript,
             winner="",
             max_actions=args.sample_actions,
+        )
+        print(
+            "final_update",
+            f"games={completed_games}",
+            f"steps={len(pending_steps)}",
+            f"loss={stats.loss:.4f}",
+            f"policy={stats.policy_loss:.4f}",
+            f"value={stats.value_loss:.4f}",
+            f"entropy={stats.entropy:.4f}",
+            flush=True,
+        )
+        log_ppo_stats(stats, games=completed_games, steps=len(pending_steps), win_stats=win_stats)
+        policy.release_replay_rows(
+            [step.replay_idx for step in pending_steps if step.replay_idx is not None]
+        )
+
+
+def train_native_batched_envs(
+    args: argparse.Namespace,
+    mage: Any,
+    deck_a: dict[str, Any],
+    deck_b: dict[str, Any],
+    policy: PPOPolicy,
+    native_encoder: NativeBatchEncoder,
+    optimizer: torch.optim.Optimizer,
+    native_rollout: NativeRolloutDriver,
+) -> None:
+    if not native_encoder.is_available:
+        raise SystemExit("--native-rollout requires MageEncodeBatch")
+
+    pending_steps: list[RolloutStep] = []
+    pending_returns: list[torch.Tensor] = []
+    completed_games = 0
+    last_saved_games = 0
+    next_episode_idx = 0
+    live_games: list[LiveGame] = []
+    win_stats = WinFractionStats()
+
+    def start_game(episode_idx: int) -> LiveGame:
+        return LiveGame(
+            game=mage.new_game(
+                deck_a,
+                deck_b,
+                name_a=args.name_a,
+                name_b=args.name_b,
+                seed=args.seed + episode_idx,
+                shuffle=not args.no_shuffle,
+                hand_size=args.hand_size,
+            ),
+            episode_idx=episode_idx,
+            episode_steps=[],
+            episode_transcript=[],
+        )
+
+    def maybe_start_games() -> None:
+        nonlocal next_episode_idx
+        while len(live_games) < args.num_envs and next_episode_idx < args.episodes:
+            live_games.append(start_game(next_episode_idx))
+            next_episode_idx += 1
+
+    def finish_game(env: LiveGame, winner_idx: int) -> None:
+        nonlocal completed_games
+        env.game.close()
+        winner = str(winner_idx) if winner_idx >= 0 else ""
+        if env.episode_steps:
+            returns = terminal_returns(env.episode_steps, winner=winner, gamma=args.gamma)
+            pending_steps.extend(env.episode_steps)
+            pending_returns.append(returns)
+        if winner_idx == 0:
+            win_stats.p1_wins += 1
+        elif winner_idx == 1:
+            win_stats.p2_wins += 1
+        else:
+            win_stats.draws += 1
+        completed_games += 1
+
+    maybe_start_games()
+    while live_games:
+        ready_t, over_t, player_t, winner_t = native_rollout.poll([env.game for env in live_games])
+        ready_envs: list[LiveGame] = []
+        ready_players: list[int] = []
+        still_live: list[LiveGame] = []
+        for idx, env in enumerate(live_games):
+            if int(over_t[idx]) or env.action_count >= args.max_steps_per_game:
+                finish_game(env, int(winner_t[idx]) if int(over_t[idx]) else -1)
+                continue
+            still_live.append(env)
+            if int(ready_t[idx]):
+                ready_envs.append(env)
+                ready_players.append(int(player_t[idx]))
+        live_games = still_live
+
+        if ready_envs:
+            parsed_batch = native_encoder.encode_handles(
+                [env.game for env in ready_envs],
+                perspective_player_indices=ready_players,
+            )
+            with torch.no_grad():
+                policy_steps = policy.act_parsed_batch(
+                    parsed_batch,
+                    deterministic=args.deterministic_rollout,
+                )
+
+            starts: list[int] = []
+            counts: list[int] = []
+            selected_cols: list[int] = []
+            may_selected: list[int] = []
+            cursor = 0
+            for env, player_idx, policy_step in zip(
+                ready_envs, ready_players, policy_steps, strict=True
+            ):
+                cols = list(policy_step.selected_choice_cols)
+                starts.append(cursor)
+                counts.append(len(cols))
+                selected_cols.extend(cols)
+                may_selected.append(policy_step.may_selected)
+                cursor += len(cols)
+                env.episode_steps.append(
+                    RolloutStep(
+                        state=cast(GameStateSnapshot, {}),
+                        pending=cast(PendingState, {}),
+                        perspective_player_idx=player_idx,
+                        player_id=str(player_idx),
+                        player_name=str(player_idx),
+                        trace=policy_step.trace,
+                        old_log_prob=float(policy_step.log_prob.detach().cpu()),
+                        value=float(policy_step.value.detach().cpu()),
+                        replay_idx=policy_step.replay_idx,
+                    )
+                )
+                env.action_count += 1
+
+            native_rollout.step_by_choice(
+                [env.game for env in ready_envs],
+                decision_starts=starts,
+                decision_counts=counts,
+                selected_choice_cols=selected_cols,
+                may_selected=may_selected,
+                max_options=args.max_options,
+                max_targets_per_option=args.max_targets_per_option,
+            )
+
+        if len(pending_steps) >= args.rollout_steps:
+            stats = ppo_update(
+                policy,
+                optimizer,
+                pending_steps,
+                torch.cat(pending_returns),
+                epochs=args.ppo_epochs,
+                minibatch_size=args.minibatch_size,
+                clip_epsilon=args.clip_epsilon,
+                value_coef=args.value_coef,
+                entropy_coef=args.entropy_coef,
+                max_grad_norm=args.max_grad_norm,
+            )
+            print(
+                "update",
+                f"games={completed_games}",
+                f"steps={len(pending_steps)}",
+                f"loss={stats.loss:.4f}",
+                f"policy={stats.policy_loss:.4f}",
+                f"value={stats.value_loss:.4f}",
+                f"entropy={stats.entropy:.4f}",
+                f"kl={stats.approx_kl:.4f}",
+                f"clip={stats.clip_fraction:.3f}",
+                flush=True,
+            )
+            log_ppo_stats(
+                stats,
+                games=completed_games,
+                steps=len(pending_steps),
+                win_stats=win_stats,
+            )
+            policy.release_replay_rows(
+                [step.replay_idx for step in pending_steps if step.replay_idx is not None]
+            )
+            pending_steps.clear()
+            pending_returns.clear()
+            win_stats.reset()
+
+        if (
+            args.save_every
+            and completed_games > 0
+            and completed_games % args.save_every == 0
+            and completed_games != last_saved_games
+        ):
+            save_checkpoint(args.output, policy, optimizer, args)
+            last_saved_games = completed_games
+
+        maybe_start_games()
+
+    if pending_steps:
+        stats = ppo_update(
+            policy,
+            optimizer,
+            pending_steps,
+            torch.cat(pending_returns),
+            epochs=args.ppo_epochs,
+            minibatch_size=args.minibatch_size,
+            clip_epsilon=args.clip_epsilon,
+            value_coef=args.value_coef,
+            entropy_coef=args.entropy_coef,
+            max_grad_norm=args.max_grad_norm,
         )
         print(
             "final_update",

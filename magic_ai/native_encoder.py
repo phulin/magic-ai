@@ -385,6 +385,38 @@ class NativeBatchEncoder:
             raise NativeEncodingError("empty batch")
         if batch_size != len(pendings) or batch_size != len(perspective_player_indices):
             raise NativeEncodingError("games, pendings, and perspective_player_indices must match")
+        return self._encode_games(
+            games,
+            pendings,
+            perspective_player_indices=perspective_player_indices,
+        )
+
+    def encode_handles(
+        self,
+        games: list[Any],
+        *,
+        perspective_player_indices: list[int],
+    ) -> NativeEncodedBatch:
+        if not self.is_available:
+            raise NativeEncodingError("MageEncodeBatch is unavailable")
+        if len(games) != len(perspective_player_indices):
+            raise NativeEncodingError("games and perspective_player_indices must match")
+        return self._encode_games(
+            games,
+            [],
+            perspective_player_indices=perspective_player_indices,
+        )
+
+    def _encode_games(
+        self,
+        games: list[Any],
+        pendings: list[PendingState],
+        *,
+        perspective_player_indices: list[int],
+    ) -> NativeEncodedBatch:
+        batch_size = len(games)
+        if batch_size == 0:
+            raise NativeEncodingError("empty batch")
         decision_capacity = max(1, batch_size * self.max_options)
         buffers = self._alloc(batch_size, decision_capacity)
         if self.ffi is not None:
