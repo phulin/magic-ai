@@ -149,6 +149,17 @@ class ParsedGameState:
     card_id_to_slot: dict[str, int]  # used by ActionOptionsEncoder parsing
 
 
+@dataclass(frozen=True)
+class ParsedGameStateBatch:
+    """Batched parsed game state fields for one actor forward."""
+
+    slot_card_rows: Tensor  # [N, ZONE_SLOT_COUNT]
+    slot_occupied: Tensor  # [N, ZONE_SLOT_COUNT]
+    slot_tapped: Tensor  # [N, ZONE_SLOT_COUNT]
+    game_info: Tensor  # [N, GAME_INFO_DIM]
+    card_id_to_slots: list[dict[str, int]]
+
+
 class GameStateEncoder(nn.Module):
     """Encode one engine game-state snapshot into a fixed MLP-ready vector.
 
@@ -289,6 +300,60 @@ class GameStateEncoder(nn.Module):
             slot_tapped=tapped,
             game_info=game_info,
             card_id_to_slot=card_id_to_slot,
+        )
+
+    def parse_state_batch(
+        self,
+        states: Sequence[GameStateSnapshot],
+        perspective_player_indices: Sequence[int | None],
+    ) -> ParsedGameStateBatch:
+        n = len(states)
+        slot_card_rows = torch.zeros((n, ZONE_SLOT_COUNT), dtype=torch.long)
+        slot_occupied = torch.zeros((n, ZONE_SLOT_COUNT), dtype=torch.float32)
+        slot_tapped = torch.zeros((n, ZONE_SLOT_COUNT), dtype=torch.float32)
+        game_info = torch.zeros((n, GAME_INFO_DIM), dtype=torch.float32)
+        card_id_to_slots: list[dict[str, int]] = []
+
+        for batch_idx, (state, perspective_player_idx) in enumerate(
+            zip(states, perspective_player_indices, strict=True)
+        ):
+            player_idx = self._resolve_perspective_player_idx(state, perspective_player_idx)
+            players = state["players"]
+            if not 0 <= player_idx < len(players):
+                raise IndexError(f"player index {player_idx} outside players list")
+
+            all_cards = self._collect_slot_cards(state, player_idx)
+            occupied: list[float] = [0.0] * ZONE_SLOT_COUNT
+            card_id_to_slot: dict[str, int] = {}
+
+            for slot_idx, card in enumerate(all_cards):
+                if card is None:
+                    continue
+                name = card.get("Name", "")
+                slot_card_rows[batch_idx, slot_idx] = self._card_name_to_row.get(_card_key(name), 0)
+                slot_occupied[batch_idx, slot_idx] = 1.0
+                occupied[slot_idx] = 1.0
+                is_bf = float(ZONE_SPECS[slot_idx // self.max_cards_per_zone][1] == "battlefield")
+                if card.get("Tapped", False) and is_bf:
+                    slot_tapped[batch_idx, slot_idx] = 1.0
+                card_id = card.get("ID")
+                if card_id:
+                    card_id_to_slot[card_id] = slot_idx
+
+            _fill_game_info(
+                game_info[batch_idx],
+                state,
+                perspective_player_idx=player_idx,
+                occupied=occupied,
+            )
+            card_id_to_slots.append(card_id_to_slot)
+
+        return ParsedGameStateBatch(
+            slot_card_rows=slot_card_rows,
+            slot_occupied=slot_occupied,
+            slot_tapped=slot_tapped,
+            game_info=game_info,
+            card_id_to_slots=card_id_to_slots,
         )
 
     def embed_slot_vectors(
@@ -460,6 +525,73 @@ def _clip_norm(value: int | float | None, maximum: float) -> float:
     if value is None:
         return 0.0
     return max(0.0, min(float(value), maximum)) / maximum
+
+
+def _fill_game_info(
+    out: Tensor,
+    state: GameStateSnapshot,
+    *,
+    perspective_player_idx: int,
+    occupied: Sequence[float],
+) -> None:
+    players = state["players"]
+    self_player = players[perspective_player_idx]
+    opponent = players[1 - perspective_player_idx] if len(players) == 2 else None
+    pending = state.get("pending")
+
+    cursor = 0
+    out[cursor] = _clip_norm(state.get("turn", 0), MAX_TURN)
+    cursor += 1
+    out[cursor] = float(_is_active_player(state, self_player))
+    cursor += 1
+    out[cursor] = float(pending is not None and pending.get("player_idx") == perspective_player_idx)
+    cursor += 1
+    out[cursor] = _clip_norm(self_player.get("Life", 0), MAX_LIFE)
+    cursor += 1
+    out[cursor] = _clip_norm(opponent.get("Life", 0), MAX_LIFE) if opponent else 0.0
+    cursor += 1
+
+    for player in (self_player, opponent):
+        if player is None:
+            out[cursor : cursor + 4] = 0.0
+        else:
+            out[cursor] = _clip_norm(player.get("HandCount", 0), MAX_CARDS_PER_ZONE)
+            out[cursor + 1] = _clip_norm(player.get("GraveyardCount", 0), MAX_CARDS_PER_ZONE)
+            out[cursor + 2] = _clip_norm(len(player.get("Battlefield") or []), MAX_CARDS_PER_ZONE)
+            out[cursor + 3] = _clip_norm(player.get("LibraryCount", 0), MAX_LIBRARY)
+        cursor += 4
+
+    for player in (self_player, opponent):
+        if player is None:
+            out[cursor : cursor + len(MANA_COLORS)] = 0.0
+        else:
+            mana_pool = player.get("ManaPool", cast(ManaPoolState, {}))
+            for offset, color in enumerate(MANA_COLORS):
+                out[cursor + offset] = _clip_norm(mana_pool.get(color, 0), MAX_MANA)
+        cursor += len(MANA_COLORS)
+
+    option_count = len(pending.get("options", [])) if pending is not None else 0
+    stack_count = len(state.get("stack") or [])
+    out[cursor] = _clip_norm(option_count, MAX_PENDING_OPTIONS)
+    out[cursor + 1] = _clip_norm(stack_count, MAX_PENDING_OPTIONS)
+    cursor += 2
+
+    normalized_step = " ".join(state.get("step", "").split()).casefold()
+    step_idx = len(STEP_NAMES) - 1
+    for idx, known_step in enumerate(STEP_NAMES[:-1]):
+        if normalized_step == known_step.casefold():
+            step_idx = idx
+            break
+    out[cursor : cursor + len(STEP_NAMES)] = 0.0
+    out[cursor + step_idx] = 1.0
+    cursor += len(STEP_NAMES)
+
+    for offset, value in enumerate(occupied):
+        out[cursor + offset] = value
+    cursor += len(occupied)
+
+    if cursor != GAME_INFO_DIM:
+        raise RuntimeError(f"game_info dim {cursor} != {GAME_INFO_DIM}")
 
 
 def _player_count_features(player: PlayerState | None) -> list[float]:

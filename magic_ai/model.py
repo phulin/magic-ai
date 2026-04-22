@@ -16,6 +16,8 @@ from magic_ai.actions import (
     TARGET_SCALAR_DIM,
     ActionOptionsEncoder,
     ActionRequest,
+    LegalActionCandidate,
+    ParsedActionBatch,
     ParsedActionInputs,
     PendingState,
     action_from_attackers,
@@ -34,6 +36,7 @@ from magic_ai.game_state import (
     GameStateEncoder,
     GameStateSnapshot,
     ParsedGameState,
+    ParsedGameStateBatch,
 )
 
 TraceKind = Literal[
@@ -86,6 +89,23 @@ class ParsedStep:
     decision_mask: list[list[bool]]  # [G, C]
     uses_none_head: list[bool]  # [G]
     pending: PendingState
+
+
+@dataclass(frozen=True)
+class ParsedBatch:
+    """Batched parsed policy inputs for one actor forward."""
+
+    parsed_state: ParsedGameStateBatch
+    parsed_action: ParsedActionBatch
+    trace_kinds: list[TraceKind]
+    trace_kind_ids: Tensor  # [N]
+    pendings: list[PendingState]
+    decision_option_idx: Tensor  # [total_groups, max_cached_choices]
+    decision_target_idx: Tensor  # [total_groups, max_cached_choices]
+    decision_mask: Tensor  # [total_groups, max_cached_choices]
+    uses_none_head: Tensor  # [total_groups]
+    decision_starts: list[int]
+    decision_counts: list[int]
 
 
 @dataclass(frozen=True)
@@ -200,6 +220,165 @@ class PPOPolicy(nn.Module):
             pending=pending,
         )
 
+    def parse_inputs_batch(
+        self,
+        states: list[GameStateSnapshot],
+        pendings: list[PendingState],
+        *,
+        perspective_player_indices: list[int | None],
+    ) -> ParsedBatch:
+        parsed_state = self.game_state_encoder.parse_state_batch(
+            states,
+            perspective_player_indices,
+        )
+        resolved_player_indices = [
+            self.game_state_encoder._resolve_perspective_player_idx(state, perspective_player_idx)
+            for state, perspective_player_idx in zip(
+                states, perspective_player_indices, strict=True
+            )
+        ]
+        parsed_action = self.action_encoder.parse_pending_batch(
+            states,
+            pendings,
+            perspective_player_indices=resolved_player_indices,
+            card_id_to_slots=parsed_state.card_id_to_slots,
+        )
+
+        trace_kinds = [_trace_kind_for_pending(pending) for pending in pendings]
+        trace_kind_ids = torch.tensor(
+            [TRACE_KIND_TO_ID[trace_kind] for trace_kind in trace_kinds],
+            dtype=torch.long,
+        )
+
+        flat_option_idx: list[list[int]] = []
+        flat_target_idx: list[list[int]] = []
+        flat_mask: list[list[bool]] = []
+        flat_uses_none: list[bool] = []
+        decision_starts: list[int] = []
+        decision_counts: list[int] = []
+        cursor = 0
+
+        for step_idx, (trace_kind, pending) in enumerate(zip(trace_kinds, pendings, strict=True)):
+            option_idx, target_idx, mask, uses_none = self._build_decision_layout_batch_step(
+                trace_kind,
+                pending,
+                num_present_options=int(parsed_action.num_present_options[step_idx].item()),
+                target_mask=parsed_action.target_mask[step_idx],
+                priority_candidates=parsed_action.priority_candidates[step_idx],
+            )
+            decision_starts.append(cursor)
+            decision_counts.append(len(option_idx))
+            cursor += len(option_idx)
+            flat_option_idx.extend(option_idx)
+            flat_target_idx.extend(target_idx)
+            flat_mask.extend(mask)
+            flat_uses_none.extend(uses_none)
+
+        if flat_option_idx:
+            decision_option_idx = torch.tensor(flat_option_idx, dtype=torch.long)
+            decision_target_idx = torch.tensor(flat_target_idx, dtype=torch.long)
+            decision_mask = torch.tensor(flat_mask, dtype=torch.bool)
+            uses_none_head = torch.tensor(flat_uses_none, dtype=torch.bool)
+        else:
+            decision_option_idx = torch.zeros((0, self.max_cached_choices), dtype=torch.long)
+            decision_target_idx = torch.zeros((0, self.max_cached_choices), dtype=torch.long)
+            decision_mask = torch.zeros((0, self.max_cached_choices), dtype=torch.bool)
+            uses_none_head = torch.zeros((0,), dtype=torch.bool)
+
+        return ParsedBatch(
+            parsed_state=parsed_state,
+            parsed_action=parsed_action,
+            trace_kinds=trace_kinds,
+            trace_kind_ids=trace_kind_ids,
+            pendings=pendings,
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            decision_starts=decision_starts,
+            decision_counts=decision_counts,
+        )
+
+    def _build_decision_layout_batch_step(
+        self,
+        trace_kind: TraceKind,
+        pending: PendingState,
+        *,
+        num_present_options: int,
+        target_mask: Tensor,
+        priority_candidates: list[LegalActionCandidate],
+    ) -> tuple[list[list[int]], list[list[int]], list[list[bool]], list[bool]]:
+        choices = self.max_cached_choices
+
+        if trace_kind == "may":
+            return [], [], [], []
+
+        if trace_kind == "priority":
+            candidates = priority_candidates[:choices]
+            if not candidates:
+                return [], [], [], []
+            option_row = [-1] * choices
+            target_row = [-1] * choices
+            mask_row = [False] * choices
+            for col, cand in enumerate(candidates):
+                option_row[col] = cand.option_index
+                if cand.target_index is not None:
+                    target_row[col] = cand.target_index
+                mask_row[col] = True
+            return [option_row], [target_row], [mask_row], [False]
+
+        option_count = min(num_present_options, self.max_options)
+
+        if trace_kind == "attackers":
+            if option_count == 0:
+                return [], [], [], []
+            option_idx_l: list[list[int]] = []
+            target_idx_l: list[list[int]] = []
+            mask_l: list[list[bool]] = []
+            for i in range(option_count):
+                option_row = [-1] * choices
+                option_row[1] = i
+                target_row = [-1] * choices
+                mask_row = [False] * choices
+                mask_row[0] = True
+                mask_row[1] = True
+                option_idx_l.append(option_row)
+                target_idx_l.append(target_row)
+                mask_l.append(mask_row)
+            return option_idx_l, target_idx_l, mask_l, [False] * option_count
+
+        if trace_kind == "blockers":
+            if option_count == 0:
+                return [], [], [], []
+            option_idx_l = []
+            target_idx_l = []
+            mask_l = []
+            target_counts = target_mask[:option_count].count_nonzero(dim=-1).detach().cpu().tolist()
+            for i, target_count in enumerate(target_counts):
+                option_row = [-1] * choices
+                target_row = [-1] * choices
+                mask_row = [False] * choices
+                mask_row[0] = True
+                for t in range(int(target_count)):
+                    col = t + 1
+                    option_row[col] = i
+                    target_row[col] = t
+                    mask_row[col] = True
+                option_idx_l.append(option_row)
+                target_idx_l.append(target_row)
+                mask_l.append(mask_row)
+            return option_idx_l, target_idx_l, mask_l, [True] * option_count
+
+        if option_count == 0:
+            return [], [], [], []
+        option_row = [-1] * choices
+        target_row = [-1] * choices
+        mask_row = [False] * choices
+        for i in range(option_count):
+            option_row[i] = i
+            mask_row[i] = True
+        return [option_row], [target_row], [mask_row], [False]
+
     def act(
         self,
         state: GameStateSnapshot,
@@ -215,9 +394,17 @@ class PPOPolicy(nn.Module):
         )
         return self.act_batch([parsed], deterministic=deterministic)[0]
 
+    def act_parsed_batch(
+        self,
+        parsed_batch: ParsedBatch,
+        *,
+        deterministic: bool = False,
+    ) -> list[PolicyStep]:
+        return self.act_batch(parsed_batch, deterministic=deterministic)
+
     def act_batch(
         self,
-        parsed_steps: list[ParsedStep],
+        parsed_steps: list[ParsedStep] | ParsedBatch,
         *,
         deterministic: bool = False,
     ) -> list[PolicyStep]:
@@ -229,21 +416,28 @@ class PPOPolicy(nn.Module):
         probs from integer handles alone.
         """
 
-        if not parsed_steps:
+        if isinstance(parsed_steps, ParsedBatch):
+            parsed_batch = parsed_steps
+        else:
+            if not parsed_steps:
+                return []
+            parsed_batch = self._parsed_batch_from_steps(parsed_steps)
+
+        if not parsed_batch.pendings:
             return []
 
         device = self.device
         rb = self.rollout_buffer
-        write = rb.ingest_batch(parsed_steps)
-        n = len(parsed_steps)
+        write = rb.ingest_parsed_batch(parsed_batch)
+        n = len(parsed_batch.pendings)
 
         forward = self._forward_batch(write.step_indices)
 
         may_positions: list[int] = []
         group_step_positions: list[int] = []
         group_decision_indices: list[int] = []
-        for step_idx, parsed in enumerate(parsed_steps):
-            if parsed.trace_kind == "may":
+        for step_idx, trace_kind in enumerate(parsed_batch.trace_kinds):
+            if trace_kind == "may":
                 may_positions.append(step_idx)
                 continue
             count = write.decision_counts[step_idx]
@@ -310,12 +504,14 @@ class PPOPolicy(nn.Module):
         may_lookup = {step_idx: pos for pos, step_idx in enumerate(may_positions)}
         results: list[PolicyStep] = []
         offset = 0
-        for step_idx, parsed in enumerate(parsed_steps):
+        for step_idx, (trace_kind, pending) in enumerate(
+            zip(parsed_batch.trace_kinds, parsed_batch.pendings, strict=True)
+        ):
             value = forward.values[step_idx]
             replay_idx = int(write.step_indices[step_idx])
             decision_count = write.decision_counts[step_idx]
 
-            if parsed.trace_kind == "may":
+            if trace_kind == "may":
                 pos = may_lookup[step_idx]
                 assert may_log_probs is not None and may_entropies is not None
                 sel_scalar = may_selected_cpu[pos]
@@ -349,7 +545,7 @@ class PPOPolicy(nn.Module):
             assert per_step_log_prob_sum is not None and per_step_entropy_sum is not None
             step_selected = decision_selected_cpu[offset : offset + decision_count]
             offset += decision_count
-            trace, action = self._decode_action(parsed.trace_kind, parsed.pending, step_selected)
+            trace, action = self._decode_action(trace_kind, pending, step_selected)
             results.append(
                 PolicyStep(
                     action=action,
@@ -361,6 +557,130 @@ class PPOPolicy(nn.Module):
                 )
             )
         return results
+
+    def _parsed_batch_from_steps(self, parsed_steps: list[ParsedStep]) -> ParsedBatch:
+        parsed_state = ParsedGameStateBatch(
+            slot_card_rows=torch.tensor(
+                [parsed.parsed_state.slot_card_rows for parsed in parsed_steps],
+                dtype=torch.long,
+            ),
+            slot_occupied=torch.tensor(
+                [parsed.parsed_state.slot_occupied for parsed in parsed_steps],
+                dtype=torch.float32,
+            ),
+            slot_tapped=torch.tensor(
+                [parsed.parsed_state.slot_tapped for parsed in parsed_steps],
+                dtype=torch.float32,
+            ),
+            game_info=torch.tensor(
+                [parsed.parsed_state.game_info for parsed in parsed_steps],
+                dtype=torch.float32,
+            ),
+            card_id_to_slots=[parsed.parsed_state.card_id_to_slot for parsed in parsed_steps],
+        )
+        parsed_action = ParsedActionBatch(
+            pending_kind_id=torch.tensor(
+                [parsed.parsed_action.pending_kind_id for parsed in parsed_steps],
+                dtype=torch.long,
+            ),
+            num_present_options=torch.tensor(
+                [parsed.parsed_action.num_present_options for parsed in parsed_steps],
+                dtype=torch.long,
+            ),
+            option_kind_ids=torch.tensor(
+                [parsed.parsed_action.option_kind_ids for parsed in parsed_steps],
+                dtype=torch.long,
+            ),
+            option_scalars=torch.tensor(
+                [parsed.parsed_action.option_scalars for parsed in parsed_steps],
+                dtype=torch.float32,
+            ),
+            option_mask=torch.tensor(
+                [parsed.parsed_action.option_mask for parsed in parsed_steps],
+                dtype=torch.float32,
+            ),
+            option_ref_slot_idx=torch.tensor(
+                [parsed.parsed_action.option_ref_slot_idx for parsed in parsed_steps],
+                dtype=torch.long,
+            ),
+            option_ref_card_row=torch.tensor(
+                [parsed.parsed_action.option_ref_card_row for parsed in parsed_steps],
+                dtype=torch.long,
+            ),
+            target_mask=torch.tensor(
+                [parsed.parsed_action.target_mask for parsed in parsed_steps],
+                dtype=torch.float32,
+            ),
+            target_type_ids=torch.tensor(
+                [parsed.parsed_action.target_type_ids for parsed in parsed_steps],
+                dtype=torch.long,
+            ),
+            target_scalars=torch.tensor(
+                [parsed.parsed_action.target_scalars for parsed in parsed_steps],
+                dtype=torch.float32,
+            ),
+            target_overflow=torch.tensor(
+                [parsed.parsed_action.target_overflow for parsed in parsed_steps],
+                dtype=torch.float32,
+            ),
+            target_ref_slot_idx=torch.tensor(
+                [parsed.parsed_action.target_ref_slot_idx for parsed in parsed_steps],
+                dtype=torch.long,
+            ),
+            target_ref_is_player=torch.tensor(
+                [parsed.parsed_action.target_ref_is_player for parsed in parsed_steps],
+                dtype=torch.bool,
+            ),
+            target_ref_is_self=torch.tensor(
+                [parsed.parsed_action.target_ref_is_self for parsed in parsed_steps],
+                dtype=torch.bool,
+            ),
+            priority_candidates=[
+                parsed.parsed_action.priority_candidates for parsed in parsed_steps
+            ],
+        )
+        flat_option_idx: list[list[int]] = []
+        flat_target_idx: list[list[int]] = []
+        flat_mask: list[list[bool]] = []
+        flat_uses_none: list[bool] = []
+        decision_starts: list[int] = []
+        decision_counts: list[int] = []
+        cursor = 0
+        for parsed in parsed_steps:
+            decision_starts.append(cursor)
+            count = len(parsed.decision_option_idx)
+            decision_counts.append(count)
+            cursor += count
+            flat_option_idx.extend(parsed.decision_option_idx)
+            flat_target_idx.extend(parsed.decision_target_idx)
+            flat_mask.extend(parsed.decision_mask)
+            flat_uses_none.extend(parsed.uses_none_head)
+        if flat_option_idx:
+            decision_option_idx = torch.tensor(flat_option_idx, dtype=torch.long)
+            decision_target_idx = torch.tensor(flat_target_idx, dtype=torch.long)
+            decision_mask = torch.tensor(flat_mask, dtype=torch.bool)
+            uses_none_head = torch.tensor(flat_uses_none, dtype=torch.bool)
+        else:
+            decision_option_idx = torch.zeros((0, self.max_cached_choices), dtype=torch.long)
+            decision_target_idx = torch.zeros((0, self.max_cached_choices), dtype=torch.long)
+            decision_mask = torch.zeros((0, self.max_cached_choices), dtype=torch.bool)
+            uses_none_head = torch.zeros((0,), dtype=torch.bool)
+        return ParsedBatch(
+            parsed_state=parsed_state,
+            parsed_action=parsed_action,
+            trace_kinds=[parsed.trace_kind for parsed in parsed_steps],
+            trace_kind_ids=torch.tensor(
+                [parsed.trace_kind_id for parsed in parsed_steps],
+                dtype=torch.long,
+            ),
+            pendings=[parsed.pending for parsed in parsed_steps],
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            decision_starts=decision_starts,
+            decision_counts=decision_counts,
+        )
 
     def evaluate_replay_batch(
         self,

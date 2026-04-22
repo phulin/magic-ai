@@ -135,6 +135,27 @@ class ParsedActionInputs:
     priority_candidates: list[LegalActionCandidate]
 
 
+@dataclass(frozen=True)
+class ParsedActionBatch:
+    """Batched parsed pending-request fields for one actor forward."""
+
+    pending_kind_id: Tensor  # [N]
+    num_present_options: Tensor  # [N]
+    option_kind_ids: Tensor  # [N, max_options]
+    option_scalars: Tensor  # [N, max_options, OPTION_SCALAR_DIM]
+    option_mask: Tensor  # [N, max_options]
+    option_ref_slot_idx: Tensor  # [N, max_options]
+    option_ref_card_row: Tensor  # [N, max_options]
+    target_mask: Tensor  # [N, max_options, max_targets]
+    target_type_ids: Tensor  # [N, max_options, max_targets]
+    target_scalars: Tensor  # [N, max_options, max_targets, TARGET_SCALAR_DIM]
+    target_overflow: Tensor  # [N, max_options]
+    target_ref_slot_idx: Tensor  # [N, max_options, max_targets]
+    target_ref_is_player: Tensor  # [N, max_options, max_targets]
+    target_ref_is_self: Tensor  # [N, max_options, max_targets]
+    priority_candidates: list[list[LegalActionCandidate]]
+
+
 class SelectedActionEncoder:
     """Encode a selected MageStep action into supervised labels.
 
@@ -336,6 +357,126 @@ class ActionOptionsEncoder(nn.Module):
         return ParsedActionInputs(
             pending_kind_id=_index_or_unknown(PENDING_KINDS, pending.get("kind", "")),
             num_present_options=num_present,
+            option_kind_ids=option_kind_ids,
+            option_scalars=option_scalars,
+            option_mask=option_mask,
+            option_ref_slot_idx=option_ref_slot_idx,
+            option_ref_card_row=option_ref_card_row,
+            target_mask=target_mask,
+            target_type_ids=target_type_ids,
+            target_scalars=target_scalars,
+            target_overflow=target_overflow,
+            target_ref_slot_idx=target_ref_slot_idx,
+            target_ref_is_player=target_ref_is_player,
+            target_ref_is_self=target_ref_is_self,
+            priority_candidates=priority_candidates,
+        )
+
+    def parse_pending_batch(
+        self,
+        states: list[GameStateSnapshot],
+        pendings: list[PendingState],
+        *,
+        perspective_player_indices: list[int],
+        card_id_to_slots: list[dict[str, int]],
+    ) -> ParsedActionBatch:
+        n = len(states)
+        max_opt = self.max_options
+        max_tgt = self.max_targets_per_option
+        pending_kind_id = torch.zeros((n,), dtype=torch.long)
+        num_present_options = torch.zeros((n,), dtype=torch.long)
+        option_kind_ids = torch.zeros((n, max_opt), dtype=torch.long)
+        option_scalars = torch.zeros((n, max_opt, OPTION_SCALAR_DIM), dtype=torch.float32)
+        option_mask = torch.zeros((n, max_opt), dtype=torch.float32)
+        option_ref_slot_idx = torch.full((n, max_opt), -1, dtype=torch.long)
+        option_ref_card_row = torch.full((n, max_opt), -1, dtype=torch.long)
+        target_mask = torch.zeros((n, max_opt, max_tgt), dtype=torch.float32)
+        target_type_ids = torch.full(
+            (n, max_opt, max_tgt),
+            UNKNOWN_TARGET_TYPE_ID,
+            dtype=torch.long,
+        )
+        target_scalars = torch.zeros(
+            (n, max_opt, max_tgt, TARGET_SCALAR_DIM),
+            dtype=torch.float32,
+        )
+        target_overflow = torch.zeros((n, max_opt), dtype=torch.float32)
+        target_ref_slot_idx = torch.full((n, max_opt, max_tgt), -1, dtype=torch.long)
+        target_ref_is_player = torch.zeros((n, max_opt, max_tgt), dtype=torch.bool)
+        target_ref_is_self = torch.zeros((n, max_opt, max_tgt), dtype=torch.bool)
+        priority_candidates: list[list[LegalActionCandidate]] = []
+        max_tgt_scalar = max(1.0, float(max_tgt - 1))
+        name_to_row = self.game_state_encoder._card_name_to_row
+
+        for batch_idx, (state, pending, perspective_player_idx, card_id_to_slot) in enumerate(
+            zip(
+                states,
+                pendings,
+                perspective_player_indices,
+                card_id_to_slots,
+                strict=True,
+            )
+        ):
+            options = pending.get("options", [])
+            num_present = min(len(options), max_opt)
+            pending_kind_id[batch_idx] = _index_or_unknown(PENDING_KINDS, pending.get("kind", ""))
+            num_present_options[batch_idx] = num_present
+            player_self_id, player_opp_id = _player_ids(state, perspective_player_idx)
+
+            for opt_i in range(num_present):
+                option = options[opt_i]
+                option_kind_ids[batch_idx, opt_i] = _index_or_unknown(
+                    ACTION_KINDS, option.get("kind", "unknown")
+                )
+                _fill_option_scalars(
+                    option_scalars[batch_idx, opt_i],
+                    option,
+                    pending=pending,
+                    option_idx=opt_i,
+                    max_options=max_opt,
+                    max_targets_per_option=max_tgt,
+                )
+                option_mask[batch_idx, opt_i] = 1.0
+
+                slot_idx, card_row = _resolve_option_reference(
+                    option,
+                    card_id_to_slot=card_id_to_slot,
+                    name_to_row=name_to_row,
+                )
+                if slot_idx is not None:
+                    option_ref_slot_idx[batch_idx, opt_i] = slot_idx
+                elif card_row is not None:
+                    option_ref_card_row[batch_idx, opt_i] = card_row
+
+                targets = option.get("valid_targets", [])
+                overflow_count = max(0, len(targets) - max_tgt)
+                target_overflow[batch_idx, opt_i] = _clip_norm(overflow_count, MAX_TARGET_OVERFLOW)
+
+                for tgt_j in range(min(len(targets), max_tgt)):
+                    target = targets[tgt_j]
+                    target_mask[batch_idx, opt_i, tgt_j] = 1.0
+                    target_scalars[batch_idx, opt_i, tgt_j, 0] = _clip_norm(tgt_j, max_tgt_scalar)
+                    target_scalars[batch_idx, opt_i, tgt_j, 1] = 1.0
+
+                    target_id = target.get("id", "")
+                    if target_id and target_id in (player_self_id, player_opp_id):
+                        target_type_ids[batch_idx, opt_i, tgt_j] = PLAYER_TARGET_TYPE_ID
+                        target_ref_is_player[batch_idx, opt_i, tgt_j] = True
+                        target_ref_is_self[batch_idx, opt_i, tgt_j] = target_id == player_self_id
+                    elif target_id in card_id_to_slot:
+                        target_type_ids[batch_idx, opt_i, tgt_j] = PERMANENT_TARGET_TYPE_ID
+                        target_ref_slot_idx[batch_idx, opt_i, tgt_j] = card_id_to_slot[target_id]
+
+            priority_candidates.append(
+                build_priority_candidates(
+                    pending,
+                    max_targets_per_option=max_tgt,
+                )
+            )
+
+        return ParsedActionBatch(
+            pending_kind_id=pending_kind_id,
+            num_present_options=num_present_options,
             option_kind_ids=option_kind_ids,
             option_scalars=option_scalars,
             option_mask=option_mask,
@@ -666,6 +807,28 @@ def _option_scalars(
     ]
 
 
+def _fill_option_scalars(
+    out: Tensor,
+    option: PendingOptionState,
+    *,
+    pending: PendingState,
+    option_idx: int,
+    max_options: int,
+    max_targets_per_option: int,
+) -> None:
+    targets = option.get("valid_targets", [])
+    overflow_count = max(0, len(targets) - max_targets_per_option)
+    out[0] = _clip_norm(option_idx, max(1.0, float(max_options - 1)))
+    out[1] = _clip_norm(option.get("ability_index", 0), MAX_ABILITY_INDEX)
+    out[2] = _clip_norm(len(targets), float(max_targets_per_option))
+    out[3] = _clip_norm(overflow_count, MAX_TARGET_OVERFLOW)
+    out[4] = float(bool(option.get("card_id")))
+    out[5] = float(bool(option.get("permanent_id")))
+    out[6] = float(bool(option.get("id")))
+    _fill_mana_cost_features(out[7:13], option.get("mana_cost", ""))
+    out[13] = _clip_norm(pending.get("amount", 0), MAX_AMOUNT)
+
+
 def _mana_cost_features(mana_cost: str) -> list[float]:
     counts = {symbol: 0.0 for symbol in MANA_SYMBOLS}
     generic = 0.0
@@ -682,6 +845,24 @@ def _mana_cost_features(mana_cost: str) -> list[float]:
     # Fold generic mana into colorless pressure for a compact V1 feature.
     counts["C"] += generic
     return [_clip_norm(counts[symbol], 10.0) for symbol in MANA_SYMBOLS]
+
+
+def _fill_mana_cost_features(out: Tensor, mana_cost: str) -> None:
+    counts = {symbol: 0.0 for symbol in MANA_SYMBOLS}
+    generic = 0.0
+    for raw_symbol in re.findall(r"\{([^}]+)\}", mana_cost):
+        symbol = raw_symbol.upper()
+        if symbol in counts:
+            counts[symbol] += 1.0
+        elif symbol.isdigit():
+            generic += float(symbol)
+        elif "/" in symbol:
+            for part in symbol.split("/"):
+                if part in counts:
+                    counts[part] += 0.5
+    counts["C"] += generic
+    for idx, symbol in enumerate(MANA_SYMBOLS):
+        out[idx] = _clip_norm(counts[symbol], 10.0)
 
 
 def _index_or_unknown(values: tuple[str, ...], value: str) -> int:

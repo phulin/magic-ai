@@ -18,7 +18,7 @@ import torch
 from torch import Tensor, nn
 
 if TYPE_CHECKING:
-    from magic_ai.model import ParsedStep
+    from magic_ai.model import ParsedBatch, ParsedStep
 
 
 @dataclass(frozen=True)
@@ -219,6 +219,88 @@ class RolloutBuffer(nn.Module):
             self._free_decision_range(int(start), int(count))
 
     def ingest_batch(self, parsed_steps: list[ParsedStep]) -> BufferWrite:
+        return self.ingest_batch_legacy(parsed_steps)
+
+    def ingest_parsed_batch(self, parsed_batch: ParsedBatch) -> BufferWrite:
+        n = int(parsed_batch.trace_kind_ids.shape[0])
+        device = self.device
+        if n == 0:
+            return BufferWrite(
+                step_indices=torch.zeros(0, dtype=torch.long, device=device),
+                decision_starts=[],
+                decision_counts=[],
+            )
+
+        step_rows = self._allocate_step_rows(n)
+        step_indices = torch.tensor(step_rows, dtype=torch.long, device=device)
+
+        self.slot_card_rows[step_indices] = parsed_batch.parsed_state.slot_card_rows.to(device)
+        self.slot_occupied[step_indices] = parsed_batch.parsed_state.slot_occupied.to(device)
+        self.slot_tapped[step_indices] = parsed_batch.parsed_state.slot_tapped.to(device)
+        self.game_info[step_indices] = parsed_batch.parsed_state.game_info.to(device)
+        self.trace_kind_id[step_indices] = parsed_batch.trace_kind_ids.to(device)
+        self.pending_kind_id[step_indices] = parsed_batch.parsed_action.pending_kind_id.to(device)
+        self.option_kind_ids[step_indices] = parsed_batch.parsed_action.option_kind_ids.to(device)
+        self.option_scalars[step_indices] = parsed_batch.parsed_action.option_scalars.to(device)
+        self.option_mask[step_indices] = parsed_batch.parsed_action.option_mask.to(device)
+        self.option_ref_slot_idx[step_indices] = parsed_batch.parsed_action.option_ref_slot_idx.to(
+            device
+        )
+        self.option_ref_card_row[step_indices] = parsed_batch.parsed_action.option_ref_card_row.to(
+            device
+        )
+        self.target_mask[step_indices] = parsed_batch.parsed_action.target_mask.to(device)
+        self.target_type_ids[step_indices] = parsed_batch.parsed_action.target_type_ids.to(device)
+        self.target_scalars[step_indices] = parsed_batch.parsed_action.target_scalars.to(device)
+        self.target_overflow[step_indices] = parsed_batch.parsed_action.target_overflow.to(device)
+        self.target_ref_slot_idx[step_indices] = parsed_batch.parsed_action.target_ref_slot_idx.to(
+            device
+        )
+        self.target_ref_is_player[step_indices] = (
+            parsed_batch.parsed_action.target_ref_is_player.to(device)
+        )
+        self.target_ref_is_self[step_indices] = parsed_batch.parsed_action.target_ref_is_self.to(
+            device
+        )
+
+        decision_counts = parsed_batch.decision_counts
+        decision_starts: list[int] = []
+        flat_cursor = 0
+        for count in decision_counts:
+            start = self._allocate_decision_range(count)
+            decision_starts.append(start)
+            if count == 0:
+                continue
+            end = start + count
+            flat_end = flat_cursor + count
+            self.decision_option_idx[start:end] = parsed_batch.decision_option_idx[
+                flat_cursor:flat_end
+            ].to(device)
+            self.decision_target_idx[start:end] = parsed_batch.decision_target_idx[
+                flat_cursor:flat_end
+            ].to(device)
+            self.decision_mask[start:end] = parsed_batch.decision_mask[flat_cursor:flat_end].to(
+                device
+            )
+            self.uses_none_head[start:end] = parsed_batch.uses_none_head[flat_cursor:flat_end].to(
+                device
+            )
+            flat_cursor = flat_end
+
+        self.decision_start[step_indices] = torch.tensor(
+            decision_starts, dtype=torch.long, device=device
+        )
+        self.decision_count[step_indices] = torch.tensor(
+            decision_counts, dtype=torch.long, device=device
+        )
+
+        return BufferWrite(
+            step_indices=step_indices,
+            decision_starts=decision_starts,
+            decision_counts=decision_counts,
+        )
+
+    def ingest_batch_legacy(self, parsed_steps: list[ParsedStep]) -> BufferWrite:
         n = len(parsed_steps)
         device = self.device
         if n == 0:

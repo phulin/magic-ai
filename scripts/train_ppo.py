@@ -486,17 +486,19 @@ def train_batched_envs(
 
         live_games = remaining_games
         if ready:
-            cached_inputs = [
-                policy.parse_inputs(
-                    state,
-                    pending,
-                    perspective_player_idx=int(pending.get("player_idx", 0)),
-                )
-                for _env, state, pending in ready
+            states = [state for _env, state, _pending in ready]
+            pendings = [pending for _env, _state, pending in ready]
+            perspective_player_indices: list[int | None] = [
+                int(pending.get("player_idx", 0)) for pending in pendings
             ]
+            parsed_batch = policy.parse_inputs_batch(
+                states,
+                pendings,
+                perspective_player_indices=perspective_player_indices,
+            )
             with torch.no_grad():
-                policy_steps = policy.act_batch(
-                    cached_inputs,
+                policy_steps = policy.act_parsed_batch(
+                    parsed_batch,
                     deterministic=args.deterministic_rollout,
                 )
             for (env, state, pending), policy_step in zip(ready, policy_steps, strict=True):
