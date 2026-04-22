@@ -119,6 +119,7 @@ def main() -> None:
     policy = PPOPolicy(
         game_state_encoder,
         hidden_dim=args.hidden_dim,
+        hidden_layers=args.hidden_layers,
         max_options=args.max_options,
         max_targets_per_option=args.max_targets_per_option,
         rollout_capacity=rollout_capacity,
@@ -319,6 +320,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-threads", type=int, default=None)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=512)
+    parser.add_argument("--hidden-layers", type=int, default=2)
     parser.add_argument("--max-options", type=int, default=64)
     parser.add_argument("--max-targets-per-option", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -353,6 +355,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-steps-per-game must be at least 1")
     if args.minibatch_size < 1:
         raise ValueError("--minibatch-size must be at least 1")
+    if args.hidden_layers < 1:
+        raise ValueError("--hidden-layers must be at least 1")
 
 
 def log_ppo_stats(

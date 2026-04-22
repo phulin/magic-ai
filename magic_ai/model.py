@@ -126,6 +126,7 @@ class PPOPolicy(nn.Module):
         game_state_encoder: GameStateEncoder,
         *,
         hidden_dim: int = 512,
+        hidden_layers: int = 2,
         max_options: int = 64,
         max_targets_per_option: int = 4,
         rollout_capacity: int = 4096,
@@ -143,12 +144,14 @@ class PPOPolicy(nn.Module):
         self.max_cached_choices = max(max_options, max_options * max(1, max_targets_per_option))
 
         input_dim = game_state_encoder.output_dim + game_state_encoder.d_model * 2
-        self.trunk = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-        )
+        if hidden_layers < 1:
+            raise ValueError("hidden_layers must be at least 1")
+        trunk_layers: list[nn.Module] = []
+        in_dim = input_dim
+        for _ in range(hidden_layers):
+            trunk_layers.extend((nn.Linear(in_dim, hidden_dim), nn.GELU()))
+            in_dim = hidden_dim
+        self.trunk = nn.Sequential(*trunk_layers)
         self.action_query = nn.Linear(hidden_dim, game_state_encoder.d_model)
         self.value_head = nn.Linear(hidden_dim, 1)
         self.none_blocker_head = nn.Linear(hidden_dim, 1)
