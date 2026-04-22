@@ -106,6 +106,8 @@ class WinFractionStats:
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    deck_a, deck_b = load_decks(args.deck_json)
+    validate_deck_embeddings(args.embeddings, deck_a, deck_b)
     if args.torch_threads is not None:
         torch.set_num_threads(args.torch_threads)
 
@@ -143,7 +145,6 @@ def main() -> None:
             optimizer.load_state_dict(checkpoint["optimizer"])
 
     mage = importlib.import_module("mage")
-    deck_a, deck_b = load_decks(args.deck_json)
     if args.num_envs > 1:
         train_batched_envs(args, mage, deck_a, deck_b, policy, native_encoder, optimizer)
         save_checkpoint(args.output, policy, optimizer, args)
@@ -663,6 +664,64 @@ def load_decks(path: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:
             cast(dict[str, Any], payload.get("player_b", DEFAULT_DECK)),
         )
     return cast(dict[str, Any], payload), cast(dict[str, Any], payload)
+
+
+def validate_deck_embeddings(
+    embeddings_path: Path,
+    deck_a: dict[str, Any],
+    deck_b: dict[str, Any],
+) -> None:
+    embedded_names = load_embedded_card_names(embeddings_path)
+    missing: dict[str, dict[str, int]] = {}
+    for label, deck in (("player_a", deck_a), ("player_b", deck_b)):
+        for name, count in deck_card_counts(deck).items():
+            if card_name_key(name) in embedded_names:
+                continue
+            missing.setdefault(name, {})[label] = count
+
+    if not missing:
+        return
+
+    details = []
+    for name in sorted(missing, key=str.casefold):
+        counts = ", ".join(f"{label}={count}" for label, count in sorted(missing[name].items()))
+        details.append(f"{name} ({counts})")
+    raise ValueError(
+        f"{embeddings_path} is missing embeddings for {len(missing)} deck cards: "
+        + "; ".join(details)
+    )
+
+
+def load_embedded_card_names(path: Path) -> set[str]:
+    payload = json.loads(path.read_text())
+    names: set[str] = set()
+    for record in payload.get("cards", []):
+        if not isinstance(record, dict):
+            continue
+        name = record.get("name")
+        if isinstance(name, str) and record.get("embedding") is not None:
+            names.add(card_name_key(name))
+    return names
+
+
+def deck_card_counts(deck: dict[str, Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    cards = deck.get("cards", [])
+    if not isinstance(cards, list):
+        return counts
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        name = card.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        count = card.get("count", 1)
+        counts[name] = counts.get(name, 0) + int(count)
+    return counts
+
+
+def card_name_key(name: str) -> str:
+    return " ".join(name.split()).casefold()
 
 
 def save_checkpoint(
