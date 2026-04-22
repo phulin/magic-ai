@@ -129,6 +129,10 @@ def main() -> None:
         max_targets_per_option=args.max_targets_per_option,
         rollout_capacity=rollout_capacity,
     ).to(device)
+    if device.type == "cuda":
+        # Force cuBLAS handle creation before rollout ingestion creates temporary
+        # CUDA copy tensors that PyTorch may hold in its caching allocator.
+        _ = torch.empty((1, 1), device=device) @ torch.empty((1, 1), device=device)
     native_encoder = NativeBatchEncoder.for_policy(policy)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
 

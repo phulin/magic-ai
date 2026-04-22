@@ -154,6 +154,44 @@ def _ptr(tensor: Tensor, ctype: Any) -> Any:
     return ctypes.cast(tensor.data_ptr(), ctypes.POINTER(ctype))
 
 
+def _validate_decision_layout(
+    *,
+    decision_option_idx: Tensor,
+    decision_target_idx: Tensor,
+    decision_mask: Tensor,
+    uses_none_head: Tensor,
+    max_options: int,
+    max_targets_per_option: int,
+) -> None:
+    valid = decision_mask.nonzero(as_tuple=False)
+    if valid.numel() == 0:
+        return
+
+    rows = valid[:, 0]
+    cols = valid[:, 1]
+    none_choices = uses_none_head[rows] & cols.eq(0)
+    scored = ~none_choices
+    if not scored.any():
+        return
+
+    scored_options = decision_option_idx[rows[scored], cols[scored]]
+    bad_options = (scored_options < 0) | (scored_options >= max_options)
+    if bad_options.any():
+        bad = scored_options[bad_options][0].item()
+        raise NativeEncodingError(
+            f"native encoder produced decision option index {bad}, outside [0, {max_options})"
+        )
+
+    scored_targets = decision_target_idx[rows[scored], cols[scored]]
+    bad_targets = scored_targets >= max_targets_per_option
+    if bad_targets.any():
+        bad = scored_targets[bad_targets][0].item()
+        raise NativeEncodingError(
+            f"native encoder produced decision target index {bad}, "
+            f"outside [0, {max_targets_per_option})"
+        )
+
+
 class NativeBatchEncoder:
     def __init__(
         self,
@@ -181,15 +219,26 @@ class NativeBatchEncoder:
         self.is_available = False
         if self.lib is None:
             return
-        if self.ffi is None and (
-            not hasattr(self.lib, "MageEncodeBatch") or not hasattr(self.lib, "MageSetCardNameRows")
-        ):
+        if not self._has_required_symbols():
             return
         if self.ffi is None:
             self._configure_ctypes()
         self.is_available = True
         if card_name_to_row is not None:
             self.register_card_rows(card_name_to_row)
+
+    def _has_required_symbols(self) -> bool:
+        return all(
+            self._has_symbol(name)
+            for name in ("MageEncodeBatch", "MageSetCardNameRows", "MageFreeString")
+        )
+
+    def _has_symbol(self, name: str) -> bool:
+        try:
+            getattr(self.lib, name)
+        except AttributeError:
+            return False
+        return True
 
     @classmethod
     def for_policy(cls, policy: Any) -> NativeBatchEncoder:
@@ -410,6 +459,18 @@ class NativeBatchEncoder:
         decision_rows_written = int(result.decision_rows_written)
         trace_kind_id = buffers.trace_kind_id
         trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
+        decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
+        decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
+        decision_mask = buffers.decision_mask_u8[:decision_rows_written].ne(0)
+        uses_none_head = buffers.uses_none_head_u8[:decision_rows_written].ne(0)
+        _validate_decision_layout(
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            max_options=self.max_options,
+            max_targets_per_option=self.max_targets_per_option,
+        )
         return NativeEncodedBatch(
             trace_kind_id=trace_kind_id,
             slot_card_rows=buffers.slot_card_rows,
@@ -433,10 +494,10 @@ class NativeBatchEncoder:
             may_mask=buffers.may_mask_u8.ne(0),
             decision_start=buffers.decision_start,
             decision_count=buffers.decision_count,
-            decision_option_idx=buffers.decision_option_idx[:decision_rows_written],
-            decision_target_idx=buffers.decision_target_idx[:decision_rows_written],
-            decision_mask=buffers.decision_mask_u8[:decision_rows_written].ne(0),
-            uses_none_head=buffers.uses_none_head_u8[:decision_rows_written].ne(0),
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
             decision_rows_written=decision_rows_written,
             pendings=pendings,
             trace_kinds=trace_kinds,
@@ -539,6 +600,18 @@ class NativeBatchEncoder:
         decision_rows_written = int(result.decision_rows_written)
         trace_kind_id = buffers.trace_kind_id
         trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
+        decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
+        decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
+        decision_mask = buffers.decision_mask_u8[:decision_rows_written].ne(0)
+        uses_none_head = buffers.uses_none_head_u8[:decision_rows_written].ne(0)
+        _validate_decision_layout(
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            max_options=self.max_options,
+            max_targets_per_option=self.max_targets_per_option,
+        )
         return NativeEncodedBatch(
             trace_kind_id=trace_kind_id,
             slot_card_rows=buffers.slot_card_rows,
@@ -562,10 +635,10 @@ class NativeBatchEncoder:
             may_mask=buffers.may_mask_u8.ne(0),
             decision_start=buffers.decision_start,
             decision_count=buffers.decision_count,
-            decision_option_idx=buffers.decision_option_idx[:decision_rows_written],
-            decision_target_idx=buffers.decision_target_idx[:decision_rows_written],
-            decision_mask=buffers.decision_mask_u8[:decision_rows_written].ne(0),
-            uses_none_head=buffers.uses_none_head_u8[:decision_rows_written].ne(0),
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
             decision_rows_written=decision_rows_written,
             pendings=pendings,
             trace_kinds=trace_kinds,

@@ -6,7 +6,12 @@ from typing import cast
 import torch
 from magic_ai.game_state import GameStateEncoder, GameStateSnapshot, PendingState
 from magic_ai.model import PPOPolicy
-from magic_ai.native_encoder import NativeBatchEncoder, NativeEncodedBatch
+from magic_ai.native_encoder import (
+    NativeBatchEncoder,
+    NativeEncodedBatch,
+    NativeEncodingError,
+    _validate_decision_layout,
+)
 
 
 def _sample_state() -> dict:
@@ -130,6 +135,17 @@ class NativeEncoderTests(unittest.TestCase):
         self.assertEqual(parsed_step.trace, native_step.trace)
         self.assertAlmostEqual(float(parsed_step.log_prob), float(native_step.log_prob), places=6)
         self.assertAlmostEqual(float(parsed_step.value), float(native_step.value), places=6)
+
+    def test_native_decision_validation_rejects_out_of_range_option(self) -> None:
+        with self.assertRaisesRegex(NativeEncodingError, "outside \\[0, 4\\)"):
+            _validate_decision_layout(
+                decision_option_idx=torch.tensor([[4]], dtype=torch.int64),
+                decision_target_idx=torch.tensor([[-1]], dtype=torch.int64),
+                decision_mask=torch.tensor([[True]], dtype=torch.bool),
+                uses_none_head=torch.tensor([False], dtype=torch.bool),
+                max_options=4,
+                max_targets_per_option=2,
+            )
 
 
 if __name__ == "__main__":

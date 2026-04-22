@@ -349,7 +349,7 @@ class PPOPolicy(nn.Module):
                 option_idx_l.append(option_row)
                 target_idx_l.append(target_row)
                 mask_l.append(mask_row)
-            return option_idx_l, target_idx_l, mask_l, [False] * option_count
+            return option_idx_l, target_idx_l, mask_l, [True] * option_count
 
         if trace_kind == "blockers":
             if option_count == 0:
@@ -804,6 +804,9 @@ class PPOPolicy(nn.Module):
         slot_tapped = rb.slot_tapped[step_indices]
         game_info = rb.game_info[step_indices]
         option_mask = rb.option_mask[step_indices]
+        self._validate_slot_card_rows(
+            slot_card_rows, self.game_state_encoder.card_embedding_table.shape[0]
+        )
 
         slot_vectors = self.game_state_encoder.embed_slot_vectors(
             slot_card_rows, slot_occupied, slot_tapped
@@ -844,6 +847,20 @@ class PPOPolicy(nn.Module):
             may_logits=may_logits,
             option_vectors=option_vectors,
             target_vectors=target_vectors,
+        )
+
+    @staticmethod
+    def _validate_slot_card_rows(slot_card_rows: Tensor, max_card_rows: int) -> None:
+        bad = (slot_card_rows < 0) | (slot_card_rows >= max_card_rows)
+        if not bad.any():
+            return
+        bad_pos = bad.nonzero(as_tuple=False)[0]
+        batch = int(bad_pos[0].item())
+        slot = int(bad_pos[1].item())
+        row = int(slot_card_rows[batch, slot].item())
+        raise ValueError(
+            f"invalid slot card row: batch={batch} slot={slot} row={row} "
+            f"bounds=[0, {max_card_rows})"
         )
 
     def _decision_logits(
@@ -894,8 +911,19 @@ class PPOPolicy(nn.Module):
         d_model = option_vectors.shape[-1]
         max_targets = target_vectors.shape[-2]
 
-        option_idx_clamped = option_idx.clamp_min(0)
-        target_idx_clamped = target_idx.clamp_min(0)
+        self._validate_decision_indices(
+            step_positions=step_positions,
+            option_idx=option_idx,
+            target_idx=target_idx,
+            masks=masks,
+            uses_none=uses_none,
+            max_steps=option_vectors.shape[0],
+            max_options=option_vectors.shape[1],
+            max_targets=max_targets,
+        )
+
+        option_idx_clamped = option_idx.clamp(0, option_vectors.shape[1] - 1)
+        target_idx_clamped = target_idx.clamp(0, max_targets - 1)
         options_for_groups = option_vectors[step_positions]
         option_gather = torch.gather(
             options_for_groups,
@@ -968,6 +996,16 @@ class PPOPolicy(nn.Module):
 
             scored_option_idx = option_idx[scored_groups, scored_cols]
             scored_target_idx = target_idx[scored_groups, scored_cols]
+            self._validate_flat_scored_indices(
+                scored_groups=scored_groups,
+                scored_cols=scored_cols,
+                scored_steps=scored_steps,
+                scored_option_idx=scored_option_idx,
+                scored_target_idx=scored_target_idx,
+                max_steps=option_vectors.shape[0],
+                max_options=option_vectors.shape[1],
+                max_targets=target_vectors.shape[2],
+            )
 
             scored_option_vectors = option_vectors[scored_steps, scored_option_idx]
             scored_target_vectors = torch.zeros_like(scored_option_vectors)
@@ -997,6 +1035,74 @@ class PPOPolicy(nn.Module):
         group_entropies.scatter_add_(0, group_idx, -(probs * flat_log_probs))
 
         return group_idx, choice_cols, flat_logits, flat_log_probs, group_entropies
+
+    @staticmethod
+    def _validate_flat_scored_indices(
+        *,
+        scored_groups: Tensor,
+        scored_cols: Tensor,
+        scored_steps: Tensor,
+        scored_option_idx: Tensor,
+        scored_target_idx: Tensor,
+        max_steps: int,
+        max_options: int,
+        max_targets: int,
+    ) -> None:
+        bad = (
+            (scored_steps < 0)
+            | (scored_steps >= max_steps)
+            | (scored_option_idx < 0)
+            | (scored_option_idx >= max_options)
+            | (scored_target_idx >= max_targets)
+        )
+        if not bad.any():
+            return
+
+        bad_pos = int(bad.nonzero(as_tuple=False)[0, 0].item())
+        group = int(scored_groups[bad_pos].item())
+        col = int(scored_cols[bad_pos].item())
+        step = int(scored_steps[bad_pos].item())
+        option = int(scored_option_idx[bad_pos].item())
+        target = int(scored_target_idx[bad_pos].item())
+        raise ValueError(
+            "invalid decision gather index: "
+            f"group={group} col={col} step={step} option={option} target={target} "
+            f"bounds=(steps={max_steps}, options={max_options}, targets={max_targets})"
+        )
+
+    @staticmethod
+    def _validate_decision_indices(
+        *,
+        step_positions: Tensor,
+        option_idx: Tensor,
+        target_idx: Tensor,
+        masks: Tensor,
+        uses_none: Tensor,
+        max_steps: int,
+        max_options: int,
+        max_targets: int,
+    ) -> None:
+        valid = masks.nonzero(as_tuple=False)
+        if valid.numel() == 0:
+            return
+        groups = valid[:, 0]
+        cols = valid[:, 1]
+        scored = ~(uses_none[groups] & cols.eq(0))
+        if not scored.any():
+            return
+        scored_groups = groups[scored]
+        scored_cols = cols[scored]
+        scored_steps = step_positions[scored_groups]
+        PPOPolicy._validate_flat_scored_indices(
+            scored_groups=scored_groups,
+            scored_cols=scored_cols,
+            scored_steps=scored_steps,
+            scored_option_idx=option_idx[scored_groups, scored_cols],
+            scored_target_idx=target_idx[scored_groups, scored_cols],
+            max_steps=max_steps,
+            max_options=max_options,
+            max_targets=max_targets,
+        )
 
     def _sample_flat_decisions(
         self,
@@ -1170,7 +1276,7 @@ class PPOPolicy(nn.Module):
                 option_idx_l.append(option_row)
                 target_idx_l.append(target_row)
                 mask_l.append(mask_row)
-            return option_idx_l, target_idx_l, mask_l, [False] * option_count
+            return option_idx_l, target_idx_l, mask_l, [True] * option_count
 
         if trace_kind == "blockers":
             options = pending.get("options", [])[: self.max_options]
