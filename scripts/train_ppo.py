@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,8 +22,14 @@ import wandb  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from magic_ai.actions import ActionRequest  # noqa: E402
 from magic_ai.buffer import NativeTrajectoryBuffer  # noqa: E402
-from magic_ai.game_state import GameStateEncoder  # noqa: E402
+from magic_ai.game_state import (  # noqa: E402
+    GameStateEncoder,
+    GameStateSnapshot,
+    PendingOptionState,
+    PendingState,
+)
 from magic_ai.model import PPOPolicy  # noqa: E402
 from magic_ai.native_encoder import NativeBatchEncoder  # noqa: E402
 from magic_ai.native_rollout import (  # noqa: E402
@@ -39,12 +47,21 @@ DEFAULT_DECK = {
 }
 
 
+@dataclass(frozen=True)
+class TranscriptAction:
+    state: GameStateSnapshot
+    pending: PendingState
+    action: ActionRequest
+
+
 @dataclass
 class LiveGame:
     game: Any
+    transcript_game: Any | None
     slot_idx: int
     episode_idx: int
     episode_steps: list[RolloutStep]
+    transcript: list[TranscriptAction]
     action_count: int = 0
 
 
@@ -281,19 +298,34 @@ def train_native_batched_envs(
 
     def start_game(slot_idx: int, episode_idx: int) -> LiveGame:
         staging_buffer.reset_env(slot_idx)
+        seed = args.seed + episode_idx
         return LiveGame(
             game=mage.new_game(
                 deck_a,
                 deck_b,
                 name_a=args.name_a,
                 name_b=args.name_b,
-                seed=args.seed + episode_idx,
+                seed=seed,
                 shuffle=not args.no_shuffle,
                 hand_size=args.hand_size,
+            ),
+            transcript_game=(
+                mage.new_game(
+                    deck_a,
+                    deck_b,
+                    name_a=args.name_a,
+                    name_b=args.name_b,
+                    seed=seed,
+                    shuffle=not args.no_shuffle,
+                    hand_size=args.hand_size,
+                )
+                if slot_idx == 0
+                else None
             ),
             slot_idx=slot_idx,
             episode_idx=episode_idx,
             episode_steps=[],
+            transcript=[],
         )
 
     def maybe_start_games() -> None:
@@ -314,6 +346,8 @@ def train_native_batched_envs(
         )
         for (env, winner_idx), replay_rows in zip(finished, replay_rows_by_env, strict=True):
             env.game.close()
+            if env.transcript_game is not None:
+                env.transcript_game.close()
             step_count = staging_buffer.active_step_count(env.slot_idx)
             if step_count:
                 player_indices = (
@@ -345,6 +379,12 @@ def train_native_batched_envs(
                 )
                 pending_steps.extend(env.episode_steps)
                 pending_returns.append(returns)
+            if env.slot_idx == 0:
+                print_sample_game(
+                    env.transcript,
+                    winner_idx=winner_idx,
+                    max_actions=args.sample_actions,
+                )
             staging_buffer.reset_env(env.slot_idx)
             free_slots.append(env.slot_idx)
             if winner_idx == 0:
@@ -392,9 +432,32 @@ def train_native_batched_envs(
             may_selected: list[int] = []
             cursor = 0
             for env, player_idx, policy_step in zip(
-                ready_envs, ready_players, policy_steps, strict=True
+                ready_envs,
+                ready_players,
+                policy_steps,
+                strict=True,
             ):
                 cols = list(policy_step.selected_choice_cols)
+                if env.transcript_game is not None:
+                    transcript_pending = env.transcript_game.pending or env.transcript_game.legal()
+                    if transcript_pending is None:
+                        raise RuntimeError("transcript shadow game is missing a pending action")
+                    transcript_action = copy.deepcopy(policy_step.action)
+                    if policy_step.trace.kind != "may":
+                        _trace, decoded_action = policy._decode_action(
+                            policy_step.trace.kind,
+                            cast(PendingState, transcript_pending),
+                            cols,
+                        )
+                        transcript_action = copy.deepcopy(decoded_action)
+                    env.transcript.append(
+                        TranscriptAction(
+                            state=cast(GameStateSnapshot, copy.deepcopy(env.transcript_game.state)),
+                            pending=cast(PendingState, copy.deepcopy(transcript_pending)),
+                            action=transcript_action,
+                        )
+                    )
+                    env.transcript_game.step(cast(dict[Any, Any], transcript_action))
                 starts.append(cursor)
                 counts.append(len(cols))
                 selected_cols.extend(cols)
@@ -588,6 +651,245 @@ def save_checkpoint(
         },
         path,
     )
+
+
+def print_sample_game(
+    transcript: list[TranscriptAction],
+    *,
+    winner_idx: int,
+    max_actions: int,
+) -> None:
+    print()
+    if not transcript:
+        print("(no actions)")
+    else:
+        condensed = condense_transcript_lines(transcript, max_actions=max_actions)
+        if condensed:
+            turn_width = max(len(line["turn"]) for line in condensed)
+            step_width = max(len(line["step"]) for line in condensed)
+            player_width = max(len(line["player"]) for line in condensed)
+            life_width = max(len(line["life"]) for line in condensed)
+            for line in condensed:
+                print(
+                    f"{line['turn']:<{turn_width}}  "
+                    f"{line['step']:<{step_width}}  "
+                    f"{line['player']:<{player_width}}  "
+                    f"{line['life']:<{life_width}}  "
+                    f"{line['action']}"
+                )
+        remaining = len(transcript) - max_actions
+        if remaining > 0:
+            print(f"... {remaining} more actions")
+    if winner_idx >= 0:
+        print(f"== PLAYER {winner_idx + 1} WINS ==")
+    else:
+        print("== DRAW ==")
+    print()
+
+
+def condense_transcript_lines(
+    transcript: list[TranscriptAction],
+    *,
+    max_actions: int,
+) -> list[dict[str, str]]:
+    lines: list[dict[str, str]] = []
+    for item in transcript[:max_actions]:
+        line = {
+            "turn": format_turn_number(item.state),
+            "step": format_step_name(str(item.state.get("step", ""))),
+            "player": f"P{int(item.pending.get('player_idx', 0)) + 1}",
+            "life": format_life_totals(item.state),
+            "action": describe_action(item),
+        }
+        if (
+            line["action"] == "pass"
+            and lines
+            and lines[-1]["action"].startswith("pass")
+            and lines[-1]["turn"] == line["turn"]
+            and lines[-1]["step"] == line["step"]
+            and lines[-1]["player"] == line["player"]
+            and lines[-1]["life"] == line["life"]
+        ):
+            prev = lines[-1]["action"]
+            if prev == "pass":
+                lines[-1]["action"] = "pass x2"
+            else:
+                count = int(prev.rsplit("x", 1)[1])
+                lines[-1]["action"] = f"pass x{count + 1}"
+            continue
+        lines.append(line)
+    return lines
+
+
+def format_step_name(step: str) -> str:
+    normalized = " ".join(step.split()).casefold()
+    aliases = {
+        "untap": "untap",
+        "upkeep": "upk",
+        "draw": "draw",
+        "precombat main": "pre",
+        "begin combat": "bcom",
+        "declare attackers": "atk",
+        "declare blockers": "blk",
+        "combat damage": "dmg",
+        "end combat": "ecom",
+        "end of combat": "ecom",
+        "postcombat main": "post",
+        "end step": "end",
+        "cleanup": "clnp",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    slug = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    return slug or "unknown"
+
+
+def format_turn_number(state: GameStateSnapshot) -> str:
+    raw_turn = int(state.get("turn", 0))
+    turn = max(1, (raw_turn + 1) // 2)
+    suffix = "?"
+    active_player = str(state.get("active_player", ""))
+    players = state.get("players", [])
+    if players:
+        player_a = players[0]
+        player_a_ids = {str(player_a.get("ID", "")), str(player_a.get("Name", ""))}
+        suffix = "A" if active_player in player_a_ids else "B"
+    return f"{turn}{suffix}"
+
+
+def format_life_totals(state: GameStateSnapshot) -> str:
+    players = state.get("players", [])
+    p1_life = int(players[0].get("Life", 0)) if players else 0
+    p2_life = int(players[1].get("Life", 0)) if len(players) > 1 else 0
+    return f"{p1_life:>2}-{p2_life:<2}"
+
+
+def describe_action(item: TranscriptAction) -> str:
+    action = item.action
+    pending = item.pending
+    action_kind = action.get("kind", "")
+    if action_kind == "pass":
+        return "pass"
+    if action_kind == "play_land":
+        return f"play {_card_name_for_id(pending, action.get('card_id', ''))}"
+    if action_kind == "cast_spell":
+        name = _card_name_for_id(pending, action.get("card_id", ""))
+        return _with_targets(f"play {name}", item, action.get("targets", []))
+    if action_kind == "activate_ability":
+        name = _card_label_for_id(item, action.get("permanent_id", ""))
+        ability_index = int(action.get("ability_index", 0))
+        return _with_targets(
+            f"activate {name} ability {ability_index}",
+            item,
+            action.get("targets", []),
+        )
+
+    if "attackers" in action:
+        attackers = [_card_label_for_id(item, attacker_id) for attacker_id in action["attackers"]]
+        if not attackers:
+            return "attack with no creatures"
+        return "attack with " + ", ".join(attackers)
+
+    if "blockers" in action:
+        assignments = []
+        for assignment in action["blockers"]:
+            blocker = _card_label_for_id(item, assignment.get("blocker", ""))
+            attacker = _card_label_for_id(item, assignment.get("attacker", ""))
+            assignments.append(f"{blocker} blocks {attacker}")
+        if not assignments:
+            return "block with no creatures"
+        return "; ".join(assignments)
+
+    if "selected_ids" in action:
+        selected = [
+            _card_name_for_id(pending, selected_id) for selected_id in action["selected_ids"]
+        ]
+        return "choose " + (", ".join(selected) if selected else "nothing")
+    if "selected_index" in action:
+        idx = int(action["selected_index"])
+        return f"choose {_option_label(pending, idx)}"
+    if "selected_color" in action:
+        return f"choose {action['selected_color']}"
+    if "accepted" in action:
+        return "accept" if action["accepted"] else "decline"
+    return str(dict(action))
+
+
+def _with_targets(
+    prefix: str,
+    item: TranscriptAction,
+    target_ids: list[str],
+) -> str:
+    if not target_ids:
+        return prefix
+    targets = [_target_label_for_id(item, target_id) for target_id in target_ids]
+    return f"{prefix}, target {', '.join(targets)}"
+
+
+def _card_name_for_id(pending: PendingState, object_id: str) -> str:
+    if not object_id:
+        return "unknown"
+    for option in pending.get("options", []):
+        if _option_ids(option) & {object_id}:
+            return option.get("card_name") or option.get("label") or object_id
+        for target in option.get("valid_targets") or []:
+            if target.get("id") == object_id:
+                return target.get("label") or object_id
+    return object_id
+
+
+def _target_label_for_id(item: TranscriptAction, target_id: str) -> str:
+    if not target_id:
+        return "unknown"
+    for player_idx, player in enumerate(item.state.get("players", [])):
+        if target_id in {player.get("ID"), player.get("Name")}:
+            return f"P{player_idx + 1}"
+    state_label = _card_label_for_id(item, target_id)
+    if state_label != target_id:
+        return state_label
+    label = _card_name_for_id(item.pending, target_id)
+    return label if label != target_id else target_id
+
+
+def _card_label_for_id(item: TranscriptAction, object_id: str) -> str:
+    if not object_id:
+        return "unknown"
+    card = _state_card_for_id(item.state, object_id)
+    if card is None:
+        return _card_name_for_id(item.pending, object_id)
+
+    name = str(card.get("Name") or object_id)
+    power = card.get("Power", card.get("power"))
+    toughness = card.get("Toughness", card.get("toughness"))
+    if power is not None and toughness is not None:
+        return f"{name} {power}/{toughness}"
+    return name
+
+
+def _state_card_for_id(state: GameStateSnapshot, object_id: str) -> dict[str, Any] | None:
+    for player in state.get("players", []):
+        for zone_name in ("Battlefield", "Hand", "Graveyard"):
+            for card in player.get(zone_name) or []:
+                if card.get("ID") == object_id:
+                    return cast(dict[str, Any], card)
+    return None
+
+
+def _option_label(pending: PendingState, idx: int) -> str:
+    options = pending.get("options", [])
+    if not 0 <= idx < len(options):
+        return str(idx)
+    option = options[idx]
+    return option.get("card_name") or option.get("label") or option.get("id") or str(idx)
+
+
+def _option_ids(option: PendingOptionState) -> set[str]:
+    values = {
+        option.get("id", ""),
+        option.get("card_id", ""),
+        option.get("permanent_id", ""),
+    }
+    return {value for value in values if value}
 
 
 if __name__ == "__main__":
