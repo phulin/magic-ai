@@ -369,6 +369,8 @@ class RolloutBuffer(nn.Module):
             (capacity, recurrent_layers, recurrent_hidden_dim),
             torch.float32,
         )
+        _reg("next_step_idx", (capacity,), torch.long)
+        _reg("has_next", (capacity,), torch.float32)
 
         _reg(
             "decision_option_idx",
@@ -415,6 +417,8 @@ class RolloutBuffer(nn.Module):
     may_selected: Tensor
     lstm_h_in: Tensor
     lstm_c_in: Tensor
+    next_step_idx: Tensor
+    has_next: Tensor
     decision_option_idx: Tensor
     decision_target_idx: Tensor
     decision_mask: Tensor
@@ -671,6 +675,17 @@ class RolloutBuffer(nn.Module):
         self.may_selected[step_indices] = staging.may_selected[src_env, src_step]
         self.lstm_h_in[step_indices] = staging.lstm_h_in[src_env, src_step]
         self.lstm_c_in[step_indices] = staging.lstm_c_in[src_env, src_step]
+
+        step_counts_per_row = step_counts_t[:, None].expand(len(env_indices), max_steps)[
+            valid_step_mask
+        ]
+        is_last = (src_step + 1) >= step_counts_per_row
+        has_next_vals = (~is_last).to(torch.float32)
+        next_rows = step_indices.clone()
+        not_last_mask = ~is_last
+        next_rows[not_last_mask] = step_indices[not_last_mask] + 1
+        self.next_step_idx[step_indices] = next_rows
+        self.has_next[step_indices] = has_next_vals
 
         decision_counts_t = staging.decision_count[src_env, src_step].to(dtype=torch.long)
         source_starts_t = staging.decision_start[src_env, src_step].to(dtype=torch.long)

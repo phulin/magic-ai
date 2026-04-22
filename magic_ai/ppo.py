@@ -31,6 +31,7 @@ class PPOStats:
     entropy: float
     approx_kl: float
     clip_fraction: float
+    spr_loss: float = 0.0
 
 
 def ppo_update(
@@ -45,6 +46,7 @@ def ppo_update(
     value_coef: float = 0.5,
     entropy_coef: float = 0.01,
     max_grad_norm: float = 0.5,
+    spr_coef: float = 0.0,
 ) -> PPOStats:
     """Run PPO over cached policy inputs.
 
@@ -96,10 +98,20 @@ def ppo_update(
             entropy = batch_entropies.mean()
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
 
+            spr_loss_val = 0.0
+            if spr_coef > 0.0 and policy.spr_enabled:
+                replay_row_tensor = torch.tensor(replay_rows, dtype=torch.long, device=device)
+                spr_loss = policy.compute_spr_loss(replay_row_tensor)
+                loss = loss + spr_coef * spr_loss
+                spr_loss_val = float(spr_loss.detach().cpu())
+
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
             optimizer.step()
+
+            if spr_coef > 0.0 and policy.spr_enabled:
+                policy.update_spr_target()
 
             with torch.no_grad():
                 approx_kl = (batch_old_log_probs - batch_log_probs).mean()
@@ -111,6 +123,7 @@ def ppo_update(
                 entropy=float(entropy.detach().cpu()),
                 approx_kl=float(approx_kl.detach().cpu()),
                 clip_fraction=float(clip_fraction.detach().cpu()),
+                spr_loss=spr_loss_val,
             )
 
     if last_stats is None:

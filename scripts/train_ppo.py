@@ -130,6 +130,9 @@ def main() -> None:
         max_targets_per_option=args.max_targets_per_option,
         rollout_capacity=rollout_capacity,
         use_lstm=args.lstm,
+        spr_enabled=args.spr,
+        spr_action_dim=args.spr_action_dim,
+        spr_ema_decay=args.spr_ema_decay,
     ).to(device)
     policy.init_lstm_env_states(args.num_envs)
     if device.type == "cuda":
@@ -220,6 +223,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--hidden-layers", type=int, default=2)
     parser.add_argument("--lstm", action="store_true", help="use an LSTM policy core")
+    parser.add_argument(
+        "--spr",
+        action="store_true",
+        help="add a self-predictive (SPR) auxiliary loss on the LSTM latent",
+    )
+    parser.add_argument("--spr-coef", type=float, default=0.1)
+    parser.add_argument("--spr-ema-decay", type=float, default=0.99)
+    parser.add_argument("--spr-action-dim", type=int, default=32)
     parser.add_argument("--max-options", type=int, default=64)
     parser.add_argument("--max-targets-per-option", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
@@ -278,6 +289,7 @@ def log_ppo_stats(
         "entropy": stats.entropy,
         "approx_kl": stats.approx_kl,
         "clip_fraction": stats.clip_fraction,
+        "spr_loss": stats.spr_loss,
         "games": games,
         "rollout_steps": steps,
     }
@@ -544,6 +556,7 @@ def train_native_batched_envs(
                 value_coef=args.value_coef,
                 entropy_coef=args.entropy_coef,
                 max_grad_norm=args.max_grad_norm,
+                spr_coef=args.spr_coef if args.spr else 0.0,
             )
             print(
                 "update",
@@ -593,6 +606,7 @@ def train_native_batched_envs(
             value_coef=args.value_coef,
             entropy_coef=args.entropy_coef,
             max_grad_norm=args.max_grad_norm,
+            spr_coef=args.spr_coef if args.spr else 0.0,
         )
         print(
             "final_update",

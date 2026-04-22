@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -9,6 +10,7 @@ from typing import Literal, cast
 import torch
 from torch import Tensor, nn
 from torch.distributions import Bernoulli
+from torch.nn import functional as F
 
 from magic_ai.actions import (
     COLORS,
@@ -135,6 +137,9 @@ class PPOPolicy(nn.Module):
         rollout_capacity: int = 4096,
         decision_capacity: int | None = None,
         use_lstm: bool = False,
+        spr_enabled: bool = False,
+        spr_action_dim: int = 32,
+        spr_ema_decay: float = 0.99,
     ) -> None:
         super().__init__()
         self.game_state_encoder = game_state_encoder
@@ -182,6 +187,35 @@ class PPOPolicy(nn.Module):
         self.value_head = nn.Linear(hidden_dim, 1)
         self.none_blocker_head = nn.Linear(hidden_dim, 1)
         self.may_head = nn.Linear(hidden_dim, 1)
+
+        self.spr_enabled = spr_enabled
+        self.spr_ema_decay = spr_ema_decay
+        if spr_enabled:
+            if not use_lstm:
+                raise ValueError("SPR auxiliary loss currently requires use_lstm=True")
+            self.target_game_state_encoder = copy.deepcopy(game_state_encoder)
+            self.target_action_encoder = copy.deepcopy(self.action_encoder)
+            self.target_feature_projection = copy.deepcopy(self.feature_projection)
+            self.target_lstm = copy.deepcopy(self.lstm)
+            for module in (
+                self.target_game_state_encoder,
+                self.target_action_encoder,
+                self.target_feature_projection,
+                self.target_lstm,
+            ):
+                for p in module.parameters():
+                    p.requires_grad_(False)
+            self.spr_action_embedding = nn.Embedding(len(TRACE_KIND_VALUES), spr_action_dim)
+            d_model = game_state_encoder.d_model
+            self.spr_action_projector = nn.Sequential(
+                nn.Linear(2 * d_model + 1, spr_action_dim),
+                nn.GELU(),
+            )
+            self.spr_predictor = nn.Sequential(
+                nn.Linear(hidden_dim + 2 * spr_action_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
 
         if decision_capacity is None:
             decision_capacity = rollout_capacity * 8
@@ -1032,6 +1066,185 @@ class PPOPolicy(nn.Module):
 
         return log_probs, entropies, forward.values
 
+    def _encode_latent(
+        self,
+        step_indices: Tensor,
+        *,
+        use_target: bool,
+    ) -> Tensor:
+        """Compute the post-LSTM feature for the given replay rows.
+
+        Mirrors the feature path of ``_forward_batch`` but returns only the
+        recurrent hidden vector, using either the online or the frozen target
+        copy of the encoder stack.
+        """
+
+        rb = self.rollout_buffer
+        if use_target:
+            gse = self.target_game_state_encoder
+            action_encoder = self.target_action_encoder
+            feature_projection = self.target_feature_projection
+            lstm = self.target_lstm
+        else:
+            gse = self.game_state_encoder
+            action_encoder = self.action_encoder
+            feature_projection = self.feature_projection
+            lstm = self.lstm
+
+        slot_card_rows = rb.slot_card_rows[step_indices]
+        slot_occupied = rb.slot_occupied[step_indices]
+        slot_tapped = rb.slot_tapped[step_indices]
+        game_info = rb.game_info[step_indices]
+        option_mask = rb.option_mask[step_indices]
+
+        slot_vectors = gse.embed_slot_vectors(slot_card_rows, slot_occupied, slot_tapped)
+        state_vector = gse.state_vector_from_slots(slot_vectors, game_info)
+
+        pending_vector, option_vectors, _target_vectors = action_encoder.embed_from_parsed(
+            slot_vectors=slot_vectors,
+            pending_kind_id=rb.pending_kind_id[step_indices],
+            option_kind_ids=rb.option_kind_ids[step_indices],
+            option_scalars=rb.option_scalars[step_indices],
+            option_mask=option_mask,
+            option_ref_slot_idx=rb.option_ref_slot_idx[step_indices],
+            option_ref_card_row=rb.option_ref_card_row[step_indices],
+            target_mask=rb.target_mask[step_indices],
+            target_type_ids=rb.target_type_ids[step_indices],
+            target_scalars=rb.target_scalars[step_indices],
+            target_ref_slot_idx=rb.target_ref_slot_idx[step_indices],
+            target_ref_is_player=rb.target_ref_is_player[step_indices],
+            target_ref_is_self=rb.target_ref_is_self[step_indices],
+        )
+
+        option_mask_f = option_mask.unsqueeze(-1)
+        option_count = option_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        pooled = (option_vectors * option_mask_f).sum(dim=1) / option_count
+        features = torch.cat([state_vector, pending_vector, pooled], dim=-1)
+
+        projected = feature_projection(features).unsqueeze(1)
+        h_in = rb.lstm_h_in[step_indices].permute(1, 0, 2).contiguous()
+        c_in = rb.lstm_c_in[step_indices].permute(1, 0, 2).contiguous()
+        output, _ = lstm(projected, (h_in, c_in))
+        return output[:, 0, :]
+
+    def _selected_action_vectors(
+        self,
+        step_indices: Tensor,
+        option_vectors: Tensor,
+        target_vectors: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Mean of selected option/target vectors per step, over decision groups.
+
+        Returns two [B, d_model] tensors. Zero when a step has no decision
+        groups, or for the "none" column of a uses_none_head group.
+        """
+
+        rb = self.rollout_buffer
+        batch_size = int(step_indices.shape[0])
+        d_model = int(option_vectors.shape[-1])
+        device = step_indices.device
+        dtype = option_vectors.dtype
+
+        decision_starts = rb.decision_start[step_indices]
+        decision_counts = rb.decision_count[step_indices]
+        total_groups = int(decision_counts.sum().item())
+        zero = torch.zeros(batch_size, d_model, device=device, dtype=dtype)
+        if total_groups == 0:
+            return zero, zero.clone()
+
+        max_count = int(decision_counts.max().item())
+        range_ = torch.arange(max_count, device=device)
+        mask = range_[None, :] < decision_counts[:, None]
+        group_rows = (decision_starts[:, None] + range_[None, :])[mask]
+        step_pos_per_group = (
+            torch.arange(batch_size, device=device).unsqueeze(1).expand(batch_size, max_count)[mask]
+        )
+
+        selected_cols = rb.selected_indices[group_rows]
+        uses_none = rb.uses_none_head[group_rows]
+        is_none = uses_none & (selected_cols == 0)
+
+        opt_idx = rb.decision_option_idx[group_rows, selected_cols]
+        tgt_idx = rb.decision_target_idx[group_rows, selected_cols]
+        opt_idx_c = opt_idx.clamp_min(0).clamp_max(option_vectors.shape[1] - 1)
+        tgt_idx_c = tgt_idx.clamp_min(0).clamp_max(target_vectors.shape[2] - 1)
+
+        opt_vec = option_vectors[step_pos_per_group, opt_idx_c]
+        opt_vec = torch.where(is_none.unsqueeze(-1), torch.zeros_like(opt_vec), opt_vec)
+
+        tgt_has = (~is_none) & (tgt_idx >= 0)
+        tgt_vec = target_vectors[step_pos_per_group, opt_idx_c, tgt_idx_c]
+        tgt_vec = torch.where(tgt_has.unsqueeze(-1), tgt_vec, torch.zeros_like(tgt_vec))
+
+        scatter_idx = step_pos_per_group.unsqueeze(-1).expand(-1, d_model)
+        opt_sum = torch.zeros_like(zero).scatter_add(0, scatter_idx, opt_vec)
+        tgt_sum = torch.zeros_like(zero).scatter_add(0, scatter_idx, tgt_vec)
+        denom = decision_counts.clamp_min(1).to(dtype).unsqueeze(-1)
+        return opt_sum / denom, tgt_sum / denom
+
+    def compute_spr_loss(self, step_indices: Tensor) -> Tensor:
+        """Self-predictive (SPR) auxiliary loss on the given replay rows.
+
+        For each row t with a valid next row t+1 in the same episode, predict
+        the target network's post-LSTM latent at t+1 from the online latent at
+        t plus an embedding of the full action taken at t (trace kind + mean
+        of selected option/target vectors + may bit), and penalize their
+        (normalized) mean squared error.
+        """
+
+        if not self.spr_enabled:
+            raise RuntimeError("SPR is not enabled on this policy")
+
+        rb = self.rollout_buffer
+        has_next = rb.has_next[step_indices]
+        if has_next.sum().item() == 0.0:
+            return torch.zeros((), device=step_indices.device, dtype=torch.float32)
+
+        forward = self._forward_batch(step_indices)
+        z_online = forward.hidden
+
+        opt_mean, tgt_mean = self._selected_action_vectors(
+            step_indices, forward.option_vectors, forward.target_vectors
+        )
+        may_bit = rb.may_selected[step_indices].unsqueeze(-1).to(opt_mean.dtype)
+        action_raw = torch.cat([opt_mean, tgt_mean, may_bit], dim=-1)
+        action_proj = self.spr_action_projector(action_raw)
+        trace_kind_ids = rb.trace_kind_id[step_indices]
+        trace_emb = self.spr_action_embedding(trace_kind_ids)
+
+        pred_in = torch.cat([z_online, trace_emb, action_proj], dim=-1)
+        z_hat_next = self.spr_predictor(pred_in)
+
+        next_idx = rb.next_step_idx[step_indices]
+        with torch.no_grad():
+            z_target_next = self._encode_latent(next_idx, use_target=True)
+
+        z_hat_n = F.normalize(z_hat_next, dim=-1)
+        z_tgt_n = F.normalize(z_target_next, dim=-1)
+        per_row = ((z_hat_n - z_tgt_n) ** 2).sum(dim=-1)
+        per_row = per_row * has_next
+        denom = has_next.sum().clamp_min(1.0)
+        return per_row.sum() / denom
+
+    @torch.no_grad()
+    def update_spr_target(self, decay: float | None = None) -> None:
+        """EMA update of the frozen target encoder stack toward the online one."""
+
+        if not self.spr_enabled:
+            return
+        tau = self.spr_ema_decay if decay is None else decay
+        pairs = (
+            (self.game_state_encoder, self.target_game_state_encoder),
+            (self.action_encoder, self.target_action_encoder),
+            (self.feature_projection, self.target_feature_projection),
+            (self.lstm, self.target_lstm),
+        )
+        for online, target in pairs:
+            for op, tp in zip(online.parameters(), target.parameters(), strict=True):
+                tp.mul_(tau).add_(op.detach(), alpha=1.0 - tau)
+            for ob, tb in zip(online.buffers(), target.buffers(), strict=True):
+                tb.copy_(ob)
+
     def _apply_policy_core(
         self,
         features: Tensor,
@@ -1126,6 +1339,7 @@ class PPOPolicy(nn.Module):
             may_logits=may_logits,
             option_vectors=option_vectors,
             target_vectors=target_vectors,
+            hidden=hidden,
         )
 
     def _forward_native_batch(
@@ -1204,6 +1418,7 @@ class PPOPolicy(nn.Module):
             may_logits=may_logits,
             option_vectors=option_vectors,
             target_vectors=target_vectors,
+            hidden=hidden,
         )
 
     @staticmethod
@@ -1700,6 +1915,7 @@ class _ForwardBatch:
     may_logits: Tensor
     option_vectors: Tensor
     target_vectors: Tensor
+    hidden: Tensor
 
 
 def _trace_kind_for_pending(pending: PendingState) -> TraceKind:
