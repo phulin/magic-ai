@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.train_ppo import validate_deck_embeddings
+from scripts.train_ppo import load_deck_dir, sample_decks, validate_deck_embeddings
 
 
 class TrainPPOTests(unittest.TestCase):
@@ -27,7 +27,33 @@ class TrainPPOTests(unittest.TestCase):
             deck_b = {"cards": [{"name": "Missing Card", "count": 3}]}
 
             with self.assertRaisesRegex(ValueError, "Missing Card .*player_b=3"):
-                validate_deck_embeddings(embeddings_path, deck_a, deck_b)
+                validate_deck_embeddings(embeddings_path, (deck_a, deck_b))
+
+    def test_load_deck_dir_loads_sorted_json_decks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            deck_dir = Path(tmpdir)
+            (deck_dir / "b.json").write_text(
+                json.dumps({"name": "B", "cards": [{"name": "Island", "count": 1}]})
+            )
+            (deck_dir / "a.json").write_text(
+                json.dumps({"name": "A", "cards": [{"name": "Forest", "count": 1}]})
+            )
+
+            decks = load_deck_dir(deck_dir)
+
+        self.assertEqual([deck["name"] for deck in decks], ["A", "B"])
+
+    def test_sample_decks_is_deterministic_for_seed(self) -> None:
+        deck_pool = [
+            {"name": "A", "cards": []},
+            {"name": "B", "cards": []},
+            {"name": "C", "cards": []},
+        ]
+
+        first = sample_decks(deck_pool, seed=17)
+        second = sample_decks(deck_pool, seed=17)
+
+        self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

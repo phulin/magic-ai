@@ -7,6 +7,7 @@ import argparse
 import copy
 import importlib
 import json
+import random
 import re
 import sys
 from dataclasses import dataclass
@@ -104,8 +105,8 @@ class WinFractionStats:
 def main() -> None:
     args = parse_args()
     validate_args(args)
-    deck_a, deck_b = load_decks(args.deck_json)
-    validate_deck_embeddings(args.embeddings, deck_a, deck_b)
+    deck_pool = load_deck_pool(args.deck_json, args.deck_dir)
+    validate_deck_embeddings(args.embeddings, deck_pool)
     if args.torch_threads is not None:
         torch.set_num_threads(args.torch_threads)
 
@@ -172,8 +173,7 @@ def main() -> None:
     train_native_batched_envs(
         args,
         mage,
-        deck_a,
-        deck_b,
+        deck_pool,
         policy,
         native_encoder,
         optimizer,
@@ -192,6 +192,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("checkpoints/ppo.pt"))
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--deck-json", type=Path, default=None)
+    parser.add_argument(
+        "--deck-dir",
+        type=Path,
+        default=None,
+        help="directory of deck JSON files to sample randomly per game",
+    )
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--rollout-steps", type=int, default=512)
@@ -250,6 +256,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--minibatch-size must be at least 1")
     if args.hidden_layers < 1:
         raise ValueError("--hidden-layers must be at least 1")
+    if args.deck_json is not None and args.deck_dir is not None:
+        raise ValueError("--deck-json and --deck-dir are mutually exclusive")
 
 
 def log_ppo_stats(
@@ -258,6 +266,7 @@ def log_ppo_stats(
     games: int,
     steps: int,
     win_stats: WinFractionStats | None = None,
+    value_metrics: dict[str, float] | None = None,
 ) -> None:
     """Log PPO update metrics to wandb (if active)."""
     if wandb.run is None:
@@ -274,14 +283,33 @@ def log_ppo_stats(
     }
     if win_stats is not None:
         payload.update(win_stats.as_wandb_metrics())
+    if value_metrics is not None:
+        payload.update(value_metrics)
     wandb.log(payload)
+
+
+def rollout_value_metrics(
+    steps: list[RolloutStep],
+    returns: torch.Tensor,
+) -> dict[str, float]:
+    """Summarize rollout return targets and sampled value predictions."""
+    return_values = returns.detach().to(dtype=torch.float32, device="cpu")
+    predicted_values = torch.tensor(
+        [step.value for step in steps],
+        dtype=torch.float32,
+    )
+    return {
+        "return_mean": float(return_values.mean().item()),
+        "return_std": float(return_values.std(unbiased=False).item()),
+        "value_mean": float(predicted_values.mean().item()),
+        "value_std": float(predicted_values.std(unbiased=False).item()),
+    }
 
 
 def train_native_batched_envs(
     args: argparse.Namespace,
     mage: Any,
-    deck_a: dict[str, Any],
-    deck_b: dict[str, Any],
+    deck_pool: list[dict[str, Any]],
     policy: PPOPolicy,
     native_encoder: NativeBatchEncoder,
     optimizer: torch.optim.Optimizer,
@@ -305,6 +333,7 @@ def train_native_batched_envs(
         staging_buffer.reset_env(slot_idx)
         policy.reset_lstm_env_states([slot_idx])
         seed = args.seed + episode_idx
+        deck_a, deck_b = sample_decks(deck_pool, seed)
         return LiveGame(
             game=mage.new_game(
                 deck_a,
@@ -503,11 +532,12 @@ def train_native_batched_envs(
             )
 
         if len(pending_steps) >= args.rollout_steps:
+            rollout_returns = torch.cat(pending_returns)
             stats = ppo_update(
                 policy,
                 optimizer,
                 pending_steps,
-                torch.cat(pending_returns),
+                rollout_returns,
                 epochs=args.ppo_epochs,
                 minibatch_size=args.minibatch_size,
                 clip_epsilon=args.clip_epsilon,
@@ -532,6 +562,7 @@ def train_native_batched_envs(
                 games=completed_games,
                 steps=len(pending_steps),
                 win_stats=win_stats,
+                value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
             )
             policy.reset_rollout_buffer()
             pending_steps.clear()
@@ -550,11 +581,12 @@ def train_native_batched_envs(
         maybe_start_games()
 
     if pending_steps:
+        rollout_returns = torch.cat(pending_returns)
         stats = ppo_update(
             policy,
             optimizer,
             pending_steps,
-            torch.cat(pending_returns),
+            rollout_returns,
             epochs=args.ppo_epochs,
             minibatch_size=args.minibatch_size,
             clip_epsilon=args.clip_epsilon,
@@ -572,8 +604,46 @@ def train_native_batched_envs(
             f"entropy={stats.entropy:.4f}",
             flush=True,
         )
-        log_ppo_stats(stats, games=completed_games, steps=len(pending_steps), win_stats=win_stats)
+        log_ppo_stats(
+            stats,
+            games=completed_games,
+            steps=len(pending_steps),
+            win_stats=win_stats,
+            value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
+        )
         policy.reset_rollout_buffer()
+
+
+def load_deck_pool(deck_json: Path | None, deck_dir: Path | None) -> list[dict[str, Any]]:
+    if deck_dir is not None:
+        return load_deck_dir(deck_dir)
+    return list(load_decks(deck_json))
+
+
+def load_deck_dir(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(f"deck directory does not exist: {path}")
+    if not path.is_dir():
+        raise NotADirectoryError(f"deck directory path is not a directory: {path}")
+
+    decks: list[dict[str, Any]] = []
+    for deck_path in sorted(path.glob("*.json")):
+        payload = json.loads(deck_path.read_text())
+        decks.append(cast(dict[str, Any], payload))
+
+    if not decks:
+        raise ValueError(f"deck directory contains no JSON decks: {path}")
+    return decks
+
+
+def sample_decks(
+    deck_pool: list[dict[str, Any]],
+    seed: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not deck_pool:
+        raise ValueError("deck pool must contain at least one deck")
+    rng = random.Random(seed)
+    return rng.choice(deck_pool), rng.choice(deck_pool)
 
 
 def load_decks(path: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -591,12 +661,12 @@ def load_decks(path: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:
 
 def validate_deck_embeddings(
     embeddings_path: Path,
-    deck_a: dict[str, Any],
-    deck_b: dict[str, Any],
+    decks: list[dict[str, Any]] | tuple[dict[str, Any], ...],
 ) -> None:
     embedded_names = load_embedded_card_names(embeddings_path)
     missing: dict[str, dict[str, int]] = {}
-    for label, deck in (("player_a", deck_a), ("player_b", deck_b)):
+    for idx, deck in enumerate(decks):
+        label = deck_label(deck, idx, len(decks))
         for name, count in deck_card_counts(deck).items():
             if card_name_key(name) in embedded_names:
                 continue
@@ -641,6 +711,15 @@ def deck_card_counts(deck: dict[str, Any]) -> dict[str, int]:
         count = card.get("count", 1)
         counts[name] = counts.get(name, 0) + int(count)
     return counts
+
+
+def deck_label(deck: dict[str, Any], idx: int, deck_count: int) -> str:
+    name = deck.get("name")
+    if isinstance(name, str) and name.strip():
+        return name
+    if deck_count == 2:
+        return "player_a" if idx == 0 else "player_b"
+    return f"deck_{idx + 1}"
 
 
 def card_name_key(name: str) -> str:

@@ -15,7 +15,7 @@ dependencies = [
 
 [tool.uv.sources]
 torch = { index = "pytorch", marker = "sys_platform != 'darwin'" }
-mage-go = { git = "https://github.com/phulin/mage-go.git" }
+mage-go = { path = "../mage-go" }
 
 [[tool.uv.index]]
 name = "pytorch"
@@ -24,6 +24,7 @@ explicit = true
 
 [dependency-groups]
 dev = [
+    "line-profiler>=5.0.2",
     "pre-commit>=4.5.1",
     "ruff>=0.15.11",
     "ty>=0.0.31",
