@@ -10,6 +10,7 @@ import json
 import random
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -112,6 +113,39 @@ class WinFractionStats:
         self.draws = 0
 
 
+def _current_transcript_snapshot(game: Any) -> tuple[GameStateSnapshot, PendingState]:
+    pending = cast(PendingState | None, game.pending)
+    if pending is None:
+        # Keep the printed state aligned with the pending action source when the
+        # shadow game requires an explicit state refresh before legal() is valid.
+        game.refresh_state()
+        pending = cast(PendingState | None, game.pending or game.legal())
+    state = cast(GameStateSnapshot, copy.deepcopy(game.state))
+    if pending is None:
+        raise RuntimeError("transcript shadow game is missing a pending action")
+    return state, copy.deepcopy(pending)
+
+
+def _wandb_summary_value(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_wandb_summary_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _wandb_summary_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def log_args_to_wandb_summary(args: argparse.Namespace, run: Any | None = None) -> None:
+    active_run = wandb.run if run is None else run
+    if active_run is None:
+        return
+    for key, value in vars(args).items():
+        active_run.summary[f"args/{key}"] = _wandb_summary_value(value)
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -126,6 +160,7 @@ def main() -> None:
             name=args.wandb_run_name,
             config=vars(args),
         )
+        log_args_to_wandb_summary(args)
 
     device = torch.device(args.device)
     torch.set_float32_matmul_precision("high")
@@ -357,11 +392,16 @@ def log_ppo_stats(
     *,
     games: int,
     steps: int,
+    total_rollout_steps: int,
+    total_generated_rollout_steps: int,
     win_stats: WinFractionStats | None = None,
     value_metrics: dict[str, float] | None = None,
+    log_fn: Callable[[dict[str, Any]], None] | None = None,
+    run_active: bool | None = None,
 ) -> None:
     """Log PPO update metrics to wandb (if active)."""
-    if wandb.run is None:
+    is_run_active = wandb.run is not None if run_active is None else run_active
+    if not is_run_active:
         return
     payload = {
         "loss": stats.loss,
@@ -373,12 +413,15 @@ def log_ppo_stats(
         "spr_loss": stats.spr_loss,
         "games": games,
         "rollout_steps": steps,
+        "total_rollout_steps": total_rollout_steps,
+        "total_generated_rollout_steps": total_generated_rollout_steps,
     }
     if win_stats is not None:
         payload.update(win_stats.as_wandb_metrics())
     if value_metrics is not None:
         payload.update(value_metrics)
-    wandb.log(payload)
+    logger = wandb.log if log_fn is None else log_fn
+    logger(payload)
 
 
 def rollout_value_metrics(
@@ -421,10 +464,13 @@ def train_native_batched_envs(
     pending_returns: list[torch.Tensor] = []
     completed_games = 0
     last_saved_games = 0
+    total_rollout_steps = 0
+    total_generated_rollout_steps = 0
     next_episode_idx = 0
     live_games: list[LiveGame] = []
     free_slots = list(range(args.num_envs - 1, -1, -1))
     win_stats = WinFractionStats()
+    transcript_warning_emitted = False
     policy.reset_rollout_buffer()
 
     def start_game(slot_idx: int, episode_idx: int) -> LiveGame:
@@ -467,8 +513,17 @@ def train_native_batched_envs(
             live_games.append(start_game(free_slots.pop(), next_episode_idx))
             next_episode_idx += 1
 
+    def disable_transcript(env: LiveGame, reason: str) -> None:
+        nonlocal transcript_warning_emitted
+        if env.transcript_game is not None:
+            env.transcript_game.close()
+            env.transcript_game = None
+        if not transcript_warning_emitted:
+            print(f"warning: disabling sample transcript shadow game: {reason}", flush=True)
+            transcript_warning_emitted = True
+
     def finish_games(finished: list[tuple[LiveGame, int]]) -> None:
-        nonlocal completed_games
+        nonlocal completed_games, total_generated_rollout_steps
         if not finished:
             return
 
@@ -513,6 +568,7 @@ def train_native_batched_envs(
                 )
                 pending_steps.extend(env.episode_steps)
                 pending_returns.append(returns)
+                total_generated_rollout_steps += len(env.episode_steps)
             if env.slot_idx == 0:
                 print_sample_game(
                     env.transcript,
@@ -576,25 +632,31 @@ def train_native_batched_envs(
             ):
                 cols = list(policy_step.selected_choice_cols)
                 if env.transcript_game is not None:
-                    transcript_pending = env.transcript_game.pending or env.transcript_game.legal()
-                    if transcript_pending is None:
-                        raise RuntimeError("transcript shadow game is missing a pending action")
+                    transcript_state, transcript_pending = _current_transcript_snapshot(
+                        env.transcript_game
+                    )
                     transcript_action = copy.deepcopy(policy_step.action)
                     if policy_step.trace.kind != "may":
                         _trace, decoded_action = policy._decode_action(
                             policy_step.trace.kind,
-                            cast(PendingState, transcript_pending),
+                            transcript_pending,
                             cols,
                         )
                         transcript_action = copy.deepcopy(decoded_action)
                     env.transcript.append(
                         TranscriptAction(
-                            state=cast(GameStateSnapshot, copy.deepcopy(env.transcript_game.state)),
-                            pending=cast(PendingState, copy.deepcopy(transcript_pending)),
+                            state=transcript_state,
+                            pending=transcript_pending,
                             action=transcript_action,
                         )
                     )
-                    env.transcript_game.step(cast(dict[Any, Any], transcript_action))
+                    try:
+                        env.transcript_game.step(cast(dict[Any, Any], transcript_action))
+                    except Exception as exc:
+                        disable_transcript(
+                            env,
+                            f"{exc} while applying transcript action {transcript_action!r}",
+                        )
                 starts.append(cursor)
                 counts.append(len(cols))
                 selected_cols.extend(cols)
@@ -632,6 +694,7 @@ def train_native_batched_envs(
 
         if len(pending_steps) >= args.rollout_steps:
             rollout_returns = torch.cat(pending_returns)
+            rollout_step_count = len(pending_steps)
             stats = ppo_update(
                 policy,
                 optimizer,
@@ -648,7 +711,7 @@ def train_native_batched_envs(
             print(
                 "update",
                 f"games={completed_games}",
-                f"steps={len(pending_steps)}",
+                f"steps={rollout_step_count}",
                 f"loss={stats.loss:.4f}",
                 f"policy={stats.policy_loss:.4f}",
                 f"value={stats.value_loss:.4f}",
@@ -657,10 +720,13 @@ def train_native_batched_envs(
                 f"clip={stats.clip_fraction:.3f}",
                 flush=True,
             )
+            total_rollout_steps += rollout_step_count
             log_ppo_stats(
                 stats,
                 games=completed_games,
-                steps=len(pending_steps),
+                steps=rollout_step_count,
+                total_rollout_steps=total_rollout_steps,
+                total_generated_rollout_steps=total_generated_rollout_steps,
                 win_stats=win_stats,
                 value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
             )
@@ -702,6 +768,7 @@ def train_native_batched_envs(
 
     if pending_steps:
         rollout_returns = torch.cat(pending_returns)
+        rollout_step_count = len(pending_steps)
         stats = ppo_update(
             policy,
             optimizer,
@@ -718,17 +785,20 @@ def train_native_batched_envs(
         print(
             "final_update",
             f"games={completed_games}",
-            f"steps={len(pending_steps)}",
+            f"steps={rollout_step_count}",
             f"loss={stats.loss:.4f}",
             f"policy={stats.policy_loss:.4f}",
             f"value={stats.value_loss:.4f}",
             f"entropy={stats.entropy:.4f}",
             flush=True,
         )
+        total_rollout_steps += rollout_step_count
         log_ppo_stats(
             stats,
             games=completed_games,
-            steps=len(pending_steps),
+            steps=rollout_step_count,
+            total_rollout_steps=total_rollout_steps,
+            total_generated_rollout_steps=total_generated_rollout_steps,
             win_stats=win_stats,
             value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
         )

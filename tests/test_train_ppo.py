@@ -7,9 +7,12 @@ from argparse import Namespace
 from pathlib import Path
 
 import torch
-from magic_ai.ppo import RolloutStep, gae_returns
+from magic_ai.ppo import PPOStats, RolloutStep, gae_returns
 from scripts.train_ppo import (
+    _current_transcript_snapshot,
     load_deck_dir,
+    log_args_to_wandb_summary,
+    log_ppo_stats,
     sample_decks,
     validate_args,
     validate_deck_embeddings,
@@ -17,6 +20,29 @@ from scripts.train_ppo import (
 
 
 class TrainPPOTests(unittest.TestCase):
+    def test_current_transcript_snapshot_refreshes_state_before_legal_lookup(self) -> None:
+        class StubGame:
+            def __init__(self) -> None:
+                self.state: dict[str, object] = {"step": "Precombat Main"}
+                self.pending = None
+                self.refresh_calls = 0
+
+            def refresh_state(self) -> dict[str, object]:
+                self.refresh_calls += 1
+                self.state = {"step": "Declare Attackers"}
+                return self.state
+
+            def legal(self) -> dict[str, object]:
+                return {"kind": "priority", "player_idx": 1, "options": []}
+
+        game = StubGame()
+
+        state, pending = _current_transcript_snapshot(game)
+
+        self.assertEqual(game.refresh_calls, 1)
+        self.assertEqual(state["step"], "Declare Attackers")
+        self.assertEqual(pending["player_idx"], 1)
+
     def test_gae_returns_flips_bootstrap_sign_for_opponent_steps(self) -> None:
         steps = [
             RolloutStep(perspective_player_idx=0, old_log_prob=0.0, value=0.2),
@@ -79,6 +105,64 @@ class TrainPPOTests(unittest.TestCase):
         second = sample_decks(deck_pool, seed=17)
 
         self.assertEqual(first, second)
+
+    def test_log_args_to_wandb_summary_serializes_namespace(self) -> None:
+        args = Namespace(
+            checkpoint_dir=Path("checkpoints/latest"),
+            no_wandb=False,
+            wandb_run_name=None,
+            layers=[128, 256],
+            metadata={"seed": 7},
+        )
+
+        class StubRun:
+            def __init__(self) -> None:
+                self.summary: dict[str, object] = {}
+
+        run = StubRun()
+
+        log_args_to_wandb_summary(args, run=run)
+
+        self.assertEqual(
+            run.summary,
+            {
+                "args/checkpoint_dir": "checkpoints/latest",
+                "args/no_wandb": False,
+                "args/wandb_run_name": None,
+                "args/layers": [128, 256],
+                "args/metadata": {"seed": 7},
+            },
+        )
+
+    def test_log_ppo_stats_includes_total_rollout_steps(self) -> None:
+        stats = PPOStats(
+            loss=1.0,
+            policy_loss=2.0,
+            value_loss=3.0,
+            entropy=4.0,
+            approx_kl=5.0,
+            clip_fraction=6.0,
+            spr_loss=7.0,
+        )
+        payloads: list[dict[str, object]] = []
+
+        log_ppo_stats(
+            stats,
+            games=8,
+            steps=13,
+            total_rollout_steps=21,
+            total_generated_rollout_steps=34,
+            value_metrics={"return_mean": 0.5},
+            log_fn=payloads.append,
+            run_active=True,
+        )
+
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["rollout_steps"], 13)
+        self.assertEqual(payloads[0]["total_rollout_steps"], 21)
+        self.assertEqual(payloads[0]["total_generated_rollout_steps"], 34)
+        self.assertEqual(payloads[0]["games"], 8)
+        self.assertEqual(payloads[0]["return_mean"], 0.5)
 
     def test_validate_args_requires_no_validate_for_torch_compile(self) -> None:
         args = Namespace(
