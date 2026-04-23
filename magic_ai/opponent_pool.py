@@ -22,6 +22,7 @@ class OpponentEntry:
     path: Path
     tag: str
     rating: trueskill.Rating
+    cached_policy: dict[str, torch.Tensor] | None = None
 
 
 @dataclass
@@ -134,6 +135,15 @@ def snapshot_tag(threshold: int, total_episodes: int) -> str:
     return f"g{threshold:06d}_p{pct:05.1f}"
 
 
+def opponent_policy_state_dict(policy: PPOPolicy) -> dict[str, torch.Tensor]:
+    state_dict = policy.state_dict()
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in state_dict.items()
+        if not key.startswith(("target_", "spr_"))
+    }
+
+
 def save_snapshot(policy: PPOPolicy, directory: Path, tag: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"snapshot_{tag}.pt"
@@ -163,12 +173,27 @@ def build_opponent_policy(main_policy: PPOPolicy, device: torch.device) -> PPOPo
     return opponent
 
 
-def load_opponent_weights(opponent: PPOPolicy, path: Path, device: torch.device) -> None:
-    checkpoint = torch.load(path, map_location=device)
+def ensure_opponent_cached(entry: OpponentEntry) -> None:
+    if entry.cached_policy is not None:
+        return
+    checkpoint = torch.load(entry.path, map_location="cpu")
     state_dict = checkpoint["policy"] if "policy" in checkpoint else checkpoint
-    # Filter SPR / target-network keys that the inference-only opponent lacks.
-    filtered = {k: v for k, v in state_dict.items() if not k.startswith(("target_", "spr_"))}
-    opponent.load_state_dict(filtered, strict=False)
+    entry.cached_policy = {
+        key: value.detach().cpu().clone()
+        for key, value in state_dict.items()
+        if not key.startswith(("target_", "spr_"))
+    }
+
+
+def load_opponent_weights(
+    opponent: PPOPolicy,
+    entry: OpponentEntry,
+    device: torch.device,
+) -> None:
+    ensure_opponent_cached(entry)
+    assert entry.cached_policy is not None
+    opponent.load_state_dict(entry.cached_policy, strict=False)
+    opponent.to(device)
 
 
 @dataclass
@@ -176,6 +201,8 @@ class _EvalGame:
     game: Any
     slot_idx: int
     main_player_idx: int  # 0 or 1 — which side the main policy plays
+    opponent: OpponentEntry
+    round_idx: int
     action_count: int = 0
     winner_idx: int = -2  # -2 unresolved, -1 draw, 0/1 player
 
@@ -184,13 +211,13 @@ def run_eval_matches(
     *,
     main_policy: PPOPolicy,
     opponent_policy: PPOPolicy,
-    opponent: OpponentEntry,
+    opponents: list[OpponentEntry],
     pool: OpponentPool,
     native_encoder: NativeBatchEncoder,
     native_rollout: NativeRolloutDriver,
     mage: Any,
     deck_pool: list[dict[str, Any]],
-    num_games: int,
+    num_games_per_opponent: int,
     num_envs: int,
     max_steps_per_game: int,
     max_options: int,
@@ -202,10 +229,15 @@ def run_eval_matches(
     seed_base: int,
     rng: random.Random,
 ) -> dict[str, float]:
-    """Play eval games against a single opponent; update ratings; return metrics."""
-    load_opponent_weights(opponent_policy, opponent.path, main_policy.device)
+    """Play eval games against sampled opponents; update ratings; return metrics."""
+    if not opponents or num_games_per_opponent < 1:
+        return {}
 
-    num_envs = max(1, min(num_envs, num_games))
+    for opponent in opponents:
+        ensure_opponent_cached(opponent)
+
+    total_games_target = len(opponents) * num_games_per_opponent
+    num_envs = max(1, min(num_envs, total_games_target))
 
     saved_main_h: torch.Tensor | None = None
     saved_main_c: torch.Tensor | None = None
@@ -219,6 +251,9 @@ def run_eval_matches(
     main_wins = 0
     opp_wins = 0
     draws = 0
+    round_main_wins = [0 for _ in opponents]
+    round_opp_wins = [0 for _ in opponents]
+    round_draws = [0 for _ in opponents]
 
     free_slots = list(range(num_envs - 1, -1, -1))
     live: list[_EvalGame] = []
@@ -233,6 +268,8 @@ def run_eval_matches(
         deck_a = deck_rng.choice(deck_pool)
         deck_b = deck_rng.choice(deck_pool)
         main_player_idx = rng.randrange(2)
+        round_idx = game_idx // num_games_per_opponent
+        opponent = opponents[round_idx]
         if main_policy.use_lstm:
             main_policy.reset_lstm_env_states([slot_idx])
         if opponent_policy.use_lstm:
@@ -249,10 +286,12 @@ def run_eval_matches(
             ),
             slot_idx=slot_idx,
             main_player_idx=main_player_idx,
+            opponent=opponent,
+            round_idx=round_idx,
         )
 
     def fill_slots() -> None:
-        while free_slots and next_game_idx < num_games:
+        while free_slots and next_game_idx < total_games_target:
             live.append(start_game(free_slots.pop()))
 
     def run_policy(
@@ -302,8 +341,7 @@ def run_eval_matches(
         still_live: list[_EvalGame] = []
         main_envs: list[_EvalGame] = []
         main_players: list[int] = []
-        opp_envs: list[_EvalGame] = []
-        opp_players: list[int] = []
+        opp_groups: dict[Path, tuple[OpponentEntry, list[_EvalGame], list[int]]] = {}
 
         for idx, env in enumerate(live):
             over = bool(int(over_t[idx]))
@@ -313,13 +351,16 @@ def run_eval_matches(
                 env.game.close()
                 if env.winner_idx == env.main_player_idx:
                     main_wins += 1
-                    pool.record_match(opponent, main_won=True)
+                    round_main_wins[env.round_idx] += 1
+                    pool.record_match(env.opponent, main_won=True)
                 elif env.winner_idx == -1:
                     draws += 1
-                    pool.record_match(opponent, main_won=None)
+                    round_draws[env.round_idx] += 1
+                    pool.record_match(env.opponent, main_won=None)
                 else:
                     opp_wins += 1
-                    pool.record_match(opponent, main_won=False)
+                    round_opp_wins[env.round_idx] += 1
+                    pool.record_match(env.opponent, main_won=False)
                 free_slots.append(env.slot_idx)
                 continue
             still_live.append(env)
@@ -330,13 +371,18 @@ def run_eval_matches(
                 main_envs.append(env)
                 main_players.append(player)
             else:
-                opp_envs.append(env)
-                opp_players.append(player)
+                group = opp_groups.get(env.opponent.path)
+                if group is None:
+                    opp_groups[env.opponent.path] = (env.opponent, [env], [player])
+                else:
+                    group[1].append(env)
+                    group[2].append(player)
         live = still_live
 
         if main_envs:
             run_policy(main_policy, main_envs, main_players)
-        if opp_envs:
+        for opponent, opp_envs, opp_players in opp_groups.values():
+            load_opponent_weights(opponent_policy, opponent, main_policy.device)
             run_policy(opponent_policy, opp_envs, opp_players)
 
         fill_slots()
@@ -347,11 +393,24 @@ def run_eval_matches(
 
     total = main_wins + opp_wins + draws
     denom = float(total) if total else 1.0
-    return {
+    metrics = {
         "eval/games": float(total),
         "eval/main_win_fraction": main_wins / denom,
         "eval/opp_win_fraction": opp_wins / denom,
         "eval/draw_fraction": draws / denom,
-        f"eval/opp_{opponent.tag}_rating_mu": float(opponent.rating.mu),
-        f"eval/opp_{opponent.tag}_rating_sigma": float(opponent.rating.sigma),
     }
+    for round_idx, opponent in enumerate(opponents):
+        round_total = (
+            round_main_wins[round_idx] + round_opp_wins[round_idx] + round_draws[round_idx]
+        )
+        round_denom = float(round_total) if round_total else 1.0
+        metrics[f"eval/round_{round_idx}_main_win_fraction"] = (
+            round_main_wins[round_idx] / round_denom
+        )
+        metrics[f"eval/round_{round_idx}_opp_win_fraction"] = (
+            round_opp_wins[round_idx] / round_denom
+        )
+        metrics[f"eval/round_{round_idx}_draw_fraction"] = round_draws[round_idx] / round_denom
+        metrics[f"eval/opp_{opponent.tag}_rating_mu"] = float(opponent.rating.mu)
+        metrics[f"eval/opp_{opponent.tag}_rating_sigma"] = float(opponent.rating.sigma)
+    return metrics

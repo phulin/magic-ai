@@ -38,9 +38,11 @@ from magic_ai.native_rollout import (  # noqa: E402
     NativeRolloutUnavailable,
 )
 from magic_ai.opponent_pool import (  # noqa: E402
+    OpponentEntry,
     OpponentPool,
     SnapshotSchedule,
     build_opponent_policy,
+    opponent_policy_state_dict,
     run_eval_matches,
     save_snapshot,
     snapshot_tag,
@@ -744,7 +746,10 @@ def take_snapshot_and_eval(
 ) -> None:
     tag = snapshot_tag(threshold, args.episodes)
     snapshot_path = save_snapshot(policy, args.opponent_pool_dir, tag)
-    opponent_pool.add_snapshot(snapshot_path, tag)
+    opponent_pool.add_snapshot(
+        snapshot_path,
+        tag,
+    ).cached_policy = opponent_policy_state_dict(policy)
     print(
         f"pool: snapshot {tag} -> {snapshot_path} (pool size={len(opponent_pool.entries)})",
         flush=True,
@@ -760,52 +765,62 @@ def take_snapshot_and_eval(
             )
         return
 
-    eval_num_envs = args.eval_num_envs if args.eval_num_envs is not None else args.num_envs
-
-    for round_idx in range(args.eval_rounds_per_snapshot):
+    sampled_opponents: list[OpponentEntry] = []
+    for _round_idx in range(args.eval_rounds_per_snapshot):
         opponent = opponent_pool.sample(rng)
         if opponent is None:
             break
-        seed_base = args.seed + threshold * 1000 + round_idx * args.eval_games_per_round
-        metrics = run_eval_matches(
-            main_policy=policy,
-            opponent_policy=opponent_policy,
-            opponent=opponent,
-            pool=opponent_pool,
-            native_encoder=native_encoder,
-            native_rollout=native_rollout,
-            mage=mage,
-            deck_pool=deck_pool,
-            num_games=args.eval_games_per_round,
-            num_envs=eval_num_envs,
-            max_steps_per_game=args.max_steps_per_game,
-            max_options=args.max_options,
-            max_targets_per_option=args.max_targets_per_option,
-            hand_size=args.hand_size,
-            name_a=args.name_a,
-            name_b=args.name_b,
-            no_shuffle=args.no_shuffle,
-            seed_base=seed_base,
-            rng=rng,
-        )
-        main_rating = opponent_pool.main_rating
-        assert main_rating is not None
+        sampled_opponents.append(opponent)
+
+    if not sampled_opponents:
+        return
+
+    eval_num_envs = (
+        args.eval_num_envs
+        if args.eval_num_envs is not None
+        else args.eval_rounds_per_snapshot * args.eval_games_per_round
+    )
+    seed_base = args.seed + threshold * 1000
+    metrics = run_eval_matches(
+        main_policy=policy,
+        opponent_policy=opponent_policy,
+        opponents=sampled_opponents,
+        pool=opponent_pool,
+        native_encoder=native_encoder,
+        native_rollout=native_rollout,
+        mage=mage,
+        deck_pool=deck_pool,
+        num_games_per_opponent=args.eval_games_per_round,
+        num_envs=eval_num_envs,
+        max_steps_per_game=args.max_steps_per_game,
+        max_options=args.max_options,
+        max_targets_per_option=args.max_targets_per_option,
+        hand_size=args.hand_size,
+        name_a=args.name_a,
+        name_b=args.name_b,
+        no_shuffle=args.no_shuffle,
+        seed_base=seed_base,
+        rng=rng,
+    )
+    main_rating = opponent_pool.main_rating
+    assert main_rating is not None
+    for round_idx, opponent in enumerate(sampled_opponents):
         print(
             f"eval: snapshot_tag={tag} round={round_idx} "
             f"opponent={opponent.tag} "
-            f"main_win={metrics['eval/main_win_fraction']:.2f} "
+            f"main_win={metrics[f'eval/round_{round_idx}_main_win_fraction']:.2f} "
             f"main_rating=mu={main_rating.mu:.2f},"
             f"sigma={main_rating.sigma:.2f}",
             flush=True,
         )
-        if wandb.run is not None:
-            payload = {
-                **metrics,
-                "eval/snapshot_games": float(threshold),
-                "eval/new_snapshot_tag": tag,
-                "eval/opponent_tag": opponent.tag,
-            }
-            wandb.log(payload)
+
+    if wandb.run is not None:
+        payload = {
+            **metrics,
+            "eval/snapshot_games": float(threshold),
+            "eval/new_snapshot_tag": tag,
+        }
+        wandb.log(payload)
 
     if wandb.run is not None:
         wandb.log(

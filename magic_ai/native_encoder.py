@@ -150,6 +150,15 @@ class _BufferSet:
     uses_none_head_u8: Tensor
 
 
+@dataclass
+class _EncoderScratch:
+    batch_size: int = 0
+    decision_capacity: int = 0
+    buffers: _BufferSet | None = None
+    handles_t: Tensor | None = None
+    perspectives_t: Tensor | None = None
+
+
 def _ptr(tensor: Tensor, ctype: Any) -> Any:
     return ctypes.cast(tensor.data_ptr(), ctypes.POINTER(ctype))
 
@@ -224,6 +233,7 @@ class NativeBatchEncoder:
         if self.ffi is None:
             self._configure_ctypes()
         self.is_available = True
+        self._scratch = _EncoderScratch()
         if card_name_to_row is not None:
             self.register_card_rows(card_name_to_row)
 
@@ -371,6 +381,21 @@ class NativeBatchEncoder:
             uses_none_head_u8=torch.empty((decision_capacity,), dtype=torch.uint8),
         )
 
+    def _scratch_buffers(self, batch_size: int, decision_capacity: int) -> _BufferSet:
+        scratch = self._scratch
+        if (
+            scratch.buffers is None
+            or batch_size > scratch.batch_size
+            or decision_capacity > scratch.decision_capacity
+        ):
+            scratch.batch_size = batch_size
+            scratch.decision_capacity = decision_capacity
+            scratch.buffers = self._alloc(batch_size, decision_capacity)
+            scratch.handles_t = torch.empty((batch_size,), dtype=torch.int64)
+            scratch.perspectives_t = torch.empty((batch_size,), dtype=torch.int64)
+        assert scratch.buffers is not None
+        return scratch.buffers
+
     def encode_batch(
         self,
         games: list[Any],
@@ -418,7 +443,7 @@ class NativeBatchEncoder:
         if batch_size == 0:
             raise NativeEncodingError("empty batch")
         decision_capacity = max(1, batch_size * self.max_options)
-        buffers = self._alloc(batch_size, decision_capacity)
+        buffers = self._scratch_buffers(batch_size, decision_capacity)
         if self.ffi is not None:
             return self._encode_batch_cffi(
                 buffers,
@@ -427,8 +452,12 @@ class NativeBatchEncoder:
                 perspective_player_indices=perspective_player_indices,
                 decision_capacity=decision_capacity,
             )
-        handles_t = torch.tensor([int(game.handle) for game in games], dtype=torch.int64)
-        perspectives_t = torch.tensor(perspective_player_indices, dtype=torch.int64)
+        scratch = self._scratch
+        assert scratch.handles_t is not None and scratch.perspectives_t is not None
+        handles_t = scratch.handles_t[:batch_size]
+        perspectives_t = scratch.perspectives_t[:batch_size]
+        handles_t.copy_(torch.tensor([int(game.handle) for game in games], dtype=torch.int64))
+        perspectives_t.copy_(torch.tensor(perspective_player_indices, dtype=torch.int64))
         request = _MageBatchRequest(
             n=batch_size,
             handles=_ptr(handles_t, ctypes.c_int64),
@@ -547,11 +576,18 @@ class NativeBatchEncoder:
         ffi = self.ffi
         assert ffi is not None
         lib = cast(Any, self.lib)
-        handles_t = torch.tensor(
-            [int(getattr(game, "handle", getattr(game, "_id"))) for game in games],
-            dtype=torch.int64,
+        batch_size = len(games)
+        scratch = self._scratch
+        assert scratch.handles_t is not None and scratch.perspectives_t is not None
+        handles_t = scratch.handles_t[:batch_size]
+        perspectives_t = scratch.perspectives_t[:batch_size]
+        handles_t.copy_(
+            torch.tensor(
+                [int(getattr(game, "handle", getattr(game, "_id"))) for game in games],
+                dtype=torch.int64,
+            )
         )
-        perspectives_t = torch.tensor(perspective_player_indices, dtype=torch.int64)
+        perspectives_t.copy_(torch.tensor(perspective_player_indices, dtype=torch.int64))
         req = ffi.new(
             "MageBatchRequest *",
             {

@@ -72,7 +72,7 @@ class NativeMageStatus:
             self.lib.MageFreeString(raw)
 
 
-@dataclass(frozen=True)
+@dataclass
 class NativeRolloutDriver:
     """Capability guard for the planned no-JSON rollout API.
 
@@ -83,6 +83,21 @@ class NativeRolloutDriver:
 
     lib: Any
     ffi: Any
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_poll_capacity", 0)
+        object.__setattr__(self, "_poll_handles", torch.empty((0,), dtype=torch.int64))
+        object.__setattr__(self, "_poll_ready", torch.empty((0,), dtype=torch.int64))
+        object.__setattr__(self, "_poll_game_over", torch.empty((0,), dtype=torch.int64))
+        object.__setattr__(self, "_poll_pending_player_idx", torch.empty((0,), dtype=torch.int64))
+        object.__setattr__(self, "_poll_winner_player_idx", torch.empty((0,), dtype=torch.int64))
+        object.__setattr__(self, "_step_capacity", 0)
+        object.__setattr__(self, "_step_handles", torch.empty((0,), dtype=torch.int64))
+        object.__setattr__(self, "_step_starts", torch.empty((0,), dtype=torch.int64))
+        object.__setattr__(self, "_step_counts", torch.empty((0,), dtype=torch.int64))
+        object.__setattr__(self, "_step_selected_capacity", 0)
+        object.__setattr__(self, "_step_selected", torch.empty((0,), dtype=torch.int64))
+        object.__setattr__(self, "_step_may", torch.empty((0,), dtype=torch.int64))
 
     @classmethod
     def for_mage(cls, mage: Any) -> NativeRolloutDriver:
@@ -110,11 +125,19 @@ class NativeRolloutDriver:
         self, games: list[Any]
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         n = len(games)
-        handles = torch.tensor([int(game.handle) for game in games], dtype=torch.int64)
-        ready = torch.empty((n,), dtype=torch.int64)
-        game_over = torch.empty((n,), dtype=torch.int64)
-        pending_player_idx = torch.empty((n,), dtype=torch.int64)
-        winner_player_idx = torch.empty((n,), dtype=torch.int64)
+        if n > self._poll_capacity:
+            self._poll_capacity = n
+            self._poll_handles = torch.empty((n,), dtype=torch.int64)
+            self._poll_ready = torch.empty((n,), dtype=torch.int64)
+            self._poll_game_over = torch.empty((n,), dtype=torch.int64)
+            self._poll_pending_player_idx = torch.empty((n,), dtype=torch.int64)
+            self._poll_winner_player_idx = torch.empty((n,), dtype=torch.int64)
+        handles = self._poll_handles[:n]
+        ready = self._poll_ready[:n]
+        game_over = self._poll_game_over[:n]
+        pending_player_idx = self._poll_pending_player_idx[:n]
+        winner_player_idx = self._poll_winner_player_idx[:n]
+        handles.copy_(torch.tensor([int(game.handle) for game in games], dtype=torch.int64))
         req = self.ffi.new(
             "MageBatchRequest *",
             {
@@ -148,11 +171,27 @@ class NativeRolloutDriver:
         max_targets_per_option: int,
     ) -> None:
         n = len(games)
-        handles = torch.tensor([int(game.handle) for game in games], dtype=torch.int64)
-        starts = torch.tensor(decision_starts, dtype=torch.int64)
-        counts = torch.tensor(decision_counts, dtype=torch.int64)
-        selected = torch.tensor(selected_choice_cols, dtype=torch.int64)
-        may = torch.tensor(may_selected, dtype=torch.int64)
+        selected_n = len(selected_choice_cols)
+        if n > self._step_capacity:
+            self._step_capacity = n
+            self._step_handles = torch.empty((n,), dtype=torch.int64)
+            self._step_starts = torch.empty((n,), dtype=torch.int64)
+            self._step_counts = torch.empty((n,), dtype=torch.int64)
+            self._step_may = torch.empty((n,), dtype=torch.int64)
+        if selected_n > self._step_selected_capacity:
+            self._step_selected_capacity = selected_n
+            self._step_selected = torch.empty((selected_n,), dtype=torch.int64)
+        handles = self._step_handles[:n]
+        starts = self._step_starts[:n]
+        counts = self._step_counts[:n]
+        may = self._step_may[:n]
+        selected = self._step_selected[:selected_n]
+        handles.copy_(torch.tensor([int(game.handle) for game in games], dtype=torch.int64))
+        starts.copy_(torch.tensor(decision_starts, dtype=torch.int64))
+        counts.copy_(torch.tensor(decision_counts, dtype=torch.int64))
+        may.copy_(torch.tensor(may_selected, dtype=torch.int64))
+        if selected_n:
+            selected.copy_(torch.tensor(selected_choice_cols, dtype=torch.int64))
         req = self.ffi.new(
             "MageStepChoiceRequest *",
             {
