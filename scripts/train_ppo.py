@@ -220,9 +220,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="directory of deck JSON files to sample randomly per game",
     )
-    parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--num-envs", type=int, default=1)
-    parser.add_argument("--rollout-steps", type=int, default=512)
+    parser.add_argument("--episodes", type=int, default=65536)
+    parser.add_argument("--num-envs", type=int, default=128)
+    parser.add_argument("--rollout-steps", type=int, default=4096)
     parser.add_argument(
         "--rollout-buffer-capacity",
         type=int,
@@ -236,16 +236,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--name-b", default="B")
     parser.add_argument("--no-shuffle", action="store_true")
     parser.add_argument("--deterministic-rollout", action="store_true")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--torch-threads", type=int, default=None)
-    parser.add_argument("--d-model", type=int, default=128)
-    parser.add_argument("--hidden-dim", type=int, default=512)
-    parser.add_argument("--hidden-layers", type=int, default=2)
-    parser.add_argument("--lstm", action="store_true", help="use an LSTM policy core")
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--hidden-layers", type=int, default=4)
+    parser.add_argument(
+        "--lstm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use an LSTM policy core (default: on; pass --no-lstm to disable)",
+    )
     parser.add_argument(
         "--spr",
-        action="store_true",
-        help="add a self-predictive (SPR) auxiliary loss on the LSTM latent",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="add a self-predictive (SPR) auxiliary loss on the LSTM latent "
+        "(default: on; pass --no-spr to disable)",
     )
     parser.add_argument("--spr-coef", type=float, default=0.1)
     parser.add_argument("--spr-ema-decay", type=float, default=0.99)
@@ -255,12 +262,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--ppo-epochs", type=int, default=4)
-    parser.add_argument("--minibatch-size", type=int, default=256)
+    parser.add_argument("--minibatch-size", type=int, default=2048)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
-    parser.add_argument("--save-every", type=int, default=10)
+    parser.add_argument("--save-every", type=int, default=8192)
     parser.add_argument(
         "--sample-actions",
         type=int,
@@ -284,13 +291,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-rounds-per-snapshot",
         type=int,
-        default=3,
+        default=5,
         help="number of random opponents to evaluate against each time a snapshot is taken",
     )
     parser.add_argument(
         "--eval-games-per-round",
         type=int,
-        default=8,
+        default=50,
         help="eval games played against each sampled opponent",
     )
     parser.add_argument(
@@ -779,12 +786,20 @@ def take_snapshot_and_eval(
         if wandb.run is not None:
             payload = {
                 **metrics,
-                **opponent_pool.main_rating_metrics(),
                 "eval/snapshot_games": float(threshold),
                 "eval/new_snapshot_tag": tag,
                 "eval/opponent_tag": opponent.tag,
             }
             wandb.log(payload)
+
+    if wandb.run is not None:
+        wandb.log(
+            {
+                **opponent_pool.main_rating_metrics(),
+                "eval/snapshot_games": float(threshold),
+                "eval/new_snapshot_tag": tag,
+            }
+        )
 
 
 def load_deck_pool(deck_json: Path | None, deck_dir: Path | None) -> list[dict[str, Any]]:
