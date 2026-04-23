@@ -51,20 +51,25 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(trace.indices, (3,))
         self.assertEqual(action, {"selected_color": "red"})
 
-    def test_current_transcript_snapshot_refreshes_state_before_legal_lookup(self) -> None:
+    def test_current_transcript_snapshot_refreshes_live_game_before_snapshot(self) -> None:
         class StubGame:
             def __init__(self) -> None:
                 self.state: dict[str, object] = {"step": "Precombat Main"}
-                self.pending = None
+                self.pending: dict[str, object] | None = {
+                    "kind": "priority",
+                    "player_idx": 0,
+                    "options": [],
+                }
                 self.refresh_calls = 0
 
             def refresh_state(self) -> dict[str, object]:
                 self.refresh_calls += 1
                 self.state = {"step": "Declare Attackers"}
+                self.pending = {"kind": "priority", "player_idx": 1, "options": []}
                 return self.state
 
             def legal(self) -> dict[str, object]:
-                return {"kind": "priority", "player_idx": 1, "options": []}
+                return {"kind": "priority", "player_idx": 99, "options": []}
 
         game = StubGame()
 

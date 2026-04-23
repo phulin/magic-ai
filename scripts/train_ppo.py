@@ -122,12 +122,10 @@ class WinFractionStats:
 
 
 def _current_transcript_snapshot(game: Any) -> tuple[GameStateSnapshot, PendingState]:
-    pending = cast(PendingState | None, game.pending)
-    if pending is None:
-        # Keep the printed state aligned with the pending action source when the
-        # live game requires an explicit state refresh before legal() is valid.
-        game.refresh_state()
-        pending = cast(PendingState | None, game.pending or game.legal())
+    # Native batch rollout advances the engine without updating the Python
+    # wrapper's cached state, so refresh before every transcript snapshot.
+    game.refresh_state()
+    pending = cast(PendingState | None, game.pending or game.legal())
     state = cast(GameStateSnapshot, copy.deepcopy(game.state))
     if pending is None:
         raise RuntimeError("live game is missing a pending action for transcript capture")
