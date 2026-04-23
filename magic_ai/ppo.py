@@ -92,8 +92,9 @@ def ppo_update(
         for start in range(0, len(indices), minibatch_size):
             batch_indices = indices[start : start + minibatch_size]
             replay_rows = [cast(int, steps[idx].replay_idx) for idx in batch_indices]
-            batch_log_probs, batch_entropies, batch_values = policy.evaluate_replay_batch(
-                replay_rows
+            spr_active = spr_coef > 0.0 and policy.spr_enabled
+            batch_log_probs, batch_entropies, batch_values, extras = policy.evaluate_replay_batch(
+                replay_rows, return_extras=spr_active
             )
             batch_old_log_probs = old_log_probs[batch_indices]
             batch_returns = returns[batch_indices]
@@ -108,9 +109,9 @@ def ppo_update(
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
 
             spr_loss_val = 0.0
-            if spr_coef > 0.0 and policy.spr_enabled:
-                replay_row_tensor = torch.tensor(replay_rows, dtype=torch.long, device=device)
-                spr_loss = policy.compute_spr_loss(replay_row_tensor)
+            if spr_active:
+                assert extras is not None
+                spr_loss = policy.compute_spr_loss(extras.step_indices, extras=extras)
                 loss = loss + spr_coef * spr_loss
                 spr_loss_val = float(spr_loss.detach().cpu())
 
@@ -118,9 +119,6 @@ def ppo_update(
             loss.backward()
             nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
             optimizer.step()
-
-            if spr_coef > 0.0 and policy.spr_enabled:
-                policy.update_spr_target()
 
             with torch.no_grad():
                 approx_kl = (batch_old_log_probs - batch_log_probs).mean()
@@ -136,6 +134,8 @@ def ppo_update(
 
     if num_minibatches == 0:
         raise RuntimeError("PPO update did not run any minibatches")
+    if spr_coef > 0.0 and policy.spr_enabled:
+        policy.update_spr_target()
     return PPOStats(
         loss=sums["loss"] / num_minibatches,
         policy_loss=sums["policy_loss"] / num_minibatches,

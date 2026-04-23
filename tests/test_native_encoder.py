@@ -207,7 +207,7 @@ class NativeEncoderTests(unittest.TestCase):
         self.assertTrue(
             torch.equal(policy.rollout_buffer.lstm_h_in[write.step_indices[0]], state_inputs[0][0])
         )
-        log_probs, entropies, values = policy.evaluate_replay_batch(
+        log_probs, entropies, values, _extras = policy.evaluate_replay_batch(
             [int(idx) for idx in write.step_indices.detach().cpu().tolist()]
         )
         self.assertEqual(tuple(log_probs.shape), (2,))
