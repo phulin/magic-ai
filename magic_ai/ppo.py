@@ -76,7 +76,16 @@ def ppo_update(
             unbiased=False,
         ).clamp_min(1e-8)
 
-    last_stats: PPOStats | None = None
+    sums = {
+        "loss": 0.0,
+        "policy_loss": 0.0,
+        "value_loss": 0.0,
+        "entropy": 0.0,
+        "approx_kl": 0.0,
+        "clip_fraction": 0.0,
+        "spr_loss": 0.0,
+    }
+    num_minibatches = 0
     indices = list(range(len(steps)))
     for _ in range(epochs):
         random.shuffle(indices)
@@ -116,19 +125,26 @@ def ppo_update(
             with torch.no_grad():
                 approx_kl = (batch_old_log_probs - batch_log_probs).mean()
                 clip_fraction = ((ratio - 1.0).abs() > clip_epsilon).float().mean()
-            last_stats = PPOStats(
-                loss=float(loss.detach().cpu()),
-                policy_loss=float(policy_loss.detach().cpu()),
-                value_loss=float(value_loss.detach().cpu()),
-                entropy=float(entropy.detach().cpu()),
-                approx_kl=float(approx_kl.detach().cpu()),
-                clip_fraction=float(clip_fraction.detach().cpu()),
-                spr_loss=spr_loss_val,
-            )
+            sums["loss"] += float(loss.detach().cpu())
+            sums["policy_loss"] += float(policy_loss.detach().cpu())
+            sums["value_loss"] += float(value_loss.detach().cpu())
+            sums["entropy"] += float(entropy.detach().cpu())
+            sums["approx_kl"] += float(approx_kl.detach().cpu())
+            sums["clip_fraction"] += float(clip_fraction.detach().cpu())
+            sums["spr_loss"] += spr_loss_val
+            num_minibatches += 1
 
-    if last_stats is None:
+    if num_minibatches == 0:
         raise RuntimeError("PPO update did not run any minibatches")
-    return last_stats
+    return PPOStats(
+        loss=sums["loss"] / num_minibatches,
+        policy_loss=sums["policy_loss"] / num_minibatches,
+        value_loss=sums["value_loss"] / num_minibatches,
+        entropy=sums["entropy"] / num_minibatches,
+        approx_kl=sums["approx_kl"] / num_minibatches,
+        clip_fraction=sums["clip_fraction"] / num_minibatches,
+        spr_loss=sums["spr_loss"] / num_minibatches,
+    )
 
 
 def terminal_returns(
