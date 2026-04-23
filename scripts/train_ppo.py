@@ -266,7 +266,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-targets-per-option", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.995)
-    parser.add_argument("--gae-lambda", type=float, default=0.95)
+    parser.add_argument("--gae-lambda", type=float, default=0.97)
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--minibatch-size", type=int, default=2048)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
