@@ -38,8 +38,8 @@ from magic_ai.native_encoder import NativeBatchEncoder, NativeEncodedBatch, Nati
 from magic_ai.ppo import (
     PPOStats,
     RolloutStep,
+    gae_returns,
     ppo_update,
-    terminal_returns,
 )
 
 __all__ = [
@@ -76,7 +76,7 @@ __all__ = [
     "action_from_choice_index",
     "action_from_priority_candidate",
     "build_priority_candidates",
+    "gae_returns",
     "ppo_update",
     "selected_priority_candidate_index",
-    "terminal_returns",
 ]

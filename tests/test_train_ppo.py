@@ -6,6 +6,8 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
+import torch
+from magic_ai.ppo import RolloutStep, gae_returns
 from scripts.train_ppo import (
     load_deck_dir,
     sample_decks,
@@ -15,6 +17,23 @@ from scripts.train_ppo import (
 
 
 class TrainPPOTests(unittest.TestCase):
+    def test_gae_returns_flips_bootstrap_sign_for_opponent_steps(self) -> None:
+        steps = [
+            RolloutStep(perspective_player_idx=0, old_log_prob=0.0, value=0.2),
+            RolloutStep(perspective_player_idx=1, old_log_prob=0.0, value=-0.1),
+            RolloutStep(perspective_player_idx=1, old_log_prob=0.0, value=0.3),
+        ]
+
+        returns = gae_returns(
+            steps,
+            winner_idx=1,
+            gamma=1.0,
+            gae_lambda=1.0,
+        )
+
+        expected = torch.tensor([-1.0, 1.0, 1.0], dtype=torch.float32)
+        self.assertTrue(torch.allclose(returns, expected))
+
     def test_validate_deck_embeddings_reports_missing_cards(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             embeddings_path = Path(tmpdir) / "embeddings.json"
@@ -69,6 +88,7 @@ class TrainPPOTests(unittest.TestCase):
             max_steps_per_game=1,
             minibatch_size=1,
             hidden_layers=1,
+            gae_lambda=0.95,
             torch_compile=True,
             no_validate=False,
             deck_json=None,
@@ -79,6 +99,27 @@ class TrainPPOTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "--torch-compile requires --no-validate"):
+            validate_args(args)
+
+    def test_validate_args_rejects_invalid_gae_lambda(self) -> None:
+        args = Namespace(
+            episodes=1,
+            num_envs=1,
+            rollout_steps=1,
+            max_steps_per_game=1,
+            minibatch_size=1,
+            hidden_layers=1,
+            gae_lambda=1.5,
+            torch_compile=False,
+            no_validate=False,
+            deck_json=None,
+            deck_dir=None,
+            eval_rounds_per_snapshot=0,
+            eval_games_per_round=0,
+            eval_num_envs=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--gae-lambda must be in \\[0, 1\\]"):
             validate_args(args)
 
 

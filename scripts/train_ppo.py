@@ -47,7 +47,7 @@ from magic_ai.opponent_pool import (  # noqa: E402
     save_snapshot,
     snapshot_tag,
 )
-from magic_ai.ppo import PPOStats, RolloutStep, ppo_update, terminal_returns  # noqa: E402
+from magic_ai.ppo import PPOStats, RolloutStep, gae_returns, ppo_update  # noqa: E402
 
 DEFAULT_DECK = {
     "name": "bolt-mountain",
@@ -265,7 +265,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-options", type=int, default=64)
     parser.add_argument("--max-targets-per-option", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--gamma", type=float, default=0.995)
+    parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--minibatch-size", type=int, default=2048)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
@@ -335,6 +336,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-steps-per-game must be at least 1")
     if args.minibatch_size < 1:
         raise ValueError("--minibatch-size must be at least 1")
+    if not 0.0 <= args.gae_lambda <= 1.0:
+        raise ValueError("--gae-lambda must be in [0, 1]")
     if args.hidden_layers < 1:
         raise ValueError("--hidden-layers must be at least 1")
     if args.torch_compile and not args.no_validate:
@@ -502,10 +505,11 @@ def train_native_batched_envs(
                     )
                 ]
             if env.episode_steps:
-                returns = terminal_returns(
+                returns = gae_returns(
                     env.episode_steps,
                     winner_idx=winner_idx,
                     gamma=args.gamma,
+                    gae_lambda=args.gae_lambda,
                 )
                 pending_steps.extend(env.episode_steps)
                 pending_returns.append(returns)

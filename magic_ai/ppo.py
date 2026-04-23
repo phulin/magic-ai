@@ -147,22 +147,43 @@ def ppo_update(
     )
 
 
-def terminal_returns(
+def gae_returns(
     steps: Sequence[RolloutStep],
     *,
     winner_idx: int,
     gamma: float = 1.0,
+    gae_lambda: float = 0.95,
 ) -> Tensor:
-    """Assign final game outcome from each acting player's perspective."""
+    """Compute perspective-aware GAE returns for a zero-sum two-player game."""
 
-    values: list[float] = []
-    total = len(steps)
-    for idx, step in enumerate(steps):
-        if winner_idx < 0:
-            outcome = 0.0
-        elif winner_idx == step.perspective_player_idx:
-            outcome = 1.0
+    if not steps:
+        raise ValueError("cannot compute GAE returns for an empty rollout")
+
+    num_steps = len(steps)
+    values_t = torch.tensor([step.value for step in steps], dtype=torch.float32)
+    rewards_t = torch.zeros(num_steps, dtype=torch.float32)
+    advantages_t = torch.zeros(num_steps, dtype=torch.float32)
+
+    last_step = steps[-1]
+    if winner_idx < 0:
+        rewards_t[-1] = 0.0
+    elif winner_idx == last_step.perspective_player_idx:
+        rewards_t[-1] = 1.0
+    else:
+        rewards_t[-1] = -1.0
+
+    next_advantage = 0.0
+    for idx in range(num_steps - 1, -1, -1):
+        if idx == num_steps - 1:
+            delta = rewards_t[idx] - values_t[idx]
+            next_advantage = float(delta.item())
         else:
-            outcome = -1.0
-        values.append(outcome * (gamma ** max(0, total - idx - 1)))
-    return torch.tensor(values, dtype=torch.float32)
+            next_same_player = (
+                steps[idx + 1].perspective_player_idx == steps[idx].perspective_player_idx
+            )
+            sign = 1.0 if next_same_player else -1.0
+            delta = rewards_t[idx] + gamma * sign * values_t[idx + 1] - values_t[idx]
+            next_advantage = float(delta.item()) + gamma * gae_lambda * sign * next_advantage
+        advantages_t[idx] = next_advantage
+
+    return advantages_t + values_t
