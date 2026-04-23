@@ -396,6 +396,33 @@ class NativeBatchEncoder:
         assert scratch.buffers is not None
         return scratch.buffers
 
+    @staticmethod
+    def _slice_batch_buffers(buffers: _BufferSet, batch_size: int) -> dict[str, Tensor]:
+        return {
+            "trace_kind_id": buffers.trace_kind_id[:batch_size],
+            "slot_card_rows": buffers.slot_card_rows[:batch_size],
+            "slot_occupied": buffers.slot_occupied[:batch_size],
+            "slot_tapped": buffers.slot_tapped[:batch_size],
+            "game_info": buffers.game_info[:batch_size],
+            "pending_kind_id": buffers.pending_kind_id[:batch_size],
+            "num_present_options": buffers.num_present_options[:batch_size],
+            "option_kind_ids": buffers.option_kind_ids[:batch_size],
+            "option_scalars": buffers.option_scalars[:batch_size],
+            "option_mask": buffers.option_mask[:batch_size],
+            "option_ref_slot_idx": buffers.option_ref_slot_idx[:batch_size],
+            "option_ref_card_row": buffers.option_ref_card_row[:batch_size],
+            "target_mask": buffers.target_mask[:batch_size],
+            "target_type_ids": buffers.target_type_ids[:batch_size],
+            "target_scalars": buffers.target_scalars[:batch_size],
+            "target_overflow": buffers.target_overflow[:batch_size],
+            "target_ref_slot_idx": buffers.target_ref_slot_idx[:batch_size],
+            "target_ref_is_player": buffers.target_ref_is_player_u8[:batch_size].ne(0),
+            "target_ref_is_self": buffers.target_ref_is_self_u8[:batch_size].ne(0),
+            "may_mask": buffers.may_mask_u8[:batch_size].ne(0),
+            "decision_start": buffers.decision_start[:batch_size],
+            "decision_count": buffers.decision_count[:batch_size],
+        }
+
     def encode_batch(
         self,
         games: list[Any],
@@ -518,7 +545,8 @@ class NativeBatchEncoder:
                     lib.MageFreeString(result.error_message)
             raise NativeEncodingError(message)
         decision_rows_written = int(result.decision_rows_written)
-        trace_kind_id = buffers.trace_kind_id
+        batch = self._slice_batch_buffers(buffers, batch_size)
+        trace_kind_id = batch["trace_kind_id"]
         trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
         decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
         decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
@@ -534,27 +562,27 @@ class NativeBatchEncoder:
         )
         return NativeEncodedBatch(
             trace_kind_id=trace_kind_id,
-            slot_card_rows=buffers.slot_card_rows,
-            slot_occupied=buffers.slot_occupied,
-            slot_tapped=buffers.slot_tapped,
-            game_info=buffers.game_info,
-            pending_kind_id=buffers.pending_kind_id,
-            num_present_options=buffers.num_present_options,
-            option_kind_ids=buffers.option_kind_ids,
-            option_scalars=buffers.option_scalars,
-            option_mask=buffers.option_mask,
-            option_ref_slot_idx=buffers.option_ref_slot_idx,
-            option_ref_card_row=buffers.option_ref_card_row,
-            target_mask=buffers.target_mask,
-            target_type_ids=buffers.target_type_ids,
-            target_scalars=buffers.target_scalars,
-            target_overflow=buffers.target_overflow,
-            target_ref_slot_idx=buffers.target_ref_slot_idx,
-            target_ref_is_player=buffers.target_ref_is_player_u8.ne(0),
-            target_ref_is_self=buffers.target_ref_is_self_u8.ne(0),
-            may_mask=buffers.may_mask_u8.ne(0),
-            decision_start=buffers.decision_start,
-            decision_count=buffers.decision_count,
+            slot_card_rows=batch["slot_card_rows"],
+            slot_occupied=batch["slot_occupied"],
+            slot_tapped=batch["slot_tapped"],
+            game_info=batch["game_info"],
+            pending_kind_id=batch["pending_kind_id"],
+            num_present_options=batch["num_present_options"],
+            option_kind_ids=batch["option_kind_ids"],
+            option_scalars=batch["option_scalars"],
+            option_mask=batch["option_mask"],
+            option_ref_slot_idx=batch["option_ref_slot_idx"],
+            option_ref_card_row=batch["option_ref_card_row"],
+            target_mask=batch["target_mask"],
+            target_type_ids=batch["target_type_ids"],
+            target_scalars=batch["target_scalars"],
+            target_overflow=batch["target_overflow"],
+            target_ref_slot_idx=batch["target_ref_slot_idx"],
+            target_ref_is_player=batch["target_ref_is_player"],
+            target_ref_is_self=batch["target_ref_is_self"],
+            may_mask=batch["may_mask"],
+            decision_start=batch["decision_start"],
+            decision_count=batch["decision_count"],
             decision_option_idx=decision_option_idx,
             decision_target_idx=decision_target_idx,
             decision_mask=decision_mask,
@@ -666,7 +694,8 @@ class NativeBatchEncoder:
                     lib.MageFreeString(result.error_message)
             raise NativeEncodingError(message)
         decision_rows_written = int(result.decision_rows_written)
-        trace_kind_id = buffers.trace_kind_id
+        batch = self._slice_batch_buffers(buffers, batch_size)
+        trace_kind_id = batch["trace_kind_id"]
         trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
         decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
         decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
@@ -682,27 +711,27 @@ class NativeBatchEncoder:
         )
         return NativeEncodedBatch(
             trace_kind_id=trace_kind_id,
-            slot_card_rows=buffers.slot_card_rows,
-            slot_occupied=buffers.slot_occupied,
-            slot_tapped=buffers.slot_tapped,
-            game_info=buffers.game_info,
-            pending_kind_id=buffers.pending_kind_id,
-            num_present_options=buffers.num_present_options,
-            option_kind_ids=buffers.option_kind_ids,
-            option_scalars=buffers.option_scalars,
-            option_mask=buffers.option_mask,
-            option_ref_slot_idx=buffers.option_ref_slot_idx,
-            option_ref_card_row=buffers.option_ref_card_row,
-            target_mask=buffers.target_mask,
-            target_type_ids=buffers.target_type_ids,
-            target_scalars=buffers.target_scalars,
-            target_overflow=buffers.target_overflow,
-            target_ref_slot_idx=buffers.target_ref_slot_idx,
-            target_ref_is_player=buffers.target_ref_is_player_u8.ne(0),
-            target_ref_is_self=buffers.target_ref_is_self_u8.ne(0),
-            may_mask=buffers.may_mask_u8.ne(0),
-            decision_start=buffers.decision_start,
-            decision_count=buffers.decision_count,
+            slot_card_rows=batch["slot_card_rows"],
+            slot_occupied=batch["slot_occupied"],
+            slot_tapped=batch["slot_tapped"],
+            game_info=batch["game_info"],
+            pending_kind_id=batch["pending_kind_id"],
+            num_present_options=batch["num_present_options"],
+            option_kind_ids=batch["option_kind_ids"],
+            option_scalars=batch["option_scalars"],
+            option_mask=batch["option_mask"],
+            option_ref_slot_idx=batch["option_ref_slot_idx"],
+            option_ref_card_row=batch["option_ref_card_row"],
+            target_mask=batch["target_mask"],
+            target_type_ids=batch["target_type_ids"],
+            target_scalars=batch["target_scalars"],
+            target_overflow=batch["target_overflow"],
+            target_ref_slot_idx=batch["target_ref_slot_idx"],
+            target_ref_is_player=batch["target_ref_is_player"],
+            target_ref_is_self=batch["target_ref_is_self"],
+            may_mask=batch["may_mask"],
+            decision_start=batch["decision_start"],
+            decision_count=batch["decision_count"],
             decision_option_idx=decision_option_idx,
             decision_target_idx=decision_target_idx,
             decision_mask=decision_mask,
