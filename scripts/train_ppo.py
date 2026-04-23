@@ -37,6 +37,14 @@ from magic_ai.native_rollout import (  # noqa: E402
     NativeRolloutDriver,
     NativeRolloutUnavailable,
 )
+from magic_ai.opponent_pool import (  # noqa: E402
+    OpponentPool,
+    SnapshotSchedule,
+    build_opponent_policy,
+    run_eval_matches,
+    save_snapshot,
+    snapshot_tag,
+)
 from magic_ai.ppo import PPOStats, RolloutStep, ppo_update, terminal_returns  # noqa: E402
 
 DEFAULT_DECK = {
@@ -173,6 +181,14 @@ def main() -> None:
     except NativeRolloutUnavailable as exc:
         raise SystemExit(f"native rollout is unavailable: {exc}") from exc
 
+    opponent_pool: OpponentPool | None = None
+    snapshot_schedule: SnapshotSchedule | None = None
+    opponent_policy: PPOPolicy | None = None
+    if not args.disable_opponent_pool:
+        opponent_pool = OpponentPool()
+        snapshot_schedule = SnapshotSchedule.build(args.episodes)
+        opponent_policy = build_opponent_policy(policy, device)
+
     train_native_batched_envs(
         args,
         mage,
@@ -182,6 +198,9 @@ def main() -> None:
         optimizer,
         native_rollout,
         staging_buffer,
+        opponent_pool=opponent_pool,
+        snapshot_schedule=snapshot_schedule,
+        opponent_policy=opponent_policy,
     )
 
     save_checkpoint(args.output, policy, optimizer, args)
@@ -251,6 +270,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", default="magic-ai")
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
+    parser.add_argument(
+        "--disable-opponent-pool",
+        action="store_true",
+        help="skip snapshotting, TrueSkill eval, and opponent-pool logging",
+    )
+    parser.add_argument(
+        "--opponent-pool-dir",
+        type=Path,
+        default=Path("checkpoints/opponent_pool"),
+        help="directory to store frozen opponent snapshots",
+    )
+    parser.add_argument(
+        "--eval-rounds-per-snapshot",
+        type=int,
+        default=3,
+        help="number of random opponents to evaluate against each time a snapshot is taken",
+    )
+    parser.add_argument(
+        "--eval-games-per-round",
+        type=int,
+        default=8,
+        help="eval games played against each sampled opponent",
+    )
+    parser.add_argument(
+        "--eval-num-envs",
+        type=int,
+        default=None,
+        help="parallel envs during eval; defaults to --num-envs",
+    )
     return parser.parse_args()
 
 
@@ -269,6 +317,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--hidden-layers must be at least 1")
     if args.deck_json is not None and args.deck_dir is not None:
         raise ValueError("--deck-json and --deck-dir are mutually exclusive")
+    if args.eval_rounds_per_snapshot < 0:
+        raise ValueError("--eval-rounds-per-snapshot must be non-negative")
+    if args.eval_games_per_round < 0:
+        raise ValueError("--eval-games-per-round must be non-negative")
+    if args.eval_num_envs is not None and args.eval_num_envs < 1:
+        raise ValueError("--eval-num-envs must be at least 1")
 
 
 def log_ppo_stats(
@@ -327,9 +381,14 @@ def train_native_batched_envs(
     optimizer: torch.optim.Optimizer,
     native_rollout: NativeRolloutDriver,
     staging_buffer: NativeTrajectoryBuffer,
+    *,
+    opponent_pool: OpponentPool | None = None,
+    snapshot_schedule: SnapshotSchedule | None = None,
+    opponent_policy: PPOPolicy | None = None,
 ) -> None:
     if not native_encoder.is_available:
         raise SystemExit("native rollout requires MageEncodeBatch")
+    eval_rng = random.Random(args.seed ^ 0x5EED5)
 
     pending_steps: list[RolloutStep] = []
     pending_returns: list[torch.Tensor] = []
@@ -591,6 +650,26 @@ def train_native_batched_envs(
             save_checkpoint(args.output, policy, optimizer, args)
             last_saved_games = completed_games
 
+        if (
+            opponent_pool is not None
+            and snapshot_schedule is not None
+            and opponent_policy is not None
+        ):
+            fired = snapshot_schedule.fire(completed_games)
+            for threshold in fired:
+                take_snapshot_and_eval(
+                    args=args,
+                    threshold=threshold,
+                    policy=policy,
+                    opponent_policy=opponent_policy,
+                    opponent_pool=opponent_pool,
+                    native_encoder=native_encoder,
+                    native_rollout=native_rollout,
+                    mage=mage,
+                    deck_pool=deck_pool,
+                    rng=eval_rng,
+                )
+
         maybe_start_games()
 
     if pending_steps:
@@ -626,6 +705,86 @@ def train_native_batched_envs(
             value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
         )
         policy.reset_rollout_buffer()
+
+
+def take_snapshot_and_eval(
+    *,
+    args: argparse.Namespace,
+    threshold: int,
+    policy: PPOPolicy,
+    opponent_policy: PPOPolicy,
+    opponent_pool: OpponentPool,
+    native_encoder: NativeBatchEncoder,
+    native_rollout: NativeRolloutDriver,
+    mage: Any,
+    deck_pool: list[dict[str, Any]],
+    rng: random.Random,
+) -> None:
+    tag = snapshot_tag(threshold, args.episodes)
+    snapshot_path = save_snapshot(policy, args.opponent_pool_dir, tag)
+    opponent_pool.add_snapshot(snapshot_path, tag)
+    print(
+        f"pool: snapshot {tag} -> {snapshot_path} (pool size={len(opponent_pool.entries)})",
+        flush=True,
+    )
+
+    if args.eval_rounds_per_snapshot == 0 or args.eval_games_per_round == 0:
+        if wandb.run is not None:
+            wandb.log(
+                {
+                    **opponent_pool.main_rating_metrics(),
+                    "eval/snapshot_games": float(threshold),
+                }
+            )
+        return
+
+    eval_num_envs = args.eval_num_envs if args.eval_num_envs is not None else args.num_envs
+
+    for round_idx in range(args.eval_rounds_per_snapshot):
+        opponent = opponent_pool.sample(rng)
+        if opponent is None:
+            break
+        seed_base = args.seed + threshold * 1000 + round_idx * args.eval_games_per_round
+        metrics = run_eval_matches(
+            main_policy=policy,
+            opponent_policy=opponent_policy,
+            opponent=opponent,
+            pool=opponent_pool,
+            native_encoder=native_encoder,
+            native_rollout=native_rollout,
+            mage=mage,
+            deck_pool=deck_pool,
+            num_games=args.eval_games_per_round,
+            num_envs=eval_num_envs,
+            max_steps_per_game=args.max_steps_per_game,
+            max_options=args.max_options,
+            max_targets_per_option=args.max_targets_per_option,
+            hand_size=args.hand_size,
+            name_a=args.name_a,
+            name_b=args.name_b,
+            no_shuffle=args.no_shuffle,
+            seed_base=seed_base,
+            rng=rng,
+        )
+        main_rating = opponent_pool.main_rating
+        assert main_rating is not None
+        print(
+            f"eval: snapshot_tag={tag} round={round_idx} "
+            f"opponent={opponent.tag} "
+            f"main_win={metrics['eval/main_win_fraction']:.2f} "
+            f"main_rating=mu={main_rating.mu:.2f},"
+            f"sigma={main_rating.sigma:.2f}",
+            flush=True,
+        )
+        if wandb.run is not None:
+            payload = {
+                **metrics,
+                **opponent_pool.main_rating_metrics(),
+                "eval/snapshot_games": float(threshold),
+                "eval/new_snapshot_tag": tag,
+                "eval/opponent_tag": opponent.tag,
+            }
+            wandb.log(payload)
 
 
 def load_deck_pool(deck_json: Path | None, deck_dir: Path | None) -> list[dict[str, Any]]:
