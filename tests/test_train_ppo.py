@@ -7,19 +7,50 @@ from argparse import Namespace
 from pathlib import Path
 
 import torch
+from magic_ai.game_state import GameStateEncoder
+from magic_ai.model import PPOPolicy
+from magic_ai.opponent_pool import OpponentPool, SnapshotSchedule
 from magic_ai.ppo import PPOStats, RolloutStep, gae_returns
 from scripts.train_ppo import (
+    TrainingResumeState,
     _current_transcript_snapshot,
+    _restore_opponent_pool,
     load_deck_dir,
+    load_training_checkpoint,
     log_args_to_wandb_summary,
     log_ppo_stats,
     sample_decks,
+    save_checkpoint,
     validate_args,
     validate_deck_embeddings,
 )
 
 
 class TrainPPOTests(unittest.TestCase):
+    def test_load_training_checkpoint_supports_legacy_path_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "legacy.pt"
+            torch.save({"args": {"output": Path("checkpoints/ppo.pt")}}, checkpoint_path)
+
+            checkpoint = load_training_checkpoint(checkpoint_path)
+
+        self.assertIsNotNone(checkpoint)
+        assert checkpoint is not None
+        self.assertEqual(checkpoint["args"]["output"], Path("checkpoints/ppo.pt"))
+
+    def test_decode_action_choice_color_falls_back_when_transcript_options_are_short(self) -> None:
+        policy = PPOPolicy.__new__(PPOPolicy)
+
+        trace, action = policy._decode_action(
+            "choice_color",
+            {"kind": "mana_color", "options": [{"color": "white"}]},
+            [3],
+        )
+
+        self.assertEqual(trace.kind, "choice_color")
+        self.assertEqual(trace.indices, (3,))
+        self.assertEqual(action, {"selected_color": "red"})
+
     def test_current_transcript_snapshot_refreshes_state_before_legal_lookup(self) -> None:
         class StubGame:
             def __init__(self) -> None:
@@ -163,6 +194,92 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(payloads[0]["total_generated_rollout_steps"], 34)
         self.assertEqual(payloads[0]["games"], 8)
         self.assertEqual(payloads[0]["return_mean"], 0.5)
+
+    def test_save_checkpoint_serializes_resume_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "ppo.pt"
+            opponent_pool_dir = Path(tmpdir) / "runs" / "run-123" / "opponent_pool"
+            encoder = GameStateEncoder({"Mountain": [0.1, 0.2, 0.3]}, d_model=8)
+            policy = PPOPolicy(
+                encoder,
+                hidden_dim=16,
+                hidden_layers=1,
+                max_options=4,
+                max_targets_per_option=2,
+                rollout_capacity=16,
+            )
+            optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+            args = Namespace(output=checkpoint_path, opponent_pool_dir=opponent_pool_dir)
+            pool = OpponentPool()
+            snapshot_path = opponent_pool_dir / "snapshot_g000100_p010.0.pt"
+            pool.add_snapshot(snapshot_path, "g000100_p010.0")
+
+            save_checkpoint(
+                checkpoint_path,
+                policy,
+                optimizer,
+                args,
+                opponent_pool=pool,
+                snapshot_schedule=SnapshotSchedule(
+                    total_episodes=10, thresholds=[1, 2], next_idx=1
+                ),
+                resume_state=TrainingResumeState(
+                    completed_games=7,
+                    last_saved_games=6,
+                    total_rollout_steps=11,
+                    total_generated_rollout_steps=13,
+                ),
+                wandb_run_id="run-123",
+            )
+
+            checkpoint = load_training_checkpoint(checkpoint_path)
+
+        self.assertIsNotNone(checkpoint)
+        assert checkpoint is not None
+        self.assertEqual(checkpoint["args"]["output"], str(checkpoint_path))
+        self.assertEqual(checkpoint["metadata"]["wandb_run_id"], "run-123")
+        self.assertEqual(
+            checkpoint["metadata"]["run_artifact_dir"],
+            str(opponent_pool_dir.parent),
+        )
+        self.assertEqual(checkpoint["training_state"]["completed_games"], 7)
+        self.assertEqual(checkpoint["training_state"]["snapshot_schedule_next_idx"], 1)
+        self.assertEqual(
+            checkpoint["training_state"]["opponent_pool"]["entries"][0]["tag"],
+            "g000100_p010.0",
+        )
+
+    def test_restore_opponent_pool_loads_checkpoint_state_and_new_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_dir = Path(tmpdir) / "opponent_pool"
+            snapshot_dir.mkdir(parents=True)
+            existing_snapshot = snapshot_dir / "snapshot_g000100_p010.0.pt"
+            extra_snapshot = snapshot_dir / "snapshot_g000200_p020.0.pt"
+            existing_snapshot.write_bytes(b"")
+            extra_snapshot.write_bytes(b"")
+            checkpoint = {
+                "training_state": {
+                    "opponent_pool": {
+                        "main_rating": {"mu": 30.0, "sigma": 4.0},
+                        "entries": [
+                            {
+                                "path": str(existing_snapshot),
+                                "tag": "g000100_p010.0",
+                                "mu": 31.0,
+                                "sigma": 5.0,
+                            }
+                        ],
+                    }
+                }
+            }
+
+            pool = _restore_opponent_pool(checkpoint, snapshot_dir)
+
+        self.assertEqual(len(pool.entries), 2)
+        self.assertEqual(pool.entries[0].tag, "g000100_p010.0")
+        self.assertEqual(pool.entries[1].tag, "g000200_p020.0")
+        assert pool.main_rating is not None
+        self.assertEqual(pool.main_rating.mu, 30.0)
 
     def test_validate_args_requires_no_validate_for_torch_compile(self) -> None:
         args = Namespace(

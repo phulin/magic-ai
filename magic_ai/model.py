@@ -1973,8 +1973,12 @@ class PPOPolicy(nn.Module):
             )
         if trace_kind == "choice_color":
             selected_idx = selected[0]
-            option = pending.get("options", [])[selected_idx]
-            color = option.get("color", option.get("id", COLORS[selected_idx % len(COLORS)]))
+            options = pending.get("options", [])
+            if 0 <= selected_idx < len(options):
+                option = options[selected_idx]
+                color = option.get("color", option.get("id", COLORS[selected_idx % len(COLORS)]))
+            else:
+                color = COLORS[selected_idx % len(COLORS)]
             return (
                 ActionTrace("choice_color", indices=(selected_idx,)),
                 action_from_choice_color(color),

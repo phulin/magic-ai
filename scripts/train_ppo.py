@@ -69,12 +69,20 @@ class TranscriptAction:
 @dataclass
 class LiveGame:
     game: Any
-    transcript_game: Any | None
     slot_idx: int
     episode_idx: int
     episode_steps: list[RolloutStep]
     transcript: list[TranscriptAction]
+    transcript_enabled: bool = False
     action_count: int = 0
+
+
+@dataclass(frozen=True)
+class TrainingResumeState:
+    completed_games: int = 0
+    last_saved_games: int = 0
+    total_rollout_steps: int = 0
+    total_generated_rollout_steps: int = 0
 
 
 @dataclass
@@ -117,12 +125,12 @@ def _current_transcript_snapshot(game: Any) -> tuple[GameStateSnapshot, PendingS
     pending = cast(PendingState | None, game.pending)
     if pending is None:
         # Keep the printed state aligned with the pending action source when the
-        # shadow game requires an explicit state refresh before legal() is valid.
+        # live game requires an explicit state refresh before legal() is valid.
         game.refresh_state()
         pending = cast(PendingState | None, game.pending or game.legal())
     state = cast(GameStateSnapshot, copy.deepcopy(game.state))
     if pending is None:
-        raise RuntimeError("transcript shadow game is missing a pending action")
+        raise RuntimeError("live game is missing a pending action for transcript capture")
     return state, copy.deepcopy(pending)
 
 
@@ -146,6 +154,89 @@ def log_args_to_wandb_summary(args: argparse.Namespace, run: Any | None = None) 
         active_run.summary[f"args/{key}"] = _wandb_summary_value(value)
 
 
+def load_training_checkpoint(
+    path: Path | None,
+    *,
+    map_location: torch.device | str = "cpu",
+) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    return cast(
+        dict[str, Any],
+        torch.load(path, map_location=map_location, weights_only=False),
+    )
+
+
+def _checkpoint_metadata(checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+    if checkpoint is None:
+        return {}
+    metadata = checkpoint.get("metadata", {})
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _training_state_dict(checkpoint: dict[str, Any] | None) -> dict[str, Any]:
+    if checkpoint is None:
+        return {}
+    training_state = checkpoint.get("training_state", {})
+    return training_state if isinstance(training_state, dict) else {}
+
+
+def _checkpoint_wandb_run_id(checkpoint: dict[str, Any] | None) -> str | None:
+    run_id = _checkpoint_metadata(checkpoint).get("wandb_run_id")
+    return str(run_id) if isinstance(run_id, str) and run_id else None
+
+
+def _default_run_artifact_dir(output_path: Path, run_id: str | None) -> Path:
+    label = run_id or output_path.stem
+    return output_path.parent / "runs" / label
+
+
+def _resolve_run_artifact_dir(
+    *,
+    args: argparse.Namespace,
+    checkpoint: dict[str, Any] | None,
+    wandb_run_id: str | None,
+) -> Path:
+    metadata = _checkpoint_metadata(checkpoint)
+    saved_dir = metadata.get("run_artifact_dir")
+    if isinstance(saved_dir, str) and saved_dir:
+        return Path(saved_dir)
+    return _default_run_artifact_dir(args.output, wandb_run_id)
+
+
+def _restore_opponent_pool(
+    checkpoint: dict[str, Any] | None,
+    snapshot_dir: Path,
+) -> OpponentPool:
+    training_state = _training_state_dict(checkpoint)
+    pool_state = training_state.get("opponent_pool")
+    if isinstance(pool_state, dict):
+        pool = OpponentPool.from_state_dict(pool_state)
+    else:
+        pool = OpponentPool()
+
+    known_paths = {entry.path.resolve() for entry in pool.entries if entry.path}
+    if snapshot_dir.exists():
+        for snapshot_path in sorted(snapshot_dir.glob("snapshot_*.pt")):
+            resolved = snapshot_path.resolve()
+            if resolved in known_paths:
+                continue
+            tag = snapshot_path.stem.removeprefix("snapshot_")
+            pool.add_snapshot(snapshot_path, tag)
+            known_paths.add(resolved)
+    return pool
+
+
+def _resume_state_from_checkpoint(checkpoint: dict[str, Any] | None) -> TrainingResumeState:
+    training_state = _training_state_dict(checkpoint)
+    return TrainingResumeState(
+        completed_games=int(training_state.get("completed_games", 0)),
+        last_saved_games=int(training_state.get("last_saved_games", 0)),
+        total_rollout_steps=int(training_state.get("total_rollout_steps", 0)),
+        total_generated_rollout_steps=int(training_state.get("total_generated_rollout_steps", 0)),
+    )
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -154,12 +245,30 @@ def main() -> None:
     if args.torch_threads is not None:
         torch.set_num_threads(args.torch_threads)
 
+    checkpoint_cpu = load_training_checkpoint(args.checkpoint, map_location="cpu")
+    checkpoint_wandb_run_id = _checkpoint_wandb_run_id(checkpoint_cpu)
+
     if not args.no_wandb:
+        init_kwargs: dict[str, Any] = {
+            "project": args.wandb_project,
+            "name": args.wandb_run_name,
+            "config": vars(args),
+        }
+        if checkpoint_wandb_run_id is not None:
+            init_kwargs["id"] = checkpoint_wandb_run_id
+            init_kwargs["resume"] = "must"
         wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            config=vars(args),
+            **init_kwargs,
         )
+
+    active_wandb_run_id = wandb.run.id if wandb.run is not None else checkpoint_wandb_run_id
+    run_artifact_dir = _resolve_run_artifact_dir(
+        args=args,
+        checkpoint=checkpoint_cpu,
+        wandb_run_id=active_wandb_run_id,
+    )
+    args.opponent_pool_dir = run_artifact_dir / "opponent_pool"
+    if not args.no_wandb:
         log_args_to_wandb_summary(args)
 
     device = torch.device(args.device)
@@ -209,8 +318,8 @@ def main() -> None:
         recurrent_hidden_dim=policy.hidden_dim if policy.use_lstm else 0,
     ).to(device)
 
-    if args.checkpoint and args.checkpoint.exists():
-        checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = load_training_checkpoint(args.checkpoint, map_location=device)
+    if checkpoint is not None:
         policy.load_state_dict(checkpoint["policy"])
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -225,11 +334,16 @@ def main() -> None:
     snapshot_schedule: SnapshotSchedule | None = None
     opponent_policy: PPOPolicy | None = None
     if not args.disable_opponent_pool:
-        opponent_pool = OpponentPool()
+        opponent_pool = _restore_opponent_pool(checkpoint_cpu, args.opponent_pool_dir)
         snapshot_schedule = SnapshotSchedule.build(args.episodes)
+        training_state = _training_state_dict(checkpoint_cpu)
+        snapshot_schedule.next_idx = min(
+            int(training_state.get("snapshot_schedule_next_idx", 0)),
+            len(snapshot_schedule.thresholds),
+        )
         opponent_policy = build_opponent_policy(policy, device)
 
-    train_native_batched_envs(
+    final_resume_state = train_native_batched_envs(
         args,
         mage,
         deck_pool,
@@ -241,9 +355,20 @@ def main() -> None:
         opponent_pool=opponent_pool,
         snapshot_schedule=snapshot_schedule,
         opponent_policy=opponent_policy,
+        resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
     )
 
-    save_checkpoint(args.output, policy, optimizer, args)
+    save_checkpoint(
+        args.output,
+        policy,
+        optimizer,
+        args,
+        opponent_pool=opponent_pool,
+        snapshot_schedule=snapshot_schedule,
+        resume_state=final_resume_state,
+        wandb_run_id=active_wandb_run_id,
+        run_artifact_dir=run_artifact_dir,
+    )
     print(f"saved checkpoint -> {args.output}")
     wandb.finish()
 
@@ -455,18 +580,20 @@ def train_native_batched_envs(
     opponent_pool: OpponentPool | None = None,
     snapshot_schedule: SnapshotSchedule | None = None,
     opponent_policy: PPOPolicy | None = None,
-) -> None:
+    resume_state: TrainingResumeState | None = None,
+) -> TrainingResumeState:
     if not native_encoder.is_available:
         raise SystemExit("native rollout requires MageEncodeBatch")
     eval_rng = random.Random(args.seed ^ 0x5EED5)
 
     pending_steps: list[RolloutStep] = []
     pending_returns: list[torch.Tensor] = []
-    completed_games = 0
-    last_saved_games = 0
-    total_rollout_steps = 0
-    total_generated_rollout_steps = 0
-    next_episode_idx = 0
+    restored_state = resume_state or TrainingResumeState()
+    completed_games = restored_state.completed_games
+    last_saved_games = restored_state.last_saved_games
+    total_rollout_steps = restored_state.total_rollout_steps
+    total_generated_rollout_steps = restored_state.total_generated_rollout_steps
+    next_episode_idx = completed_games
     live_games: list[LiveGame] = []
     free_slots = list(range(args.num_envs - 1, -1, -1))
     win_stats = WinFractionStats()
@@ -488,23 +615,11 @@ def train_native_batched_envs(
                 shuffle=not args.no_shuffle,
                 hand_size=args.hand_size,
             ),
-            transcript_game=(
-                mage.new_game(
-                    deck_a,
-                    deck_b,
-                    name_a=args.name_a,
-                    name_b=args.name_b,
-                    seed=seed,
-                    shuffle=not args.no_shuffle,
-                    hand_size=args.hand_size,
-                )
-                if slot_idx == 0
-                else None
-            ),
             slot_idx=slot_idx,
             episode_idx=episode_idx,
             episode_steps=[],
             transcript=[],
+            transcript_enabled=slot_idx == 0,
         )
 
     def maybe_start_games() -> None:
@@ -515,11 +630,9 @@ def train_native_batched_envs(
 
     def disable_transcript(env: LiveGame, reason: str) -> None:
         nonlocal transcript_warning_emitted
-        if env.transcript_game is not None:
-            env.transcript_game.close()
-            env.transcript_game = None
+        env.transcript_enabled = False
         if not transcript_warning_emitted:
-            print(f"warning: disabling sample transcript shadow game: {reason}", flush=True)
+            print(f"warning: disabling sample transcript capture: {reason}", flush=True)
             transcript_warning_emitted = True
 
     def finish_games(finished: list[tuple[LiveGame, int]]) -> None:
@@ -534,8 +647,6 @@ def train_native_batched_envs(
         )
         for (env, winner_idx), replay_rows in zip(finished, replay_rows_by_env, strict=True):
             env.game.close()
-            if env.transcript_game is not None:
-                env.transcript_game.close()
             step_count = staging_buffer.active_step_count(env.slot_idx)
             if step_count:
                 player_indices = (
@@ -631,31 +742,30 @@ def train_native_batched_envs(
                 strict=True,
             ):
                 cols = list(policy_step.selected_choice_cols)
-                if env.transcript_game is not None:
-                    transcript_state, transcript_pending = _current_transcript_snapshot(
-                        env.transcript_game
-                    )
-                    transcript_action = copy.deepcopy(policy_step.action)
-                    if policy_step.trace.kind != "may":
-                        _trace, decoded_action = policy._decode_action(
-                            policy_step.trace.kind,
-                            transcript_pending,
-                            cols,
-                        )
-                        transcript_action = copy.deepcopy(decoded_action)
-                    env.transcript.append(
-                        TranscriptAction(
-                            state=transcript_state,
-                            pending=transcript_pending,
-                            action=transcript_action,
-                        )
-                    )
+                if env.transcript_enabled:
                     try:
-                        env.transcript_game.step(cast(dict[Any, Any], transcript_action))
+                        transcript_state, transcript_pending = _current_transcript_snapshot(
+                            env.game
+                        )
+                        transcript_action = copy.deepcopy(policy_step.action)
+                        if policy_step.trace.kind != "may":
+                            _trace, decoded_action = policy._decode_action(
+                                policy_step.trace.kind,
+                                transcript_pending,
+                                cols,
+                            )
+                            transcript_action = copy.deepcopy(decoded_action)
+                        env.transcript.append(
+                            TranscriptAction(
+                                state=transcript_state,
+                                pending=transcript_pending,
+                                action=transcript_action,
+                            )
+                        )
                     except Exception as exc:
                         disable_transcript(
                             env,
-                            f"{exc} while applying transcript action {transcript_action!r}",
+                            f"{exc} while snapshotting live game for action {policy_step.action!r}",
                         )
                 starts.append(cursor)
                 counts.append(len(cols))
@@ -741,7 +851,20 @@ def train_native_batched_envs(
             and completed_games % args.save_every == 0
             and completed_games != last_saved_games
         ):
-            save_checkpoint(args.output, policy, optimizer, args)
+            save_checkpoint(
+                args.output,
+                policy,
+                optimizer,
+                args,
+                opponent_pool=opponent_pool,
+                snapshot_schedule=snapshot_schedule,
+                resume_state=TrainingResumeState(
+                    completed_games=completed_games,
+                    last_saved_games=completed_games,
+                    total_rollout_steps=total_rollout_steps,
+                    total_generated_rollout_steps=total_generated_rollout_steps,
+                ),
+            )
             last_saved_games = completed_games
 
         if (
@@ -803,6 +926,13 @@ def train_native_batched_envs(
             value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
         )
         policy.reset_rollout_buffer()
+
+    return TrainingResumeState(
+        completed_games=completed_games,
+        last_saved_games=last_saved_games,
+        total_rollout_steps=total_rollout_steps,
+        total_generated_rollout_steps=total_generated_rollout_steps,
+    )
 
 
 def take_snapshot_and_eval(
@@ -1023,13 +1153,39 @@ def save_checkpoint(
     policy: PPOPolicy,
     optimizer: torch.optim.Optimizer,
     args: argparse.Namespace,
+    *,
+    opponent_pool: OpponentPool | None = None,
+    snapshot_schedule: SnapshotSchedule | None = None,
+    resume_state: TrainingResumeState | None = None,
+    wandb_run_id: str | None = None,
+    run_artifact_dir: Path | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    effective_run_artifact_dir = run_artifact_dir or args.opponent_pool_dir.parent
+    effective_wandb_run_id = wandb_run_id
+    if effective_wandb_run_id is None and wandb.run is not None:
+        effective_wandb_run_id = wandb.run.id
+    serialized_args = {key: _wandb_summary_value(value) for key, value in vars(args).items()}
+    training_state = {
+        "completed_games": resume_state.completed_games if resume_state is not None else 0,
+        "last_saved_games": resume_state.last_saved_games if resume_state is not None else 0,
+        "total_rollout_steps": resume_state.total_rollout_steps if resume_state is not None else 0,
+        "total_generated_rollout_steps": (
+            resume_state.total_generated_rollout_steps if resume_state is not None else 0
+        ),
+        "snapshot_schedule_next_idx": snapshot_schedule.next_idx if snapshot_schedule else 0,
+        "opponent_pool": opponent_pool.state_dict() if opponent_pool is not None else None,
+    }
     torch.save(
         {
             "policy": policy.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "args": vars(args),
+            "args": serialized_args,
+            "training_state": training_state,
+            "metadata": {
+                "wandb_run_id": effective_wandb_run_id,
+                "run_artifact_dir": str(effective_run_artifact_dir),
+            },
         },
         path,
     )

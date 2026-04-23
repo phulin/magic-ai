@@ -90,6 +90,50 @@ class OpponentPool:
             "opponent_pool_size": float(len(self.entries)),
         }
 
+    def state_dict(self) -> dict[str, Any]:
+        assert self.main_rating is not None
+        return {
+            "main_rating": {
+                "mu": float(self.main_rating.mu),
+                "sigma": float(self.main_rating.sigma),
+            },
+            "entries": [
+                {
+                    "path": str(entry.path),
+                    "tag": entry.tag,
+                    "mu": float(entry.rating.mu),
+                    "sigma": float(entry.rating.sigma),
+                }
+                for entry in self.entries
+            ],
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: dict[str, Any]) -> OpponentPool:
+        pool = cls()
+        env = cast(Any, pool.env)
+        main_rating = state.get("main_rating")
+        if isinstance(main_rating, dict):
+            pool.main_rating = env.create_rating(
+                mu=float(main_rating.get("mu", 25.0)),
+                sigma=float(main_rating.get("sigma", 25.0 / 3.0)),
+            )
+        entries = state.get("entries", [])
+        if isinstance(entries, list):
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                entry = OpponentEntry(
+                    path=Path(str(item.get("path", ""))),
+                    tag=str(item.get("tag", "")),
+                    rating=env.create_rating(
+                        mu=float(item.get("mu", 25.0)),
+                        sigma=float(item.get("sigma", 25.0 / 3.0)),
+                    ),
+                )
+                pool.entries.append(entry)
+        return pool
+
 
 @dataclass
 class SnapshotSchedule:
