@@ -154,6 +154,8 @@ def build_opponent_policy(main_policy: PPOPolicy, device: torch.device) -> PPOPo
         decision_capacity=8,
         use_lstm=main_policy.use_lstm,
         spr_enabled=False,
+        validate=main_policy.validate,
+        compile_forward=main_policy.compile_forward,
     ).to(device)
     opponent.eval()
     for p in opponent.parameters():

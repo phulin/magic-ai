@@ -3,9 +3,15 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
-from scripts.train_ppo import load_deck_dir, sample_decks, validate_deck_embeddings
+from scripts.train_ppo import (
+    load_deck_dir,
+    sample_decks,
+    validate_args,
+    validate_deck_embeddings,
+)
 
 
 class TrainPPOTests(unittest.TestCase):
@@ -54,6 +60,26 @@ class TrainPPOTests(unittest.TestCase):
         second = sample_decks(deck_pool, seed=17)
 
         self.assertEqual(first, second)
+
+    def test_validate_args_requires_no_validate_for_torch_compile(self) -> None:
+        args = Namespace(
+            episodes=1,
+            num_envs=1,
+            rollout_steps=1,
+            max_steps_per_game=1,
+            minibatch_size=1,
+            hidden_layers=1,
+            torch_compile=True,
+            no_validate=False,
+            deck_json=None,
+            deck_dir=None,
+            eval_rounds_per_snapshot=0,
+            eval_games_per_round=0,
+            eval_num_envs=None,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--torch-compile requires --no-validate"):
+            validate_args(args)
 
 
 if __name__ == "__main__":

@@ -126,6 +126,7 @@ def main() -> None:
         )
 
     device = torch.device(args.device)
+    torch.set_float32_matmul_precision("high")
     game_state_encoder = GameStateEncoder.from_embedding_json(args.embeddings, d_model=args.d_model)
     rollout_capacity = args.rollout_buffer_capacity or max(
         4096, args.rollout_steps + 400 * args.num_envs
@@ -142,6 +143,7 @@ def main() -> None:
         spr_action_dim=args.spr_action_dim,
         spr_ema_decay=args.spr_ema_decay,
         validate=not args.no_validate,
+        compile_forward=args.torch_compile,
     ).to(device)
     policy.init_lstm_env_states(args.num_envs)
     if device.type == "cuda":
@@ -279,6 +281,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="compile the pure tensor policy core with torch.compile(dynamic=True)",
+    )
+    parser.add_argument(
         "--no-validate",
         action="store_true",
         help="skip runtime tensor validation checks (required for torch.compile)",
@@ -328,6 +335,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--minibatch-size must be at least 1")
     if args.hidden_layers < 1:
         raise ValueError("--hidden-layers must be at least 1")
+    if args.torch_compile and not args.no_validate:
+        raise ValueError("--torch-compile requires --no-validate")
     if args.deck_json is not None and args.deck_dir is not None:
         raise ValueError("--deck-json and --deck-dir are mutually exclusive")
     if args.eval_rounds_per_snapshot < 0:

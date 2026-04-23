@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import copy
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import torch
 from torch import Tensor, nn
@@ -141,10 +142,12 @@ class PPOPolicy(nn.Module):
         spr_action_dim: int = 32,
         spr_ema_decay: float = 0.99,
         validate: bool = True,
+        compile_forward: bool = False,
     ) -> None:
         super().__init__()
         self.game_state_encoder = game_state_encoder
         self.validate = validate
+        self.compile_forward = compile_forward
         self.action_encoder = ActionOptionsEncoder(
             game_state_encoder,
             max_options=max_options,
@@ -235,6 +238,8 @@ class PPOPolicy(nn.Module):
             recurrent_layers=hidden_layers if use_lstm else 0,
             recurrent_hidden_dim=hidden_dim if use_lstm else 0,
         )
+        self._compiled_compute_forward_impl: Callable[..., Any] | None = None
+        self._compiled_compute_hidden_target_impl: Callable[..., Any] | None = None
 
     @property
     def device(self) -> torch.device:
@@ -1110,12 +1115,19 @@ class PPOPolicy(nn.Module):
         inputs, lstm_state = self._gather_from_rollout(step_indices)
         if lstm_state is None:
             raise RuntimeError("SPR latent encoding requires LSTM state inputs")
-        hidden, _next_state = self._compute_hidden(
-            inputs,
-            h_in=lstm_state[0],
-            c_in=lstm_state[1],
-            use_target=use_target,
-        )
+        if use_target:
+            hidden, _next_state = self._call_compute_hidden_target(
+                inputs,
+                lstm_state[0],
+                lstm_state[1],
+            )
+        else:
+            hidden, _next_state = self._compute_hidden(
+                inputs,
+                h_in=lstm_state[0],
+                c_in=lstm_state[1],
+                use_target=False,
+            )
         return hidden
 
     def _selected_action_vectors_from_groups(
@@ -1455,18 +1467,29 @@ class PPOPolicy(nn.Module):
         )
         return hidden, (h_next, c_next)
 
-    def _compute_forward(
+    def _compute_hidden_target_impl(
+        self,
+        inputs: _ForwardInputs,
+        h_in: Tensor,
+        c_in: Tensor,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
+        return self._compute_hidden(
+            inputs,
+            h_in=h_in,
+            c_in=c_in,
+            use_target=True,
+        )
+
+    def _compute_forward_impl(
         self,
         inputs: _ForwardInputs,
         *,
         h_in: Tensor | None = None,
         c_in: Tensor | None = None,
-        use_target: bool = False,
-    ) -> tuple[_ForwardBatch, tuple[Tensor, Tensor] | None]:
-        features, option_vectors, target_vectors = self._embed_forward_inputs(
-            inputs,
-            use_target=use_target,
-        )
+    ) -> tuple[
+        Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, tuple[Tensor, Tensor] | None
+    ]:
+        features, option_vectors, target_vectors = self._embed_forward_inputs(inputs)
         if self.use_lstm:
             if h_in is None or c_in is None:
                 raise ValueError("h_in and c_in are required when use_lstm=True")
@@ -1474,7 +1497,6 @@ class PPOPolicy(nn.Module):
                 features,
                 h_in,
                 c_in,
-                use_target=use_target,
             )
             next_state: tuple[Tensor, Tensor] | None = (h_next, c_next)
         else:
@@ -1485,6 +1507,66 @@ class PPOPolicy(nn.Module):
         values = self.value_head(hidden).squeeze(-1)
         none_logits = self.none_blocker_head(hidden).squeeze(-1)
         may_logits = self.may_head(hidden).squeeze(-1)
+        return (
+            query,
+            values,
+            none_logits,
+            may_logits,
+            option_vectors,
+            target_vectors,
+            hidden,
+            next_state,
+        )
+
+    def _maybe_init_compiled_functions(self) -> None:
+        if not self.compile_forward:
+            return
+        if self._compiled_compute_forward_impl is not None:
+            return
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("torch.compile is not available in this PyTorch build")
+
+        self._compiled_compute_forward_impl = torch.compile(
+            self._compute_forward_impl,
+            dynamic=True,
+        )
+        if self.use_lstm and self.spr_enabled:
+            self._compiled_compute_hidden_target_impl = torch.compile(
+                self._compute_hidden_target_impl,
+                dynamic=True,
+            )
+
+    def _call_compute_hidden_target(
+        self,
+        inputs: _ForwardInputs,
+        h_in: Tensor,
+        c_in: Tensor,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
+        self._maybe_init_compiled_functions()
+        fn = self._compiled_compute_hidden_target_impl
+        if fn is not None:
+            return fn(inputs, h_in, c_in)
+        return self._compute_hidden_target_impl(inputs, h_in, c_in)
+
+    def _compute_forward(
+        self,
+        inputs: _ForwardInputs,
+        *,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
+    ) -> tuple[_ForwardBatch, tuple[Tensor, Tensor] | None]:
+        self._maybe_init_compiled_functions()
+        fn = self._compiled_compute_forward_impl or self._compute_forward_impl
+        (
+            query,
+            values,
+            none_logits,
+            may_logits,
+            option_vectors,
+            target_vectors,
+            hidden,
+            next_state,
+        ) = fn(inputs, h_in=h_in, c_in=c_in)
         return (
             _ForwardBatch(
                 query=query,
