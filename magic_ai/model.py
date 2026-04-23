@@ -140,9 +140,11 @@ class PPOPolicy(nn.Module):
         spr_enabled: bool = False,
         spr_action_dim: int = 32,
         spr_ema_decay: float = 0.99,
+        validate: bool = True,
     ) -> None:
         super().__init__()
         self.game_state_encoder = game_state_encoder
+        self.validate = validate
         self.action_encoder = ActionOptionsEncoder(
             game_state_encoder,
             max_options=max_options,
@@ -1105,53 +1107,16 @@ class PPOPolicy(nn.Module):
         copy of the encoder stack.
         """
 
-        rb = self.rollout_buffer
-        if use_target:
-            gse = self.target_game_state_encoder
-            action_encoder = self.target_action_encoder
-            feature_projection = self.target_feature_projection
-            lstm = self.target_lstm
-        else:
-            gse = self.game_state_encoder
-            action_encoder = self.action_encoder
-            feature_projection = self.feature_projection
-            lstm = self.lstm
-
-        slot_card_rows = rb.slot_card_rows[step_indices]
-        slot_occupied = rb.slot_occupied[step_indices]
-        slot_tapped = rb.slot_tapped[step_indices]
-        game_info = rb.game_info[step_indices]
-        option_mask = rb.option_mask[step_indices]
-
-        slot_vectors = gse.embed_slot_vectors(slot_card_rows, slot_occupied, slot_tapped)
-        state_vector = gse.state_vector_from_slots(slot_vectors, game_info)
-
-        pending_vector, option_vectors, _target_vectors = action_encoder.embed_from_parsed(
-            slot_vectors=slot_vectors,
-            pending_kind_id=rb.pending_kind_id[step_indices],
-            option_kind_ids=rb.option_kind_ids[step_indices],
-            option_scalars=rb.option_scalars[step_indices],
-            option_mask=option_mask,
-            option_ref_slot_idx=rb.option_ref_slot_idx[step_indices],
-            option_ref_card_row=rb.option_ref_card_row[step_indices],
-            target_mask=rb.target_mask[step_indices],
-            target_type_ids=rb.target_type_ids[step_indices],
-            target_scalars=rb.target_scalars[step_indices],
-            target_ref_slot_idx=rb.target_ref_slot_idx[step_indices],
-            target_ref_is_player=rb.target_ref_is_player[step_indices],
-            target_ref_is_self=rb.target_ref_is_self[step_indices],
+        inputs, lstm_state = self._gather_from_rollout(step_indices)
+        if lstm_state is None:
+            raise RuntimeError("SPR latent encoding requires LSTM state inputs")
+        hidden, _next_state = self._compute_hidden(
+            inputs,
+            h_in=lstm_state[0],
+            c_in=lstm_state[1],
+            use_target=use_target,
         )
-
-        option_mask_f = option_mask.unsqueeze(-1)
-        option_count = option_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        pooled = (option_vectors * option_mask_f).sum(dim=1) / option_count
-        features = torch.cat([state_vector, pending_vector, pooled], dim=-1)
-
-        projected = feature_projection(features).unsqueeze(1)
-        h_in = rb.lstm_h_in[step_indices].permute(1, 0, 2).contiguous()
-        c_in = rb.lstm_c_in[step_indices].permute(1, 0, 2).contiguous()
-        output, _ = lstm(projected, (h_in, c_in))
-        return output[:, 0, :]
+        return hidden
 
     def _selected_action_vectors_from_groups(
         self,
@@ -1306,66 +1271,25 @@ class PPOPolicy(nn.Module):
             for ob, tb in zip(online.buffers(), target.buffers(), strict=True):
                 tb.copy_(ob)
 
-    def _apply_policy_core(
+    def _compute_hidden_dtype(self) -> torch.dtype:
+        if self.use_lstm:
+            return next(self.feature_projection.parameters()).dtype
+        return next(self.trunk.parameters()).dtype
+
+    def _gather_from_rollout(
         self,
-        features: Tensor,
-        *,
-        lstm_state: tuple[Tensor, Tensor] | None = None,
-        env_indices: list[int] | None = None,
-    ) -> Tensor:
-        if not self.use_lstm:
-            return self.trunk(features)
-
-        projected = self.feature_projection(features).unsqueeze(1)
-        if lstm_state is None:
-            if env_indices is None:
-                batch_size = int(features.shape[0])
-                h_in = torch.zeros(
-                    self.hidden_layers,
-                    batch_size,
-                    self.hidden_dim,
-                    dtype=features.dtype,
-                    device=features.device,
-                )
-                c_in = torch.zeros_like(h_in)
-            else:
-                if self.live_lstm_h.shape[1] == 0:
-                    raise RuntimeError("LSTM env states have not been initialized")
-                env_idx_t = torch.tensor(env_indices, dtype=torch.long, device=features.device)
-                h_in = self.live_lstm_h[:, env_idx_t].to(dtype=features.dtype)
-                c_in = self.live_lstm_c[:, env_idx_t].to(dtype=features.dtype)
-        else:
-            h_in, c_in = lstm_state
-
-        output, (h_next, c_next) = self.lstm(projected, (h_in.contiguous(), c_in.contiguous()))
-        if env_indices is not None:
-            env_idx_t = torch.tensor(env_indices, dtype=torch.long, device=features.device)
-            self.live_lstm_h[:, env_idx_t] = h_next.detach()
-            self.live_lstm_c[:, env_idx_t] = c_next.detach()
-        return output[:, 0, :]
-
-    def _forward_batch(self, step_indices: Tensor) -> _ForwardBatch:
+        step_indices: Tensor,
+    ) -> tuple[_ForwardInputs, tuple[Tensor, Tensor] | None]:
         rb = self.rollout_buffer
-        slot_card_rows = rb.slot_card_rows[step_indices]
-        slot_occupied = rb.slot_occupied[step_indices]
-        slot_tapped = rb.slot_tapped[step_indices]
-        game_info = rb.game_info[step_indices]
-        option_mask = rb.option_mask[step_indices]
-        self._validate_slot_card_rows(
-            slot_card_rows, self.game_state_encoder.card_embedding_table.shape[0]
-        )
-
-        slot_vectors = self.game_state_encoder.embed_slot_vectors(
-            slot_card_rows, slot_occupied, slot_tapped
-        )
-        state_vector = self.game_state_encoder.state_vector_from_slots(slot_vectors, game_info)
-
-        pending_vector, option_vectors, target_vectors = self.action_encoder.embed_from_parsed(
-            slot_vectors=slot_vectors,
+        inputs = _ForwardInputs(
+            slot_card_rows=rb.slot_card_rows[step_indices],
+            slot_occupied=rb.slot_occupied[step_indices],
+            slot_tapped=rb.slot_tapped[step_indices],
+            game_info=rb.game_info[step_indices],
             pending_kind_id=rb.pending_kind_id[step_indices],
             option_kind_ids=rb.option_kind_ids[step_indices],
             option_scalars=rb.option_scalars[step_indices],
-            option_mask=option_mask,
+            option_mask=rb.option_mask[step_indices],
             option_ref_slot_idx=rb.option_ref_slot_idx[step_indices],
             option_ref_card_row=rb.option_ref_card_row[step_indices],
             target_mask=rb.target_mask[step_indices],
@@ -1375,33 +1299,213 @@ class PPOPolicy(nn.Module):
             target_ref_is_player=rb.target_ref_is_player[step_indices],
             target_ref_is_self=rb.target_ref_is_self[step_indices],
         )
-
-        option_mask_f = option_mask.unsqueeze(-1)
-        option_count = option_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        pooled = (option_vectors * option_mask_f).sum(dim=1) / option_count
-
-        features = torch.cat([state_vector, pending_vector, pooled], dim=-1)
-        lstm_state: tuple[Tensor, Tensor] | None = None
-        if self.use_lstm:
-            lstm_state = (
-                rb.lstm_h_in[step_indices].permute(1, 0, 2).contiguous(),
-                rb.lstm_c_in[step_indices].permute(1, 0, 2).contiguous(),
+        if self.validate:
+            self._validate_slot_card_rows(
+                inputs.slot_card_rows,
+                self.game_state_encoder.card_embedding_table.shape[0],
             )
-        hidden = self._apply_policy_core(features, lstm_state=lstm_state)
+
+        if not self.use_lstm:
+            return inputs, None
+
+        dtype = self._compute_hidden_dtype()
+        return inputs, (
+            rb.lstm_h_in[step_indices].permute(1, 0, 2).contiguous().to(dtype=dtype),
+            rb.lstm_c_in[step_indices].permute(1, 0, 2).contiguous().to(dtype=dtype),
+        )
+
+    def _gather_from_native(
+        self,
+        native_batch: NativeEncodedBatch,
+        *,
+        env_indices: list[int] | None = None,
+    ) -> tuple[_ForwardInputs, tuple[Tensor, Tensor] | None]:
+        device = self.device
+        inputs = _ForwardInputs(
+            slot_card_rows=native_batch.slot_card_rows.to(device),
+            slot_occupied=native_batch.slot_occupied.to(device),
+            slot_tapped=native_batch.slot_tapped.to(device),
+            game_info=native_batch.game_info.to(device),
+            pending_kind_id=native_batch.pending_kind_id.to(device),
+            option_kind_ids=native_batch.option_kind_ids.to(device),
+            option_scalars=native_batch.option_scalars.to(device),
+            option_mask=native_batch.option_mask.to(device),
+            option_ref_slot_idx=native_batch.option_ref_slot_idx.to(device),
+            option_ref_card_row=native_batch.option_ref_card_row.to(device),
+            target_mask=native_batch.target_mask.to(device),
+            target_type_ids=native_batch.target_type_ids.to(device),
+            target_scalars=native_batch.target_scalars.to(device),
+            target_ref_slot_idx=native_batch.target_ref_slot_idx.to(device),
+            target_ref_is_player=native_batch.target_ref_is_player.to(device),
+            target_ref_is_self=native_batch.target_ref_is_self.to(device),
+        )
+        if self.validate:
+            self._validate_slot_card_rows(
+                inputs.slot_card_rows,
+                self.game_state_encoder.card_embedding_table.shape[0],
+            )
+
+        if not self.use_lstm:
+            return inputs, None
+        if env_indices is None:
+            raise ValueError("env_indices are required for LSTM native rollout")
+        batch_size = int(inputs.slot_card_rows.shape[0])
+        if len(env_indices) != batch_size:
+            raise ValueError("env_indices length must match native batch length")
+        if self.live_lstm_h.shape[1] == 0:
+            raise RuntimeError("LSTM env states have not been initialized")
+
+        env_idx_t = torch.tensor(env_indices, dtype=torch.long, device=device)
+        dtype = self._compute_hidden_dtype()
+        return inputs, (
+            self.live_lstm_h[:, env_idx_t].to(dtype=dtype),
+            self.live_lstm_c[:, env_idx_t].to(dtype=dtype),
+        )
+
+    def _scatter_lstm_state(
+        self,
+        env_indices: list[int],
+        h_next: Tensor,
+        c_next: Tensor,
+    ) -> None:
+        env_idx_t = torch.tensor(env_indices, dtype=torch.long, device=h_next.device)
+        self.live_lstm_h[:, env_idx_t] = h_next.detach()
+        self.live_lstm_c[:, env_idx_t] = c_next.detach()
+
+    def _embed_forward_inputs(
+        self,
+        inputs: _ForwardInputs,
+        *,
+        use_target: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if use_target:
+            game_state_encoder = self.target_game_state_encoder
+            action_encoder = self.target_action_encoder
+        else:
+            game_state_encoder = self.game_state_encoder
+            action_encoder = self.action_encoder
+
+        slot_vectors = game_state_encoder.embed_slot_vectors(
+            inputs.slot_card_rows,
+            inputs.slot_occupied,
+            inputs.slot_tapped,
+        )
+        state_vector = game_state_encoder.state_vector_from_slots(slot_vectors, inputs.game_info)
+        pending_vector, option_vectors, target_vectors = action_encoder.embed_from_parsed(
+            slot_vectors=slot_vectors,
+            pending_kind_id=inputs.pending_kind_id,
+            option_kind_ids=inputs.option_kind_ids,
+            option_scalars=inputs.option_scalars,
+            option_mask=inputs.option_mask,
+            option_ref_slot_idx=inputs.option_ref_slot_idx,
+            option_ref_card_row=inputs.option_ref_card_row,
+            target_mask=inputs.target_mask,
+            target_type_ids=inputs.target_type_ids,
+            target_scalars=inputs.target_scalars,
+            target_ref_slot_idx=inputs.target_ref_slot_idx,
+            target_ref_is_player=inputs.target_ref_is_player,
+            target_ref_is_self=inputs.target_ref_is_self,
+        )
+        option_mask_f = inputs.option_mask.unsqueeze(-1)
+        option_count = inputs.option_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        pooled = (option_vectors * option_mask_f).sum(dim=1) / option_count
+        features = torch.cat([state_vector, pending_vector, pooled], dim=-1)
+        return features, option_vectors, target_vectors
+
+    def _apply_trunk(self, features: Tensor) -> Tensor:
+        return self.trunk(features)
+
+    def _apply_lstm_cell(
+        self,
+        features: Tensor,
+        h_in: Tensor,
+        c_in: Tensor,
+        *,
+        use_target: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        feature_projection = (
+            self.target_feature_projection if use_target else self.feature_projection
+        )
+        lstm = self.target_lstm if use_target else self.lstm
+        projected = feature_projection(features).unsqueeze(1)
+        output, (h_next, c_next) = lstm(projected, (h_in.contiguous(), c_in.contiguous()))
+        return output[:, 0, :], h_next, c_next
+
+    def _compute_hidden(
+        self,
+        inputs: _ForwardInputs,
+        *,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
+        use_target: bool = False,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
+        features, _option_vectors, _target_vectors = self._embed_forward_inputs(
+            inputs,
+            use_target=use_target,
+        )
+        if not self.use_lstm:
+            return self._apply_trunk(features), None
+        if h_in is None or c_in is None:
+            raise ValueError("h_in and c_in are required when use_lstm=True")
+        hidden, h_next, c_next = self._apply_lstm_cell(
+            features,
+            h_in,
+            c_in,
+            use_target=use_target,
+        )
+        return hidden, (h_next, c_next)
+
+    def _compute_forward(
+        self,
+        inputs: _ForwardInputs,
+        *,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
+        use_target: bool = False,
+    ) -> tuple[_ForwardBatch, tuple[Tensor, Tensor] | None]:
+        features, option_vectors, target_vectors = self._embed_forward_inputs(
+            inputs,
+            use_target=use_target,
+        )
+        if self.use_lstm:
+            if h_in is None or c_in is None:
+                raise ValueError("h_in and c_in are required when use_lstm=True")
+            hidden, h_next, c_next = self._apply_lstm_cell(
+                features,
+                h_in,
+                c_in,
+                use_target=use_target,
+            )
+            next_state: tuple[Tensor, Tensor] | None = (h_next, c_next)
+        else:
+            hidden = self._apply_trunk(features)
+            next_state = None
+
         query = self.action_query(hidden) / math.sqrt(float(self.game_state_encoder.d_model))
         values = self.value_head(hidden).squeeze(-1)
         none_logits = self.none_blocker_head(hidden).squeeze(-1)
         may_logits = self.may_head(hidden).squeeze(-1)
-
-        return _ForwardBatch(
-            query=query,
-            values=values,
-            none_logits=none_logits,
-            may_logits=may_logits,
-            option_vectors=option_vectors,
-            target_vectors=target_vectors,
-            hidden=hidden,
+        return (
+            _ForwardBatch(
+                query=query,
+                values=values,
+                none_logits=none_logits,
+                may_logits=may_logits,
+                option_vectors=option_vectors,
+                target_vectors=target_vectors,
+                hidden=hidden,
+            ),
+            next_state,
         )
+
+    def _forward_batch(self, step_indices: Tensor) -> _ForwardBatch:
+        inputs, lstm_state = self._gather_from_rollout(step_indices)
+        h_in: Tensor | None = None
+        c_in: Tensor | None = None
+        if lstm_state is not None:
+            h_in, c_in = lstm_state
+        forward, _next_state = self._compute_forward(inputs, h_in=h_in, c_in=c_in)
+        return forward
 
     def _forward_native_batch(
         self,
@@ -1409,78 +1513,17 @@ class PPOPolicy(nn.Module):
         *,
         env_indices: list[int] | None = None,
     ) -> _ForwardBatch:
-        device = self.device
-        slot_card_rows = native_batch.slot_card_rows.to(device)
-        slot_occupied = native_batch.slot_occupied.to(device)
-        slot_tapped = native_batch.slot_tapped.to(device)
-        game_info = native_batch.game_info.to(device)
-        pending_kind_id = native_batch.pending_kind_id.to(device)
-        option_kind_ids = native_batch.option_kind_ids.to(device)
-        option_scalars = native_batch.option_scalars.to(device)
-        option_mask = native_batch.option_mask.to(device)
-        option_ref_slot_idx = native_batch.option_ref_slot_idx.to(device)
-        option_ref_card_row = native_batch.option_ref_card_row.to(device)
-        target_mask = native_batch.target_mask.to(device)
-        target_type_ids = native_batch.target_type_ids.to(device)
-        target_scalars = native_batch.target_scalars.to(device)
-        target_ref_slot_idx = native_batch.target_ref_slot_idx.to(device)
-        target_ref_is_player = native_batch.target_ref_is_player.to(device)
-        target_ref_is_self = native_batch.target_ref_is_self.to(device)
-
-        self._validate_slot_card_rows(
-            slot_card_rows,
-            self.game_state_encoder.card_embedding_table.shape[0],
-        )
-        slot_vectors = self.game_state_encoder.embed_slot_vectors(
-            slot_card_rows,
-            slot_occupied,
-            slot_tapped,
-        )
-        state_vector = self.game_state_encoder.state_vector_from_slots(
-            slot_vectors,
-            game_info,
-        )
-
-        pending_vector, option_vectors, target_vectors = self.action_encoder.embed_from_parsed(
-            slot_vectors=slot_vectors,
-            pending_kind_id=pending_kind_id,
-            option_kind_ids=option_kind_ids,
-            option_scalars=option_scalars,
-            option_mask=option_mask,
-            option_ref_slot_idx=option_ref_slot_idx,
-            option_ref_card_row=option_ref_card_row,
-            target_mask=target_mask,
-            target_type_ids=target_type_ids,
-            target_scalars=target_scalars,
-            target_ref_slot_idx=target_ref_slot_idx,
-            target_ref_is_player=target_ref_is_player,
-            target_ref_is_self=target_ref_is_self,
-        )
-
-        option_mask_f = option_mask.unsqueeze(-1)
-        option_count = option_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        pooled = (option_vectors * option_mask_f).sum(dim=1) / option_count
-        features = torch.cat([state_vector, pending_vector, pooled], dim=-1)
-        if self.use_lstm:
+        inputs, lstm_state = self._gather_from_native(native_batch, env_indices=env_indices)
+        h_in: Tensor | None = None
+        c_in: Tensor | None = None
+        if lstm_state is not None:
+            h_in, c_in = lstm_state
+        forward, next_state = self._compute_forward(inputs, h_in=h_in, c_in=c_in)
+        if next_state is not None:
             if env_indices is None:
-                raise ValueError("env_indices are required for LSTM native rollout")
-            if len(env_indices) != int(features.shape[0]):
-                raise ValueError("env_indices length must match native batch length")
-        hidden = self._apply_policy_core(features, env_indices=env_indices)
-        query = self.action_query(hidden) / math.sqrt(float(self.game_state_encoder.d_model))
-        values = self.value_head(hidden).squeeze(-1)
-        none_logits = self.none_blocker_head(hidden).squeeze(-1)
-        may_logits = self.may_head(hidden).squeeze(-1)
-
-        return _ForwardBatch(
-            query=query,
-            values=values,
-            none_logits=none_logits,
-            may_logits=may_logits,
-            option_vectors=option_vectors,
-            target_vectors=target_vectors,
-            hidden=hidden,
-        )
+                raise ValueError("env_indices are required when scattering LSTM state")
+            self._scatter_lstm_state(env_indices, next_state[0], next_state[1])
+        return forward
 
     @staticmethod
     def _validate_slot_card_rows(slot_card_rows: Tensor, max_card_rows: int) -> None:
@@ -1966,6 +2009,28 @@ class PPOPolicy(nn.Module):
             option_row[i] = i
             mask_row[i] = True
         return [option_row], [target_row], [mask_row], [False]
+
+
+@dataclass(frozen=True)
+class _ForwardInputs:
+    """Device-resident tensors consumed by the pure compute core."""
+
+    slot_card_rows: Tensor
+    slot_occupied: Tensor
+    slot_tapped: Tensor
+    game_info: Tensor
+    pending_kind_id: Tensor
+    option_kind_ids: Tensor
+    option_scalars: Tensor
+    option_mask: Tensor
+    option_ref_slot_idx: Tensor
+    option_ref_card_row: Tensor
+    target_mask: Tensor
+    target_type_ids: Tensor
+    target_scalars: Tensor
+    target_ref_slot_idx: Tensor
+    target_ref_is_player: Tensor
+    target_ref_is_self: Tensor
 
 
 @dataclass(frozen=True)

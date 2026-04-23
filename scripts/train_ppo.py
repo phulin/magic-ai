@@ -141,6 +141,7 @@ def main() -> None:
         spr_enabled=args.spr,
         spr_action_dim=args.spr_action_dim,
         spr_ema_decay=args.spr_ema_decay,
+        validate=not args.no_validate,
     ).to(device)
     policy.init_lstm_env_states(args.num_envs)
     if device.type == "cuda":
@@ -277,6 +278,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", default="magic-ai")
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
+    parser.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="skip runtime tensor validation checks (required for torch.compile)",
+    )
     parser.add_argument(
         "--disable-opponent-pool",
         action="store_true",
