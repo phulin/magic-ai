@@ -153,8 +153,14 @@ def gae_returns(
     winner_idx: int,
     gamma: float = 1.0,
     gae_lambda: float = 0.95,
+    draw_penalty: float = 0.1,
 ) -> Tensor:
-    """Compute perspective-aware GAE returns for a zero-sum two-player game."""
+    """Compute perspective-aware GAE returns for a zero-sum two-player game.
+
+    ``draw_penalty`` is applied to both players' terminal reward when the game
+    ends in a draw (``winner_idx < 0``); the terminal reward is
+    ``-draw_penalty``.
+    """
 
     if not steps:
         raise ValueError("cannot compute GAE returns for an empty rollout")
@@ -166,7 +172,7 @@ def gae_returns(
 
     last_step = steps[-1]
     if winner_idx < 0:
-        rewards_t[-1] = 0.0
+        rewards_t[-1] = -draw_penalty
     elif winner_idx == last_step.perspective_player_idx:
         rewards_t[-1] = 1.0
     else:

@@ -450,6 +450,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae-lambda", type=float, default=0.97)
+    parser.add_argument(
+        "--draw-penalty",
+        type=float,
+        default=0.1,
+        help=(
+            "terminal reward magnitude applied to both players on a draw "
+            "(default 0.1 = 1/10 of win/loss)"
+        ),
+    )
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--minibatch-size", type=int, default=2048)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
@@ -702,6 +711,7 @@ def train_native_batched_envs(
                     winner_idx=winner_idx,
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
+                    draw_penalty=args.draw_penalty,
                 )
                 pending_steps.extend(env.episode_steps)
                 pending_returns.append(returns)
