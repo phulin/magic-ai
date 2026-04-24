@@ -265,7 +265,6 @@ class TrainPPOTests(unittest.TestCase):
             checkpoint = {
                 "training_state": {
                     "opponent_pool": {
-                        "main_rating": {"mu": 30.0, "sigma": 4.0},
                         "entries": [
                             {
                                 "path": str(existing_snapshot),
@@ -283,8 +282,9 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(len(pool.entries), 2)
         self.assertEqual(pool.entries[0].tag, "g000100_p010.0")
         self.assertEqual(pool.entries[1].tag, "g000200_p020.0")
-        assert pool.main_rating is not None
-        self.assertEqual(pool.main_rating.mu, 30.0)
+        self.assertEqual(pool.entries[0].rating.mu, 31.0)
+        # New snapshot seeds from the previous entry's rating.
+        self.assertEqual(pool.entries[1].rating.mu, 31.0)
 
     def test_validate_args_requires_no_validate_for_torch_compile(self) -> None:
         args = Namespace(

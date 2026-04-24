@@ -990,10 +990,8 @@ def take_snapshot_and_eval(
 ) -> None:
     tag = snapshot_tag(threshold, args.episodes)
     snapshot_path = save_snapshot(policy, args.opponent_pool_dir, tag)
-    opponent_pool.add_snapshot(
-        snapshot_path,
-        tag,
-    ).cached_policy = opponent_policy_state_dict(policy)
+    current_entry = opponent_pool.add_snapshot(snapshot_path, tag)
+    current_entry.cached_policy = opponent_policy_state_dict(policy)
     print(
         f"pool: snapshot {tag} -> {snapshot_path} (pool size={len(opponent_pool.entries)})",
         flush=True,
@@ -1005,18 +1003,23 @@ def take_snapshot_and_eval(
         else max(100, args.episodes // 2500)
     )
 
-    if eval_games_per_snapshot == 0 or not opponent_pool.entries:
+    # Historical opponents only — exclude the freshly-added snapshot from its
+    # own eval. Playing it against itself is pure variance and would fool
+    # TrueSkill into tightening σ on the current checkpoint.
+    historical_opponents = opponent_pool.entries[:-1]
+
+    if eval_games_per_snapshot == 0 or not historical_opponents:
         if wandb.run is not None:
             wandb.log(
                 {
-                    **opponent_pool.main_rating_metrics(),
+                    **opponent_pool.current_rating_metrics(),
                     "eval/snapshot_games": float(threshold),
                 }
             )
         return
 
     game_opponents = distribute_games_by_recency(
-        opponent_pool.entries,
+        historical_opponents,
         eval_games_per_snapshot,
         args.eval_recency_tau,
     )
@@ -1039,6 +1042,7 @@ def take_snapshot_and_eval(
         opponent_policy=opponent_policy,
         game_opponents=game_opponents,
         pool=opponent_pool,
+        current_entry=current_entry,
         native_encoder=native_encoder,
         native_rollout=native_rollout,
         mage=mage,
@@ -1054,35 +1058,26 @@ def take_snapshot_and_eval(
         seed_base=seed_base,
         rng=rng,
     )
-    main_rating = opponent_pool.main_rating
-    assert main_rating is not None
+    current_rating = current_entry.rating
     for opponent in unique_opponents:
         games = int(metrics.get(f"eval/opp_{opponent.tag}_games", 0.0))
         main_win = metrics.get(f"eval/opp_{opponent.tag}_main_win_fraction", 0.0)
         print(
             f"eval: snapshot_tag={tag} opponent={opponent.tag} "
             f"games={games} main_win={main_win:.2f} "
-            f"main_rating=mu={main_rating.mu:.2f},"
-            f"sigma={main_rating.sigma:.2f}",
+            f"current_rating=mu={current_rating.mu:.2f},"
+            f"sigma={current_rating.sigma:.2f}",
             flush=True,
         )
 
     if wandb.run is not None:
         payload = {
             **metrics,
+            **opponent_pool.current_rating_metrics(),
             "eval/snapshot_games": float(threshold),
             "eval/new_snapshot_tag": tag,
         }
         wandb.log(payload)
-
-    if wandb.run is not None:
-        wandb.log(
-            {
-                **opponent_pool.main_rating_metrics(),
-                "eval/snapshot_games": float(threshold),
-                "eval/new_snapshot_tag": tag,
-            }
-        )
 
 
 def load_deck_pool(deck_json: Path | None, deck_dir: Path | None) -> list[dict[str, Any]]:

@@ -28,60 +28,65 @@ class OpponentEntry:
 class OpponentPool:
     env: trueskill.TrueSkill = field(default_factory=trueskill.TrueSkill)
     entries: list[OpponentEntry] = field(default_factory=list)
-    main_rating: trueskill.Rating | None = None
-
-    def __post_init__(self) -> None:
-        if self.main_rating is None:
-            self.main_rating = self.env.create_rating()
 
     def add_snapshot(self, path: Path, tag: str) -> OpponentEntry:
-        # Seed a new snapshot at main's current rating: at the moment of snapshot
-        # they ARE main, so this is a better prior than a default fresh rating.
-        assert self.main_rating is not None
+        # Seed new snapshots at the previous entry's rating (a better prior than
+        # fresh 25±25/3, since policies generally improve monotonically). The
+        # newest entry is rated as its own independent player — σ shrinks only
+        # as games accumulate for this specific checkpoint.
         env = cast(Any, self.env)
-        seed_rating = env.create_rating(mu=self.main_rating.mu, sigma=self.main_rating.sigma)
+        if self.entries:
+            prev = self.entries[-1].rating
+            seed_rating = env.create_rating(mu=prev.mu, sigma=prev.sigma)
+        else:
+            seed_rating = env.create_rating()
         entry = OpponentEntry(path=path, tag=tag, rating=seed_rating)
         self.entries.append(entry)
         return entry
 
     def sample(self, rng: random.Random) -> OpponentEntry | None:
-        """Sample weighted toward opponents whose μ is close to main's μ.
-
-        Uses a Gaussian weight over |Δμ| with bandwidth tied to the combined
-        rating uncertainty; falls back to uniform if all weights collapse.
+        """Sample weighted toward opponents whose μ is close to the current
+        (most-recent) entry's μ. Bandwidth is tied to combined rating
+        uncertainty; falls back to uniform if all weights collapse.
         """
         if not self.entries:
             return None
-        assert self.main_rating is not None
-        main_mu = self.main_rating.mu
-        main_sigma = self.main_rating.sigma
+        current = self.entries[-1].rating
+        cur_mu = current.mu
+        cur_sigma = current.sigma
         weights: list[float] = []
         for entry in self.entries:
-            bandwidth_sq = main_sigma * main_sigma + entry.rating.sigma * entry.rating.sigma
+            bandwidth_sq = cur_sigma * cur_sigma + entry.rating.sigma * entry.rating.sigma
             bandwidth_sq = max(bandwidth_sq, 1e-6)
-            delta = entry.rating.mu - main_mu
+            delta = entry.rating.mu - cur_mu
             weights.append(math.exp(-0.5 * delta * delta / bandwidth_sq))
         total = sum(weights)
         if total <= 0.0:
             return rng.choice(self.entries)
         return rng.choices(self.entries, weights=weights, k=1)[0]
 
-    def record_match(self, opponent: OpponentEntry, main_won: bool | None) -> None:
-        assert self.main_rating is not None
+    def record_match(
+        self,
+        rated: OpponentEntry,
+        opponent: OpponentEntry,
+        rated_won: bool | None,
+    ) -> None:
         env = cast(Any, self.env)
-        if main_won is None:
-            new_main, new_opp = env.rate_1vs1(self.main_rating, opponent.rating, drawn=True)
-        elif main_won:
-            new_main, new_opp = env.rate_1vs1(self.main_rating, opponent.rating)
+        if rated_won is None:
+            new_r, new_o = env.rate_1vs1(rated.rating, opponent.rating, drawn=True)
+        elif rated_won:
+            new_r, new_o = env.rate_1vs1(rated.rating, opponent.rating)
         else:
-            new_opp, new_main = env.rate_1vs1(opponent.rating, self.main_rating)
-        self.main_rating = new_main
-        opponent.rating = new_opp
+            new_o, new_r = env.rate_1vs1(opponent.rating, rated.rating)
+        rated.rating = new_r
+        opponent.rating = new_o
 
-    def main_rating_metrics(self) -> dict[str, float]:
-        assert self.main_rating is not None
-        mu = float(self.main_rating.mu)
-        sigma = float(self.main_rating.sigma)
+    def current_rating_metrics(self) -> dict[str, float]:
+        if not self.entries:
+            return {"opponent_pool_size": 0.0}
+        current = self.entries[-1].rating
+        mu = float(current.mu)
+        sigma = float(current.sigma)
         return {
             "trueskill/mu": mu,
             "trueskill/sigma": sigma,
@@ -90,12 +95,7 @@ class OpponentPool:
         }
 
     def state_dict(self) -> dict[str, Any]:
-        assert self.main_rating is not None
         return {
-            "main_rating": {
-                "mu": float(self.main_rating.mu),
-                "sigma": float(self.main_rating.sigma),
-            },
             "entries": [
                 {
                     "path": str(entry.path),
@@ -111,12 +111,6 @@ class OpponentPool:
     def from_state_dict(cls, state: dict[str, Any]) -> OpponentPool:
         pool = cls()
         env = cast(Any, pool.env)
-        main_rating = state.get("main_rating")
-        if isinstance(main_rating, dict):
-            pool.main_rating = env.create_rating(
-                mu=float(main_rating.get("mu", 25.0)),
-                sigma=float(main_rating.get("sigma", 25.0 / 3.0)),
-            )
         entries = state.get("entries", [])
         if isinstance(entries, list):
             for item in entries:
@@ -286,6 +280,7 @@ def distribute_games_by_recency(
 class _EvalGame:
     game: Any
     slot_idx: int
+    game_idx: int  # deterministic index, used to order deferred rating updates
     main_player_idx: int  # 0 or 1 — which side the main policy plays
     opponent: OpponentEntry
     action_count: int = 0
@@ -298,6 +293,7 @@ def run_eval_matches(
     opponent_policy: PPOPolicy,
     game_opponents: list[OpponentEntry],
     pool: OpponentPool,
+    current_entry: OpponentEntry,
     native_encoder: ShardedNativeBatchEncoder,
     native_rollout: ShardedNativeRolloutDriver,
     mage: Any,
@@ -344,6 +340,10 @@ def run_eval_matches(
     per_opp_main_wins: dict[str, int] = {opp.tag: 0 for opp in unique_opponents}
     per_opp_opp_wins: dict[str, int] = {opp.tag: 0 for opp in unique_opponents}
     per_opp_draws: dict[str, int] = {opp.tag: 0 for opp in unique_opponents}
+    # Deferred outcomes: (game_idx, opponent, main_won). Applied after the
+    # eval loop in game_idx order so rating updates are reproducible and
+    # independent of non-deterministic game-completion timing.
+    outcomes: list[tuple[int, OpponentEntry, bool | None]] = []
 
     free_slots = list(range(num_envs - 1, -1, -1))
     live: list[_EvalGame] = []
@@ -374,6 +374,7 @@ def run_eval_matches(
                 hand_size=hand_size,
             ),
             slot_idx=slot_idx,
+            game_idx=game_idx,
             main_player_idx=main_player_idx,
             opponent=opponent,
         )
@@ -440,15 +441,15 @@ def run_eval_matches(
                 if env.winner_idx == env.main_player_idx:
                     main_wins += 1
                     per_opp_main_wins[env.opponent.tag] += 1
-                    pool.record_match(env.opponent, main_won=True)
+                    outcomes.append((env.game_idx, env.opponent, True))
                 elif env.winner_idx == -1:
                     draws += 1
                     per_opp_draws[env.opponent.tag] += 1
-                    pool.record_match(env.opponent, main_won=None)
+                    outcomes.append((env.game_idx, env.opponent, None))
                 else:
                     opp_wins += 1
                     per_opp_opp_wins[env.opponent.tag] += 1
-                    pool.record_match(env.opponent, main_won=False)
+                    outcomes.append((env.game_idx, env.opponent, False))
                 free_slots.append(env.slot_idx)
                 continue
             still_live.append(env)
@@ -478,6 +479,10 @@ def run_eval_matches(
     if saved_main_h is not None and saved_main_c is not None:
         main_policy.live_lstm_h = saved_main_h
         main_policy.live_lstm_c = saved_main_c
+
+    outcomes.sort(key=lambda t: t[0])
+    for _, opp_entry, main_won in outcomes:
+        pool.record_match(current_entry, opp_entry, rated_won=main_won)
 
     total = main_wins + opp_wins + draws
     denom = float(total) if total else 1.0
