@@ -292,6 +292,8 @@ def main() -> None:
         spr_enabled=args.spr,
         spr_action_dim=args.spr_action_dim,
         spr_ema_decay=args.spr_ema_decay,
+        spr_k=args.spr_k,
+        spr_proj_dim=args.spr_proj_dim,
         validate=not args.no_validate,
         compile_forward=args.torch_compile,
     ).to(device)
@@ -445,6 +447,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spr-coef", type=float, default=0.1)
     parser.add_argument("--spr-ema-decay", type=float, default=0.99)
     parser.add_argument("--spr-action-dim", type=int, default=32)
+    parser.add_argument("--spr-k", type=int, default=5)
+    parser.add_argument("--spr-proj-dim", type=int, default=256)
     parser.add_argument("--max-options", type=int, default=64)
     parser.add_argument("--max-targets-per-option", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=3e-4)

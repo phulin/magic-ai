@@ -141,6 +141,8 @@ class PPOPolicy(nn.Module):
         spr_enabled: bool = False,
         spr_action_dim: int = 32,
         spr_ema_decay: float = 0.99,
+        spr_k: int = 5,
+        spr_proj_dim: int = 256,
         validate: bool = True,
         compile_forward: bool = False,
     ) -> None:
@@ -195,9 +197,13 @@ class PPOPolicy(nn.Module):
 
         self.spr_enabled = spr_enabled
         self.spr_ema_decay = spr_ema_decay
+        self.spr_k = spr_k
+        self.spr_proj_dim = spr_proj_dim
         if spr_enabled:
             if not use_lstm:
                 raise ValueError("SPR auxiliary loss currently requires use_lstm=True")
+            if spr_k < 1:
+                raise ValueError("spr_k must be >= 1")
             self.target_game_state_encoder = copy.deepcopy(game_state_encoder)
             self.target_action_encoder = copy.deepcopy(self.action_encoder)
             self.target_feature_projection = copy.deepcopy(self.feature_projection)
@@ -216,11 +222,23 @@ class PPOPolicy(nn.Module):
                 nn.Linear(2 * d_model + 1, spr_action_dim),
                 nn.GELU(),
             )
-            self.spr_predictor = nn.Sequential(
+            # Transition model h: (z_t, action_emb_t) -> z_{t+1}
+            self.spr_transition = nn.Sequential(
                 nn.Linear(hidden_dim + 2 * spr_action_dim, hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, hidden_dim),
             )
+            # BYOL-style projection heads g_o (online) and g_m (EMA target)
+            self.spr_g_online = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, spr_proj_dim),
+            )
+            self.spr_g_target = copy.deepcopy(self.spr_g_online)
+            for p in self.spr_g_target.parameters():
+                p.requires_grad_(False)
+            # Predictor q on top of online projection
+            self.spr_q = nn.Linear(spr_proj_dim, spr_proj_dim)
 
         if decision_capacity is None:
             decision_capacity = rollout_capacity * 8
@@ -1242,27 +1260,79 @@ class PPOPolicy(nn.Module):
             group_selected=group_selected,
             group_uses_none=group_uses_none,
         )
-        may_bit = rb.may_selected[step_indices].unsqueeze(-1).to(opt_mean.dtype)
+        z_online = forward.hidden
+        action_emb_0 = self._spr_action_embedding_full(
+            step_indices, opt_mean=opt_mean, tgt_mean=tgt_mean, dtype=z_online.dtype
+        )
+
+        z_hat = z_online
+        cur_idx = step_indices
+        action_emb = action_emb_0
+        cumulative_has_next = torch.ones(
+            step_indices.shape[0], dtype=z_online.dtype, device=z_online.device
+        )
+        loss_terms: list[Tensor] = []
+        for k in range(1, self.spr_k + 1):
+            step_has_next = rb.has_next[cur_idx]
+            cumulative_has_next = cumulative_has_next * step_has_next
+
+            pred_in = torch.cat([z_hat, action_emb], dim=-1)
+            z_hat = self.spr_transition(pred_in)
+
+            next_idx = rb.next_step_idx[cur_idx]
+            with torch.no_grad():
+                z_target_next = self._encode_latent(next_idx, use_target=True)
+                y_target = self.spr_g_target(z_target_next)
+            y_pred = self.spr_q(self.spr_g_online(z_hat))
+
+            cos = F.cosine_similarity(y_pred, y_target, dim=-1)
+            denom_k = cumulative_has_next.sum().clamp_min(1.0)
+            loss_k = -(cos * cumulative_has_next).sum() / denom_k
+            loss_terms.append(loss_k)
+
+            if k < self.spr_k:
+                cur_idx = next_idx
+                action_emb = self._spr_action_embedding_simple(cur_idx, dtype=z_online.dtype)
+
+        return torch.stack(loss_terms).sum()
+
+    def _spr_action_embedding_full(
+        self,
+        step_indices: Tensor,
+        *,
+        opt_mean: Tensor,
+        tgt_mean: Tensor,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        rb = self.rollout_buffer
+        may_bit = rb.may_selected[step_indices].unsqueeze(-1).to(dtype)
         action_raw = torch.cat([opt_mean, tgt_mean, may_bit], dim=-1)
         action_proj = self.spr_action_projector(action_raw)
-        trace_kind_ids = rb.trace_kind_id[step_indices]
-        trace_emb = self.spr_action_embedding(trace_kind_ids)
+        trace_emb = self.spr_action_embedding(rb.trace_kind_id[step_indices])
+        return torch.cat([trace_emb, action_proj], dim=-1)
 
-        z_online = forward.hidden
-        pred_in = torch.cat([z_online, trace_emb, action_proj], dim=-1)
-        z_hat_next = self.spr_predictor(pred_in)
+    def _spr_action_embedding_simple(
+        self,
+        step_indices: Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> Tensor:
+        """Cheap action embedding for chained SPR rollout steps.
 
-        next_idx = rb.next_step_idx[step_indices]
-        with torch.no_grad():
-            z_target_next = self._encode_latent(next_idx, use_target=True)
+        Skips a fresh forward pass by zeroing the option/target mean components
+        and keeping only the trace-kind embedding plus the may bit.
+        """
 
-        has_next = rb.has_next[step_indices]
-        z_hat_n = F.normalize(z_hat_next, dim=-1)
-        z_tgt_n = F.normalize(z_target_next, dim=-1)
-        per_row = ((z_hat_n - z_tgt_n) ** 2).sum(dim=-1)
-        per_row = per_row * has_next
-        denom = has_next.sum().clamp_min(1.0)
-        return per_row.sum() / denom
+        rb = self.rollout_buffer
+        d_model = self.game_state_encoder.d_model
+        n = int(step_indices.shape[0])
+        device = step_indices.device
+        zeros = torch.zeros(n, 2 * d_model, device=device, dtype=dtype)
+        may_bit = rb.may_selected[step_indices].unsqueeze(-1).to(dtype)
+        action_raw = torch.cat([zeros, may_bit], dim=-1)
+        action_proj = self.spr_action_projector(action_raw)
+        trace_emb = self.spr_action_embedding(rb.trace_kind_id[step_indices])
+        return torch.cat([trace_emb, action_proj], dim=-1)
 
     @torch.no_grad()
     def update_spr_target(self, decay: float | None = None) -> None:
@@ -1276,6 +1346,7 @@ class PPOPolicy(nn.Module):
             (self.action_encoder, self.target_action_encoder),
             (self.feature_projection, self.target_feature_projection),
             (self.lstm, self.target_lstm),
+            (self.spr_g_online, self.spr_g_target),
         )
         for online, target in pairs:
             for op, tp in zip(online.parameters(), target.parameters(), strict=True):
