@@ -552,8 +552,8 @@ class PPOPolicy(nn.Module):
         decision_counts = native_batch.decision_count.detach().cpu().tolist()
         decision_option_idx = native_batch.decision_option_idx.to(device)
         decision_target_idx = native_batch.decision_target_idx.to(device)
-        decision_mask = native_batch.decision_mask.to(device)
-        uses_none_head = native_batch.uses_none_head.to(device)
+        decision_mask = native_batch.decision_mask.to(device=device, dtype=torch.bool)
+        uses_none_head = native_batch.uses_none_head.to(device=device, dtype=torch.bool)
         group_step_positions: list[int] = []
         group_decision_indices: list[int] = []
         trace_kind_ids = native_batch.trace_kind_id.detach().cpu().tolist()

@@ -178,7 +178,7 @@ def _validate_decision_layout(
 
     rows = valid[:, 0]
     cols = valid[:, 1]
-    none_choices = uses_none_head[rows] & cols.eq(0)
+    none_choices = uses_none_head[rows].bool() & cols.eq(0)
     scored = ~none_choices
     if not scored.any():
         return
@@ -419,9 +419,9 @@ class NativeBatchEncoder:
             "target_scalars": buffers.target_scalars[:batch_size],
             "target_overflow": buffers.target_overflow[:batch_size],
             "target_ref_slot_idx": buffers.target_ref_slot_idx[:batch_size],
-            "target_ref_is_player": buffers.target_ref_is_player_u8[:batch_size].ne(0),
-            "target_ref_is_self": buffers.target_ref_is_self_u8[:batch_size].ne(0),
-            "may_mask": buffers.may_mask_u8[:batch_size].ne(0),
+            "target_ref_is_player": buffers.target_ref_is_player_u8[:batch_size],
+            "target_ref_is_self": buffers.target_ref_is_self_u8[:batch_size],
+            "may_mask": buffers.may_mask_u8[:batch_size],
             "decision_start": buffers.decision_start[:batch_size],
             "decision_count": buffers.decision_count[:batch_size],
         }
@@ -553,8 +553,8 @@ class NativeBatchEncoder:
         trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
         decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
         decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
-        decision_mask = buffers.decision_mask_u8[:decision_rows_written].ne(0)
-        uses_none_head = buffers.uses_none_head_u8[:decision_rows_written].ne(0)
+        decision_mask = buffers.decision_mask_u8[:decision_rows_written]
+        uses_none_head = buffers.uses_none_head_u8[:decision_rows_written]
         if self.validate:
             _validate_decision_layout(
                 decision_option_idx=decision_option_idx,
@@ -703,8 +703,8 @@ class NativeBatchEncoder:
         trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
         decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
         decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
-        decision_mask = buffers.decision_mask_u8[:decision_rows_written].ne(0)
-        uses_none_head = buffers.uses_none_head_u8[:decision_rows_written].ne(0)
+        decision_mask = buffers.decision_mask_u8[:decision_rows_written]
+        uses_none_head = buffers.uses_none_head_u8[:decision_rows_written]
         if self.validate:
             _validate_decision_layout(
                 decision_option_idx=decision_option_idx,

@@ -229,9 +229,11 @@ class NativeTrajectoryBuffer(nn.Module):
             device
         )
         self.target_ref_is_player[env_idx_t, step_idx_t] = native_batch.target_ref_is_player.to(
-            device
+            device=device, dtype=torch.bool
         )
-        self.target_ref_is_self[env_idx_t, step_idx_t] = native_batch.target_ref_is_self.to(device)
+        self.target_ref_is_self[env_idx_t, step_idx_t] = native_batch.target_ref_is_self.to(
+            device=device, dtype=torch.bool
+        )
         self.may_selected[env_idx_t, step_idx_t] = may_selected_t
         self.old_log_prob[env_idx_t, step_idx_t] = old_log_probs.to(device)
         self.value[env_idx_t, step_idx_t] = values.to(device)
@@ -270,8 +272,8 @@ class NativeTrajectoryBuffer(nn.Module):
 
             native_decision_option_idx = native_batch.decision_option_idx.to(device)
             native_decision_target_idx = native_batch.decision_target_idx.to(device)
-            native_decision_mask = native_batch.decision_mask.to(device)
-            native_uses_none_head = native_batch.uses_none_head.to(device)
+            native_decision_mask = native_batch.decision_mask.to(device=device, dtype=torch.bool)
+            native_uses_none_head = native_batch.uses_none_head.to(device=device, dtype=torch.bool)
 
             self.decision_option_idx[decision_env, dest_rows] = native_decision_option_idx[
                 source_rows
@@ -573,8 +575,12 @@ class RolloutBuffer(nn.Module):
         self.target_scalars[step_indices] = native_batch.target_scalars.to(device)
         self.target_overflow[step_indices] = native_batch.target_overflow.to(device)
         self.target_ref_slot_idx[step_indices] = native_batch.target_ref_slot_idx.to(device)
-        self.target_ref_is_player[step_indices] = native_batch.target_ref_is_player.to(device)
-        self.target_ref_is_self[step_indices] = native_batch.target_ref_is_self.to(device)
+        self.target_ref_is_player[step_indices] = native_batch.target_ref_is_player.to(
+            device=device, dtype=torch.bool
+        )
+        self.target_ref_is_self[step_indices] = native_batch.target_ref_is_self.to(
+            device=device, dtype=torch.bool
+        )
 
         decision_counts = native_batch.decision_count.detach().cpu().tolist()
         decision_starts: list[int] = []
@@ -593,10 +599,10 @@ class RolloutBuffer(nn.Module):
                 flat_cursor:flat_end
             ].to(device)
             self.decision_mask[start:end] = native_batch.decision_mask[flat_cursor:flat_end].to(
-                device
+                device=device, dtype=torch.bool
             )
             self.uses_none_head[start:end] = native_batch.uses_none_head[flat_cursor:flat_end].to(
-                device
+                device=device, dtype=torch.bool
             )
             flat_cursor = flat_end
 
