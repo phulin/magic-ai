@@ -51,6 +51,13 @@ from magic_ai.opponent_pool import (  # noqa: E402
     snapshot_tag,
 )
 from magic_ai.ppo import PPOStats, RolloutStep, gae_returns, ppo_update  # noqa: E402
+from magic_ai.rnad import RNaDConfig  # noqa: E402
+from magic_ai.rnad_trainer import (  # noqa: E402
+    EpisodeBatch,
+    RNaDTrainerState,
+    build_trainer_state,
+    run_rnad_update,
+)
 from magic_ai.sharded_native import (  # noqa: E402
     ShardedNativeBatchEncoder,
     ShardedNativeRolloutDriver,
@@ -244,15 +251,14 @@ def _resume_state_from_checkpoint(checkpoint: dict[str, Any] | None) -> Training
 def main() -> None:
     args = parse_args()
     validate_args(args)
-    if args.trainer == "rnad":
-        raise NotImplementedError(
-            "--trainer rnad is scaffolded but the training loop is not yet "
-            "wired up. Phases 4-7 of docs/rnad_implementation_plan.md need "
-            "to land first (multi-policy replay forward, target-network "
-            "Polyak update, outer fixed-point loop). The self-contained "
-            "primitives in magic_ai/rnad.py are already implemented and "
-            "unit-tested."
+    if args.trainer == "rnad" and args.draw_penalty != 0.0:
+        print(
+            "[rnad] --draw-penalty forced to 0.0 under R-NaD trainer; the "
+            "reward transform already injects an entropy bonus and any ± "
+            "draw signal is absorbed.",
+            flush=True,
         )
+        args.draw_penalty = 0.0
     deck_pool = load_deck_pool(args.deck_json, args.deck_dir)
     validate_deck_embeddings(args.embeddings, deck_pool)
     if args.torch_threads is not None:
@@ -708,6 +714,24 @@ def train_native_batched_envs(
 
     pending_steps: list[RolloutStep] = []
     pending_returns: list[torch.Tensor] = []
+    pending_episodes: list[EpisodeBatch] = []  # R-NaD: one entry per finished game
+    rnad_state: RNaDTrainerState | None = None
+    if args.trainer == "rnad":
+        rnad_state = build_trainer_state(
+            policy,
+            config=RNaDConfig(
+                eta=args.rnad_eta,
+                delta_m=args.rnad_delta_m,
+                num_outer_iterations=args.rnad_m,
+                neurd_beta=args.rnad_neurd_beta,
+                neurd_clip=args.rnad_neurd_clip,
+                target_ema_gamma=args.rnad_target_ema,
+                finetune_eps=args.rnad_finetune_eps,
+                finetune_n_disc=args.rnad_finetune_ndisc,
+            ),
+            reg_snapshot_dir=args.output.parent / "rnad",
+            device=policy.device,
+        )
     restored_state = resume_state or TrainingResumeState()
     completed_games = restored_state.completed_games
     last_saved_games = restored_state.last_saved_games
@@ -800,6 +824,13 @@ def train_native_batched_envs(
                 )
                 pending_steps.extend(env.episode_steps)
                 pending_returns.append(returns)
+                if rnad_state is not None:
+                    pending_episodes.append(
+                        EpisodeBatch(
+                            steps=list(env.episode_steps),
+                            winner_idx=int(winner_idx),
+                        )
+                    )
                 total_generated_rollout_steps += len(env.episode_steps)
             if env.slot_idx == 0:
                 print_sample_game(
@@ -926,21 +957,29 @@ def train_native_batched_envs(
         if len(pending_steps) >= args.rollout_steps:
             rollout_returns = torch.cat(pending_returns)
             rollout_step_count = len(pending_steps)
-            stats = ppo_update(
-                policy,
-                optimizer,
-                pending_steps,
-                rollout_returns,
-                epochs=args.ppo_epochs,
-                minibatch_size=args.minibatch_size,
-                clip_epsilon=args.clip_epsilon,
-                value_coef=args.value_coef,
-                entropy_coef=args.entropy_coef,
-                max_grad_norm=args.max_grad_norm,
-                spr_coef=args.spr_coef if args.spr else 0.0,
-            )
+            if rnad_state is not None:
+                stats = run_rnad_update(
+                    policy,
+                    optimizer,
+                    rnad_state,
+                    pending_episodes,
+                )
+            else:
+                stats = ppo_update(
+                    policy,
+                    optimizer,
+                    pending_steps,
+                    rollout_returns,
+                    epochs=args.ppo_epochs,
+                    minibatch_size=args.minibatch_size,
+                    clip_epsilon=args.clip_epsilon,
+                    value_coef=args.value_coef,
+                    entropy_coef=args.entropy_coef,
+                    max_grad_norm=args.max_grad_norm,
+                    spr_coef=args.spr_coef if args.spr else 0.0,
+                )
             print(
-                "update",
+                f"update[{args.trainer}]",
                 f"games={completed_games}",
                 f"steps={rollout_step_count}",
                 f"loss={stats.loss:.4f}",
@@ -949,6 +988,7 @@ def train_native_batched_envs(
                 f"entropy={stats.entropy:.4f}",
                 f"kl={stats.approx_kl:.4f}",
                 f"clip={stats.clip_fraction:.3f}",
+                (f"rnad_m={rnad_state.outer_iteration}" if rnad_state is not None else ""),
                 flush=True,
             )
             total_rollout_steps += rollout_step_count
@@ -964,6 +1004,7 @@ def train_native_batched_envs(
             policy.reset_rollout_buffer()
             pending_steps.clear()
             pending_returns.clear()
+            pending_episodes.clear()
             win_stats.reset()
 
         if (
@@ -1013,21 +1054,29 @@ def train_native_batched_envs(
     if pending_steps:
         rollout_returns = torch.cat(pending_returns)
         rollout_step_count = len(pending_steps)
-        stats = ppo_update(
-            policy,
-            optimizer,
-            pending_steps,
-            rollout_returns,
-            epochs=args.ppo_epochs,
-            minibatch_size=args.minibatch_size,
-            clip_epsilon=args.clip_epsilon,
-            value_coef=args.value_coef,
-            entropy_coef=args.entropy_coef,
-            max_grad_norm=args.max_grad_norm,
-            spr_coef=args.spr_coef if args.spr else 0.0,
-        )
+        if rnad_state is not None and pending_episodes:
+            stats = run_rnad_update(
+                policy,
+                optimizer,
+                rnad_state,
+                pending_episodes,
+            )
+        else:
+            stats = ppo_update(
+                policy,
+                optimizer,
+                pending_steps,
+                rollout_returns,
+                epochs=args.ppo_epochs,
+                minibatch_size=args.minibatch_size,
+                clip_epsilon=args.clip_epsilon,
+                value_coef=args.value_coef,
+                entropy_coef=args.entropy_coef,
+                max_grad_norm=args.max_grad_norm,
+                spr_coef=args.spr_coef if args.spr else 0.0,
+            )
         print(
-            "final_update",
+            f"final_update[{args.trainer}]",
             f"games={completed_games}",
             f"steps={rollout_step_count}",
             f"loss={stats.loss:.4f}",
@@ -1047,6 +1096,7 @@ def train_native_batched_envs(
             value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
         )
         policy.reset_rollout_buffer()
+        pending_episodes.clear()
 
     return TrainingResumeState(
         completed_games=completed_games,
