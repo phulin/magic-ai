@@ -179,9 +179,15 @@ def snapshot_tag(threshold: int, total_episodes: int) -> str:
 
 
 def opponent_policy_state_dict(policy: PPOPolicy) -> dict[str, torch.Tensor]:
+    """Return a clone of the policy's weights suitable for opponent use.
+
+    Tensors stay on their current device (typically the training GPU) so that
+    subsequent ``load_opponent_weights`` calls do a cheap D2D copy rather than
+    a host→device transfer.
+    """
     state_dict = policy.state_dict()
     return {
-        key: value.detach().cpu().clone()
+        key: value.detach().clone()
         for key, value in state_dict.items()
         if not key.startswith(("target_", "spr_"))
     }
@@ -216,13 +222,18 @@ def build_opponent_policy(main_policy: PPOPolicy, device: torch.device) -> PPOPo
     return opponent
 
 
-def ensure_opponent_cached(entry: OpponentEntry) -> None:
+def ensure_opponent_cached(entry: OpponentEntry, device: torch.device) -> None:
+    """Pin this entry's weights on ``device``, loading from disk if needed."""
     if entry.cached_policy is not None:
+        first = next(iter(entry.cached_policy.values()), None)
+        if first is None or first.device == device:
+            return
+        entry.cached_policy = {k: v.to(device) for k, v in entry.cached_policy.items()}
         return
-    checkpoint = torch.load(entry.path, map_location="cpu")
+    checkpoint = torch.load(entry.path, map_location=device)
     state_dict = checkpoint["policy"] if "policy" in checkpoint else checkpoint
     entry.cached_policy = {
-        key: value.detach().cpu().clone()
+        key: value.detach().clone()
         for key, value in state_dict.items()
         if not key.startswith(("target_", "spr_"))
     }
@@ -233,10 +244,9 @@ def load_opponent_weights(
     entry: OpponentEntry,
     device: torch.device,
 ) -> None:
-    ensure_opponent_cached(entry)
+    ensure_opponent_cached(entry, device)
     assert entry.cached_policy is not None
     opponent.load_state_dict(entry.cached_policy, strict=False)
-    opponent.to(device)
 
 
 def distribute_games_by_recency(
@@ -315,7 +325,7 @@ def run_eval_matches(
             seen_paths.add(opp.path)
             unique_opponents.append(opp)
     for opponent in unique_opponents:
-        ensure_opponent_cached(opponent)
+        ensure_opponent_cached(opponent, main_policy.device)
 
     num_envs = max(1, min(num_envs, total_games_target))
 
