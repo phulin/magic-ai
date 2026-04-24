@@ -24,9 +24,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 
 
 @dataclass(frozen=True)
@@ -381,6 +383,271 @@ def threshold_discretize(
 # ---------------------------------------------------------------------------
 # Episode-assembly helper
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Sampled-action NeuRD (simplified policy loss usable from the existing
+# scalar-log-prob replay pipeline — see :func:`neurd_loss` for the full
+# per-action form used with ``evaluate_replay_batch_rnad``)
+# ---------------------------------------------------------------------------
+
+
+def sampled_neurd_loss(
+    *,
+    log_prob: Tensor,
+    q_hat: Tensor,
+    own_turn_mask: Tensor,
+    clip: float,
+) -> Tensor:
+    """Sampled-action NeuRD loss.
+
+    The full NeuRD gradient (paper §188) is
+
+        -sum_a grad(logit_a) * clip(Q(a), c) * 1[logit_a in [-beta, beta]]
+
+    summed over all legal actions. This variant uses only the sampled action's
+    log-prob as a stochastic estimator:
+
+        L = - mean_{t: own-turn} log_prob(t) * clip(Q(t), [-clip, clip])
+
+    This is the policy-gradient-theorem form of NeuRD and is consistent with
+    how the PPO replay pipeline currently exposes per-step log-probs. The β
+    gate on individual logit magnitudes is not applied here; the full form
+    with per-action logits lands in a later phase once ``evaluate_replay_batch``
+    grows a per-choice-logit return mode.
+    """
+
+    if log_prob.shape != q_hat.shape:
+        raise ValueError("log_prob and q_hat must share shape")
+    if log_prob.shape != own_turn_mask.shape:
+        raise ValueError("log_prob and own_turn_mask must share shape")
+    mask = own_turn_mask.to(dtype=torch.bool)
+    if not mask.any():
+        return log_prob.new_zeros(())
+    q_clipped = q_hat.clamp(-clip, clip).detach()
+    per_step = -log_prob * q_clipped
+    return per_step[mask].mean()
+
+
+# ---------------------------------------------------------------------------
+# Polyak target network + reg snapshot persistence
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def polyak_update_(target: nn.Module, online: nn.Module, gamma: float) -> None:
+    """In-place Polyak averaging: ``target <- gamma * online + (1 - gamma) * target``.
+
+    ``gamma`` is the "target learning rate" in the DeepNash paper (§191),
+    typically very small (1e-3). Only floating-point parameters and buffers
+    are averaged; integer buffers (e.g. LSTM indices) are copied verbatim.
+    """
+
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError("gamma must be in [0, 1]")
+    target_params = dict(target.named_parameters())
+    for name, p_online in online.named_parameters():
+        if name not in target_params:
+            raise ValueError(f"target missing parameter {name!r}")
+        p_target = target_params[name]
+        p_target.mul_(1.0 - gamma).add_(p_online.data, alpha=gamma)
+    target_buffers = dict(target.named_buffers())
+    for name, b_online in online.named_buffers():
+        if name not in target_buffers:
+            continue
+        b_target = target_buffers[name]
+        if b_target.dtype.is_floating_point and b_online.dtype.is_floating_point:
+            b_target.mul_(1.0 - gamma).add_(b_online.data, alpha=gamma)
+        else:
+            b_target.copy_(b_online.data)
+
+
+def save_reg_snapshot(policy: nn.Module, path: str | Path) -> None:
+    """Persist a regularization-policy snapshot to disk.
+
+    Only the ``state_dict`` is stored — the caller is responsible for
+    constructing a fresh ``PPOPolicy`` with matching hyperparameters at load
+    time. This mirrors how the PPO opponent pool handles snapshots.
+    """
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": policy.state_dict()}, path)
+
+
+def load_reg_snapshot_into(policy: nn.Module, path: str | Path) -> None:
+    """Load a reg-policy snapshot into ``policy`` in-place, freezing grads."""
+
+    payload: dict[str, Any] = torch.load(
+        str(path),
+        map_location="cpu",
+        weights_only=False,
+    )
+    policy.load_state_dict(payload["state_dict"])
+    for p in policy.parameters():
+        p.requires_grad_(False)
+    policy.eval()
+
+
+# ---------------------------------------------------------------------------
+# Trajectory-level update orchestration
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RNaDStats:
+    """Per-update statistics logged by :func:`rnad_update_trajectory`."""
+
+    loss: float
+    critic_loss: float
+    policy_loss: float
+    v_hat_mean: float
+    grad_norm: float
+    transformed_reward_mean: float
+
+
+class _ReplayEvaluator(Protocol):
+    """Structural type for the policy callable into :func:`rnad_update_trajectory`.
+
+    See :meth:`magic_ai.model.PPOPolicy.evaluate_replay_batch`.
+    """
+
+    def evaluate_replay_batch(
+        self, replay_rows: list[int]
+    ) -> tuple[Tensor, Tensor, Tensor, Any]: ...
+
+    def parameters(self) -> Any: ...  # for optimizer introspection + device
+
+
+def rnad_update_trajectory(
+    *,
+    online: _ReplayEvaluator,
+    target: _ReplayEvaluator,
+    reg_cur: _ReplayEvaluator,
+    reg_prev: _ReplayEvaluator,
+    optimizer: torch.optim.Optimizer,
+    replay_rows: list[int],
+    perspective_player_idx: Sequence[int],
+    own_player_idx: int,
+    terminal_reward_own: float,
+    logp_mu: Tensor,
+    config: RNaDConfig,
+    alpha: float,
+) -> RNaDStats:
+    """One R-NaD gradient step on a single trajectory's replay rows.
+
+    The caller is responsible for constructing ``replay_rows`` from a full
+    episode (start..end inclusive) and supplying the behavior-policy
+    log-probs ``logp_mu`` (shape ``(T,)``) that were recorded at rollout
+    time. ``terminal_reward_own`` is the own-perspective scalar (-1, 0, or
+    +1) applied at the last step; earlier steps get zero per-step reward.
+
+    Pipeline (DeepNash paper §157-191, simplified to sampled-action NeuRD):
+
+    1. Forward the trajectory through online, target (no_grad),
+       reg_cur (no_grad), reg_prev (no_grad); pull scalar joint log-probs
+       and own-side values.
+    2. Apply :func:`transform_rewards` with the target policy's log-prob
+       (the behavior distribution under which the bootstrap lives).
+    3. Run :func:`two_player_vtrace` using the target log-probs + target
+       values as the estimator inputs; produces per-step ``v_hat`` and
+       scalar ``q_hat``.
+    4. Compute :func:`critic_loss` on own-turn steps and
+       :func:`sampled_neurd_loss` using the online log-probs.
+    5. Adam step with ``config.grad_clip``; Polyak update target.
+
+    This is the trajectory-scoped update. A full trainer step batches many
+    such calls and averages their stats; that wiring lives in the outer
+    training loop (phase 6).
+    """
+
+    if not replay_rows:
+        raise ValueError("replay_rows must be non-empty")
+    t_len = len(replay_rows)
+    if len(perspective_player_idx) != t_len:
+        raise ValueError("perspective_player_idx must match replay_rows length")
+    if logp_mu.shape != (t_len,):
+        raise ValueError(f"logp_mu must have shape ({t_len},), got {tuple(logp_mu.shape)}")
+
+    device = next(iter(online.parameters())).device
+    perspective = torch.tensor(perspective_player_idx, dtype=torch.long, device=device)
+    is_own = perspective == own_player_idx
+
+    # --- forwards ---------------------------------------------------------
+    logp_theta, _entropies_online, values_online, _ = online.evaluate_replay_batch(
+        list(replay_rows)
+    )
+    with torch.no_grad():
+        logp_tgt, _e_tgt, values_tgt, _ = target.evaluate_replay_batch(list(replay_rows))
+        logp_reg_cur, _e_rc, _v_rc, _ = reg_cur.evaluate_replay_batch(list(replay_rows))
+        logp_reg_prev, _e_rp, _v_rp, _ = reg_prev.evaluate_replay_batch(list(replay_rows))
+
+    logp_mu_dev = logp_mu.to(device=device, dtype=values_online.dtype)
+
+    # --- per-step reward: terminal-only on the own perspective -----------
+    rewards = torch.zeros(t_len, dtype=values_online.dtype, device=device)
+    last_sign = 1.0 if bool(is_own[-1].item()) else -1.0
+    rewards[-1] = last_sign * terminal_reward_own
+
+    # --- transform, v-trace, losses --------------------------------------
+    transformed = transform_rewards(
+        rewards,
+        logp_theta=logp_tgt.to(dtype=values_online.dtype),
+        logp_reg_cur=logp_reg_cur.to(dtype=values_online.dtype),
+        logp_reg_prev=logp_reg_prev.to(dtype=values_online.dtype),
+        alpha=alpha,
+        eta=config.eta,
+        perspective_is_player_i=is_own,
+    )
+
+    v_out = two_player_vtrace(
+        rewards=transformed.detach(),
+        values=values_tgt.detach().to(dtype=values_online.dtype),
+        logp_theta=logp_tgt.detach().to(dtype=values_online.dtype),
+        logp_mu=logp_mu_dev,
+        perspective_is_player_i=is_own,
+        rho_bar=config.vtrace_rho_bar,
+        c_bar=config.vtrace_c_bar,
+    )
+
+    cl = critic_loss(
+        v_theta=values_online,
+        v_hat=v_out.v_hat,
+        perspective_is_player_i=is_own,
+    )
+    pl = sampled_neurd_loss(
+        log_prob=logp_theta,
+        q_hat=v_out.q_hat,
+        own_turn_mask=is_own,
+        clip=config.neurd_clip,
+    )
+    loss = cl + pl
+
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    trainable = [p for p in online.parameters() if p.requires_grad]
+    grad_norm = float(
+        nn.utils.clip_grad_norm_(
+            trainable,
+            max_norm=config.grad_clip,
+        )
+    )
+    optimizer.step()
+
+    # Target and online are `nn.Module`s in practice; the Protocol type is for
+    # structural ergonomics on the forward paths.
+    assert isinstance(target, nn.Module)
+    assert isinstance(online, nn.Module)
+    polyak_update_(target, online, gamma=config.target_ema_gamma)
+
+    return RNaDStats(
+        loss=float(loss.detach()),
+        critic_loss=float(cl.detach()),
+        policy_loss=float(pl.detach()),
+        v_hat_mean=float(v_out.v_hat.mean().detach()),
+        grad_norm=grad_norm,
+        transformed_reward_mean=float(transformed.mean().detach()),
+    )
 
 
 def episodes_from_rollout_steps(

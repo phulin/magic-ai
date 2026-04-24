@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import math
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 from magic_ai.rnad import (
     RNaDConfig,
+    RNaDStats,
     critic_loss,
     episodes_from_rollout_steps,
+    load_reg_snapshot_into,
     neurd_loss,
+    polyak_update_,
+    rnad_update_trajectory,
+    sampled_neurd_loss,
+    save_reg_snapshot,
     threshold_discretize,
     transform_rewards,
     two_player_vtrace,
 )
+from torch import nn
 
 
 class RNaDConfigTests(unittest.TestCase):
@@ -304,6 +313,247 @@ class EpisodesFromRolloutStepsTests(unittest.TestCase):
 
     def test_empty(self) -> None:
         self.assertEqual(episodes_from_rollout_steps([]), [])
+
+
+class SampledNeuRDLossTests(unittest.TestCase):
+    def test_gradient_is_negative_q_on_own_turns(self) -> None:
+        log_prob = torch.zeros(4, requires_grad=True)
+        q_hat = torch.tensor([1.0, -2.0, 3.0, -4.0])
+        own = torch.tensor([True, True, True, True])
+        loss = sampled_neurd_loss(log_prob=log_prob, q_hat=q_hat, own_turn_mask=own, clip=1e6)
+        loss.backward()
+        assert log_prob.grad is not None
+        # loss = -mean(log_prob * q), d/dlogp = -q / N
+        self.assertTrue(torch.allclose(log_prob.grad, -q_hat / 4, atol=1e-6))
+
+    def test_ignores_opponent_turns(self) -> None:
+        log_prob = torch.zeros(4, requires_grad=True)
+        q_hat = torch.tensor([1.0, -2.0, 3.0, -4.0])
+        own = torch.tensor([True, False, True, False])
+        loss = sampled_neurd_loss(log_prob=log_prob, q_hat=q_hat, own_turn_mask=own, clip=1e6)
+        loss.backward()
+        assert log_prob.grad is not None
+        # Only indices 0 and 2 contribute: grad[0] = -1/2, grad[2] = -3/2.
+        expected = torch.tensor([-0.5, 0.0, -1.5, 0.0])
+        self.assertTrue(torch.allclose(log_prob.grad, expected, atol=1e-6))
+
+    def test_clips_q(self) -> None:
+        log_prob = torch.zeros(1, requires_grad=True)
+        q_hat = torch.tensor([1000.0])
+        own = torch.tensor([True])
+        loss = sampled_neurd_loss(log_prob=log_prob, q_hat=q_hat, own_turn_mask=own, clip=5.0)
+        loss.backward()
+        assert log_prob.grad is not None
+        self.assertAlmostEqual(float(log_prob.grad.item()), -5.0)
+
+    def test_no_own_turns_returns_zero(self) -> None:
+        log_prob = torch.zeros(3, requires_grad=True)
+        q_hat = torch.ones(3)
+        own = torch.zeros(3, dtype=torch.bool)
+        loss = sampled_neurd_loss(log_prob=log_prob, q_hat=q_hat, own_turn_mask=own, clip=1.0)
+        self.assertEqual(float(loss), 0.0)
+
+
+class PolyakUpdateTests(unittest.TestCase):
+    def _make_module(self, seed: int) -> nn.Module:
+        torch.manual_seed(seed)
+        return nn.Sequential(nn.Linear(3, 4), nn.Linear(4, 2))
+
+    def test_zero_gamma_leaves_target_unchanged(self) -> None:
+        online = self._make_module(0)
+        target = self._make_module(1)
+        target_snapshot = {k: v.clone() for k, v in target.state_dict().items()}
+        polyak_update_(target, online, gamma=0.0)
+        for k, v in target.state_dict().items():
+            self.assertTrue(torch.allclose(v, target_snapshot[k]))
+
+    def test_full_gamma_copies_online_to_target(self) -> None:
+        online = self._make_module(0)
+        target = self._make_module(1)
+        polyak_update_(target, online, gamma=1.0)
+        for k, v in target.state_dict().items():
+            self.assertTrue(torch.allclose(v, online.state_dict()[k]))
+
+    def test_partial_gamma_blends(self) -> None:
+        online = self._make_module(0)
+        target = self._make_module(1)
+        online_snap = {k: v.clone() for k, v in online.state_dict().items()}
+        target_snap = {k: v.clone() for k, v in target.state_dict().items()}
+        gamma = 0.25
+        polyak_update_(target, online, gamma=gamma)
+        for k, blended in target.state_dict().items():
+            expected = gamma * online_snap[k] + (1.0 - gamma) * target_snap[k]
+            self.assertTrue(torch.allclose(blended, expected, atol=1e-6))
+
+    def test_rejects_bad_gamma(self) -> None:
+        online = self._make_module(0)
+        target = self._make_module(1)
+        with self.assertRaises(ValueError):
+            polyak_update_(target, online, gamma=1.5)
+        with self.assertRaises(ValueError):
+            polyak_update_(target, online, gamma=-0.1)
+
+
+class RegSnapshotTests(unittest.TestCase):
+    def test_roundtrip_preserves_parameters(self) -> None:
+        torch.manual_seed(0)
+        src = nn.Sequential(nn.Linear(5, 3), nn.ReLU(), nn.Linear(3, 2))
+        dst = nn.Sequential(nn.Linear(5, 3), nn.ReLU(), nn.Linear(3, 2))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "reg" / "snap.pt"
+            save_reg_snapshot(src, path)
+            self.assertTrue(path.exists())
+            load_reg_snapshot_into(dst, path)
+        for a, b in zip(src.state_dict().values(), dst.state_dict().values(), strict=True):
+            self.assertTrue(torch.allclose(a, b))
+
+    def test_load_freezes_gradients(self) -> None:
+        src = nn.Linear(3, 2)
+        dst = nn.Linear(3, 2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "snap.pt"
+            save_reg_snapshot(src, path)
+            load_reg_snapshot_into(dst, path)
+        for p in dst.parameters():
+            self.assertFalse(p.requires_grad)
+
+    def test_save_creates_parent_dirs(self) -> None:
+        src = nn.Linear(2, 2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested = Path(tmpdir) / "a" / "b" / "c" / "snap.pt"
+            save_reg_snapshot(src, nested)
+            self.assertTrue(nested.exists())
+
+
+class _StubPolicy(nn.Module):
+    """Minimal `evaluate_replay_batch`-compatible policy for unit tests.
+
+    Produces log-probs and values as linear functions of learnable per-row
+    parameters keyed by ``replay_idx``, so rnad_update_trajectory can run a
+    real Adam step and we can observe its effects.
+    """
+
+    def __init__(self, t_len: int, *, logp_init: float, value_init: float) -> None:
+        super().__init__()
+        self.logp = nn.Parameter(torch.full((t_len,), float(logp_init)))
+        self.values = nn.Parameter(torch.full((t_len,), float(value_init)))
+
+    def evaluate_replay_batch(
+        self, replay_rows: list[int]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        idx = torch.tensor(replay_rows, dtype=torch.long)
+        logp = self.logp[idx]
+        values = self.values[idx]
+        entropies = torch.zeros_like(logp)
+        return logp, entropies, values, None
+
+
+class RNaDUpdateTrajectoryTests(unittest.TestCase):
+    def _stub(self, t_len: int, *, logp: float = -1.0, value: float = 0.0) -> _StubPolicy:
+        return _StubPolicy(t_len, logp_init=logp, value_init=value)
+
+    def test_runs_and_returns_finite_stats(self) -> None:
+        t_len = 6
+        online = self._stub(t_len, logp=-1.0, value=0.0)
+        target = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_cur = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_prev = self._stub(t_len, logp=-1.0, value=0.0)
+        opt = torch.optim.Adam(online.parameters(), lr=1e-2)
+        stats = rnad_update_trajectory(
+            online=online,
+            target=target,
+            reg_cur=reg_cur,
+            reg_prev=reg_prev,
+            optimizer=opt,
+            replay_rows=list(range(t_len)),
+            perspective_player_idx=[0, 1, 0, 1, 0, 1],
+            own_player_idx=0,
+            terminal_reward_own=1.0,
+            logp_mu=torch.full((t_len,), -1.0),
+            config=RNaDConfig(delta_m=1, num_outer_iterations=1),
+            alpha=1.0,
+        )
+        self.assertIsInstance(stats, RNaDStats)
+        self.assertTrue(math.isfinite(stats.loss))
+        self.assertTrue(math.isfinite(stats.critic_loss))
+        self.assertTrue(math.isfinite(stats.policy_loss))
+        self.assertTrue(math.isfinite(stats.grad_norm))
+
+    def test_critic_moves_toward_terminal_reward_in_on_policy(self) -> None:
+        # With on-policy data, zero reg entropy bonus (theta == reg), and a
+        # terminal +1 reward on the own player's last step, the v-hat target
+        # for every own-turn step is +1; after one Adam step the online value
+        # parameters should move up from 0.
+        t_len = 5
+        online = self._stub(t_len, logp=-1.0, value=0.0)
+        target = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_cur = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_prev = self._stub(t_len, logp=-1.0, value=0.0)
+        opt = torch.optim.Adam(online.parameters(), lr=1e-1)
+        before = online.values.detach().clone()
+        rnad_update_trajectory(
+            online=online,
+            target=target,
+            reg_cur=reg_cur,
+            reg_prev=reg_prev,
+            optimizer=opt,
+            replay_rows=list(range(t_len)),
+            perspective_player_idx=[0, 0, 0, 0, 0],  # all own turns
+            own_player_idx=0,
+            terminal_reward_own=1.0,
+            logp_mu=torch.full((t_len,), -1.0),
+            config=RNaDConfig(eta=0.0),  # disable entropy regularization
+            alpha=1.0,
+        )
+        after = online.values.detach()
+        self.assertTrue(torch.all(after > before))
+
+    def test_polyak_updates_target(self) -> None:
+        t_len = 3
+        online = self._stub(t_len, logp=-1.0, value=0.5)
+        # Target starts at a different value so Polyak movement is observable.
+        target = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_cur = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_prev = self._stub(t_len, logp=-1.0, value=0.0)
+        opt = torch.optim.Adam(online.parameters(), lr=1e-3)
+        target_before = target.values.detach().clone()
+        rnad_update_trajectory(
+            online=online,
+            target=target,
+            reg_cur=reg_cur,
+            reg_prev=reg_prev,
+            optimizer=opt,
+            replay_rows=list(range(t_len)),
+            perspective_player_idx=[0, 1, 0],
+            own_player_idx=0,
+            terminal_reward_own=1.0,
+            logp_mu=torch.full((t_len,), -1.0),
+            config=RNaDConfig(target_ema_gamma=0.5),
+            alpha=1.0,
+        )
+        # target should have blended ~halfway toward online.
+        self.assertTrue(torch.all(target.values.detach() > target_before))
+
+    def test_rejects_mismatched_shapes(self) -> None:
+        online = self._stub(3)
+        target = self._stub(3)
+        reg = self._stub(3)
+        opt = torch.optim.Adam(online.parameters(), lr=1e-3)
+        with self.assertRaises(ValueError):
+            rnad_update_trajectory(
+                online=online,
+                target=target,
+                reg_cur=reg,
+                reg_prev=reg,
+                optimizer=opt,
+                replay_rows=[0, 1, 2],
+                perspective_player_idx=[0, 1],  # wrong length
+                own_player_idx=0,
+                terminal_reward_own=1.0,
+                logp_mu=torch.zeros(3),
+                config=RNaDConfig(),
+                alpha=1.0,
+            )
 
 
 if __name__ == "__main__":
