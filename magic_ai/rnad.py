@@ -287,6 +287,45 @@ def neurd_loss(
 
 
 # ---------------------------------------------------------------------------
+# Ragged per-choice NeuRD
+# ---------------------------------------------------------------------------
+
+
+def neurd_loss_per_choice(
+    *,
+    flat_logits: Tensor,
+    flat_q: Tensor,
+    group_idx: Tensor,
+    num_groups: int,
+    beta: float,
+    clip: float,
+) -> Tensor:
+    """NeuRD loss over a flattened, ragged set of per-choice logits.
+
+    The decision-group structure of :meth:`PPOPolicy.evaluate_replay_batch`
+    produces a flat tensor of per-legal-choice logits together with a
+    ``group_idx`` mapping each entry to its source step. This form
+    supports variable-size legal-action sets without padding.
+
+    ``num_groups`` is the number of decision steps in the batch (used
+    only as the averaging denominator, to keep the loss scale
+    comparable to the dense :func:`neurd_loss`).
+    """
+
+    if flat_logits.shape != flat_q.shape:
+        raise ValueError("flat_logits and flat_q must share shape")
+    if flat_logits.shape != group_idx.shape:
+        raise ValueError("flat_logits and group_idx must share shape")
+    if num_groups < 1:
+        raise ValueError("num_groups must be >= 1")
+    q_clipped = flat_q.clamp(-clip, clip).detach()
+    with torch.no_grad():
+        in_range = (flat_logits >= -beta) & (flat_logits <= beta)
+    per_entry = -flat_logits * q_clipped * in_range.to(dtype=flat_logits.dtype)
+    return per_entry.sum() / max(num_groups, 1)
+
+
+# ---------------------------------------------------------------------------
 # Critic loss
 # ---------------------------------------------------------------------------
 
