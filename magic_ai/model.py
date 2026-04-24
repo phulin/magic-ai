@@ -1287,14 +1287,14 @@ class PPOPolicy(nn.Module):
 
             cos = F.cosine_similarity(y_pred, y_target, dim=-1)
             denom_k = cumulative_has_next.sum().clamp_min(1.0)
-            loss_k = -(cos * cumulative_has_next).sum() / denom_k
-            loss_terms.append(loss_k)
+            mean_cos_k = (cos * cumulative_has_next).sum() / denom_k
+            loss_terms.append(mean_cos_k)
 
             if k < self.spr_k:
                 cur_idx = next_idx
                 action_emb = self._spr_action_embedding_simple(cur_idx, dtype=z_online.dtype)
 
-        return torch.stack(loss_terms).sum()
+        return 1.0 - torch.stack(loss_terms).sum() / self.spr_k
 
     def _spr_action_embedding_full(
         self,
