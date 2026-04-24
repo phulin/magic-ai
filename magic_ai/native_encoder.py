@@ -215,6 +215,7 @@ class NativeBatchEncoder:
         lib: Any | None = None,
         ffi: Any | None = None,
         card_name_to_row: dict[str, int] | None = None,
+        validate: bool = True,
     ) -> None:
         self.max_options = max_options
         self.max_targets_per_option = max_targets_per_option
@@ -225,6 +226,7 @@ class NativeBatchEncoder:
         self.target_scalar_dim = target_scalar_dim
         self.lib = lib
         self.ffi = ffi
+        self.validate = validate
         self.is_available = False
         if self.lib is None:
             return
@@ -276,6 +278,7 @@ class NativeBatchEncoder:
             lib=lib,
             ffi=ffi,
             card_name_to_row=policy.game_state_encoder._card_name_to_row,
+            validate=policy.validate,
         )
 
     def _configure_ctypes(self) -> None:
@@ -552,14 +555,15 @@ class NativeBatchEncoder:
         decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
         decision_mask = buffers.decision_mask_u8[:decision_rows_written].ne(0)
         uses_none_head = buffers.uses_none_head_u8[:decision_rows_written].ne(0)
-        _validate_decision_layout(
-            decision_option_idx=decision_option_idx,
-            decision_target_idx=decision_target_idx,
-            decision_mask=decision_mask,
-            uses_none_head=uses_none_head,
-            max_options=self.max_options,
-            max_targets_per_option=self.max_targets_per_option,
-        )
+        if self.validate:
+            _validate_decision_layout(
+                decision_option_idx=decision_option_idx,
+                decision_target_idx=decision_target_idx,
+                decision_mask=decision_mask,
+                uses_none_head=uses_none_head,
+                max_options=self.max_options,
+                max_targets_per_option=self.max_targets_per_option,
+            )
         return NativeEncodedBatch(
             trace_kind_id=trace_kind_id,
             slot_card_rows=batch["slot_card_rows"],
@@ -701,14 +705,15 @@ class NativeBatchEncoder:
         decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
         decision_mask = buffers.decision_mask_u8[:decision_rows_written].ne(0)
         uses_none_head = buffers.uses_none_head_u8[:decision_rows_written].ne(0)
-        _validate_decision_layout(
-            decision_option_idx=decision_option_idx,
-            decision_target_idx=decision_target_idx,
-            decision_mask=decision_mask,
-            uses_none_head=uses_none_head,
-            max_options=self.max_options,
-            max_targets_per_option=self.max_targets_per_option,
-        )
+        if self.validate:
+            _validate_decision_layout(
+                decision_option_idx=decision_option_idx,
+                decision_target_idx=decision_target_idx,
+                decision_mask=decision_mask,
+                uses_none_head=uses_none_head,
+                max_options=self.max_options,
+                max_targets_per_option=self.max_targets_per_option,
+            )
         return NativeEncodedBatch(
             trace_kind_id=trace_kind_id,
             slot_card_rows=batch["slot_card_rows"],
