@@ -1304,6 +1304,7 @@ def format_step_name(step: str) -> str:
         "begin combat": "bcom",
         "declare attackers": "atk",
         "declare blockers": "blk",
+        "first strike damage": "fsd",
         "combat damage": "dmg",
         "end combat": "ecom",
         "end of combat": "ecom",
