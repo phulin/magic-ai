@@ -373,6 +373,8 @@ class RolloutBuffer(nn.Module):
         )
         _reg("next_step_idx", (capacity,), torch.long)
         _reg("has_next", (capacity,), torch.float32)
+        _reg("next_same_perspective_step_idx", (capacity,), torch.long)
+        _reg("has_next_same_perspective", (capacity,), torch.float32)
 
         _reg(
             "decision_option_idx",
@@ -421,6 +423,8 @@ class RolloutBuffer(nn.Module):
     lstm_c_in: Tensor
     next_step_idx: Tensor
     has_next: Tensor
+    next_same_perspective_step_idx: Tensor
+    has_next_same_perspective: Tensor
     decision_option_idx: Tensor
     decision_target_idx: Tensor
     decision_mask: Tensor
@@ -692,6 +696,60 @@ class RolloutBuffer(nn.Module):
         next_rows[not_last_mask] = step_indices[not_last_mask] + 1
         self.next_step_idx[step_indices] = next_rows
         self.has_next[step_indices] = has_next_vals
+
+        # Compute next-same-perspective chain for SPR. For each row, find the
+        # next row in the same env whose perspective_player_idx matches; if
+        # none exists before the episode ends, self-reference with has_next=0.
+        # Vectorized via a per-perspective suffix-min of valid positions.
+        num_envs_committed = len(env_indices)
+        persp_full = staging.perspective_player_idx[env_idx_t].to(device)[:, :max_steps]
+        env_pos = torch.arange(num_envs_committed, device=device)
+        src_env_pos = env_pos[:, None].expand(num_envs_committed, max_steps)[valid_step_mask]
+        flat_2d = torch.full((num_envs_committed, max_steps), -1, dtype=torch.long, device=device)
+        flat_2d[src_env_pos, src_step] = step_indices
+
+        pos_row = torch.arange(max_steps, device=device).expand(num_envs_committed, max_steps)
+        sentinel = torch.full_like(pos_row, max_steps)
+        next_s_per_persp: list[Tensor] = []
+        # 2-player zero-sum; compute for each unique perspective value actually present.
+        unique_persp = torch.unique(persp_full[valid_step_mask]).tolist()
+        for v in unique_persp:
+            mask_v = (persp_full == v) & valid_step_mask
+            pos_masked = torch.where(mask_v, pos_row, sentinel)
+            # suffix min along step axis: min over s' >= s.
+            rev_cummin, _ = pos_masked.flip(dims=[1]).cummin(dim=1)
+            suffix_min = rev_cummin.flip(dims=[1])
+            next_s = torch.full_like(suffix_min, max_steps)
+            if max_steps > 1:
+                next_s[:, :-1] = suffix_min[:, 1:]
+            next_s_per_persp.append(next_s)
+
+        if unique_persp:
+            stacked = torch.stack(next_s_per_persp, dim=0)  # [V, P, S]
+            persp_to_slot = torch.full(
+                (int(persp_full.max().item()) + 1,),
+                -1,
+                dtype=torch.long,
+                device=device,
+            )
+            for slot, v in enumerate(unique_persp):
+                persp_to_slot[v] = slot
+            persp_slot = persp_to_slot[persp_full]
+            # Gather along V using persp_slot.
+            gather_idx = persp_slot.unsqueeze(0).clamp_min(0)
+            next_s_chosen = stacked.gather(0, gather_idx).squeeze(0)  # [P, S]
+        else:
+            next_s_chosen = torch.full(
+                (num_envs_committed, max_steps), max_steps, dtype=torch.long, device=device
+            )
+
+        valid_next_2d = next_s_chosen < max_steps
+        safe_s = next_s_chosen.clamp(max=max(max_steps - 1, 0))
+        next_flat_2d = flat_2d.gather(1, safe_s)
+        next_flat_2d = torch.where(valid_next_2d, next_flat_2d, flat_2d)
+        has_next_same_2d = valid_next_2d.to(torch.float32)
+        self.next_same_perspective_step_idx[step_indices] = next_flat_2d[valid_step_mask]
+        self.has_next_same_perspective[step_indices] = has_next_same_2d[valid_step_mask]
 
         decision_counts_t = staging.decision_count[src_env, src_step].to(dtype=torch.long)
         source_starts_t = staging.decision_start[src_env, src_step].to(dtype=torch.long)

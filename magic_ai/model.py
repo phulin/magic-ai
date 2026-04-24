@@ -1273,13 +1273,13 @@ class PPOPolicy(nn.Module):
         )
         loss_terms: list[Tensor] = []
         for k in range(1, self.spr_k + 1):
-            step_has_next = rb.has_next[cur_idx]
+            step_has_next = rb.has_next_same_perspective[cur_idx]
             cumulative_has_next = cumulative_has_next * step_has_next
 
             pred_in = torch.cat([z_hat, action_emb], dim=-1)
             z_hat = self.spr_transition(pred_in)
 
-            next_idx = rb.next_step_idx[cur_idx]
+            next_idx = rb.next_same_perspective_step_idx[cur_idx]
             with torch.no_grad():
                 z_target_next = self._encode_latent(next_idx, use_target=True)
                 y_target = self.spr_g_target(z_target_next)
