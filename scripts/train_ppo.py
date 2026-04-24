@@ -244,6 +244,15 @@ def _resume_state_from_checkpoint(checkpoint: dict[str, Any] | None) -> Training
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    if args.trainer == "rnad":
+        raise NotImplementedError(
+            "--trainer rnad is scaffolded but the training loop is not yet "
+            "wired up. Phases 4-7 of docs/rnad_implementation_plan.md need "
+            "to land first (multi-policy replay forward, target-network "
+            "Polyak update, outer fixed-point loop). The self-contained "
+            "primitives in magic_ai/rnad.py are already implemented and "
+            "unit-tested."
+        )
     deck_pool = load_deck_pool(args.deck_json, args.deck_dir)
     validate_deck_embeddings(args.embeddings, deck_pool)
     if args.torch_threads is not None:
@@ -403,6 +412,63 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="directory of deck JSON files to sample randomly per game",
     )
+    parser.add_argument(
+        "--trainer",
+        choices=("ppo", "rnad"),
+        default="ppo",
+        help="training algorithm: 'ppo' (default) or 'rnad' (Regularized Nash "
+        "Dynamics / DeepNash). The 'rnad' path is scaffolded via CLI and "
+        "primitives in magic_ai/rnad.py; the full training loop integration "
+        "lands in phases 4-7 of docs/rnad_implementation_plan.md.",
+    )
+    parser.add_argument(
+        "--rnad-eta",
+        type=float,
+        default=0.2,
+        help="R-NaD reward-transform regularization strength (paper default 0.2)",
+    )
+    parser.add_argument(
+        "--rnad-delta-m",
+        type=int,
+        default=25_000,
+        help="R-NaD gradient steps per outer iteration",
+    )
+    parser.add_argument(
+        "--rnad-m",
+        type=int,
+        default=20,
+        help="R-NaD number of outer fixed-point iterations",
+    )
+    parser.add_argument(
+        "--rnad-neurd-beta",
+        type=float,
+        default=2.0,
+        help="R-NaD NeuRD logit magnitude threshold",
+    )
+    parser.add_argument(
+        "--rnad-neurd-clip",
+        type=float,
+        default=10_000.0,
+        help="R-NaD NeuRD Q clip",
+    )
+    parser.add_argument(
+        "--rnad-target-ema",
+        type=float,
+        default=0.001,
+        help="R-NaD target-network Polyak averaging rate",
+    )
+    parser.add_argument(
+        "--rnad-finetune-eps",
+        type=float,
+        default=0.03,
+        help="R-NaD fine-tune / test-time probability threshold",
+    )
+    parser.add_argument(
+        "--rnad-finetune-ndisc",
+        type=int,
+        default=16,
+        help="R-NaD fine-tune / test-time probability quanta",
+    )
     parser.add_argument("--episodes", type=int, default=65536)
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--rollout-steps", type=int, default=4096)
@@ -549,6 +615,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--eval-games-per-snapshot must be non-negative")
     if args.eval_num_envs is not None and args.eval_num_envs < 1:
         raise ValueError("--eval-num-envs must be at least 1")
+    if args.trainer == "rnad":
+        if args.rnad_eta <= 0.0:
+            raise ValueError("--rnad-eta must be positive")
+        if args.rnad_delta_m < 1:
+            raise ValueError("--rnad-delta-m must be at least 1")
+        if args.rnad_m < 1:
+            raise ValueError("--rnad-m must be at least 1")
+        if args.rnad_neurd_beta <= 0.0:
+            raise ValueError("--rnad-neurd-beta must be positive")
+        if not 0.0 < args.rnad_target_ema < 1.0:
+            raise ValueError("--rnad-target-ema must be in (0, 1)")
+        if not 0.0 <= args.rnad_finetune_eps < 1.0:
+            raise ValueError("--rnad-finetune-eps must be in [0, 1)")
+        if args.rnad_finetune_ndisc < 1:
+            raise ValueError("--rnad-finetune-ndisc must be at least 1")
 
 
 def log_ppo_stats(
