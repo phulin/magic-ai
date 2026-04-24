@@ -120,5 +120,72 @@ class TrainerStateTests(unittest.TestCase):
         )
 
 
+class CheckpointRoundTripTests(unittest.TestCase):
+    def test_save_and_restore_rnad_state(self) -> None:
+        from argparse import Namespace
+
+        from magic_ai.opponent_pool import OpponentPool
+        from scripts.train_ppo import (
+            _restore_rnad_state,
+            load_training_checkpoint,
+            save_checkpoint,
+        )
+
+        policy = _make_policy()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reg_dir = tmp / "rnad"
+            state = build_trainer_state(
+                policy,
+                config=RNaDConfig(delta_m=5),
+                reg_snapshot_dir=reg_dir,
+                device=policy.device,
+            )
+            # Mutate target so the roundtrip is observable.
+            with torch.no_grad():
+                state.target.value_head.weight.fill_(0.321)
+            state.outer_iteration = 2
+            state.gradient_step = 7
+            # Ensure reg_m001.pt and reg_m002.pt exist so resume can load both.
+            from magic_ai.rnad import save_reg_snapshot
+
+            save_reg_snapshot(state.reg_cur, reg_dir / "reg_m001.pt")
+            save_reg_snapshot(state.target, reg_dir / "reg_m002.pt")
+
+            ckpt_path = tmp / "ckpt.pt"
+            optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+            args = Namespace(
+                output=ckpt_path,
+                opponent_pool_dir=tmp / "opponent_pool",
+            )
+            save_checkpoint(
+                ckpt_path,
+                policy,
+                optimizer,
+                args,
+                opponent_pool=OpponentPool(),
+                rnad_state=state,
+            )
+
+            checkpoint = load_training_checkpoint(ckpt_path)
+            self.assertIsNotNone(checkpoint)
+
+            # Rebuild a fresh trainer state and restore into it.
+            fresh_policy = _make_policy()
+            fresh = build_trainer_state(
+                fresh_policy,
+                config=RNaDConfig(delta_m=5),
+                reg_snapshot_dir=reg_dir,
+                device=fresh_policy.device,
+            )
+            _restore_rnad_state(fresh, checkpoint)
+
+        self.assertEqual(fresh.outer_iteration, 2)
+        self.assertEqual(fresh.gradient_step, 7)
+        self.assertTrue(
+            torch.allclose(fresh.target.value_head.weight, torch.tensor(0.321)),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

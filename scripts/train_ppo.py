@@ -248,6 +248,44 @@ def _resume_state_from_checkpoint(checkpoint: dict[str, Any] | None) -> Training
     )
 
 
+def _restore_rnad_state(
+    state: RNaDTrainerState,
+    checkpoint: dict[str, Any] | None,
+) -> None:
+    """Pull R-NaD outer-loop state out of a resumed PPO checkpoint.
+
+    No-op when ``checkpoint`` is missing the ``rnad_state`` key (e.g. a PPO
+    checkpoint is being used to bootstrap an R-NaD run).
+    """
+
+    payload = _training_state_dict(checkpoint).get("rnad_state")
+    if not isinstance(payload, dict):
+        return
+    target_sd = payload.get("target")
+    if isinstance(target_sd, dict):
+        state.target.load_state_dict(target_sd)
+        for p in state.target.parameters():
+            p.requires_grad_(False)
+        state.target.eval()
+    outer = int(payload.get("outer_iteration", 0))
+    grad_step = int(payload.get("gradient_step", 0))
+    # Reg snapshots live on disk; load both the current and previous indices
+    # from their canonical filenames so the smooth-interpolation schedule
+    # continues consistently.
+    try:
+        from magic_ai.rnad_trainer import resume_from_snapshot_dir
+
+        resume_from_snapshot_dir(state, outer_iteration=outer, gradient_step=grad_step)
+    except (FileNotFoundError, KeyError) as err:
+        print(
+            f"[rnad] failed to restore reg snapshots from "
+            f"{state.reg_snapshot_dir!s}: {err}; continuing with in-memory regs",
+            flush=True,
+        )
+        state.outer_iteration = outer
+        state.gradient_step = grad_step
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -374,7 +412,7 @@ def main() -> None:
         )
         opponent_policy = build_opponent_policy(policy, device)
 
-    final_resume_state = train_native_batched_envs(
+    final_resume_state, final_rnad_state = train_native_batched_envs(
         args,
         mage,
         deck_pool,
@@ -387,6 +425,7 @@ def main() -> None:
         snapshot_schedule=snapshot_schedule,
         opponent_policy=opponent_policy,
         resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
+        resume_checkpoint=checkpoint_cpu,
     )
 
     save_checkpoint(
@@ -399,6 +438,7 @@ def main() -> None:
         resume_state=final_resume_state,
         wandb_run_id=active_wandb_run_id,
         run_artifact_dir=run_artifact_dir,
+        rnad_state=final_rnad_state,
     )
     print(f"saved checkpoint -> {args.output}")
     wandb.finish()
@@ -707,7 +747,8 @@ def train_native_batched_envs(
     snapshot_schedule: SnapshotSchedule | None = None,
     opponent_policy: PPOPolicy | None = None,
     resume_state: TrainingResumeState | None = None,
-) -> TrainingResumeState:
+    resume_checkpoint: dict[str, Any] | None = None,
+) -> tuple[TrainingResumeState, RNaDTrainerState | None]:
     if not native_encoder.is_available:
         raise SystemExit("native rollout requires MageEncodeBatch")
     eval_rng = random.Random(args.seed ^ 0x5EED5)
@@ -732,6 +773,7 @@ def train_native_batched_envs(
             reg_snapshot_dir=args.output.parent / "rnad",
             device=policy.device,
         )
+        _restore_rnad_state(rnad_state, resume_checkpoint)
     restored_state = resume_state or TrainingResumeState()
     completed_games = restored_state.completed_games
     last_saved_games = restored_state.last_saved_games
@@ -1026,6 +1068,7 @@ def train_native_batched_envs(
                     total_rollout_steps=total_rollout_steps,
                     total_generated_rollout_steps=total_generated_rollout_steps,
                 ),
+                rnad_state=rnad_state,
             )
             last_saved_games = completed_games
 
@@ -1098,11 +1141,14 @@ def train_native_batched_envs(
         policy.reset_rollout_buffer()
         pending_episodes.clear()
 
-    return TrainingResumeState(
-        completed_games=completed_games,
-        last_saved_games=last_saved_games,
-        total_rollout_steps=total_rollout_steps,
-        total_generated_rollout_steps=total_generated_rollout_steps,
+    return (
+        TrainingResumeState(
+            completed_games=completed_games,
+            last_saved_games=last_saved_games,
+            total_rollout_steps=total_rollout_steps,
+            total_generated_rollout_steps=total_generated_rollout_steps,
+        ),
+        rnad_state,
     )
 
 
@@ -1334,6 +1380,7 @@ def save_checkpoint(
     resume_state: TrainingResumeState | None = None,
     wandb_run_id: str | None = None,
     run_artifact_dir: Path | None = None,
+    rnad_state: RNaDTrainerState | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     effective_run_artifact_dir = run_artifact_dir or args.opponent_pool_dir.parent
@@ -1351,6 +1398,16 @@ def save_checkpoint(
         "snapshot_schedule_next_idx": snapshot_schedule.next_idx if snapshot_schedule else 0,
         "opponent_pool": opponent_pool.state_dict() if opponent_pool is not None else None,
     }
+    if rnad_state is not None:
+        # Reg snapshots are persisted separately under reg_snapshot_dir as
+        # reg_m{N}.pt; here we only serialize the live trainer state the
+        # outer loop needs to resume in-place (target EMA, counters).
+        training_state["rnad_state"] = {
+            "outer_iteration": rnad_state.outer_iteration,
+            "gradient_step": rnad_state.gradient_step,
+            "target": rnad_state.target.state_dict(),
+            "reg_snapshot_dir": str(rnad_state.reg_snapshot_dir),
+        }
     torch.save(
         {
             "policy": policy.state_dict(),
