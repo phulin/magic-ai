@@ -239,13 +239,45 @@ def load_opponent_weights(
     opponent.to(device)
 
 
+def distribute_games_by_recency(
+    entries: list[OpponentEntry],
+    total_games: int,
+    tau: float,
+) -> list[OpponentEntry]:
+    """Assign ``total_games`` across ``entries`` with an exp(-age/tau) bias.
+
+    Age is measured in positions from the newest entry (age=0 for the last
+    element in ``entries``). ``tau <= 0`` produces a uniform split. The return
+    order groups all games for the same entry together (oldest-first), which
+    keeps opponent-weight swaps bounded during evaluation.
+    """
+    if not entries or total_games <= 0:
+        return []
+    n = len(entries)
+    if tau <= 0:
+        weights = [1.0] * n
+    else:
+        weights = [math.exp(-(n - 1 - i) / tau) for i in range(n)]
+    total_w = sum(weights)
+    raw = [w / total_w * total_games for w in weights]
+    counts = [int(math.floor(x)) for x in raw]
+    remainder = total_games - sum(counts)
+    if remainder > 0:
+        order = sorted(range(n), key=lambda i: raw[i] - counts[i], reverse=True)
+        for i in order[:remainder]:
+            counts[i] += 1
+    out: list[OpponentEntry] = []
+    for entry, c in zip(entries, counts):
+        out.extend([entry] * c)
+    return out
+
+
 @dataclass
 class _EvalGame:
     game: Any
     slot_idx: int
     main_player_idx: int  # 0 or 1 — which side the main policy plays
     opponent: OpponentEntry
-    round_idx: int
     action_count: int = 0
     winner_idx: int = -2  # -2 unresolved, -1 draw, 0/1 player
 
@@ -254,13 +286,12 @@ def run_eval_matches(
     *,
     main_policy: PPOPolicy,
     opponent_policy: PPOPolicy,
-    opponents: list[OpponentEntry],
+    game_opponents: list[OpponentEntry],
     pool: OpponentPool,
     native_encoder: ShardedNativeBatchEncoder,
     native_rollout: ShardedNativeRolloutDriver,
     mage: Any,
     deck_pool: list[dict[str, Any]],
-    num_games_per_opponent: int,
     num_envs: int,
     max_steps_per_game: int,
     max_options: int,
@@ -272,14 +303,20 @@ def run_eval_matches(
     seed_base: int,
     rng: random.Random,
 ) -> dict[str, float]:
-    """Play eval games against sampled opponents; update ratings; return metrics."""
-    if not opponents or num_games_per_opponent < 1:
+    """Play one eval game per entry in ``game_opponents``; update ratings; return metrics."""
+    total_games_target = len(game_opponents)
+    if total_games_target == 0:
         return {}
 
-    for opponent in opponents:
+    unique_opponents: list[OpponentEntry] = []
+    seen_paths: set[Path] = set()
+    for opp in game_opponents:
+        if opp.path not in seen_paths:
+            seen_paths.add(opp.path)
+            unique_opponents.append(opp)
+    for opponent in unique_opponents:
         ensure_opponent_cached(opponent)
 
-    total_games_target = len(opponents) * num_games_per_opponent
     num_envs = max(1, min(num_envs, total_games_target))
 
     saved_main_h: torch.Tensor | None = None
@@ -294,9 +331,9 @@ def run_eval_matches(
     main_wins = 0
     opp_wins = 0
     draws = 0
-    round_main_wins = [0 for _ in opponents]
-    round_opp_wins = [0 for _ in opponents]
-    round_draws = [0 for _ in opponents]
+    per_opp_main_wins: dict[str, int] = {opp.tag: 0 for opp in unique_opponents}
+    per_opp_opp_wins: dict[str, int] = {opp.tag: 0 for opp in unique_opponents}
+    per_opp_draws: dict[str, int] = {opp.tag: 0 for opp in unique_opponents}
 
     free_slots = list(range(num_envs - 1, -1, -1))
     live: list[_EvalGame] = []
@@ -311,8 +348,7 @@ def run_eval_matches(
         deck_a = deck_rng.choice(deck_pool)
         deck_b = deck_rng.choice(deck_pool)
         main_player_idx = rng.randrange(2)
-        round_idx = game_idx // num_games_per_opponent
-        opponent = opponents[round_idx]
+        opponent = game_opponents[game_idx]
         if main_policy.use_lstm:
             main_policy.reset_lstm_env_states([slot_idx])
         if opponent_policy.use_lstm:
@@ -330,7 +366,6 @@ def run_eval_matches(
             slot_idx=slot_idx,
             main_player_idx=main_player_idx,
             opponent=opponent,
-            round_idx=round_idx,
         )
 
     def fill_slots() -> None:
@@ -394,15 +429,15 @@ def run_eval_matches(
                 env.game.close()
                 if env.winner_idx == env.main_player_idx:
                     main_wins += 1
-                    round_main_wins[env.round_idx] += 1
+                    per_opp_main_wins[env.opponent.tag] += 1
                     pool.record_match(env.opponent, main_won=True)
                 elif env.winner_idx == -1:
                     draws += 1
-                    round_draws[env.round_idx] += 1
+                    per_opp_draws[env.opponent.tag] += 1
                     pool.record_match(env.opponent, main_won=None)
                 else:
                     opp_wins += 1
-                    round_opp_wins[env.round_idx] += 1
+                    per_opp_opp_wins[env.opponent.tag] += 1
                     pool.record_match(env.opponent, main_won=False)
                 free_slots.append(env.slot_idx)
                 continue
@@ -442,18 +477,14 @@ def run_eval_matches(
         "eval/opp_win_fraction": opp_wins / denom,
         "eval/draw_fraction": draws / denom,
     }
-    for round_idx, opponent in enumerate(opponents):
-        round_total = (
-            round_main_wins[round_idx] + round_opp_wins[round_idx] + round_draws[round_idx]
-        )
-        round_denom = float(round_total) if round_total else 1.0
-        metrics[f"eval/round_{round_idx}_main_win_fraction"] = (
-            round_main_wins[round_idx] / round_denom
-        )
-        metrics[f"eval/round_{round_idx}_opp_win_fraction"] = (
-            round_opp_wins[round_idx] / round_denom
-        )
-        metrics[f"eval/round_{round_idx}_draw_fraction"] = round_draws[round_idx] / round_denom
-        metrics[f"eval/opp_{opponent.tag}_rating_mu"] = float(opponent.rating.mu)
-        metrics[f"eval/opp_{opponent.tag}_rating_sigma"] = float(opponent.rating.sigma)
+    for opponent in unique_opponents:
+        tag = opponent.tag
+        opp_total = per_opp_main_wins[tag] + per_opp_opp_wins[tag] + per_opp_draws[tag]
+        opp_denom = float(opp_total) if opp_total else 1.0
+        metrics[f"eval/opp_{tag}_games"] = float(opp_total)
+        metrics[f"eval/opp_{tag}_main_win_fraction"] = per_opp_main_wins[tag] / opp_denom
+        metrics[f"eval/opp_{tag}_opp_win_fraction"] = per_opp_opp_wins[tag] / opp_denom
+        metrics[f"eval/opp_{tag}_draw_fraction"] = per_opp_draws[tag] / opp_denom
+        metrics[f"eval/opp_{tag}_rating_mu"] = float(opponent.rating.mu)
+        metrics[f"eval/opp_{tag}_rating_sigma"] = float(opponent.rating.sigma)
     return metrics

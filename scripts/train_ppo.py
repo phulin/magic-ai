@@ -44,6 +44,7 @@ from magic_ai.opponent_pool import (  # noqa: E402
     OpponentPool,
     SnapshotSchedule,
     build_opponent_policy,
+    distribute_games_by_recency,
     opponent_policy_state_dict,
     run_eval_matches,
     save_snapshot,
@@ -487,16 +488,18 @@ def parse_args() -> argparse.Namespace:
         help="directory to store frozen opponent snapshots",
     )
     parser.add_argument(
-        "--eval-rounds-per-snapshot",
+        "--eval-games-per-snapshot",
         type=int,
-        default=5,
-        help="number of random opponents to evaluate against each time a snapshot is taken",
+        default=250,
+        help="total eval games played each time a snapshot is taken, distributed "
+        "across the opponent pool with a recency bias",
     )
     parser.add_argument(
-        "--eval-games-per-round",
-        type=int,
-        default=50,
-        help="eval games played against each sampled opponent",
+        "--eval-recency-tau",
+        type=float,
+        default=4.0,
+        help="decay constant (in checkpoint positions) for recency-biased eval-game "
+        "distribution; 0 = uniform across all checkpoints",
     )
     parser.add_argument(
         "--eval-num-envs",
@@ -526,10 +529,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--torch-compile requires --no-validate")
     if args.deck_json is not None and args.deck_dir is not None:
         raise ValueError("--deck-json and --deck-dir are mutually exclusive")
-    if args.eval_rounds_per_snapshot < 0:
-        raise ValueError("--eval-rounds-per-snapshot must be non-negative")
-    if args.eval_games_per_round < 0:
-        raise ValueError("--eval-games-per-round must be non-negative")
+    if args.eval_games_per_snapshot < 0:
+        raise ValueError("--eval-games-per-snapshot must be non-negative")
     if args.eval_num_envs is not None and args.eval_num_envs < 1:
         raise ValueError("--eval-num-envs must be at least 1")
 
@@ -981,7 +982,7 @@ def take_snapshot_and_eval(
         flush=True,
     )
 
-    if args.eval_rounds_per_snapshot == 0 or args.eval_games_per_round == 0:
+    if args.eval_games_per_snapshot == 0 or not opponent_pool.entries:
         if wandb.run is not None:
             wandb.log(
                 {
@@ -991,32 +992,34 @@ def take_snapshot_and_eval(
             )
         return
 
-    sampled_opponents: list[OpponentEntry] = []
-    for _round_idx in range(args.eval_rounds_per_snapshot):
-        opponent = opponent_pool.sample(rng)
-        if opponent is None:
-            break
-        sampled_opponents.append(opponent)
-
-    if not sampled_opponents:
+    game_opponents = distribute_games_by_recency(
+        opponent_pool.entries,
+        args.eval_games_per_snapshot,
+        args.eval_recency_tau,
+    )
+    if not game_opponents:
         return
 
+    unique_opponents: list[OpponentEntry] = []
+    seen: set[str] = set()
+    for opp in game_opponents:
+        if opp.tag not in seen:
+            seen.add(opp.tag)
+            unique_opponents.append(opp)
+
     eval_num_envs = (
-        args.eval_num_envs
-        if args.eval_num_envs is not None
-        else args.eval_rounds_per_snapshot * args.eval_games_per_round
+        args.eval_num_envs if args.eval_num_envs is not None else args.eval_games_per_snapshot
     )
     seed_base = args.seed + threshold * 1000
     metrics = run_eval_matches(
         main_policy=policy,
         opponent_policy=opponent_policy,
-        opponents=sampled_opponents,
+        game_opponents=game_opponents,
         pool=opponent_pool,
         native_encoder=native_encoder,
         native_rollout=native_rollout,
         mage=mage,
         deck_pool=deck_pool,
-        num_games_per_opponent=args.eval_games_per_round,
         num_envs=eval_num_envs,
         max_steps_per_game=args.max_steps_per_game,
         max_options=args.max_options,
@@ -1030,11 +1033,12 @@ def take_snapshot_and_eval(
     )
     main_rating = opponent_pool.main_rating
     assert main_rating is not None
-    for round_idx, opponent in enumerate(sampled_opponents):
+    for opponent in unique_opponents:
+        games = int(metrics.get(f"eval/opp_{opponent.tag}_games", 0.0))
+        main_win = metrics.get(f"eval/opp_{opponent.tag}_main_win_fraction", 0.0)
         print(
-            f"eval: snapshot_tag={tag} round={round_idx} "
-            f"opponent={opponent.tag} "
-            f"main_win={metrics[f'eval/round_{round_idx}_main_win_fraction']:.2f} "
+            f"eval: snapshot_tag={tag} opponent={opponent.tag} "
+            f"games={games} main_win={main_win:.2f} "
             f"main_rating=mu={main_rating.mu:.2f},"
             f"sigma={main_rating.sigma:.2f}",
             flush=True,

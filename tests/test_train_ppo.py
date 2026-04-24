@@ -299,8 +299,8 @@ class TrainPPOTests(unittest.TestCase):
             no_validate=False,
             deck_json=None,
             deck_dir=None,
-            eval_rounds_per_snapshot=0,
-            eval_games_per_round=0,
+            eval_games_per_snapshot=0,
+            eval_recency_tau=4.0,
             eval_num_envs=None,
         )
 
@@ -320,8 +320,8 @@ class TrainPPOTests(unittest.TestCase):
             no_validate=False,
             deck_json=None,
             deck_dir=None,
-            eval_rounds_per_snapshot=0,
-            eval_games_per_round=0,
+            eval_games_per_snapshot=0,
+            eval_recency_tau=4.0,
             eval_num_envs=None,
         )
 
