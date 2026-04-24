@@ -490,9 +490,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-games-per-snapshot",
         type=int,
-        default=250,
+        default=None,
         help="total eval games played each time a snapshot is taken, distributed "
-        "across the opponent pool with a recency bias",
+        "across the opponent pool with a recency bias. Defaults to "
+        "max(100, episodes // 2500) so eval time stays near 2%% of training "
+        "(~50 snapshots * ~2%% of per-snapshot training budget), with a 100-game "
+        "floor to keep win-rate estimates meaningful",
     )
     parser.add_argument(
         "--eval-recency-tau",
@@ -529,7 +532,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--torch-compile requires --no-validate")
     if args.deck_json is not None and args.deck_dir is not None:
         raise ValueError("--deck-json and --deck-dir are mutually exclusive")
-    if args.eval_games_per_snapshot < 0:
+    if args.eval_games_per_snapshot is not None and args.eval_games_per_snapshot < 0:
         raise ValueError("--eval-games-per-snapshot must be non-negative")
     if args.eval_num_envs is not None and args.eval_num_envs < 1:
         raise ValueError("--eval-num-envs must be at least 1")
@@ -982,7 +985,13 @@ def take_snapshot_and_eval(
         flush=True,
     )
 
-    if args.eval_games_per_snapshot == 0 or not opponent_pool.entries:
+    eval_games_per_snapshot = (
+        args.eval_games_per_snapshot
+        if args.eval_games_per_snapshot is not None
+        else max(100, args.episodes // 2500)
+    )
+
+    if eval_games_per_snapshot == 0 or not opponent_pool.entries:
         if wandb.run is not None:
             wandb.log(
                 {
@@ -994,7 +1003,7 @@ def take_snapshot_and_eval(
 
     game_opponents = distribute_games_by_recency(
         opponent_pool.entries,
-        args.eval_games_per_snapshot,
+        eval_games_per_snapshot,
         args.eval_recency_tau,
     )
     if not game_opponents:
@@ -1008,7 +1017,7 @@ def take_snapshot_and_eval(
             unique_opponents.append(opp)
 
     eval_num_envs = (
-        args.eval_num_envs if args.eval_num_envs is not None else args.eval_games_per_snapshot
+        args.eval_num_envs if args.eval_num_envs is not None else eval_games_per_snapshot
     )
     seed_base = args.seed + threshold * 1000
     metrics = run_eval_matches(
