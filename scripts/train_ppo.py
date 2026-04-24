@@ -11,6 +11,7 @@ import random
 import re
 import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -33,9 +34,9 @@ from magic_ai.game_state import (  # noqa: E402
     PendingState,
 )
 from magic_ai.model import PPOPolicy  # noqa: E402
-from magic_ai.native_encoder import NativeBatchEncoder  # noqa: E402
+from magic_ai.native_encoder import NativeBatchEncoder  # noqa: E402,F401
 from magic_ai.native_rollout import (  # noqa: E402
-    NativeRolloutDriver,
+    NativeRolloutDriver,  # noqa: F401
     NativeRolloutUnavailable,
 )
 from magic_ai.opponent_pool import (  # noqa: E402
@@ -49,6 +50,10 @@ from magic_ai.opponent_pool import (  # noqa: E402
     snapshot_tag,
 )
 from magic_ai.ppo import PPOStats, RolloutStep, gae_returns, ppo_update  # noqa: E402
+from magic_ai.sharded_native import (  # noqa: E402
+    ShardedNativeBatchEncoder,
+    ShardedNativeRolloutDriver,
+)
 
 DEFAULT_DECK = {
     "name": "bolt-mountain",
@@ -294,7 +299,15 @@ def main() -> None:
         # Force cuBLAS handle creation before rollout ingestion creates temporary
         # CUDA copy tensors that PyTorch may hold in its caching allocator.
         _ = torch.empty((1, 1), device=device) @ torch.empty((1, 1), device=device)
-    native_encoder = NativeBatchEncoder.for_policy(policy)
+    batch_workers = max(1, args.batch_workers)
+    batch_pool = (
+        ThreadPoolExecutor(max_workers=batch_workers, thread_name_prefix="mage-batch")
+        if batch_workers > 1
+        else None
+    )
+    native_encoder = ShardedNativeBatchEncoder.for_policy(
+        policy, workers=batch_workers, pool=batch_pool
+    )
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
     staging_decision_capacity_per_env = max(
         1,
@@ -324,7 +337,9 @@ def main() -> None:
 
     mage = importlib.import_module("mage")
     try:
-        native_rollout = NativeRolloutDriver.for_mage(mage)
+        native_rollout = ShardedNativeRolloutDriver.for_mage(
+            mage, workers=batch_workers, pool=batch_pool
+        )
     except NativeRolloutUnavailable as exc:
         raise SystemExit(f"native rollout is unavailable: {exc}") from exc
 
@@ -369,6 +384,8 @@ def main() -> None:
     )
     print(f"saved checkpoint -> {args.output}")
     wandb.finish()
+    if batch_pool is not None:
+        batch_pool.shutdown(wait=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -401,6 +418,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deterministic-rollout", action="store_true")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--torch-threads", type=int, default=None)
+    parser.add_argument(
+        "--batch-workers",
+        type=int,
+        default=1,
+        help="parallel worker threads for Go-side engine step/encode batches "
+        "(default: 1 = serial; cgo releases the GIL so N threads run in parallel)",
+    )
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--hidden-layers", type=int, default=4)
@@ -570,9 +594,9 @@ def train_native_batched_envs(
     mage: Any,
     deck_pool: list[dict[str, Any]],
     policy: PPOPolicy,
-    native_encoder: NativeBatchEncoder,
+    native_encoder: ShardedNativeBatchEncoder,
     optimizer: torch.optim.Optimizer,
-    native_rollout: NativeRolloutDriver,
+    native_rollout: ShardedNativeRolloutDriver,
     staging_buffer: NativeTrajectoryBuffer,
     *,
     opponent_pool: OpponentPool | None = None,
@@ -940,8 +964,8 @@ def take_snapshot_and_eval(
     policy: PPOPolicy,
     opponent_policy: PPOPolicy,
     opponent_pool: OpponentPool,
-    native_encoder: NativeBatchEncoder,
-    native_rollout: NativeRolloutDriver,
+    native_encoder: ShardedNativeBatchEncoder,
+    native_rollout: ShardedNativeRolloutDriver,
     mage: Any,
     deck_pool: list[dict[str, Any]],
     rng: random.Random,

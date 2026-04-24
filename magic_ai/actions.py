@@ -568,7 +568,7 @@ class ActionOptionsEncoder(nn.Module):
         player_ref = player_type_emb + player_scalar_proj
 
         target_slot_mask = (target_ref_slot_idx >= 0).unsqueeze(-1)
-        target_player_mask = target_ref_is_player.unsqueeze(-1)
+        target_player_mask = target_ref_is_player.bool().unsqueeze(-1)
         zero_target = torch.zeros_like(target_slot_ref)
         target_ref = torch.where(
             target_player_mask,

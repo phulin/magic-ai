@@ -13,8 +13,7 @@ import torch
 import trueskill
 
 from magic_ai.model import PPOPolicy
-from magic_ai.native_encoder import NativeBatchEncoder
-from magic_ai.native_rollout import NativeRolloutDriver
+from magic_ai.sharded_native import ShardedNativeBatchEncoder, ShardedNativeRolloutDriver
 
 
 @dataclass
@@ -257,8 +256,8 @@ def run_eval_matches(
     opponent_policy: PPOPolicy,
     opponents: list[OpponentEntry],
     pool: OpponentPool,
-    native_encoder: NativeBatchEncoder,
-    native_rollout: NativeRolloutDriver,
+    native_encoder: ShardedNativeBatchEncoder,
+    native_rollout: ShardedNativeRolloutDriver,
     mage: Any,
     deck_pool: list[dict[str, Any]],
     num_games_per_opponent: int,
