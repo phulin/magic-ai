@@ -43,6 +43,7 @@ from magic_ai.rnad import (
     RNaDStats,
     load_reg_snapshot_into,
     rnad_update_trajectory,
+    rnad_update_trajectory_full_neurd,
     save_reg_snapshot,
 )
 
@@ -178,6 +179,7 @@ def run_rnad_update(
     episodes: Sequence[EpisodeBatch],
     *,
     entropy_coef: float = 0.0,
+    full_neurd: bool = False,
 ) -> PPOStats:
     """Run R-NaD on a batch of freshly-finished episodes.
 
@@ -208,7 +210,8 @@ def run_rnad_update(
             logp_mu.append(float(step.old_log_prob))
         alpha = _alpha_for_step(state.gradient_step, state.config.delta_m)
 
-        stats = rnad_update_trajectory(
+        update_fn = rnad_update_trajectory_full_neurd if full_neurd else rnad_update_trajectory
+        stats = update_fn(
             online=policy,
             target=state.target,
             reg_cur=state.reg_cur,

@@ -210,6 +210,57 @@ class FinetuneGateTests(unittest.TestCase):
             self.assertFalse((Path(tmp) / "reg_m003.pt").exists())
 
 
+class FinetuneSamplingTests(unittest.TestCase):
+    def test_finetune_eps_drops_low_probability_choices(self) -> None:
+        """PPOPolicy._sample_flat_decisions with finetune_eps > 0 must
+        zero out choices below the threshold and never sample them."""
+        policy = _make_policy()
+        # Three choices in one group; probs after softmax are ~uniform for
+        # equal logits, so bias heavily toward choice 0.
+        flat_logits = torch.tensor([3.0, -3.0, -3.0])
+        flat_log_probs = torch.log_softmax(flat_logits, dim=-1)
+        group_idx = torch.zeros(3, dtype=torch.long)
+        choice_cols = torch.arange(3, dtype=torch.long)
+        torch.manual_seed(0)
+        for _ in range(50):
+            selected_cols, selected_lp = policy._sample_flat_decisions(
+                group_idx=group_idx,
+                choice_cols=choice_cols,
+                flat_logits=flat_logits,
+                flat_log_probs=flat_log_probs,
+                deterministic=False,
+                finetune_eps=0.25,  # survivors: choice 0 (prob > 0.25)
+            )
+            # Only choice 0 has prob above the threshold, so it's the
+            # only survivor; should be the sole sampled option.
+            self.assertEqual(int(selected_cols[0]), 0)
+
+    def test_finetune_eps_zero_is_identity(self) -> None:
+        policy = _make_policy()
+        flat_logits = torch.tensor([1.0, 0.0, -1.0])
+        flat_log_probs = torch.log_softmax(flat_logits, dim=-1)
+        group_idx = torch.zeros(3, dtype=torch.long)
+        choice_cols = torch.arange(3, dtype=torch.long)
+        torch.manual_seed(0)
+        cols_no_eps, _ = policy._sample_flat_decisions(
+            group_idx=group_idx,
+            choice_cols=choice_cols,
+            flat_logits=flat_logits,
+            flat_log_probs=flat_log_probs,
+            deterministic=False,
+            finetune_eps=0.0,
+        )
+        torch.manual_seed(0)
+        cols_explicit, _ = policy._sample_flat_decisions(
+            group_idx=group_idx,
+            choice_cols=choice_cols,
+            flat_logits=flat_logits,
+            flat_log_probs=flat_log_probs,
+            deterministic=False,
+        )
+        self.assertTrue(torch.equal(cols_no_eps, cols_explicit))
+
+
 class RegPathRelocationTests(unittest.TestCase):
     def test_restore_uses_saved_reg_dir_when_configured_path_is_empty(self) -> None:
         """Checkpoint moved to a new machine: serialized reg_snapshot_dir

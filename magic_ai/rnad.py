@@ -642,9 +642,10 @@ def rnad_update_trajectory(
         # we sign-flip the reward when the final step isn't ``own_idx``.
         rewards = torch.zeros(t_len, dtype=dtype, device=device)
         if winner_idx >= 0:
-            terminal_own_pov = 1.0 if winner_idx == own_idx else -1.0
-            last_perspective_sign = 1.0 if bool(is_own[-1].item()) else -1.0
-            rewards[-1] = last_perspective_sign * terminal_own_pov
+            # Terminal reward is game-global from ``own_idx``'s POV, not
+            # perspective-sign-flipped: the zero-sum accumulator in
+            # two_player_vtrace consumes rewards in the own-player frame.
+            rewards[-1] = 1.0 if winner_idx == own_idx else -1.0
 
         transformed = transform_rewards(
             rewards,
@@ -682,6 +683,148 @@ def rnad_update_trajectory(
 
     loss = total_cl + total_pl
 
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    trainable = [p for p in online.parameters() if p.requires_grad]
+    grad_norm = float(
+        nn.utils.clip_grad_norm_(
+            trainable,
+            max_norm=config.grad_clip,
+        )
+    )
+    optimizer.step()
+
+    assert isinstance(target, nn.Module)
+    assert isinstance(online, nn.Module)
+    polyak_update_(target, online, gamma=config.target_ema_gamma)
+
+    return RNaDStats(
+        loss=float(loss.detach()),
+        critic_loss=float(total_cl.detach()),
+        policy_loss=float(total_pl.detach()),
+        v_hat_mean=sum(v_hat_means) / len(v_hat_means),
+        grad_norm=grad_norm,
+        transformed_reward_mean=sum(transformed_means) / len(transformed_means),
+    )
+
+
+def rnad_update_trajectory_full_neurd(
+    *,
+    online: _ReplayEvaluator,
+    target: _ReplayEvaluator,
+    reg_cur: _ReplayEvaluator,
+    reg_prev: _ReplayEvaluator,
+    optimizer: torch.optim.Optimizer,
+    replay_rows: list[int],
+    perspective_player_idx: Sequence[int],
+    winner_idx: int,
+    logp_mu: Tensor,
+    config: RNaDConfig,
+    alpha: float,
+) -> RNaDStats:
+    """Full per-action NeuRD variant (paper §188, with beta gate).
+
+    Differs from :func:`rnad_update_trajectory` only in the policy loss:
+    uses :func:`neurd_loss_per_choice` over all legal per-choice logits
+    with the paper's ``[-beta, beta]`` logit-magnitude gate, rather than
+    the sampled-action policy-gradient estimator. Q per choice is
+    simplified to ``v_hat * 1[choice == sampled]`` — a single-sample
+    estimator that avoids needing counterfactual per-action value
+    estimates.
+
+    Requires the policy objects to expose ``evaluate_replay_batch_per_choice``.
+    """
+
+    if not replay_rows:
+        raise ValueError("replay_rows must be non-empty")
+    t_len = len(replay_rows)
+    if len(perspective_player_idx) != t_len:
+        raise ValueError("perspective_player_idx must match replay_rows length")
+    if logp_mu.shape != (t_len,):
+        raise ValueError(f"logp_mu must have shape ({t_len},), got {tuple(logp_mu.shape)}")
+
+    device = next(iter(online.parameters())).device
+    perspective = torch.tensor(perspective_player_idx, dtype=torch.long, device=device)
+
+    # Per-choice forward on online; scalar-log-prob forwards on others.
+    online_per_choice = getattr(online, "evaluate_replay_batch_per_choice")  # noqa: B009
+    lp_online, _, v_online, pc_online = online_per_choice(list(replay_rows))
+    with torch.no_grad():
+        lp_tgt, _, v_tgt, _ = target.evaluate_replay_batch(list(replay_rows))
+        lp_reg_cur, _, _, _ = reg_cur.evaluate_replay_batch(list(replay_rows))
+        lp_reg_prev, _, _, _ = reg_prev.evaluate_replay_batch(list(replay_rows))
+
+    dtype = v_online.dtype
+    logp_mu_dev = logp_mu.to(device=device, dtype=dtype)
+    lp_online_dt = lp_online.detach().to(dtype=dtype)
+    lp_tgt_dt = lp_tgt.detach().to(dtype=dtype)
+    lp_reg_cur_dt = lp_reg_cur.to(dtype=dtype)
+    lp_reg_prev_dt = lp_reg_prev.to(dtype=dtype)
+    v_tgt_dt = v_tgt.detach().to(dtype=dtype)
+
+    total_cl = v_online.new_zeros(())
+    total_pl = v_online.new_zeros(())
+    v_hat_means: list[float] = []
+    transformed_means: list[float] = []
+
+    for own_idx in (0, 1):
+        is_own = perspective == own_idx
+        rewards = torch.zeros(t_len, dtype=dtype, device=device)
+        if winner_idx >= 0:
+            # Terminal reward is game-global from ``own_idx``'s POV, not
+            # perspective-sign-flipped: the zero-sum accumulator in
+            # two_player_vtrace consumes rewards in the own-player frame.
+            rewards[-1] = 1.0 if winner_idx == own_idx else -1.0
+
+        transformed = transform_rewards(
+            rewards,
+            logp_theta=lp_online_dt,
+            logp_reg_cur=lp_reg_cur_dt,
+            logp_reg_prev=lp_reg_prev_dt,
+            alpha=alpha,
+            eta=config.eta,
+            perspective_is_player_i=is_own,
+        )
+        v_out = two_player_vtrace(
+            rewards=transformed.detach(),
+            values=v_tgt_dt,
+            logp_theta=lp_tgt_dt,
+            logp_mu=logp_mu_dev,
+            perspective_is_player_i=is_own,
+            rho_bar=config.vtrace_rho_bar,
+            c_bar=config.vtrace_c_bar,
+        )
+
+        total_cl = total_cl + critic_loss(
+            v_theta=v_online,
+            v_hat=v_out.v_hat,
+            perspective_is_player_i=is_own,
+        )
+
+        if pc_online.flat_logits.numel() > 0:
+            # Q per choice: v_hat if (step is own-turn AND choice is sampled),
+            # zero otherwise. Non-own-turn choices contribute zero gradient.
+            step_is_own = is_own[pc_online.group_idx]
+            sampled_for_step = pc_online.sampled_col_per_step[pc_online.group_idx]
+            is_sampled = pc_online.choice_cols == sampled_for_step
+            flat_q = torch.where(
+                step_is_own & is_sampled,
+                v_out.q_hat[pc_online.group_idx],
+                torch.zeros_like(pc_online.flat_logits),
+            )
+            total_pl = total_pl + neurd_loss_per_choice(
+                flat_logits=pc_online.flat_logits,
+                flat_q=flat_q,
+                group_idx=pc_online.group_idx,
+                num_groups=t_len,
+                beta=config.neurd_beta,
+                clip=config.neurd_clip,
+            )
+
+        v_hat_means.append(float(v_out.v_hat.detach().mean()))
+        transformed_means.append(float(transformed.detach().mean()))
+
+    loss = total_cl + total_pl
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     trainable = [p for p in online.parameters() if p.requires_grad]

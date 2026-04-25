@@ -534,6 +534,13 @@ def parse_args() -> argparse.Namespace:
         default=16,
         help="R-NaD fine-tune / test-time probability quanta",
     )
+    parser.add_argument(
+        "--rnad-full-neurd",
+        action="store_true",
+        help="use the full per-action NeuRD loss (paper §188 with the "
+        "beta-magnitude logit gate) instead of the sampled-action "
+        "policy-gradient estimator",
+    )
     parser.add_argument("--episodes", type=int, default=65536)
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--rollout-steps", type=int, default=4096)
@@ -793,6 +800,9 @@ def train_native_batched_envs(
             device=policy.device,
         )
         _restore_rnad_state(rnad_state, resume_checkpoint)
+        # The target network runs rollouts under R-NaD; give it its own set
+        # of LSTM env buffers (online retains its own for evaluate_replay_batch).
+        rnad_state.target.init_lstm_env_states(args.num_envs)
     restored_state = resume_state or TrainingResumeState()
     completed_games = restored_state.completed_games
     last_saved_games = restored_state.last_saved_games
@@ -805,9 +815,16 @@ def train_native_batched_envs(
     transcript_warning_emitted = False
     policy.reset_rollout_buffer()
 
+    # Rollouts sample from the target policy under R-NaD (paper §157-§191),
+    # and from the online policy under PPO. The online policy always owns
+    # the rollout buffer; target is a Polyak-averaged EMA living alongside.
+    sampling_policy: PPOPolicy = rnad_state.target if rnad_state is not None else policy
+
     def start_game(slot_idx: int, episode_idx: int) -> LiveGame:
         staging_buffer.reset_env(slot_idx)
         policy.reset_lstm_env_states([slot_idx])
+        if sampling_policy is not policy:
+            sampling_policy.reset_lstm_env_states([slot_idx])
         seed = args.seed + episode_idx
         deck_a, deck_b = sample_decks(deck_pool, seed)
         return LiveGame(
@@ -933,12 +950,18 @@ def train_native_batched_envs(
                 [env.game for env in ready_envs],
                 perspective_player_indices=ready_players,
             )
-            lstm_state_inputs = policy.lstm_env_state_inputs(ready_env_indices)
+            lstm_state_inputs = sampling_policy.lstm_env_state_inputs(ready_env_indices)
+            finetune_eps = (
+                args.rnad_finetune_eps
+                if rnad_state is not None and rnad_state.is_finetuning
+                else 0.0
+            )
             with torch.no_grad():
-                policy_steps = policy.sample_native_batch(
+                policy_steps = sampling_policy.sample_native_batch(
                     parsed_batch,
                     env_indices=ready_env_indices,
                     deterministic=args.deterministic_rollout,
+                    finetune_eps=finetune_eps,
                 )
             log_probs = torch.stack([policy_step.log_prob for policy_step in policy_steps])
             values = torch.stack([policy_step.value for policy_step in policy_steps])
@@ -1024,6 +1047,7 @@ def train_native_batched_envs(
                     optimizer,
                     rnad_state,
                     pending_episodes,
+                    full_neurd=bool(getattr(args, "rnad_full_neurd", False)),
                 )
             else:
                 stats = ppo_update(
@@ -1122,6 +1146,7 @@ def train_native_batched_envs(
                 optimizer,
                 rnad_state,
                 pending_episodes,
+                full_neurd=bool(getattr(args, "rnad_full_neurd", False)),
             )
         else:
             stats = ppo_update(

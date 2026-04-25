@@ -17,6 +17,7 @@ from magic_ai.rnad import (
     neurd_loss,
     polyak_update_,
     rnad_update_trajectory,
+    rnad_update_trajectory_full_neurd,
     sampled_neurd_loss,
     save_reg_snapshot,
     threshold_discretize,
@@ -433,10 +434,20 @@ class _StubPolicy(nn.Module):
     real Adam step and we can observe its effects.
     """
 
-    def __init__(self, t_len: int, *, logp_init: float, value_init: float) -> None:
+    def __init__(
+        self,
+        t_len: int,
+        *,
+        logp_init: float,
+        value_init: float,
+        num_choices: int = 3,
+    ) -> None:
         super().__init__()
         self.logp = nn.Parameter(torch.full((t_len,), float(logp_init)))
         self.values = nn.Parameter(torch.full((t_len,), float(value_init)))
+        self.num_choices = num_choices
+        # Per-step per-choice logits; sampled column is choice 0 by construction.
+        self.per_choice_logits = nn.Parameter(torch.zeros(t_len, num_choices, dtype=torch.float32))
 
     def evaluate_replay_batch(
         self, replay_rows: list[int]
@@ -446,6 +457,33 @@ class _StubPolicy(nn.Module):
         values = self.values[idx]
         entropies = torch.zeros_like(logp)
         return logp, entropies, values, None
+
+    def evaluate_replay_batch_per_choice(self, replay_rows: list[int]):  # type: ignore[no-untyped-def]
+        from magic_ai.model import ReplayPerChoice
+
+        idx = torch.tensor(replay_rows, dtype=torch.long)
+        n = int(idx.numel())
+        values = self.values[idx]
+        # Flatten per-step choices; group_idx is the step-in-batch index.
+        group_idx = torch.arange(n, dtype=torch.long).repeat_interleave(self.num_choices)
+        choice_cols = torch.arange(self.num_choices).repeat(n)
+        flat_logits = self.per_choice_logits[idx].reshape(-1)
+        flat_log_probs = torch.log_softmax(self.per_choice_logits[idx], dim=-1).reshape(-1)
+        logp = flat_log_probs.reshape(n, self.num_choices)[:, 0]  # sampled col 0
+        entropies = torch.zeros_like(logp)
+        sampled_col_per_step = torch.zeros(n, dtype=torch.long)
+        return (
+            logp,
+            entropies,
+            values,
+            ReplayPerChoice(
+                flat_logits=flat_logits,
+                flat_log_probs=flat_log_probs,
+                group_idx=group_idx,
+                choice_cols=choice_cols,
+                sampled_col_per_step=sampled_col_per_step,
+            ),
+        )
 
 
 class RNaDUpdateTrajectoryTests(unittest.TestCase):
@@ -550,6 +588,38 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
                 config=RNaDConfig(),
                 alpha=1.0,
             )
+
+    def test_full_neurd_variant_runs_and_moves_per_choice_logits(self) -> None:
+        """Full per-action NeuRD should deposit gradient on per-choice
+        logits at own-turn sampled entries."""
+        t_len = 4
+        online = self._stub(t_len, logp=-1.0, value=0.0)
+        target = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_cur = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_prev = self._stub(t_len, logp=-1.0, value=0.0)
+        opt = torch.optim.SGD(online.parameters(), lr=1.0)
+        before = online.per_choice_logits.detach().clone()
+        rnad_update_trajectory_full_neurd(
+            online=online,
+            target=target,
+            reg_cur=reg_cur,
+            reg_prev=reg_prev,
+            optimizer=opt,
+            replay_rows=list(range(t_len)),
+            perspective_player_idx=[0, 1, 0, 1],
+            winner_idx=0,
+            logp_mu=torch.full((t_len,), -1.0),
+            config=RNaDConfig(eta=0.0, neurd_beta=100.0),
+            alpha=1.0,
+        )
+        after = online.per_choice_logits.detach()
+        # Steps carrying nonzero Q (closest to the terminal +1 / -1 reward)
+        # must have moved on their sampled column (col 0).
+        self.assertFalse(torch.equal(after[2, 0], before[2, 0]))
+        self.assertFalse(torch.equal(after[3, 0], before[3, 0]))
+        # Non-sampled columns get zero per-entry Q -> no movement.
+        self.assertTrue(torch.allclose(after[:, 1], before[:, 1]))
+        self.assertTrue(torch.allclose(after[:, 2], before[:, 2]))
 
     def test_both_players_receive_critic_signal(self) -> None:
         """The self-play update must train values on both perspective

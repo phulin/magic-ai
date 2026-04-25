@@ -558,6 +558,7 @@ class PPOPolicy(nn.Module):
         *,
         env_indices: list[int] | None = None,
         deterministic: bool = False,
+        finetune_eps: float = 0.0,
     ) -> list[PolicyStep]:
         n = int(native_batch.trace_kind_id.shape[0])
         if n == 0:
@@ -628,6 +629,7 @@ class PPOPolicy(nn.Module):
                 flat_logits=flat_logits,
                 flat_log_probs=flat_log_probs,
                 deterministic=deterministic,
+                finetune_eps=finetune_eps,
             )
             per_step_log_prob_sum = torch.zeros(n, dtype=forward.values.dtype, device=device)
             per_step_entropy_sum = torch.zeros(n, dtype=forward.values.dtype, device=device)
@@ -1116,6 +1118,109 @@ class PPOPolicy(nn.Module):
                 group_uses_none=group_uses_none,
             )
         return log_probs, entropies, forward.values, extras
+
+    def evaluate_replay_batch_per_choice(
+        self,
+        replay_rows: list[int],
+    ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice]:
+        """Like :meth:`evaluate_replay_batch` but also returns per-choice tensors.
+
+        Used by the R-NaD full per-action NeuRD trainer path: the returned
+        :class:`ReplayPerChoice` carries the flat logits and log-probs for
+        every legal decision-group choice across the batch, plus the
+        mapping back to batch-step indices and the sampled column per step.
+        ``may``-kind steps have no decision group and get a ``-1`` sentinel
+        in ``sampled_col_per_step``.
+        """
+
+        if not replay_rows:
+            raise ValueError("replay_rows must not be empty")
+
+        device = self.device
+        rb = self.rollout_buffer
+        step_indices = torch.tensor(replay_rows, dtype=torch.long, device=device)
+        n = int(step_indices.numel())
+        forward = self._forward_batch(step_indices)
+        log_probs = torch.zeros(n, dtype=forward.values.dtype, device=device)
+        entropies = torch.zeros(n, dtype=forward.values.dtype, device=device)
+        sampled_col_per_step = torch.full((n,), -1, dtype=torch.long, device=device)
+
+        trace_kind_ids = rb.trace_kind_id[step_indices]
+        may_mask = trace_kind_ids == TRACE_KIND_TO_ID["may"]
+        if may_mask.any():
+            may_pos_t = may_mask.nonzero(as_tuple=False).squeeze(-1)
+            may_buf_t = step_indices[may_pos_t]
+            may_logits = forward.may_logits[may_pos_t]
+            may_selected_t = rb.may_selected[may_buf_t].to(dtype=forward.values.dtype)
+            may_dist = Bernoulli(logits=may_logits)
+            log_probs[may_pos_t] = may_dist.log_prob(may_selected_t)
+            entropies[may_pos_t] = may_dist.entropy()
+
+        decision_starts = rb.decision_start[step_indices]
+        decision_counts = rb.decision_count[step_indices]
+        active_mask = decision_counts > 0
+
+        flat_logits = forward.values.new_zeros(0)
+        flat_log_probs = forward.values.new_zeros(0)
+        group_idx_out = torch.zeros(0, dtype=torch.long, device=device)
+        choice_cols_out = torch.zeros(0, dtype=torch.long, device=device)
+
+        if active_mask.any():
+            pos_t = active_mask.nonzero(as_tuple=False).squeeze(-1)
+            active_counts = decision_counts[pos_t]
+            max_count = int(active_counts.max().item())
+            offsets = torch.arange(max_count, dtype=torch.long, device=device).unsqueeze(0)
+            expanded_offsets = offsets.expand(pos_t.shape[0], -1)
+            valid_offsets = expanded_offsets < active_counts.unsqueeze(1)
+            idx_t = (decision_starts[pos_t].unsqueeze(1) + expanded_offsets)[valid_offsets]
+            pos_t_flat = torch.repeat_interleave(pos_t, active_counts)
+            option_idx = rb.decision_option_idx[idx_t]
+            target_idx = rb.decision_target_idx[idx_t]
+            masks = rb.decision_mask[idx_t]
+            uses_none = rb.uses_none_head[idx_t]
+            selected = rb.selected_indices[idx_t]
+            sampled_col_per_step[pos_t_flat] = selected
+
+            group_idx, choice_cols, flat_logits_all, flat_log_probs_all, group_entropies = (
+                self._flat_decision_distribution(
+                    step_positions=pos_t_flat,
+                    option_idx=option_idx,
+                    target_idx=target_idx,
+                    masks=masks,
+                    uses_none=uses_none,
+                    option_vectors=forward.option_vectors,
+                    target_vectors=forward.target_vectors,
+                    query=forward.query,
+                    none_logits=forward.none_logits,
+                )
+            )
+            # group_idx maps each flat entry to its POSITION within pos_t_flat
+            # (0..len(idx_t)-1); we want the batch-step index in 0..n-1.
+            step_for_flat = pos_t_flat[group_idx]
+            selected_mask = choice_cols == selected[group_idx]
+            selected_flat_log_probs = torch.where(
+                selected_mask,
+                flat_log_probs_all,
+                torch.zeros_like(flat_log_probs_all),
+            )
+            group_log_probs = torch.zeros_like(group_entropies)
+            group_log_probs.scatter_add_(0, group_idx, selected_flat_log_probs)
+            log_probs.scatter_add_(0, pos_t_flat, group_log_probs)
+            entropies.scatter_add_(0, pos_t_flat, group_entropies)
+
+            flat_logits = flat_logits_all
+            flat_log_probs = flat_log_probs_all
+            group_idx_out = step_for_flat
+            choice_cols_out = choice_cols
+
+        per_choice = ReplayPerChoice(
+            flat_logits=flat_logits,
+            flat_log_probs=flat_log_probs,
+            group_idx=group_idx_out,
+            choice_cols=choice_cols_out,
+            sampled_col_per_step=sampled_col_per_step,
+        )
+        return log_probs, entropies, forward.values, per_choice
 
     def _encode_latent(
         self,
@@ -1941,8 +2046,17 @@ class PPOPolicy(nn.Module):
         flat_logits: Tensor,
         flat_log_probs: Tensor,
         deterministic: bool,
+        finetune_eps: float = 0.0,
     ) -> tuple[Tensor, Tensor]:
-        """Sample one valid choice per decision group."""
+        """Sample one valid choice per decision group.
+
+        When ``finetune_eps > 0``, applies the R-NaD fine-tune / test-time
+        projection (paper §197 / §279-282) to the per-group distribution:
+        entries with probability below ``finetune_eps`` are zeroed and the
+        survivors renormalized within each group. Sampling (and the
+        returned log-prob) then reflect the projected distribution. If a
+        group has no survivors, the original distribution is used.
+        """
 
         device = flat_logits.device
         group_count = int(group_idx.max().item()) + 1
@@ -1954,6 +2068,30 @@ class PPOPolicy(nn.Module):
         if group_count > 1:
             group_offsets[1:] = counts.cumsum(dim=0)[:-1]
         group_last = group_offsets + counts - 1
+
+        if finetune_eps > 0.0 and not deterministic:
+            probs = flat_log_probs.exp()
+            survivors = probs >= finetune_eps
+            kept = torch.where(survivors, probs, torch.zeros_like(probs))
+            group_sums = torch.zeros(group_count, dtype=probs.dtype, device=device)
+            group_sums.scatter_add_(0, group_idx, kept)
+            # Groups with no survivors: fall back to the raw distribution.
+            degenerate = group_sums <= 0.0
+            per_choice_sum = group_sums[group_idx]
+            safe_sum = torch.where(
+                per_choice_sum > 0.0, per_choice_sum, torch.ones_like(per_choice_sum)
+            )
+            projected_probs = kept / safe_sum
+            # Restore full distribution for degenerate groups.
+            projected_probs = torch.where(degenerate[group_idx], probs, projected_probs)
+            # Recompute log-probs from the projected distribution. Zero
+            # probabilities cannot be sampled but receive a sentinel -inf
+            # log-prob to mark unreachable actions.
+            flat_log_probs = torch.where(
+                projected_probs > 0.0,
+                projected_probs.log(),
+                torch.full_like(projected_probs, float("-inf")),
+            )
 
         if deterministic:
             group_max = torch.full(
@@ -2199,6 +2337,31 @@ class _ForwardBatch:
     option_vectors: Tensor
     target_vectors: Tensor
     hidden: Tensor
+
+
+@dataclass(frozen=True)
+class ReplayPerChoice:
+    """Per-choice decision-group tensors from ``evaluate_replay_batch_per_choice``.
+
+    Lets the R-NaD trainer apply the full per-action NeuRD loss (paper
+    §188) rather than the sampled-action policy-gradient estimator.
+
+    ``flat_logits`` and ``flat_log_probs`` are concatenated across all
+    decision groups in all batch rows. ``group_idx`` maps each flat entry
+    to its **step index** in the original replay batch (i.e., the same
+    indexing space as ``values``), so downstream code can align per-step
+    v-trace targets with per-choice logits in one lookup. ``choice_cols``
+    is the original decision-choice index (0..max_cached_choices) for
+    each flat entry. ``sampled_col_per_step`` is the column that was
+    actually sampled at each step at rollout time (or ``-1`` for ``may``
+    steps with no decision group).
+    """
+
+    flat_logits: Tensor
+    flat_log_probs: Tensor
+    group_idx: Tensor
+    choice_cols: Tensor
+    sampled_col_per_step: Tensor
 
 
 @dataclass(frozen=True)
