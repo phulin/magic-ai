@@ -197,39 +197,95 @@ def two_player_vtrace(
     v_hat = torch.zeros(T, dtype=dtype, device=device)
     q_hat = torch.zeros(T, dtype=dtype, device=device)
 
-    # Sentinels for the "past the end" state: zero future reward, and
-    # v_next/q_next carry zero (no bootstrap past terminal).
-    r_acc = torch.zeros((), dtype=dtype, device=device)
-    v_next = torch.zeros((), dtype=dtype, device=device)
-    xi_next = torch.ones((), dtype=dtype, device=device)
-    v_next_own = torch.zeros((), dtype=dtype, device=device)
+    # Vectorized backward pass (paper §170-182, algebraically rewritten).
+    #
+    # The per-step recursion resets at every own-turn step, so we split
+    # the trajectory into segments delimited by own-turn indices. Between
+    # own-turn k and own-turn k+1 there are zero or more opponent-turn
+    # steps; all of their reward / importance-ratio accumulation can be
+    # computed with cumsum/cumprod in O(T) tensor ops. Only the final
+    # own-turn-indexed ``v_hat`` linear recurrence remains, and that runs
+    # on K scalars on-device (no .item() sync per step, unlike the
+    # previous per-T Python loop).
+    own_idx = is_own.nonzero(as_tuple=False).squeeze(-1)  # (K,) sorted ascending
+    K = int(own_idx.numel())
+    if K == 0:
+        # No own-turn steps in this trajectory: both outputs stay zero
+        # (the original recursion's sentinels never bootstrap).
+        return VTraceOutput(v_hat=v_hat, q_hat=q_hat)
 
-    for t in range(T - 1, -1, -1):
-        rho_t = min(rho_bar, float(ratio[t].item()) * float(xi_next.item()))
-        c_t = min(c_bar, float(ratio[t].item()) * float(xi_next.item()))
-        if bool(is_own[t].item()):
-            # Own-turn step: v-trace advantage bootstraps onto values[t].
-            delta = rho_t * (rewards[t] + r_acc + v_next_own - values[t])
-            v_hat_t = values[t] + delta + c_t * (v_next - v_next_own)
-            v_hat[t] = v_hat_t
-            # Q for the sampled action: same form as v_hat with the
-            # policy-prior absorbed (see paper §179-180). For the scalar
-            # variant we use the same estimate; the per-head NeuRD loss
-            # combines this with policy logits to produce per-action Q.
-            q_hat[t] = values[t] + rho_t * (rewards[t] + r_acc + v_next_own - values[t])
-            # reset accumulators: the next (earlier) step's "future reward"
-            # starts empty, and the bootstrap target becomes values[t].
-            r_acc = torch.zeros((), dtype=dtype, device=device)
-            v_next = v_hat_t
-            v_next_own = values[t]
-            xi_next = torch.ones((), dtype=dtype, device=device)
-        else:
-            # Opponent-turn step: accumulate reward with importance weight.
-            r_acc = rewards[t] + ratio[t] * r_acc
-            xi_next = ratio[t] * xi_next
-            # v_next and v_next_own pass through unchanged.
-            v_hat[t] = v_next
-            q_hat[t] = v_next
+    # Per-step segmentation: ``seg[t]`` = index of the most recent own-turn
+    # at or before t (= k when t == own_idx[k]; = k when t is opp-turn in
+    # the segment immediately after own_idx[k]; = -1 for opp-turn steps
+    # before the first own-turn).
+    cum_own = is_own.to(dtype=torch.long).cumsum(0)
+    seg = cum_own - 1  # (T,); -1 before any own-turn
+    safe_seg = seg.clamp_min(0)
+
+    # ``r_acc[k]`` = sum over opp-turn steps s in (own_idx[k], own_idx[k+1])
+    # of rewards[s] * prod_{s' in that range, s' < s} ratio[s']. The
+    # "per-step multiplier" is exp(cumA[s] - opp_log_ratio[s] - cumA[own_idx[k]])
+    # where opp_log_ratio is log(ratio) on opp-turn steps only.
+    log_ratio = ratio.log()
+    opp_log_ratio = torch.where(is_own, torch.zeros_like(log_ratio), log_ratio)
+    cumA = opp_log_ratio.cumsum(0)
+    cumA_at_own = cumA[own_idx]  # (K,)
+    base_cumA = cumA_at_own[safe_seg]  # (T,); garbage for seg == -1 but zeroed below
+    multiplier = torch.exp(cumA - opp_log_ratio - base_cumA)
+
+    opp_contrib = torch.where(
+        is_own | (seg < 0),
+        torch.zeros_like(rewards),
+        rewards * multiplier.to(dtype=dtype),
+    )
+    r_acc = torch.zeros(K, dtype=dtype, device=device)
+    r_acc.scatter_add_(0, safe_seg, opp_contrib)
+
+    # ``xi_prod[k]`` = prod of ratio over opp-turn steps in the segment after
+    # own_idx[k]. Last segment extends to the trajectory end.
+    if K > 1:
+        right_boundary = torch.cat(
+            [own_idx[1:] - 1, torch.tensor([T - 1], dtype=torch.long, device=device)]
+        )
+    else:
+        right_boundary = torch.tensor([T - 1], dtype=torch.long, device=device)
+    xi_prod = torch.exp(cumA[right_boundary] - cumA_at_own).to(dtype=dtype)
+
+    # Per-own-turn rho / c clips.
+    ratio_own = ratio[own_idx].to(dtype=dtype)
+    rho_arg = ratio_own * xi_prod
+    rho = torch.clamp(rho_arg, max=rho_bar)
+    c = torch.clamp(rho_arg, max=c_bar)
+
+    # Per-own-turn pre-c quantity: this is also ``q_hat_sampled`` for the
+    # paper's per-action Q form used by the full-NeuRD trainer.
+    values_own = values[own_idx]
+    rewards_own = rewards[own_idx]
+    v_next_own_vec = torch.cat([values_own[1:], values_own.new_zeros(1)])
+    pre_c = values_own + rho * (rewards_own + r_acc + v_next_own_vec - values_own)
+
+    # Own-turn linear recurrence:
+    #   v_hat_own[k] = A[k] + B[k] * v_hat_own[k+1],  v_hat_own[K] = 0
+    A = pre_c - c * v_next_own_vec
+    B = c
+    v_hat_own = torch.zeros(K, dtype=dtype, device=device)
+    next_val = values_own.new_zeros(())
+    for k in range(K - 1, -1, -1):
+        next_val = A[k] + B[k] * next_val
+        v_hat_own[k] = next_val
+
+    # Scatter own-turn results back; opp-turn steps inherit v_hat from the
+    # next own-turn (or zero if none follows).
+    v_hat.index_copy_(0, own_idx, v_hat_own)
+    q_hat.index_copy_(0, own_idx, pre_c)
+
+    next_k = seg + 1
+    valid_next = next_k < K
+    safe_next_k = next_k.clamp(min=0, max=max(K - 1, 0))
+    opp_v = v_hat_own[safe_next_k]
+    opp_mask = ~is_own & valid_next
+    v_hat = torch.where(opp_mask, opp_v, v_hat)
+    q_hat = torch.where(opp_mask, opp_v, q_hat)
 
     return VTraceOutput(v_hat=v_hat, q_hat=q_hat)
 
