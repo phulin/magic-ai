@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from magic_ai.model import PPOPolicy
 from magic_ai.ppo import PPOStats, RolloutStep
@@ -42,8 +43,9 @@ from magic_ai.rnad import (
     RNaDConfig,
     RNaDStats,
     load_reg_snapshot_into,
-    rnad_update_trajectory,
-    rnad_update_trajectory_full_neurd,
+    polyak_update_,
+    rnad_trajectory_loss,
+    rnad_trajectory_loss_full_neurd,
     save_reg_snapshot,
 )
 
@@ -195,7 +197,16 @@ def run_rnad_update(
     if not episodes:
         raise ValueError("run_rnad_update requires at least one episode")
 
-    per_episode: list[RNaDStats] = []
+    # Batched update: accumulate losses across all episodes in this rollout
+    # batch, then do ONE backward + Adam + Polyak. Amortizes optimizer and
+    # target-network averaging overhead over the (often dozens of) short
+    # episodes a single rollout produces. Each episode still runs its own
+    # forwards + v-trace (those are trajectory-dependent by construction).
+    loss_fn = rnad_trajectory_loss_full_neurd if full_neurd else rnad_trajectory_loss
+    total_loss: torch.Tensor | None = None
+    per_episode_stats: list[tuple[float, float, float, float]] = []
+    alpha = _alpha_for_step(state.gradient_step, state.config.delta_m)
+
     for episode in episodes:
         if not episode.steps:
             continue
@@ -208,15 +219,12 @@ def run_rnad_update(
             replay_rows.append(int(step.replay_idx))
             perspective.append(int(step.perspective_player_idx))
             logp_mu.append(float(step.old_log_prob))
-        alpha = _alpha_for_step(state.gradient_step, state.config.delta_m)
 
-        update_fn = rnad_update_trajectory_full_neurd if full_neurd else rnad_update_trajectory
-        stats = update_fn(
+        pieces = loss_fn(
             online=policy,
             target=state.target,
             reg_cur=state.reg_cur,
             reg_prev=state.reg_prev,
-            optimizer=optimizer,
             replay_rows=replay_rows,
             perspective_player_idx=perspective,
             winner_idx=int(episode.winner_idx),
@@ -224,11 +232,49 @@ def run_rnad_update(
             config=state.config,
             alpha=alpha,
         )
-        per_episode.append(stats)
-        state.gradient_step += 1
-        if state.gradient_step >= state.config.delta_m:
-            _advance_outer_iteration(state)
+        episode_loss = pieces.cl + pieces.pl
+        total_loss = episode_loss if total_loss is None else total_loss + episode_loss
+        per_episode_stats.append(
+            (
+                float(episode_loss.detach()),
+                float(pieces.cl.detach()),
+                float(pieces.pl.detach()),
+                pieces.v_hat_mean,
+            )
+        )
 
+    if total_loss is None:
+        raise ValueError("no non-empty episodes to update on")
+
+    # Mean over episodes keeps the loss magnitude comparable to the
+    # single-trajectory variant; Adam's update step stays well-scaled.
+    n_episodes = max(1, len(per_episode_stats))
+    total_loss = total_loss / n_episodes
+
+    optimizer.zero_grad(set_to_none=True)
+    total_loss.backward()
+    trainable = [p for p in policy.parameters() if p.requires_grad]
+    grad_norm = float(nn.utils.clip_grad_norm_(trainable, max_norm=state.config.grad_clip))
+    optimizer.step()
+    polyak_update_(state.target, policy, gamma=state.config.target_ema_gamma)
+
+    # One gradient step per rollout batch (not per episode) -> one outer-loop
+    # tick per batch. This matches the paper's §163 "one step per iteration".
+    state.gradient_step += 1
+    if state.gradient_step >= state.config.delta_m:
+        _advance_outer_iteration(state)
+
+    per_episode = [
+        RNaDStats(
+            loss=loss_val,
+            critic_loss=cl_val,
+            policy_loss=pl_val,
+            v_hat_mean=v_hat_mean,
+            grad_norm=grad_norm,
+            transformed_reward_mean=0.0,
+        )
+        for loss_val, cl_val, pl_val, v_hat_mean in per_episode_stats
+    ]
     state.last_stats = per_episode
 
     # Aggregate for PPO-shaped logging. Leave PPO-specific fields at zero;

@@ -595,48 +595,36 @@ class _ReplayEvaluator(Protocol):
     def parameters(self) -> Any: ...  # for optimizer introspection + device
 
 
-def rnad_update_trajectory(
+@dataclass(frozen=True)
+class _TrajLossPieces:
+    """Raw loss tensors + scalar stats for one trajectory."""
+
+    cl: Tensor
+    pl: Tensor
+    v_hat_mean: float
+    transformed_mean: float
+
+
+def rnad_trajectory_loss(
     *,
     online: _ReplayEvaluator,
     target: _ReplayEvaluator,
     reg_cur: _ReplayEvaluator,
     reg_prev: _ReplayEvaluator,
-    optimizer: torch.optim.Optimizer,
     replay_rows: list[int],
     perspective_player_idx: Sequence[int],
     winner_idx: int,
     logp_mu: Tensor,
     config: RNaDConfig,
     alpha: float,
-) -> RNaDStats:
-    """One R-NaD gradient step on a single trajectory's replay rows.
+) -> _TrajLossPieces:
+    """Compute the R-NaD critic + sampled-action NeuRD losses for one trajectory.
 
-    Trains both players simultaneously (self-play symmetry): the loss is
-    summed over both ``own_player_idx in {0, 1}`` branches so each
-    trajectory contributes to both halves of the policy, matching the
-    paper's self-play formulation.
-
-    Pipeline (DeepNash paper §157-191, simplified to sampled-action NeuRD):
-
-    1. Forward the trajectory through online, target (no_grad),
-       reg_cur (no_grad), reg_prev (no_grad); pull scalar joint log-probs
-       and own-side values.
-    2. For each player i in {0, 1}:
-         a. Construct i's terminal reward vector (±1 on winner, 0 on draw,
-            sign-flipped if the final step's perspective-player != i).
-         b. Apply :func:`transform_rewards` using the **online** log-probs
-            (detached) so the entropy-bonus r' - eta * log(pi_theta/pi_reg)
-            matches paper §161, where pi_theta is the learning policy.
-         c. Run :func:`two_player_vtrace` using target log-probs and target
-            values as the bootstrap estimator inputs.
-         d. Accumulate :func:`critic_loss` on i's own-turn steps and
-            :func:`sampled_neurd_loss` using the online log-probs.
-    3. Single backward + Adam step with ``config.grad_clip``; Polyak update
-       target.
-
-    The per-player branches are disjoint in ``is_own`` masks (each step
-    belongs to exactly one player), so summing the two losses covers every
-    timestep exactly once.
+    Stateless: returns the loss tensors (with grad), leaving the backward +
+    optimizer + Polyak step to the caller. :func:`run_rnad_update` calls
+    this per episode in a rollout batch and accumulates losses for a single
+    backward/step/Polyak cycle; that amortizes optimizer overhead over many
+    short episodes and keeps GPU saturation high.
     """
 
     if not replay_rows:
@@ -674,14 +662,8 @@ def rnad_update_trajectory(
 
     for own_idx in (0, 1):
         is_own = perspective == own_idx
-        # Terminal reward from player ``own_idx``'s POV. The network value
-        # at the last step is from that step's perspective-player POV, so
-        # we sign-flip the reward when the final step isn't ``own_idx``.
         rewards = torch.zeros(t_len, dtype=dtype, device=device)
         if winner_idx >= 0:
-            # Terminal reward is game-global from ``own_idx``'s POV, not
-            # perspective-sign-flipped: the zero-sum accumulator in
-            # two_player_vtrace consumes rewards in the own-player frame.
             rewards[-1] = 1.0 if winner_idx == own_idx else -1.0
 
         transformed = transform_rewards(
@@ -718,7 +700,50 @@ def rnad_update_trajectory(
         v_hat_means.append(float(v_out.v_hat.detach().mean()))
         transformed_means.append(float(transformed.detach().mean()))
 
-    loss = total_cl + total_pl
+    return _TrajLossPieces(
+        cl=total_cl,
+        pl=total_pl,
+        v_hat_mean=sum(v_hat_means) / len(v_hat_means),
+        transformed_mean=sum(transformed_means) / len(transformed_means),
+    )
+
+
+def rnad_update_trajectory(
+    *,
+    online: _ReplayEvaluator,
+    target: _ReplayEvaluator,
+    reg_cur: _ReplayEvaluator,
+    reg_prev: _ReplayEvaluator,
+    optimizer: torch.optim.Optimizer,
+    replay_rows: list[int],
+    perspective_player_idx: Sequence[int],
+    winner_idx: int,
+    logp_mu: Tensor,
+    config: RNaDConfig,
+    alpha: float,
+) -> RNaDStats:
+    """Single-trajectory convenience wrapper (loss + backward + step + Polyak).
+
+    Thin wrapper around :func:`rnad_trajectory_loss` kept for tests and
+    single-episode driver scripts. The production trainer
+    (:func:`magic_ai.rnad_trainer.run_rnad_update`) batches trajectories and
+    calls the loss-only helper directly to amortize optimizer + Polyak
+    overhead across a rollout batch.
+    """
+
+    pieces = rnad_trajectory_loss(
+        online=online,
+        target=target,
+        reg_cur=reg_cur,
+        reg_prev=reg_prev,
+        replay_rows=replay_rows,
+        perspective_player_idx=perspective_player_idx,
+        winner_idx=winner_idx,
+        logp_mu=logp_mu,
+        config=config,
+        alpha=alpha,
+    )
+    loss = pieces.cl + pieces.pl
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -737,11 +762,11 @@ def rnad_update_trajectory(
 
     return RNaDStats(
         loss=float(loss.detach()),
-        critic_loss=float(total_cl.detach()),
-        policy_loss=float(total_pl.detach()),
-        v_hat_mean=sum(v_hat_means) / len(v_hat_means),
+        critic_loss=float(pieces.cl.detach()),
+        policy_loss=float(pieces.pl.detach()),
+        v_hat_mean=pieces.v_hat_mean,
         grad_norm=grad_norm,
-        transformed_reward_mean=sum(transformed_means) / len(transformed_means),
+        transformed_reward_mean=pieces.transformed_mean,
     )
 
 
@@ -786,21 +811,20 @@ def _gather_sampled_scalar(pc: Any, may_logp: Tensor) -> Tensor:
     return out
 
 
-def rnad_update_trajectory_full_neurd(
+def rnad_trajectory_loss_full_neurd(
     *,
     online: _ReplayEvaluator,
     target: _ReplayEvaluator,
     reg_cur: _ReplayEvaluator,
     reg_prev: _ReplayEvaluator,
-    optimizer: torch.optim.Optimizer,
     replay_rows: list[int],
     perspective_player_idx: Sequence[int],
     winner_idx: int,
     logp_mu: Tensor,
     config: RNaDConfig,
     alpha: float,
-) -> RNaDStats:
-    """Full per-action NeuRD variant (paper §188, with beta gate).
+) -> _TrajLossPieces:
+    """Loss-only variant of :func:`rnad_update_trajectory_full_neurd`.
 
     Uses :func:`neurd_loss_per_choice` over all legal per-choice logits
     with the paper's ``[-beta, beta]`` logit-magnitude gate, and
@@ -970,7 +994,43 @@ def rnad_update_trajectory_full_neurd(
         v_hat_means.append(float(v_out.v_hat.detach().mean()))
         transformed_means.append(float(transformed.detach().mean()))
 
-    loss = total_cl + total_pl
+    return _TrajLossPieces(
+        cl=total_cl,
+        pl=total_pl,
+        v_hat_mean=sum(v_hat_means) / len(v_hat_means),
+        transformed_mean=sum(transformed_means) / len(transformed_means),
+    )
+
+
+def rnad_update_trajectory_full_neurd(
+    *,
+    online: _ReplayEvaluator,
+    target: _ReplayEvaluator,
+    reg_cur: _ReplayEvaluator,
+    reg_prev: _ReplayEvaluator,
+    optimizer: torch.optim.Optimizer,
+    replay_rows: list[int],
+    perspective_player_idx: Sequence[int],
+    winner_idx: int,
+    logp_mu: Tensor,
+    config: RNaDConfig,
+    alpha: float,
+) -> RNaDStats:
+    """Single-trajectory convenience wrapper for the full-NeuRD variant."""
+
+    pieces = rnad_trajectory_loss_full_neurd(
+        online=online,
+        target=target,
+        reg_cur=reg_cur,
+        reg_prev=reg_prev,
+        replay_rows=replay_rows,
+        perspective_player_idx=perspective_player_idx,
+        winner_idx=winner_idx,
+        logp_mu=logp_mu,
+        config=config,
+        alpha=alpha,
+    )
+    loss = pieces.cl + pieces.pl
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     trainable = [p for p in online.parameters() if p.requires_grad]
@@ -988,11 +1048,11 @@ def rnad_update_trajectory_full_neurd(
 
     return RNaDStats(
         loss=float(loss.detach()),
-        critic_loss=float(total_cl.detach()),
-        policy_loss=float(total_pl.detach()),
-        v_hat_mean=sum(v_hat_means) / len(v_hat_means),
+        critic_loss=float(pieces.cl.detach()),
+        policy_loss=float(pieces.pl.detach()),
+        v_hat_mean=pieces.v_hat_mean,
         grad_norm=grad_norm,
-        transformed_reward_mean=sum(transformed_means) / len(transformed_means),
+        transformed_reward_mean=pieces.transformed_mean,
     )
 
 
