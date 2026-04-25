@@ -1149,6 +1149,8 @@ class PPOPolicy(nn.Module):
 
         trace_kind_ids = rb.trace_kind_id[step_indices]
         may_mask = trace_kind_ids == TRACE_KIND_TO_ID["may"]
+        may_logits_per_step = forward.values.new_zeros(n)
+        may_selected_per_step = forward.values.new_zeros(n)
         if may_mask.any():
             may_pos_t = may_mask.nonzero(as_tuple=False).squeeze(-1)
             may_buf_t = step_indices[may_pos_t]
@@ -1157,6 +1159,11 @@ class PPOPolicy(nn.Module):
             may_dist = Bernoulli(logits=may_logits)
             log_probs[may_pos_t] = may_dist.log_prob(may_selected_t)
             entropies[may_pos_t] = may_dist.entropy()
+            # Preserve differentiability on may_logits_per_step so downstream
+            # losses applied to it (e.g. beta-gated NeuRD) receive gradient.
+            may_logits_per_step = may_logits_per_step.clone()
+            may_logits_per_step[may_pos_t] = may_logits
+            may_selected_per_step[may_pos_t] = may_selected_t
 
         decision_starts = rb.decision_start[step_indices]
         decision_counts = rb.decision_count[step_indices]
@@ -1222,6 +1229,8 @@ class PPOPolicy(nn.Module):
             choice_cols=choice_cols_out,
             sampled_col_per_step=sampled_col_per_step,
             may_is_active=may_mask,
+            may_logits_per_step=may_logits_per_step,
+            may_selected_per_step=may_selected_per_step,
         )
         return log_probs, entropies, forward.values, per_choice
 
@@ -2425,6 +2434,8 @@ class ReplayPerChoice:
     choice_cols: Tensor
     sampled_col_per_step: Tensor
     may_is_active: Tensor
+    may_logits_per_step: Tensor
+    may_selected_per_step: Tensor
 
 
 @dataclass(frozen=True)

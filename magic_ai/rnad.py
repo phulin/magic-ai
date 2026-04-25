@@ -468,6 +468,43 @@ def sampled_neurd_loss(
     return per_step[mask].mean()
 
 
+def may_neurd_loss(
+    *,
+    may_logits: Tensor,
+    may_selected: Tensor,
+    q_hat: Tensor,
+    own_turn_may_mask: Tensor,
+    beta: float,
+    clip: float,
+) -> Tensor:
+    """β-gated NeuRD loss for the Bernoulli ``may`` head.
+
+    Treats the may head as a 1-logit Bernoulli (accept vs decline). The
+    full NeuRD gradient on a Bernoulli with logit ``l`` is
+
+        d(loss)/dl = -(1[a=accept] - sigmoid(l)) * clip(Q, c) * gate(|l| <= beta)
+
+    which matches the sampled-action policy-gradient-theorem form with a
+    per-step β-magnitude gate — the Bernoulli analogue of
+    :func:`neurd_loss_per_choice`.
+    """
+
+    if may_logits.shape != may_selected.shape:
+        raise ValueError("may_logits and may_selected must share shape")
+    if may_logits.shape != q_hat.shape:
+        raise ValueError("may_logits and q_hat must share shape")
+    mask = own_turn_may_mask.to(dtype=torch.bool)
+    if not mask.any():
+        return may_logits.new_zeros(())
+    prob_accept = torch.sigmoid(may_logits)
+    advantage = may_selected.to(dtype=may_logits.dtype) - prob_accept
+    q_clipped = q_hat.clamp(-clip, clip).detach()
+    with torch.no_grad():
+        in_range = may_logits.abs() <= beta
+    per_step = -advantage * q_clipped * in_range.to(dtype=may_logits.dtype)
+    return per_step[mask].mean()
+
+
 # ---------------------------------------------------------------------------
 # Polyak target network + reg snapshot persistence
 # ---------------------------------------------------------------------------
@@ -708,6 +745,47 @@ def rnad_update_trajectory(
     )
 
 
+def _sampled_may_log_prob(pc: Any) -> Tensor:
+    """Per-step Bernoulli log-prob of the sampled may decision under ``pc``.
+
+    ``pc.may_logits_per_step`` holds zeros on non-may steps, so the
+    returned tensor is also zero there — convenient for the combiner in
+    :func:`_gather_sampled_scalar`.
+    """
+
+    prob_accept = torch.sigmoid(pc.may_logits_per_step)
+    selected = pc.may_selected_per_step
+    p_sel = torch.where(selected > 0.5, prob_accept, 1.0 - prob_accept)
+    safe = p_sel.clamp_min(1e-30)
+    return safe.log() * pc.may_is_active.to(dtype=safe.dtype)
+
+
+def _gather_sampled_scalar(pc: Any, may_logp: Tensor) -> Tensor:
+    """Assemble a per-step scalar log-prob from a per-choice forward.
+
+    Decision-group steps pick the flat entry whose ``choice_col`` equals
+    the step's sampled column; may steps use the precomputed
+    ``may_logp``; steps with no action (shouldn't occur in practice) stay
+    at zero.
+    """
+
+    device = may_logp.device
+    n = may_logp.shape[0]
+    out = may_logp.clone()
+    if pc.flat_logits.numel() > 0:
+        sampled_col_flat = pc.sampled_col_per_step[pc.group_idx]
+        is_sampled = pc.choice_cols == sampled_col_flat
+        contributions = torch.where(
+            is_sampled,
+            pc.flat_log_probs,
+            torch.zeros_like(pc.flat_log_probs),
+        )
+        per_step = torch.zeros(n, dtype=may_logp.dtype, device=device)
+        per_step.scatter_add_(0, pc.group_idx, contributions.to(dtype=may_logp.dtype))
+        out = out + per_step
+    return out
+
+
 def rnad_update_trajectory_full_neurd(
     *,
     online: _ReplayEvaluator,
@@ -724,15 +802,26 @@ def rnad_update_trajectory_full_neurd(
 ) -> RNaDStats:
     """Full per-action NeuRD variant (paper §188, with beta gate).
 
-    Differs from :func:`rnad_update_trajectory` only in the policy loss:
-    uses :func:`neurd_loss_per_choice` over all legal per-choice logits
-    with the paper's ``[-beta, beta]`` logit-magnitude gate, rather than
-    the sampled-action policy-gradient estimator. Q per choice is
-    simplified to ``v_hat * 1[choice == sampled]`` — a single-sample
-    estimator that avoids needing counterfactual per-action value
-    estimates.
+    Uses :func:`neurd_loss_per_choice` over all legal per-choice logits
+    with the paper's ``[-beta, beta]`` logit-magnitude gate, and
+    :func:`may_neurd_loss` (beta-gated) on the Bernoulli ``may`` head.
 
-    Requires the policy objects to expose ``evaluate_replay_batch_per_choice``.
+    Per-choice Q tracks the paper's estimator (§179-180) rather than the
+    sampled-action stand-in:
+
+        Q(a) = v_tgt(o_t) - eta * log_ratio(a)
+             + 1{a = a_sampled} * (q_hat_sampled(t) - v_tgt(o_t)
+                                    + eta * log_ratio(a_sampled))
+
+    where ``log_ratio(a) = log pi_theta(a) - log pi_reg_blend(a)`` is
+    computed per legal choice from the same per-choice forwards used for
+    the online logits, and ``q_hat_sampled`` is the v-trace scalar at the
+    sampled action. The ``v(o_t)`` additive constant preserves the
+    paper's form for the β-gated NeuRD (it is not shift-invariant under
+    the gate).
+
+    Requires online/target/reg policies to expose
+    ``evaluate_replay_batch_per_choice``.
     """
 
     if not replay_rows:
@@ -746,21 +835,57 @@ def rnad_update_trajectory_full_neurd(
     device = next(iter(online.parameters())).device
     perspective = torch.tensor(perspective_player_idx, dtype=torch.long, device=device)
 
-    # Per-choice forward on online; scalar-log-prob forwards on others.
+    # Per-choice forward on online; per-choice forwards on reg policies are
+    # also required so the full-NeuRD Q estimate includes log(pi/pi_reg)[a]
+    # for every legal a, not just the sampled one.
     online_per_choice = getattr(online, "evaluate_replay_batch_per_choice")  # noqa: B009
+    target_per_choice = getattr(target, "evaluate_replay_batch_per_choice")  # noqa: B009
+    reg_cur_per_choice = getattr(reg_cur, "evaluate_replay_batch_per_choice")  # noqa: B009
+    reg_prev_per_choice = getattr(reg_prev, "evaluate_replay_batch_per_choice")  # noqa: B009
     lp_online, _, v_online, pc_online = online_per_choice(list(replay_rows))
     with torch.no_grad():
-        lp_tgt, _, v_tgt, _ = target.evaluate_replay_batch(list(replay_rows))
-        lp_reg_cur, _, _, _ = reg_cur.evaluate_replay_batch(list(replay_rows))
-        lp_reg_prev, _, _, _ = reg_prev.evaluate_replay_batch(list(replay_rows))
+        _lp_tgt_scalar, _, v_tgt, pc_tgt = target_per_choice(list(replay_rows))
+        _, _, _, pc_reg_cur = reg_cur_per_choice(list(replay_rows))
+        _, _, _, pc_reg_prev = reg_prev_per_choice(list(replay_rows))
 
     dtype = v_online.dtype
     logp_mu_dev = logp_mu.to(device=device, dtype=dtype)
     lp_online_dt = lp_online.detach().to(dtype=dtype)
-    lp_tgt_dt = lp_tgt.detach().to(dtype=dtype)
-    lp_reg_cur_dt = lp_reg_cur.to(dtype=dtype)
-    lp_reg_prev_dt = lp_reg_prev.to(dtype=dtype)
+    # Target per-step log-prob at sampled action is needed by v-trace for
+    # the importance ratio. We reconstruct it from pc_tgt.flat_log_probs by
+    # picking the entry whose choice_col matches each step's sampled column.
+    lp_tgt_scalar = _lp_tgt_scalar.detach().to(dtype=dtype)
+    lp_reg_cur_scalar_flat = pc_reg_cur.flat_log_probs.to(dtype=dtype)
+    lp_reg_prev_scalar_flat = pc_reg_prev.flat_log_probs.to(dtype=dtype)
     v_tgt_dt = v_tgt.detach().to(dtype=dtype)
+
+    # Scalar reg log-probs (for reward transform): pick sampled-choice entry
+    # per step; fall back to may-head log_prob for may steps.
+    lp_reg_cur_scalar = _gather_sampled_scalar(
+        pc_reg_cur, may_logp=_sampled_may_log_prob(pc_reg_cur)
+    ).to(dtype=dtype)
+    lp_reg_prev_scalar = _gather_sampled_scalar(
+        pc_reg_prev, may_logp=_sampled_may_log_prob(pc_reg_prev)
+    ).to(dtype=dtype)
+
+    # Blended reg log-probs per flat choice (paper §164 alpha interpolation).
+    blended_reg_flat = alpha * lp_reg_cur_scalar_flat + (1.0 - alpha) * lp_reg_prev_scalar_flat
+    log_ratio_flat = pc_online.flat_log_probs.to(dtype=dtype) - blended_reg_flat
+
+    # Also build the per-step scalar log_ratio at the sampled action for the
+    # "sampled correction" term of the paper's Q estimator.
+    if pc_online.flat_logits.numel() > 0:
+        sampled_col_flat = pc_online.sampled_col_per_step[pc_online.group_idx]
+        is_sampled_flat = pc_online.choice_cols == sampled_col_flat
+        per_step_log_ratio_sampled = torch.zeros(t_len, dtype=dtype, device=device)
+        per_step_log_ratio_sampled.scatter_add_(
+            0,
+            pc_online.group_idx,
+            torch.where(is_sampled_flat, log_ratio_flat, torch.zeros_like(log_ratio_flat)),
+        )
+    else:
+        is_sampled_flat = torch.zeros(0, dtype=torch.bool, device=device)
+        per_step_log_ratio_sampled = torch.zeros(t_len, dtype=dtype, device=device)
 
     total_cl = v_online.new_zeros(())
     total_pl = v_online.new_zeros(())
@@ -779,8 +904,8 @@ def rnad_update_trajectory_full_neurd(
         transformed = transform_rewards(
             rewards,
             logp_theta=lp_online_dt,
-            logp_reg_cur=lp_reg_cur_dt,
-            logp_reg_prev=lp_reg_prev_dt,
+            logp_reg_cur=lp_reg_cur_scalar,
+            logp_reg_prev=lp_reg_prev_scalar,
             alpha=alpha,
             eta=config.eta,
             perspective_is_player_i=is_own,
@@ -788,7 +913,7 @@ def rnad_update_trajectory_full_neurd(
         v_out = two_player_vtrace(
             rewards=transformed.detach(),
             values=v_tgt_dt,
-            logp_theta=lp_tgt_dt,
+            logp_theta=lp_tgt_scalar,
             logp_mu=logp_mu_dev,
             perspective_is_player_i=is_own,
             rho_bar=config.vtrace_rho_bar,
@@ -801,31 +926,38 @@ def rnad_update_trajectory_full_neurd(
             perspective_is_player_i=is_own,
         )
 
-        # Sampled-action NeuRD on the Bernoulli may head. The may head is a
-        # single logit per step with two implicit "choices" (accept / decline);
-        # surfacing it through neurd_loss_per_choice would double the complexity
-        # of ReplayPerChoice for no gain, so we use the policy-gradient-theorem
-        # form here — same as sampled_neurd_loss — gated to may steps only.
+        # beta-gated NeuRD on the Bernoulli may head (paper §188 applied to
+        # the 1-logit Bernoulli form; see :func:`may_neurd_loss`).
         if pc_online.may_is_active.any():
             may_and_own = pc_online.may_is_active & is_own
-            total_pl = total_pl + sampled_neurd_loss(
-                log_prob=lp_online,
+            total_pl = total_pl + may_neurd_loss(
+                may_logits=pc_online.may_logits_per_step.to(dtype=dtype),
+                may_selected=pc_online.may_selected_per_step.to(dtype=dtype),
                 q_hat=v_out.q_hat,
-                own_turn_mask=may_and_own,
+                own_turn_may_mask=may_and_own,
+                beta=config.neurd_beta,
                 clip=config.neurd_clip,
             )
 
         if pc_online.flat_logits.numel() > 0:
-            # Q per choice: v_hat if (step is own-turn AND choice is sampled),
-            # zero otherwise. Non-own-turn choices contribute zero gradient.
+            # Per-choice Q from paper §179-180 (own-turn steps only):
+            #   Q(a) = v_tgt(o_t) - eta * log_ratio[a]
+            #        + 1[a=a_sampled] * (q_hat_sampled - v_tgt(o_t)
+            #                            + eta * log_ratio[a_sampled])
+            # Non-own-turn steps contribute zero gradient: they are zeroed
+            # after the gather so the β-gate still sees paper-form Q.
             step_is_own = is_own[pc_online.group_idx]
-            sampled_for_step = pc_online.sampled_col_per_step[pc_online.group_idx]
-            is_sampled = pc_online.choice_cols == sampled_for_step
-            flat_q = torch.where(
-                step_is_own & is_sampled,
-                v_out.q_hat[pc_online.group_idx],
-                torch.zeros_like(pc_online.flat_logits),
+            v_per_choice = v_tgt_dt[pc_online.group_idx]
+            base_q = v_per_choice - config.eta * log_ratio_flat
+            sampled_correction = (
+                v_out.q_hat[pc_online.group_idx]
+                - v_per_choice
+                + config.eta * per_step_log_ratio_sampled[pc_online.group_idx]
             )
+            flat_q = base_q + torch.where(
+                is_sampled_flat, sampled_correction, torch.zeros_like(sampled_correction)
+            )
+            flat_q = torch.where(step_is_own, flat_q, torch.zeros_like(flat_q))
             total_pl = total_pl + neurd_loss_per_choice(
                 flat_logits=pc_online.flat_logits,
                 flat_q=flat_q,

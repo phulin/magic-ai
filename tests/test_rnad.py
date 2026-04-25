@@ -484,6 +484,8 @@ class _StubPolicy(nn.Module):
                 choice_cols=choice_cols,
                 sampled_col_per_step=sampled_col_per_step,
                 may_is_active=torch.zeros(n, dtype=torch.bool),
+                may_logits_per_step=torch.zeros(n),
+                may_selected_per_step=torch.zeros(n),
             ),
         )
 
@@ -591,6 +593,54 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
                 alpha=1.0,
             )
 
+    def test_full_neurd_per_action_regularization_touches_unsampled_choices(
+        self,
+    ) -> None:
+        """Paper §179-180: Q(a) includes a -eta*log_ratio(a) term for every
+        legal a, so unsampled choices must receive nonzero NeuRD gradient
+        as soon as pi_theta and pi_reg diverge."""
+        t_len = 4
+        online = self._stub(t_len, logp=-1.0, value=0.0)
+        # Give online different per-choice logits from the regs so the
+        # log_ratio per action is nonzero.
+        with torch.no_grad():
+            online.per_choice_logits.copy_(
+                torch.tensor(
+                    [[2.0, 0.0, -2.0], [-2.0, 0.0, 2.0], [0.0, 1.0, -1.0], [1.0, -1.0, 0.0]]
+                )
+            )
+        target = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_cur = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_prev = self._stub(t_len, logp=-1.0, value=0.0)
+        opt = torch.optim.SGD(online.parameters(), lr=1.0)
+        before = online.per_choice_logits.detach().clone()
+        rnad_update_trajectory_full_neurd(
+            online=cast(Any, online),
+            target=cast(Any, target),
+            reg_cur=cast(Any, reg_cur),
+            reg_prev=cast(Any, reg_prev),
+            optimizer=opt,
+            replay_rows=list(range(t_len)),
+            perspective_player_idx=[0, 1, 0, 1],
+            winner_idx=0,
+            logp_mu=torch.full((t_len,), -1.0),
+            config=RNaDConfig(eta=0.5, neurd_beta=100.0),
+            alpha=1.0,
+        )
+        after = online.per_choice_logits.detach()
+        # Sampled col 0 must have moved (has both base Q and sampled correction).
+        self.assertFalse(torch.allclose(after[0, 0], before[0, 0]))
+        # Unsampled cols at own-turn steps must also have moved — that's the
+        # paper's -eta*log_ratio(a) term, which is the whole point of the
+        # full per-action Q form.
+        own_step_unsampled_moved = (
+            (after[0, 1] != before[0, 1]).item()
+            or (after[0, 2] != before[0, 2]).item()
+            or (after[2, 1] != before[2, 1]).item()
+            or (after[2, 2] != before[2, 2]).item()
+        )
+        self.assertTrue(own_step_unsampled_moved)
+
     def test_full_neurd_trains_may_head_on_may_steps(self) -> None:
         """Full-NeuRD must not drop the may head from policy training on
         steps whose action came from the Bernoulli may branch."""
@@ -601,6 +651,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
                 super().__init__()
                 self.logp = nn.Parameter(torch.zeros(t_len))
                 self.values = nn.Parameter(torch.zeros(t_len))
+                self.may_logits = nn.Parameter(torch.zeros(t_len))
 
             def evaluate_replay_batch(self, rows: list[int]):  # type: ignore[no-untyped-def]
                 idx = torch.tensor(rows, dtype=torch.long)
@@ -626,6 +677,8 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
                         choice_cols=torch.zeros(0, dtype=torch.long),
                         sampled_col_per_step=torch.full((n,), -1, dtype=torch.long),
                         may_is_active=torch.ones(n, dtype=torch.bool),
+                        may_logits_per_step=self.may_logits[idx],
+                        may_selected_per_step=torch.ones(n),
                     ),
                 )
 
@@ -635,7 +688,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
         reg_cur = MayStub(t_len)
         reg_prev = MayStub(t_len)
         opt = torch.optim.SGD(online.parameters(), lr=1.0)
-        logp_before = online.logp.detach().clone()
+        may_before = online.may_logits.detach().clone()
         rnad_update_trajectory_full_neurd(
             online=cast(Any, online),
             target=cast(Any, target),
@@ -649,9 +702,9 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
             config=RNaDConfig(eta=0.0),
             alpha=1.0,
         )
-        # Without the may-head fix, logp would stay at zeros; with the fix
-        # the sampled-action NeuRD term moves it at own-turn may steps.
-        self.assertFalse(torch.allclose(online.logp.detach(), logp_before))
+        # Without the may-head fix, may_logits stays at zeros; with the
+        # beta-gated may-head NeuRD term, it moves at own-turn may steps.
+        self.assertFalse(torch.allclose(online.may_logits.detach(), may_before))
 
     def test_full_neurd_variant_runs_and_moves_per_choice_logits(self) -> None:
         """Full per-action NeuRD should deposit gradient on per-choice
