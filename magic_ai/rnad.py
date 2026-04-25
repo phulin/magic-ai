@@ -801,6 +801,20 @@ def rnad_update_trajectory_full_neurd(
             perspective_is_player_i=is_own,
         )
 
+        # Sampled-action NeuRD on the Bernoulli may head. The may head is a
+        # single logit per step with two implicit "choices" (accept / decline);
+        # surfacing it through neurd_loss_per_choice would double the complexity
+        # of ReplayPerChoice for no gain, so we use the policy-gradient-theorem
+        # form here — same as sampled_neurd_loss — gated to may steps only.
+        if pc_online.may_is_active.any():
+            may_and_own = pc_online.may_is_active & is_own
+            total_pl = total_pl + sampled_neurd_loss(
+                log_prob=lp_online,
+                q_hat=v_out.q_hat,
+                own_turn_mask=may_and_own,
+                clip=config.neurd_clip,
+            )
+
         if pc_online.flat_logits.numel() > 0:
             # Q per choice: v_hat if (step is own-turn AND choice is sampled),
             # zero otherwise. Non-own-turn choices contribute zero gradient.

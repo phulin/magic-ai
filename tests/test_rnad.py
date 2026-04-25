@@ -6,6 +6,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, cast
 
 import torch
 from magic_ai.rnad import (
@@ -482,6 +483,7 @@ class _StubPolicy(nn.Module):
                 group_idx=group_idx,
                 choice_cols=choice_cols,
                 sampled_col_per_step=sampled_col_per_step,
+                may_is_active=torch.zeros(n, dtype=torch.bool),
             ),
         )
 
@@ -588,6 +590,68 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
                 config=RNaDConfig(),
                 alpha=1.0,
             )
+
+    def test_full_neurd_trains_may_head_on_may_steps(self) -> None:
+        """Full-NeuRD must not drop the may head from policy training on
+        steps whose action came from the Bernoulli may branch."""
+        from magic_ai.model import ReplayPerChoice
+
+        class MayStub(nn.Module):
+            def __init__(self, t_len: int) -> None:
+                super().__init__()
+                self.logp = nn.Parameter(torch.zeros(t_len))
+                self.values = nn.Parameter(torch.zeros(t_len))
+
+            def evaluate_replay_batch(self, rows: list[int]):  # type: ignore[no-untyped-def]
+                idx = torch.tensor(rows, dtype=torch.long)
+                return (
+                    self.logp[idx],
+                    torch.zeros_like(self.logp[idx]),
+                    self.values[idx],
+                    None,
+                )
+
+            def evaluate_replay_batch_per_choice(self, rows: list[int]):  # type: ignore[no-untyped-def]
+                idx = torch.tensor(rows, dtype=torch.long)
+                n = int(idx.numel())
+                # All steps are may-kind: no decision-group entries at all.
+                return (
+                    self.logp[idx],
+                    torch.zeros_like(self.logp[idx]),
+                    self.values[idx],
+                    ReplayPerChoice(
+                        flat_logits=torch.zeros(0),
+                        flat_log_probs=torch.zeros(0),
+                        group_idx=torch.zeros(0, dtype=torch.long),
+                        choice_cols=torch.zeros(0, dtype=torch.long),
+                        sampled_col_per_step=torch.full((n,), -1, dtype=torch.long),
+                        may_is_active=torch.ones(n, dtype=torch.bool),
+                    ),
+                )
+
+        t_len = 4
+        online = MayStub(t_len)
+        target = MayStub(t_len)
+        reg_cur = MayStub(t_len)
+        reg_prev = MayStub(t_len)
+        opt = torch.optim.SGD(online.parameters(), lr=1.0)
+        logp_before = online.logp.detach().clone()
+        rnad_update_trajectory_full_neurd(
+            online=cast(Any, online),
+            target=cast(Any, target),
+            reg_cur=cast(Any, reg_cur),
+            reg_prev=cast(Any, reg_prev),
+            optimizer=opt,
+            replay_rows=list(range(t_len)),
+            perspective_player_idx=[0, 1, 0, 1],
+            winner_idx=0,
+            logp_mu=torch.zeros(t_len),
+            config=RNaDConfig(eta=0.0),
+            alpha=1.0,
+        )
+        # Without the may-head fix, logp would stay at zeros; with the fix
+        # the sampled-action NeuRD term moves it at own-turn may steps.
+        self.assertFalse(torch.allclose(online.logp.detach(), logp_before))
 
     def test_full_neurd_variant_runs_and_moves_per_choice_logits(self) -> None:
         """Full per-action NeuRD should deposit gradient on per-choice

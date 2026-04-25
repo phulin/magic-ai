@@ -235,6 +235,37 @@ class FinetuneSamplingTests(unittest.TestCase):
             # only survivor; should be the sole sampled option.
             self.assertEqual(int(selected_cols[0]), 0)
 
+    def test_finetune_n_disc_quantizes_survivor_probabilities(self) -> None:
+        """n_disc quantization must snap surviving probabilities to
+        multiples of 1/n_disc and truncate past cumulative 1.0."""
+        policy = _make_policy()
+        # Four choices; uniform raw prob is 0.25 each so all survive any
+        # threshold <= 0.25. With n_disc=2 (quantum=0.5), rounded probs
+        # per entry ceil(0.25/0.5)*0.5 = 0.5, so cumulative hits 1.0 at
+        # index 2 and the last two entries truncate to zero.
+        flat_logits = torch.zeros(4)
+        flat_log_probs = torch.log_softmax(flat_logits, dim=-1)
+        group_idx = torch.zeros(4, dtype=torch.long)
+        choice_cols = torch.arange(4, dtype=torch.long)
+        torch.manual_seed(0)
+        survivor_counts: dict[int, int] = {0: 0, 1: 0, 2: 0, 3: 0}
+        for _ in range(200):
+            selected, _ = policy._sample_flat_decisions(
+                group_idx=group_idx,
+                choice_cols=choice_cols,
+                flat_logits=flat_logits,
+                flat_log_probs=flat_log_probs,
+                deterministic=False,
+                finetune_eps=0.0,
+                finetune_n_disc=2,
+            )
+            survivor_counts[int(selected[0])] += 1
+        # With n_disc=2 and uniform input, only the top-2 tied entries can
+        # be sampled. Which two get picked depends on tie-breaking in the
+        # sort; the point is two entries should account for ~all samples.
+        nonzero_buckets = sum(1 for v in survivor_counts.values() if v > 0)
+        self.assertLessEqual(nonzero_buckets, 2)
+
     def test_finetune_eps_zero_is_identity(self) -> None:
         policy = _make_policy()
         flat_logits = torch.tensor([1.0, 0.0, -1.0])

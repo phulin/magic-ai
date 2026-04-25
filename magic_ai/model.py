@@ -559,6 +559,7 @@ class PPOPolicy(nn.Module):
         env_indices: list[int] | None = None,
         deterministic: bool = False,
         finetune_eps: float = 0.0,
+        finetune_n_disc: int = 0,
     ) -> list[PolicyStep]:
         n = int(native_batch.trace_kind_id.shape[0])
         if n == 0:
@@ -630,6 +631,7 @@ class PPOPolicy(nn.Module):
                 flat_log_probs=flat_log_probs,
                 deterministic=deterministic,
                 finetune_eps=finetune_eps,
+                finetune_n_disc=finetune_n_disc,
             )
             per_step_log_prob_sum = torch.zeros(n, dtype=forward.values.dtype, device=device)
             per_step_entropy_sum = torch.zeros(n, dtype=forward.values.dtype, device=device)
@@ -1219,6 +1221,7 @@ class PPOPolicy(nn.Module):
             group_idx=group_idx_out,
             choice_cols=choice_cols_out,
             sampled_col_per_step=sampled_col_per_step,
+            may_is_active=may_mask,
         )
         return log_probs, entropies, forward.values, per_choice
 
@@ -2047,15 +2050,18 @@ class PPOPolicy(nn.Module):
         flat_log_probs: Tensor,
         deterministic: bool,
         finetune_eps: float = 0.0,
+        finetune_n_disc: int = 0,
     ) -> tuple[Tensor, Tensor]:
         """Sample one valid choice per decision group.
 
-        When ``finetune_eps > 0``, applies the R-NaD fine-tune / test-time
-        projection (paper §197 / §279-282) to the per-group distribution:
-        entries with probability below ``finetune_eps`` are zeroed and the
-        survivors renormalized within each group. Sampling (and the
-        returned log-prob) then reflect the projected distribution. If a
-        group has no survivors, the original distribution is used.
+        When ``finetune_eps > 0`` or ``finetune_n_disc > 0``, applies the
+        R-NaD fine-tune / test-time projection (paper §197 / §279-282) to
+        the per-group distribution before sampling. ``finetune_eps`` zeros
+        entries below the threshold and renormalizes the survivors;
+        ``finetune_n_disc`` quantizes survivor probabilities to multiples
+        of ``1 / finetune_n_disc`` (rounded up, highest-probability first)
+        and truncates once the running sum reaches 1. A group with no
+        survivors falls back to the raw distribution.
         """
 
         device = flat_logits.device
@@ -2069,24 +2075,70 @@ class PPOPolicy(nn.Module):
             group_offsets[1:] = counts.cumsum(dim=0)[:-1]
         group_last = group_offsets + counts - 1
 
-        if finetune_eps > 0.0 and not deterministic:
+        finetune_active = (finetune_eps > 0.0 or finetune_n_disc > 0) and not deterministic
+        if finetune_active:
             probs = flat_log_probs.exp()
-            survivors = probs >= finetune_eps
+            survivors = (
+                probs >= finetune_eps
+                if finetune_eps > 0.0
+                else torch.ones_like(probs, dtype=torch.bool)
+            )
             kept = torch.where(survivors, probs, torch.zeros_like(probs))
             group_sums = torch.zeros(group_count, dtype=probs.dtype, device=device)
             group_sums.scatter_add_(0, group_idx, kept)
-            # Groups with no survivors: fall back to the raw distribution.
             degenerate = group_sums <= 0.0
             per_choice_sum = group_sums[group_idx]
             safe_sum = torch.where(
                 per_choice_sum > 0.0, per_choice_sum, torch.ones_like(per_choice_sum)
             )
             projected_probs = kept / safe_sum
-            # Restore full distribution for degenerate groups.
             projected_probs = torch.where(degenerate[group_idx], probs, projected_probs)
-            # Recompute log-probs from the projected distribution. Zero
-            # probabilities cannot be sampled but receive a sentinel -inf
-            # log-prob to mark unreachable actions.
+
+            if finetune_n_disc > 0:
+                # Quantize per group: highest-probability-first, round up to
+                # the nearest 1/n, truncate any entry after cumulative >= 1.
+                quantum = 1.0 / float(finetune_n_disc)
+                # Sort within groups by sorting the flat tensor with a key
+                # that groups first, then rank descending by prob within group.
+                sort_key = group_idx.to(dtype=projected_probs.dtype) * 2.0 - projected_probs
+                order = torch.argsort(sort_key, stable=True)
+                sorted_probs = projected_probs[order]
+                sorted_group = group_idx[order]
+                # Ceil-quantize.
+                rounded = torch.ceil(sorted_probs / quantum) * quantum
+                # Per-group running cumsum.
+                cumsum = torch.zeros_like(rounded)
+                accum = torch.zeros(group_count, dtype=rounded.dtype, device=device)
+                # Iterative cumsum per group — group sizes are small
+                # (<= max_cached_choices), so this stays fast.
+                for pos in range(rounded.shape[0]):
+                    g = int(sorted_group[pos].item())
+                    accum[g] = accum[g] + rounded[pos]
+                    cumsum[pos] = accum[g]
+                # Clamp the first entry that crosses 1.0 to fill the remainder,
+                # zero subsequent entries.
+                prev = cumsum - rounded
+                crossed = cumsum > 1.0
+                first_over = crossed & ~torch.roll(crossed, 1)
+                first_over[0] = first_over[0] | (crossed[0] and True)
+                rounded = torch.where(first_over, torch.clamp(1.0 - prev, min=0.0), rounded)
+                rounded = torch.where(crossed & ~first_over, torch.zeros_like(rounded), rounded)
+                # Restore to original order.
+                restored = torch.zeros_like(projected_probs)
+                restored[order] = rounded
+                # Renormalize each group to absorb rounding drift.
+                final_sums = torch.zeros(group_count, dtype=restored.dtype, device=device)
+                final_sums.scatter_add_(0, group_idx, restored)
+                per_group_sum = final_sums[group_idx]
+                safe_group_sum = torch.where(
+                    per_group_sum > 0.0, per_group_sum, torch.ones_like(per_group_sum)
+                )
+                projected_probs = torch.where(
+                    per_group_sum > 0.0,
+                    restored / safe_group_sum,
+                    projected_probs,
+                )
+
             flat_log_probs = torch.where(
                 projected_probs > 0.0,
                 projected_probs.log(),
@@ -2355,6 +2407,16 @@ class ReplayPerChoice:
     each flat entry. ``sampled_col_per_step`` is the column that was
     actually sampled at each step at rollout time (or ``-1`` for ``may``
     steps with no decision group).
+
+    ``may_is_active`` is a boolean mask of shape ``(n,)`` flagging steps
+    whose action came from the Bernoulli may head rather than a
+    decision group; the per-step sampled-action log-prob for those
+    steps lives in the ``log_probs`` return value of
+    :meth:`evaluate_replay_batch_per_choice` (alongside the scalar
+    decision-group log-probs). The full-NeuRD trajectory update uses
+    this mask to apply sampled-action NeuRD to the may head on may
+    steps, since the may head is a 1-logit Bernoulli and ``flat_logits``
+    only covers decision-group choices.
     """
 
     flat_logits: Tensor
@@ -2362,6 +2424,7 @@ class ReplayPerChoice:
     group_idx: Tensor
     choice_cols: Tensor
     sampled_col_per_step: Tensor
+    may_is_active: Tensor
 
 
 @dataclass(frozen=True)

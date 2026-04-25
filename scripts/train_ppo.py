@@ -951,17 +951,16 @@ def train_native_batched_envs(
                 perspective_player_indices=ready_players,
             )
             lstm_state_inputs = sampling_policy.lstm_env_state_inputs(ready_env_indices)
-            finetune_eps = (
-                args.rnad_finetune_eps
-                if rnad_state is not None and rnad_state.is_finetuning
-                else 0.0
-            )
+            finetune_active = rnad_state is not None and rnad_state.is_finetuning
+            finetune_eps = args.rnad_finetune_eps if finetune_active else 0.0
+            finetune_n_disc = args.rnad_finetune_ndisc if finetune_active else 0
             with torch.no_grad():
                 policy_steps = sampling_policy.sample_native_batch(
                     parsed_batch,
                     env_indices=ready_env_indices,
                     deterministic=args.deterministic_rollout,
                     finetune_eps=finetune_eps,
+                    finetune_n_disc=finetune_n_disc,
                 )
             log_probs = torch.stack([policy_step.log_prob for policy_step in policy_steps])
             values = torch.stack([policy_step.value for policy_step in policy_steps])
