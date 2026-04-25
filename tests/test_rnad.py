@@ -467,8 +467,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
             optimizer=opt,
             replay_rows=list(range(t_len)),
             perspective_player_idx=[0, 1, 0, 1, 0, 1],
-            own_player_idx=0,
-            terminal_reward_own=1.0,
+            winner_idx=0,
             logp_mu=torch.full((t_len,), -1.0),
             config=RNaDConfig(delta_m=1, num_outer_iterations=1),
             alpha=1.0,
@@ -499,8 +498,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
             optimizer=opt,
             replay_rows=list(range(t_len)),
             perspective_player_idx=[0, 0, 0, 0, 0],  # all own turns
-            own_player_idx=0,
-            terminal_reward_own=1.0,
+            winner_idx=0,
             logp_mu=torch.full((t_len,), -1.0),
             config=RNaDConfig(eta=0.0),  # disable entropy regularization
             alpha=1.0,
@@ -525,8 +523,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
             optimizer=opt,
             replay_rows=list(range(t_len)),
             perspective_player_idx=[0, 1, 0],
-            own_player_idx=0,
-            terminal_reward_own=1.0,
+            winner_idx=0,
             logp_mu=torch.full((t_len,), -1.0),
             config=RNaDConfig(target_ema_gamma=0.5),
             alpha=1.0,
@@ -548,12 +545,39 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
                 optimizer=opt,
                 replay_rows=[0, 1, 2],
                 perspective_player_idx=[0, 1],  # wrong length
-                own_player_idx=0,
-                terminal_reward_own=1.0,
+                winner_idx=0,
                 logp_mu=torch.zeros(3),
                 config=RNaDConfig(),
                 alpha=1.0,
             )
+
+    def test_both_players_receive_critic_signal(self) -> None:
+        """The self-play update must train values on both perspective
+        players, not only the first-step player's side."""
+        t_len = 4
+        online = self._stub(t_len, logp=-1.0, value=0.0)
+        target = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_cur = self._stub(t_len, logp=-1.0, value=0.0)
+        reg_prev = self._stub(t_len, logp=-1.0, value=0.0)
+        opt = torch.optim.SGD(online.parameters(), lr=1.0)
+        before = online.values.detach().clone()
+        rnad_update_trajectory(
+            online=online,
+            target=target,
+            reg_cur=reg_cur,
+            reg_prev=reg_prev,
+            optimizer=opt,
+            replay_rows=list(range(t_len)),
+            perspective_player_idx=[0, 1, 0, 1],
+            winner_idx=0,
+            logp_mu=torch.full((t_len,), -1.0),
+            config=RNaDConfig(eta=0.0),
+            alpha=1.0,
+        )
+        after = online.values.detach()
+        # Every timestep belongs to exactly one player; both-player update
+        # should nudge every entry (none should be untouched).
+        self.assertTrue(torch.all(after != before))
 
 
 if __name__ == "__main__":

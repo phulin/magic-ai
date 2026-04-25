@@ -567,37 +567,39 @@ def rnad_update_trajectory(
     optimizer: torch.optim.Optimizer,
     replay_rows: list[int],
     perspective_player_idx: Sequence[int],
-    own_player_idx: int,
-    terminal_reward_own: float,
+    winner_idx: int,
     logp_mu: Tensor,
     config: RNaDConfig,
     alpha: float,
 ) -> RNaDStats:
     """One R-NaD gradient step on a single trajectory's replay rows.
 
-    The caller is responsible for constructing ``replay_rows`` from a full
-    episode (start..end inclusive) and supplying the behavior-policy
-    log-probs ``logp_mu`` (shape ``(T,)``) that were recorded at rollout
-    time. ``terminal_reward_own`` is the own-perspective scalar (-1, 0, or
-    +1) applied at the last step; earlier steps get zero per-step reward.
+    Trains both players simultaneously (self-play symmetry): the loss is
+    summed over both ``own_player_idx in {0, 1}`` branches so each
+    trajectory contributes to both halves of the policy, matching the
+    paper's self-play formulation.
 
     Pipeline (DeepNash paper §157-191, simplified to sampled-action NeuRD):
 
     1. Forward the trajectory through online, target (no_grad),
        reg_cur (no_grad), reg_prev (no_grad); pull scalar joint log-probs
        and own-side values.
-    2. Apply :func:`transform_rewards` with the target policy's log-prob
-       (the behavior distribution under which the bootstrap lives).
-    3. Run :func:`two_player_vtrace` using the target log-probs + target
-       values as the estimator inputs; produces per-step ``v_hat`` and
-       scalar ``q_hat``.
-    4. Compute :func:`critic_loss` on own-turn steps and
-       :func:`sampled_neurd_loss` using the online log-probs.
-    5. Adam step with ``config.grad_clip``; Polyak update target.
+    2. For each player i in {0, 1}:
+         a. Construct i's terminal reward vector (±1 on winner, 0 on draw,
+            sign-flipped if the final step's perspective-player != i).
+         b. Apply :func:`transform_rewards` using the **online** log-probs
+            (detached) so the entropy-bonus r' - eta * log(pi_theta/pi_reg)
+            matches paper §161, where pi_theta is the learning policy.
+         c. Run :func:`two_player_vtrace` using target log-probs and target
+            values as the bootstrap estimator inputs.
+         d. Accumulate :func:`critic_loss` on i's own-turn steps and
+            :func:`sampled_neurd_loss` using the online log-probs.
+    3. Single backward + Adam step with ``config.grad_clip``; Polyak update
+       target.
 
-    This is the trajectory-scoped update. A full trainer step batches many
-    such calls and averages their stats; that wiring lives in the outer
-    training loop (phase 6).
+    The per-player branches are disjoint in ``is_own`` masks (each step
+    belongs to exactly one player), so summing the two losses covers every
+    timestep exactly once.
     """
 
     if not replay_rows:
@@ -610,9 +612,8 @@ def rnad_update_trajectory(
 
     device = next(iter(online.parameters())).device
     perspective = torch.tensor(perspective_player_idx, dtype=torch.long, device=device)
-    is_own = perspective == own_player_idx
 
-    # --- forwards ---------------------------------------------------------
+    # --- forwards (one set of passes, reused across both player branches) --
     logp_theta, _entropies_online, values_online, _ = online.evaluate_replay_batch(
         list(replay_rows)
     )
@@ -621,46 +622,65 @@ def rnad_update_trajectory(
         logp_reg_cur, _e_rc, _v_rc, _ = reg_cur.evaluate_replay_batch(list(replay_rows))
         logp_reg_prev, _e_rp, _v_rp, _ = reg_prev.evaluate_replay_batch(list(replay_rows))
 
-    logp_mu_dev = logp_mu.to(device=device, dtype=values_online.dtype)
+    dtype = values_online.dtype
+    logp_mu_dev = logp_mu.to(device=device, dtype=dtype)
+    logp_theta_dt = logp_theta.detach().to(dtype=dtype)
+    logp_tgt_dt = logp_tgt.detach().to(dtype=dtype)
+    logp_reg_cur_dt = logp_reg_cur.to(dtype=dtype)
+    logp_reg_prev_dt = logp_reg_prev.to(dtype=dtype)
+    values_tgt_dt = values_tgt.detach().to(dtype=dtype)
 
-    # --- per-step reward: terminal-only on the own perspective -----------
-    rewards = torch.zeros(t_len, dtype=values_online.dtype, device=device)
-    last_sign = 1.0 if bool(is_own[-1].item()) else -1.0
-    rewards[-1] = last_sign * terminal_reward_own
+    total_cl = values_online.new_zeros(())
+    total_pl = values_online.new_zeros(())
+    v_hat_means: list[float] = []
+    transformed_means: list[float] = []
 
-    # --- transform, v-trace, losses --------------------------------------
-    transformed = transform_rewards(
-        rewards,
-        logp_theta=logp_tgt.to(dtype=values_online.dtype),
-        logp_reg_cur=logp_reg_cur.to(dtype=values_online.dtype),
-        logp_reg_prev=logp_reg_prev.to(dtype=values_online.dtype),
-        alpha=alpha,
-        eta=config.eta,
-        perspective_is_player_i=is_own,
-    )
+    for own_idx in (0, 1):
+        is_own = perspective == own_idx
+        # Terminal reward from player ``own_idx``'s POV. The network value
+        # at the last step is from that step's perspective-player POV, so
+        # we sign-flip the reward when the final step isn't ``own_idx``.
+        rewards = torch.zeros(t_len, dtype=dtype, device=device)
+        if winner_idx >= 0:
+            terminal_own_pov = 1.0 if winner_idx == own_idx else -1.0
+            last_perspective_sign = 1.0 if bool(is_own[-1].item()) else -1.0
+            rewards[-1] = last_perspective_sign * terminal_own_pov
 
-    v_out = two_player_vtrace(
-        rewards=transformed.detach(),
-        values=values_tgt.detach().to(dtype=values_online.dtype),
-        logp_theta=logp_tgt.detach().to(dtype=values_online.dtype),
-        logp_mu=logp_mu_dev,
-        perspective_is_player_i=is_own,
-        rho_bar=config.vtrace_rho_bar,
-        c_bar=config.vtrace_c_bar,
-    )
+        transformed = transform_rewards(
+            rewards,
+            logp_theta=logp_theta_dt,
+            logp_reg_cur=logp_reg_cur_dt,
+            logp_reg_prev=logp_reg_prev_dt,
+            alpha=alpha,
+            eta=config.eta,
+            perspective_is_player_i=is_own,
+        )
 
-    cl = critic_loss(
-        v_theta=values_online,
-        v_hat=v_out.v_hat,
-        perspective_is_player_i=is_own,
-    )
-    pl = sampled_neurd_loss(
-        log_prob=logp_theta,
-        q_hat=v_out.q_hat,
-        own_turn_mask=is_own,
-        clip=config.neurd_clip,
-    )
-    loss = cl + pl
+        v_out = two_player_vtrace(
+            rewards=transformed.detach(),
+            values=values_tgt_dt,
+            logp_theta=logp_tgt_dt,
+            logp_mu=logp_mu_dev,
+            perspective_is_player_i=is_own,
+            rho_bar=config.vtrace_rho_bar,
+            c_bar=config.vtrace_c_bar,
+        )
+
+        total_cl = total_cl + critic_loss(
+            v_theta=values_online,
+            v_hat=v_out.v_hat,
+            perspective_is_player_i=is_own,
+        )
+        total_pl = total_pl + sampled_neurd_loss(
+            log_prob=logp_theta,
+            q_hat=v_out.q_hat,
+            own_turn_mask=is_own,
+            clip=config.neurd_clip,
+        )
+        v_hat_means.append(float(v_out.v_hat.detach().mean()))
+        transformed_means.append(float(transformed.detach().mean()))
+
+    loss = total_cl + total_pl
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -673,19 +693,17 @@ def rnad_update_trajectory(
     )
     optimizer.step()
 
-    # Target and online are `nn.Module`s in practice; the Protocol type is for
-    # structural ergonomics on the forward paths.
     assert isinstance(target, nn.Module)
     assert isinstance(online, nn.Module)
     polyak_update_(target, online, gamma=config.target_ema_gamma)
 
     return RNaDStats(
         loss=float(loss.detach()),
-        critic_loss=float(cl.detach()),
-        policy_loss=float(pl.detach()),
-        v_hat_mean=float(v_out.v_hat.mean().detach()),
+        critic_loss=float(total_cl.detach()),
+        policy_loss=float(total_pl.detach()),
+        v_hat_mean=sum(v_hat_means) / len(v_hat_means),
         grad_norm=grad_norm,
-        transformed_reward_mean=float(transformed.mean().detach()),
+        transformed_reward_mean=sum(transformed_means) / len(transformed_means),
     )
 
 

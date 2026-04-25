@@ -256,6 +256,13 @@ def _restore_rnad_state(
 
     No-op when ``checkpoint`` is missing the ``rnad_state`` key (e.g. a PPO
     checkpoint is being used to bootstrap an R-NaD run).
+
+    Honors the serialized ``reg_snapshot_dir``: if it exists and differs
+    from the current configured dir, the reg snapshots are loaded from the
+    saved path (and ``state.reg_snapshot_dir`` is repointed so subsequent
+    outer-iteration snapshots land in the same place). This covers the
+    common case where checkpoints are copied between machines with
+    different ``--output`` paths.
     """
 
     payload = _training_state_dict(checkpoint).get("rnad_state")
@@ -269,9 +276,20 @@ def _restore_rnad_state(
         state.target.eval()
     outer = int(payload.get("outer_iteration", 0))
     grad_step = int(payload.get("gradient_step", 0))
-    # Reg snapshots live on disk; load both the current and previous indices
-    # from their canonical filenames so the smooth-interpolation schedule
-    # continues consistently.
+    finetuning = bool(payload.get("is_finetuning", False))
+
+    saved_dir_raw = payload.get("reg_snapshot_dir")
+    saved_dir = Path(saved_dir_raw) if isinstance(saved_dir_raw, str) and saved_dir_raw else None
+    # Prefer the saved dir when it actually has the reg snapshot we need.
+    if saved_dir is not None and (saved_dir / f"reg_m{outer:03d}.pt").exists():
+        if saved_dir != state.reg_snapshot_dir:
+            print(
+                f"[rnad] resuming from saved reg_snapshot_dir {saved_dir!s} "
+                f"(configured was {state.reg_snapshot_dir!s})",
+                flush=True,
+            )
+            state.reg_snapshot_dir = saved_dir
+
     try:
         from magic_ai.rnad_trainer import resume_from_snapshot_dir
 
@@ -284,6 +302,7 @@ def _restore_rnad_state(
         )
         state.outer_iteration = outer
         state.gradient_step = grad_step
+    state.is_finetuning = finetuning
 
 
 def main() -> None:
@@ -1405,6 +1424,7 @@ def save_checkpoint(
         training_state["rnad_state"] = {
             "outer_iteration": rnad_state.outer_iteration,
             "gradient_step": rnad_state.gradient_step,
+            "is_finetuning": rnad_state.is_finetuning,
             "target": rnad_state.target.state_dict(),
             "reg_snapshot_dir": str(rnad_state.reg_snapshot_dir),
         }

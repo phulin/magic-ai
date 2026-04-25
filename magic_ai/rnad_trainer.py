@@ -66,6 +66,7 @@ class RNaDTrainerState:
     reg_snapshot_dir: Path
     gradient_step: int = 0
     outer_iteration: int = 0
+    is_finetuning: bool = False
     last_stats: list[RNaDStats] = field(default_factory=list)
 
 
@@ -133,7 +134,19 @@ def _alpha_for_step(step_in_m: int, delta_m: int) -> float:
 
 
 def _advance_outer_iteration(state: RNaDTrainerState) -> None:
-    """Perform one fixed-point step: ``reg_prev <- reg_cur``, ``reg_cur <- target``."""
+    """Perform one fixed-point step: ``reg_prev <- reg_cur``, ``reg_cur <- target``.
+
+    Once the configured ``num_outer_iterations`` cap is reached, further
+    calls are no-ops: ``gradient_step`` resets to zero (so ``alpha``
+    restarts the smooth ramp on each subsequent rollout batch) and
+    ``is_finetuning`` is set so the trainer can switch to test-time
+    sampling heuristics.
+    """
+
+    if state.outer_iteration >= state.config.num_outer_iterations:
+        state.is_finetuning = True
+        state.gradient_step = 0
+        return
 
     # Snapshot target before rewiring the regs (target state is what becomes
     # the new reg_cur).
@@ -154,6 +167,8 @@ def _advance_outer_iteration(state: RNaDTrainerState) -> None:
 
     state.outer_iteration = next_iter
     state.gradient_step = 0
+    if state.outer_iteration >= state.config.num_outer_iterations:
+        state.is_finetuning = True
 
 
 def run_rnad_update(
@@ -185,19 +200,12 @@ def run_rnad_update(
         replay_rows: list[int] = []
         perspective: list[int] = []
         logp_mu: list[float] = []
-        own_player_idx = episode.steps[0].perspective_player_idx
         for step in episode.steps:
             if step.replay_idx is None:
                 raise ValueError("R-NaD requires replay_idx on every rollout step")
             replay_rows.append(int(step.replay_idx))
             perspective.append(int(step.perspective_player_idx))
             logp_mu.append(float(step.old_log_prob))
-        if episode.winner_idx < 0:
-            terminal_reward_own = 0.0  # draw: no material payoff under R-NaD
-        elif episode.winner_idx == own_player_idx:
-            terminal_reward_own = 1.0
-        else:
-            terminal_reward_own = -1.0
         alpha = _alpha_for_step(state.gradient_step, state.config.delta_m)
 
         stats = rnad_update_trajectory(
@@ -208,8 +216,7 @@ def run_rnad_update(
             optimizer=optimizer,
             replay_rows=replay_rows,
             perspective_player_idx=perspective,
-            own_player_idx=own_player_idx,
-            terminal_reward_own=terminal_reward_own,
+            winner_idx=int(episode.winner_idx),
             logp_mu=torch.tensor(logp_mu, dtype=torch.float32),
             config=state.config,
             alpha=alpha,

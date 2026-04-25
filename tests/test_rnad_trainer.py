@@ -187,5 +187,83 @@ class CheckpointRoundTripTests(unittest.TestCase):
         )
 
 
+class FinetuneGateTests(unittest.TestCase):
+    def test_cap_triggers_finetuning_mode(self) -> None:
+        policy = _make_policy()
+        with tempfile.TemporaryDirectory() as tmp:
+            state = build_trainer_state(
+                policy,
+                config=RNaDConfig(delta_m=1, num_outer_iterations=2),
+                reg_snapshot_dir=Path(tmp),
+                device=policy.device,
+            )
+            # Advance through the configured iterations.
+            _advance_outer_iteration(state)
+            self.assertFalse(state.is_finetuning)
+            _advance_outer_iteration(state)
+            self.assertTrue(state.is_finetuning)
+            # Further advances stay in finetuning mode and do not create
+            # new snapshot files past the configured cap.
+            _advance_outer_iteration(state)
+            self.assertEqual(state.outer_iteration, 2)
+            self.assertTrue(state.is_finetuning)
+            self.assertFalse((Path(tmp) / "reg_m003.pt").exists())
+
+
+class RegPathRelocationTests(unittest.TestCase):
+    def test_restore_uses_saved_reg_dir_when_configured_path_is_empty(self) -> None:
+        """Checkpoint moved to a new machine: serialized reg_snapshot_dir
+        should take precedence if the configured path has no snapshots."""
+        from argparse import Namespace
+
+        from magic_ai.opponent_pool import OpponentPool
+        from scripts.train_ppo import (
+            _restore_rnad_state,
+            load_training_checkpoint,
+            save_checkpoint,
+        )
+
+        policy = _make_policy()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            saved_dir = tmp / "original" / "rnad"
+            state = build_trainer_state(
+                policy,
+                config=RNaDConfig(delta_m=5),
+                reg_snapshot_dir=saved_dir,
+                device=policy.device,
+            )
+            with torch.no_grad():
+                state.target.value_head.weight.fill_(0.9)
+            _advance_outer_iteration(state)
+            optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+            ckpt_path = tmp / "ckpt.pt"
+            args = Namespace(output=ckpt_path, opponent_pool_dir=tmp / "op")
+            save_checkpoint(
+                ckpt_path,
+                policy,
+                optimizer,
+                args,
+                opponent_pool=OpponentPool(),
+                rnad_state=state,
+            )
+            checkpoint = load_training_checkpoint(ckpt_path)
+
+            # Rebuild with a DIFFERENT (empty) reg dir and verify restore
+            # repoints to the saved dir.
+            fresh_policy = _make_policy()
+            empty_dir = tmp / "moved" / "rnad"
+            fresh = build_trainer_state(
+                fresh_policy,
+                config=RNaDConfig(delta_m=5),
+                reg_snapshot_dir=empty_dir,
+                device=fresh_policy.device,
+            )
+            _restore_rnad_state(fresh, checkpoint)
+            # reg_snapshot_dir should have been repointed to the saved dir.
+            self.assertEqual(fresh.reg_snapshot_dir, saved_dir)
+            self.assertEqual(fresh.outer_iteration, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
