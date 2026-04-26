@@ -32,11 +32,15 @@ class RNaDConfigTests(unittest.TestCase):
     def test_defaults(self) -> None:
         cfg = RNaDConfig()
         self.assertAlmostEqual(cfg.eta, 0.2)
-        self.assertEqual(cfg.delta_m, 25_000)
-        self.assertEqual(cfg.num_outer_iterations, 20)
+        self.assertEqual(cfg.delta_m, 1_000)
+        self.assertEqual(cfg.num_outer_iterations, 50)
         self.assertAlmostEqual(cfg.neurd_beta, 2.0)
         self.assertGreater(cfg.target_ema_gamma, 0.0)
         self.assertLess(cfg.target_ema_gamma, 1.0)
+        # Polyak target-tracking sanity (paper §191): ``delta_m * target_ema``
+        # must be large enough that target meaningfully tracks online inside
+        # one outer iter. See the warning in scripts/train.py.
+        self.assertGreaterEqual(cfg.delta_m * cfg.target_ema_gamma, 0.5)
 
 
 class TransformRewardsTests(unittest.TestCase):
@@ -125,7 +129,10 @@ def _reference_vtrace(
         rho_t = min(rho_bar, float(ratio[t]) * xi_next)
         c_t = min(c_bar, float(ratio[t]) * xi_next)
         if bool(is_own[t]):
-            delta = rho_t * (float(rewards[t]) + r_acc + v_next_own - float(values[t]))
+            # Paper §177: the (π/μ)_t factor on r̂_{t+1} is the unclipped
+            # own-turn importance ratio.
+            pi_mu_t = float(ratio[t])
+            delta = rho_t * (float(rewards[t]) + pi_mu_t * r_acc + v_next_own - float(values[t]))
             v_hat_t = float(values[t]) + delta + c_t * (v_next - v_next_own)
             v_hat[t] = v_hat_t
             r_acc = 0.0

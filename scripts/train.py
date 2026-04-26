@@ -508,14 +508,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rnad-delta-m",
         type=int,
-        default=25_000,
-        help="R-NaD gradient steps per outer iteration",
+        default=1_000,
+        help="R-NaD gradient steps per outer iteration. Paper §199 uses "
+        "10k-100k on 768 TPU learners; this default is scaled for "
+        "single-GPU rollout-batch cadence. Scale up proportionally with "
+        "rollout-batch size if you have more compute.",
     )
     parser.add_argument(
         "--rnad-m",
         type=int,
-        default=20,
-        help="R-NaD number of outer fixed-point iterations",
+        default=50,
+        help="R-NaD number of outer fixed-point iterations (paper: ~200)",
     )
     parser.add_argument(
         "--rnad-neurd-beta",
@@ -532,8 +535,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rnad-target-ema",
         type=float,
-        default=0.001,
-        help="R-NaD target-network Polyak averaging rate",
+        default=0.005,
+        help="R-NaD target-network Polyak averaging rate. Paired with the "
+        "scaled --rnad-delta-m default so target tracks online inside one "
+        "outer iter (delta_m * target_ema ~= 5). Paper uses 1e-3 with "
+        "delta_m=10k-100k.",
     )
     parser.add_argument(
         "--rnad-finetune-eps",
@@ -715,6 +721,25 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--rnad-finetune-eps must be in [0, 1)")
         if args.rnad_finetune_ndisc < 1:
             raise ValueError("--rnad-finetune-ndisc must be at least 1")
+        # Polyak target-tracking sanity: target needs to actually move
+        # toward online inside one outer iteration, otherwise reg snapshots
+        # are pinned to the initial random network forever and the R-NaD
+        # outer-loop convergence guarantee (paper §38) does not apply.
+        # ``delta_m * target_ema`` is the integrated tracking strength per
+        # outer iter; below ~0.5, the EMA half-life exceeds the outer
+        # iteration length and ``rnad_m`` will stay at 0 in practice.
+        track = args.rnad_delta_m * args.rnad_target_ema
+        if track < 0.5:
+            print(
+                f"warning: --rnad-delta-m ({args.rnad_delta_m}) * "
+                f"--rnad-target-ema ({args.rnad_target_ema}) = {track:.3f} "
+                "< 0.5: target network will not meaningfully track online "
+                "within one outer iteration, so reg snapshots stay pinned "
+                "near the initial random policy. Either increase "
+                "--rnad-target-ema or --rnad-delta-m. Paper uses "
+                "delta_m * target_ema ~= 10-100 (delta_m=10k-100k, ema=1e-3).",
+                flush=True,
+            )
 
 
 def log_ppo_stats(
@@ -808,6 +833,7 @@ def train_native_batched_envs(
                 target_ema_gamma=args.rnad_target_ema,
                 finetune_eps=args.rnad_finetune_eps,
                 finetune_n_disc=args.rnad_finetune_ndisc,
+                learning_rate=args.learning_rate,
             ),
             reg_snapshot_dir=args.output.parent / "rnad",
             device=policy.device,

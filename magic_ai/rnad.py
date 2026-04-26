@@ -43,10 +43,13 @@ class RNaDConfig:
     eta: float = 0.2
     """Regularization strength for the reward transform (paper: 0.2)."""
 
-    delta_m: int = 25_000
-    """Gradient steps per outer iteration (paper: 10k-100k)."""
+    delta_m: int = 1_000
+    """Gradient steps per outer iteration. Paper §199 uses 10k-100k on 768
+    TPU learners; this default is scaled for a single-GPU rollout-batch
+    cadence so the outer fixed-point iteration actually advances within a
+    typical run. Increase proportionally with rollout-batch size."""
 
-    num_outer_iterations: int = 20
+    num_outer_iterations: int = 50
     """Number of fixed-point outer iterations ``m`` (paper: ~200)."""
 
     vtrace_rho_bar: float = 1.0
@@ -64,14 +67,25 @@ class RNaDConfig:
     grad_clip: float = 10_000.0
     """Global grad-norm clip applied before the optimizer step."""
 
-    target_ema_gamma: float = 0.001
-    """Polyak averaging rate for the target network (paper: 1e-3)."""
+    target_ema_gamma: float = 0.005
+    """Polyak averaging rate for the target network. Paper §199 uses 1e-3
+    paired with delta_m=10k-100k (i.e. ``delta_m · γ ≈ 10-100`` so the
+    target tracks online many times over inside one outer iter); this
+    default is scaled to match the smaller :attr:`delta_m` above so the
+    target meaningfully tracks online within one outer iteration on
+    single-GPU compute."""
 
     finetune_eps: float = 0.03
     """Probability threshold for fine-tune / test-time discretization."""
 
     finetune_n_disc: int = 16
     """Number of probability quanta for fine-tune / test-time discretization."""
+
+    learning_rate: float = 5e-5
+    """Optimizer learning rate (paper §199: 5e-5). Used by the NeuRD
+    gradient gate (paper §189) to evaluate the post-update logit predicate
+    ``|logit + lr · Clip(Q, c)| <= beta`` rather than the looser
+    current-logit predicate ``|logit| <= beta``."""
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +160,21 @@ class VTraceOutput:
     against a Python-reference implementation.
     """
 
+    r_hat_next: Tensor
+    """Propagated opp-turn reward tail :math:`\\hat r^i_{t+1}` per own-turn
+    step, broadcast to shape ``(T,)`` (zero on opp-turn steps).
+
+    Required by the paper's per-action Q estimator (§179-180): the sampled
+    correction includes :math:`(\\pi/\\mu)_t \\cdot (\\hat r^i_{t+1} +
+    \\hat v^i_{t+1})`, where :math:`\\hat r^i_{t+1}` is the v-trace
+    accumulator over the opp-turn rewards starting at the next step.
+    """
+
+    v_hat_next: Tensor
+    """V-trace target at the next own-turn step :math:`\\hat v^i_{t+1}` per
+    own-turn step, broadcast to shape ``(T,)`` (zero on opp-turn steps and
+    on the final own-turn step). Required by paper §179-180."""
+
 
 def two_player_vtrace(
     *,
@@ -196,6 +225,8 @@ def two_player_vtrace(
 
     v_hat = torch.zeros(T, dtype=dtype, device=device)
     q_hat = torch.zeros(T, dtype=dtype, device=device)
+    r_hat_next_step = torch.zeros(T, dtype=dtype, device=device)
+    v_hat_next_step = torch.zeros(T, dtype=dtype, device=device)
 
     # Vectorized backward pass (paper §170-182, algebraically rewritten).
     #
@@ -212,7 +243,12 @@ def two_player_vtrace(
     if K == 0:
         # No own-turn steps in this trajectory: both outputs stay zero
         # (the original recursion's sentinels never bootstrap).
-        return VTraceOutput(v_hat=v_hat, q_hat=q_hat)
+        return VTraceOutput(
+            v_hat=v_hat,
+            q_hat=q_hat,
+            r_hat_next=r_hat_next_step,
+            v_hat_next=v_hat_next_step,
+        )
 
     # Per-step segmentation: ``seg[t]`` = index of the most recent own-turn
     # at or before t (= k when t == own_idx[k]; = k when t is opp-turn in
@@ -259,10 +295,17 @@ def two_player_vtrace(
 
     # Per-own-turn pre-c quantity: this is also ``q_hat_sampled`` for the
     # paper's per-action Q form used by the full-NeuRD trainer.
+    #
+    # Paper §177:
+    #   δV = ρ_t · (r^i_t + (π/μ)_t · r̂^i_{t+1} + V_next - v(o_t))
+    # The (π/μ)_t prefactor on the opp-tail accumulator r̂_{t+1} is the
+    # *unclipped* own-turn importance ratio. ``ratio_own`` already holds
+    # this scalar (clipped variants are computed below as ``rho``/``c``);
+    # multiply r_acc by it before the ρ-clip on the bracket as a whole.
     values_own = values[own_idx]
     rewards_own = rewards[own_idx]
     v_next_own_vec = torch.cat([values_own[1:], values_own.new_zeros(1)])
-    pre_c = values_own + rho * (rewards_own + r_acc + v_next_own_vec - values_own)
+    pre_c = values_own + rho * (rewards_own + ratio_own * r_acc + v_next_own_vec - values_own)
 
     # Own-turn linear recurrence:
     #   v_hat_own[k] = A[k] + B[k] * v_hat_own[k+1],  v_hat_own[K] = 0
@@ -278,6 +321,11 @@ def two_player_vtrace(
     # next own-turn (or zero if none follows).
     v_hat.index_copy_(0, own_idx, v_hat_own)
     q_hat.index_copy_(0, own_idx, pre_c)
+    # Per-own-turn r̂_{t+1} (= r_acc[k]) and v̂_{t+1} (= v_hat_own[k+1] | 0),
+    # required by the paper's per-action Q estimator (§179-180).
+    v_hat_next_own = torch.cat([v_hat_own[1:], v_hat_own.new_zeros(1)])
+    r_hat_next_step.index_copy_(0, own_idx, r_acc)
+    v_hat_next_step.index_copy_(0, own_idx, v_hat_next_own)
 
     next_k = seg + 1
     valid_next = next_k < K
@@ -287,7 +335,12 @@ def two_player_vtrace(
     v_hat = torch.where(opp_mask, opp_v, v_hat)
     q_hat = torch.where(opp_mask, opp_v, q_hat)
 
-    return VTraceOutput(v_hat=v_hat, q_hat=q_hat)
+    return VTraceOutput(
+        v_hat=v_hat,
+        q_hat=q_hat,
+        r_hat_next=r_hat_next_step,
+        v_hat_next=v_hat_next_step,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +355,7 @@ def neurd_loss(
     legal_mask: Tensor,
     beta: float,
     clip: float,
+    lr: float = 0.0,
 ) -> Tensor:
     """NeuRD policy loss with the paper's logit-magnitude gate (§188).
 
@@ -333,7 +387,13 @@ def neurd_loss(
 
     q_clipped = q_hat.clamp(-clip, clip).detach()
     with torch.no_grad():
-        in_range = (logits >= -beta) & (logits <= beta)
+        # Paper §189: gate on the post-update logit value. The NeuRD gradient
+        # on logit_a is Clip(Q, c), so the post-update logit is approximately
+        # ``logit + lr · Clip(Q, c)``. Gating on this anticipates the step
+        # and zeroes the gradient before the logit exits ``[-beta, beta]``.
+        # With lr=0.0 (default) this reduces to the current-logit predicate.
+        post_update = logits + lr * q_clipped
+        in_range = (post_update >= -beta) & (post_update <= beta)
         active = legal_mask & in_range
     # Loss = -sum_{t,a in active} logits * Q. Negative because Adam minimizes
     # and we want d logits proportional to +Q * grad_flag_in_range.
@@ -355,6 +415,7 @@ def neurd_loss_per_choice(
     num_groups: int,
     beta: float,
     clip: float,
+    lr: float = 0.0,
 ) -> Tensor:
     """NeuRD loss over a flattened, ragged set of per-choice logits.
 
@@ -376,7 +437,9 @@ def neurd_loss_per_choice(
         raise ValueError("num_groups must be >= 1")
     q_clipped = flat_q.clamp(-clip, clip).detach()
     with torch.no_grad():
-        in_range = (flat_logits >= -beta) & (flat_logits <= beta)
+        # Paper §189 post-update logit predicate; see :func:`neurd_loss`.
+        post_update = flat_logits + lr * q_clipped
+        in_range = (post_update >= -beta) & (post_update <= beta)
     per_entry = -flat_logits * q_clipped * in_range.to(dtype=flat_logits.dtype)
     return per_entry.sum() / max(num_groups, 1)
 
@@ -532,6 +595,7 @@ def may_neurd_loss(
     own_turn_may_mask: Tensor,
     beta: float,
     clip: float,
+    lr: float = 0.0,
 ) -> Tensor:
     """β-gated NeuRD loss for the Bernoulli ``may`` head.
 
@@ -556,7 +620,11 @@ def may_neurd_loss(
     advantage = may_selected.to(dtype=may_logits.dtype) - prob_accept
     q_clipped = q_hat.clamp(-clip, clip).detach()
     with torch.no_grad():
-        in_range = may_logits.abs() <= beta
+        # Paper §189 post-update logit predicate. The Bernoulli NeuRD
+        # gradient on may_logits is ``advantage · Clip(Q, c)``; gate on the
+        # post-update logit ``logit + lr · advantage · Clip(Q, c)``.
+        post_update = may_logits + lr * advantage * q_clipped
+        in_range = post_update.abs() <= beta
     per_step = -advantage * q_clipped * in_range.to(dtype=may_logits.dtype)
     return per_step[mask].mean()
 
@@ -1017,25 +1085,45 @@ def rnad_trajectory_loss_full_neurd(
                 own_turn_may_mask=may_and_own,
                 beta=config.neurd_beta,
                 clip=config.neurd_clip,
+                lr=config.learning_rate,
             )
 
         if pc_online.flat_logits.numel() > 0:
-            # Per-choice Q from paper §179-180 (own-turn steps only):
-            #   Q(a) = v_tgt(o_t) - eta * log_ratio[a]
-            #        + 1[a=a_sampled] * (q_hat_sampled - v_tgt(o_t)
-            #                            + eta * log_ratio[a_sampled])
-            # Non-own-turn steps contribute zero gradient: they are zeroed
-            # after the gather so the β-gate still sees paper-form Q.
+            # Per-action Q from paper §179-180 (own-turn steps only):
+            #   Q(a) = -eta * log_ratio[a]
+            #        + 1[a=a_t] * (1/mu_t) * (
+            #              r_t + eta * log_ratio[a_t]
+            #            + (pi/mu)_t * (r̂_{t+1} + v̂_{t+1})
+            #            - v(o_t)
+            #          )
+            #        + v(o_t)
+            # The bracketed quantity uses raw (un-transformed) reward r_t,
+            # the unclipped own-turn ratio (pi/mu)_t = exp(lp_tgt - lp_mu),
+            # and the v-trace bootstrap r̂_{t+1} / v̂_{t+1} returned per
+            # step by two_player_vtrace. The leading 1/mu_t is the importance
+            # correction that converts the sampled-action contribution from
+            # mu's expectation to pi's expectation.
             step_is_own = is_own[pc_online.group_idx]
             v_per_choice = v_tgt_dt[pc_online.group_idx]
-            base_q = v_per_choice - config.eta * log_ratio_flat
-            sampled_correction = (
-                v_out.q_hat[pc_online.group_idx]
-                - v_per_choice
-                + config.eta * per_step_log_ratio_sampled[pc_online.group_idx]
+            base_q_flat = -config.eta * log_ratio_flat
+            inv_mu = (-logp_mu_dev).exp()
+            ratio_own_per_step = (lp_tgt_scalar - logp_mu_dev).exp()
+            sampled_inner = (
+                rewards
+                + config.eta * per_step_log_ratio_sampled
+                + ratio_own_per_step * (v_out.r_hat_next + v_out.v_hat_next)
+                - v_tgt_dt
             )
-            flat_q = base_q + torch.where(
-                is_sampled_flat, sampled_correction, torch.zeros_like(sampled_correction)
+            sampled_correction_per_step = inv_mu * sampled_inner
+            sampled_correction_flat = sampled_correction_per_step[pc_online.group_idx]
+            flat_q = (
+                base_q_flat
+                + torch.where(
+                    is_sampled_flat,
+                    sampled_correction_flat,
+                    torch.zeros_like(sampled_correction_flat),
+                )
+                + v_per_choice
             )
             flat_q = torch.where(step_is_own, flat_q, torch.zeros_like(flat_q))
             total_pl = total_pl + neurd_loss_per_choice(
@@ -1045,6 +1133,7 @@ def rnad_trajectory_loss_full_neurd(
                 num_groups=t_len,
                 beta=config.neurd_beta,
                 clip=config.neurd_clip,
+                lr=config.learning_rate,
             )
 
         v_hat_means.append(float(v_out.v_hat.detach().mean()))
