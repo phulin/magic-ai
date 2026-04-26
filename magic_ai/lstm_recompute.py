@@ -162,72 +162,86 @@ def _slice_history(
 
 def lstm_recompute_per_step_h_out(
     lstm: nn.LSTM,
-    projected: Tensor,
-    lengths: Sequence[int],
+    proj_per_episode: Sequence[Tensor],
     *,
     chunk_size: int = 200,
     compiled_lstm: Callable[..., Any] | None = None,
 ) -> list[Tensor]:
     """Chunked-BPTT fused cuDNN recompute returning per-step top-layer h_out.
 
+    Takes a list of per-episode projected feature tensors of shape
+    ``(T_i, hidden)`` -- already in the LSTM's input space, no padding.
+    Returns a list of ``(T_i, hidden)`` top-layer hidden outputs.
+
     Implements the DeepNash R-NaD recipe (arxiv 2206.15378 §"Full games
-    learning"): pad to ``T_max``, chop along the time axis into chunks of
-    ``chunk_size`` steps, and process chunk-by-chunk. Within each chunk the
-    LSTM runs as one fused cuDNN call (full BPTT inside the chunk); the
-    state crossing each chunk boundary is detached so gradients do not
-    flow across boundaries. Pass-(a)/pass-(b) are merged here -- if the
-    caller is in ``torch.no_grad`` mode the whole thing is forward-only;
-    otherwise gradients are captured within each chunk.
+    learning"): chop along the time axis into chunks of ``chunk_size``
+    steps, and process chunk-by-chunk. Within each chunk the LSTM runs as
+    one fused cuDNN call (full BPTT inside the chunk); the state crossing
+    each chunk boundary is detached so gradients do not flow across
+    boundaries.
+
+    Each chunk is fed to ``nn.LSTM`` as a :class:`PackedSequence` built
+    from the active episodes' chunk slices, so cuDNN never does work on
+    padding and we never materialize a ``(T_max, N, hidden)`` padded
+    tensor. Pass-(a)/pass-(b) are merged here -- if the caller is in
+    ``torch.no_grad`` mode the whole thing is forward-only; otherwise
+    gradients are captured within each chunk.
 
     Default ``chunk_size=200`` matches the production
     ``--max-steps-per-game=200`` cap, so by default the whole trajectory
     is one chunk (full BPTT through the fused call). Smaller values cap
     activation memory at the cost of truncating gradient flow.
 
-    ``projected``: ``(T_max, N, hidden)``. Returns a list of ``(T_i, hidden)``
-    tensors -- the top-layer hidden output at each step.
-
     ``compiled_lstm`` (optional): a ``torch.compile``'d wrapper around the
     LSTM forward. Falls back to the un-compiled module when ``None``.
     """
 
-    if not lengths:
-        raise ValueError("lengths must be non-empty")
-    if any(t <= 0 for t in lengths):
-        raise ValueError("each length must be >= 1")
+    if not proj_per_episode:
+        raise ValueError("proj_per_episode must be non-empty")
+    if any(t.dim() != 2 for t in proj_per_episode):
+        raise ValueError("each per-episode projection must be (T_i, hidden)")
+    if any(t.shape[0] == 0 for t in proj_per_episode):
+        raise ValueError("each episode must have at least one step")
     if chunk_size < 1:
         raise ValueError(f"chunk_size must be >= 1 (got {chunk_size})")
-    t_max, n, h = projected.shape
-    if n != len(lengths):
-        raise ValueError(f"projected dim 1 ({n}) must match len(lengths) ({len(lengths)})")
-    if t_max < max(lengths):
-        raise ValueError(f"projected dim 0 ({t_max}) must be >= max(lengths) ({max(lengths)})")
-    if h != lstm.hidden_size:
-        raise ValueError(f"projected dim 2 ({h}) must equal lstm.hidden_size ({lstm.hidden_size})")
+    n = len(proj_per_episode)
+    hidden = int(lstm.hidden_size)
+    if any(int(t.shape[1]) != hidden for t in proj_per_episode):
+        raise ValueError(f"each per-episode projection must have hidden dim {hidden}")
 
-    # nn.LSTM with batch_first=True wants (N, T, hidden). cuDNN fuses the
-    # T loop internally -- one launch per chunk instead of T_chunk launches.
-    inputs = projected.transpose(0, 1).contiguous()
-    h_state = torch.zeros(
-        lstm.num_layers, n, lstm.hidden_size, dtype=projected.dtype, device=projected.device
-    )
-    c_state = torch.zeros_like(h_state)
+    device = proj_per_episode[0].device
+    dtype = proj_per_episode[0].dtype
+    lengths = [int(t.shape[0]) for t in proj_per_episode]
+    t_max = max(lengths)
+
     runner = compiled_lstm if compiled_lstm is not None else lstm
-    chunk_outputs: list[Tensor] = []
-    for start in range(0, t_max, chunk_size):
-        stop = min(start + chunk_size, t_max)
-        chunk_in = inputs[:, start:stop, :].contiguous()
-        chunk_out, (h_state, c_state) = runner(chunk_in, (h_state, c_state))
-        chunk_outputs.append(chunk_out)
+    h_state = torch.zeros(lstm.num_layers, n, hidden, dtype=dtype, device=device)
+    c_state = torch.zeros_like(h_state)
+    chunks_per_ep: list[list[Tensor]] = [[] for _ in range(n)]
+
+    for chunk_start in range(0, t_max, chunk_size):
+        chunk_stop = chunk_start + chunk_size
+        active_idx = [i for i, t_i in enumerate(lengths) if t_i > chunk_start]
+        if not active_idx:
+            break
+        chunk_seqs = [
+            proj_per_episode[i][chunk_start : min(chunk_stop, lengths[i])] for i in active_idx
+        ]
+        active_idx_t = torch.tensor(active_idx, dtype=torch.long, device=device)
+        h_in = h_state.index_select(1, active_idx_t).contiguous()
+        c_in = c_state.index_select(1, active_idx_t).contiguous()
+        packed = nn.utils.rnn.pack_sequence(chunk_seqs, enforce_sorted=False)
+        out_packed, (h_out, c_out) = runner(packed, (h_in, c_in))
         # Detach state crossing the chunk boundary so the next chunk's
         # backward stops here. Within a chunk, BPTT is full.
-        h_state = h_state.detach()
-        c_state = c_state.detach()
-    outputs = chunk_outputs[0] if len(chunk_outputs) == 1 else torch.cat(chunk_outputs, dim=1)
-    out: list[Tensor] = []
-    for i, t_i in enumerate(lengths):
-        out.append(outputs[i, :t_i, :].contiguous())
-    return out
+        h_state.index_copy_(1, active_idx_t, h_out.detach())
+        c_state.index_copy_(1, active_idx_t, c_out.detach())
+        padded, chunk_lengths = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True)
+        for i_local, ep_idx in enumerate(active_idx):
+            t_chunk = int(chunk_lengths[i_local])
+            chunks_per_ep[ep_idx].append(padded[i_local, :t_chunk])
+
+    return [parts[0] if len(parts) == 1 else torch.cat(parts, dim=0) for parts in chunks_per_ep]
 
 
 @torch.no_grad()

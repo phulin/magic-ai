@@ -1248,16 +1248,14 @@ class PPOPolicy(nn.Module):
         inputs, _stale_lstm_state = self._gather_from_rollout(step_indices)
         features_flat, _option_vectors, _target_vectors = self._embed_forward_inputs(inputs)
         proj_flat = self.feature_projection(features_flat).to(dtype=dtype)
-        n = len(episodes)
         lengths = [len(ep) for ep in episodes]
-        t_max = max(lengths)
-        projected = torch.zeros(t_max, n, self.hidden_dim, dtype=dtype, device=device)
+        proj_per_episode: list[Tensor] = []
         offset = 0
-        for i, t_i in enumerate(lengths):
-            projected[:t_i, i] = proj_flat[offset : offset + t_i]
+        for t_i in lengths:
+            proj_per_episode.append(proj_flat[offset : offset + t_i])
             offset += t_i
         return lstm_recompute_per_step_h_out(
-            self.lstm, projected, lengths, chunk_size=chunk_size, compiled_lstm=compiled_lstm
+            self.lstm, proj_per_episode, chunk_size=chunk_size, compiled_lstm=compiled_lstm
         )
 
     def evaluate_replay_batch_per_choice(

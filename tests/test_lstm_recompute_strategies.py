@@ -67,6 +67,11 @@ def _make_workload(
     return projected, lengths
 
 
+def _per_episode(projected: torch.Tensor, lengths: list[int]) -> list[torch.Tensor]:
+    """Slice a ``(T_max, N, hidden)`` workload into per-episode tensors."""
+    return [projected[: lengths[i], i, :].contiguous() for i in range(len(lengths))]
+
+
 class LstmRecomputeStrategiesCorrectness(unittest.TestCase):
     """All strategies must agree with the legacy per-episode reference."""
 
@@ -158,14 +163,15 @@ class LstmRecomputeChunkedBptt(unittest.TestCase):
             device=device,
         )
         # Reference: chunk_size = T_max (single chunk, full BPTT).
-        ref = lstm_recompute_per_step_h_out(lstm, projected, lengths, chunk_size=max(lengths))
+        per_ep = _per_episode(projected, lengths)
+        ref = lstm_recompute_per_step_h_out(lstm, per_ep, chunk_size=max(lengths))
         # All other chunk sizes -- including ones that don't evenly divide
         # T_max -- must produce identical forward output. Gradient flow is
         # truncated at chunk boundaries, but the forward computation is
         # exact.
         for chunk_size in (1, 2, 3, 7, 10, 19, 100):
             with self.subTest(chunk_size=chunk_size):
-                got = lstm_recompute_per_step_h_out(lstm, projected, lengths, chunk_size=chunk_size)
+                got = lstm_recompute_per_step_h_out(lstm, per_ep, chunk_size=chunk_size)
                 for g, r in zip(got, ref, strict=True):
                     torch.testing.assert_close(g, r, rtol=1e-5, atol=1e-6)
 
@@ -188,11 +194,13 @@ class LstmRecomputeChunkedBptt(unittest.TestCase):
         )
         projected = projected.detach().requires_grad_(False)
 
+        per_ep = _per_episode(projected, lengths)
+
         def grad_norm(chunk_size: int) -> float:
             for p in lstm.parameters():
                 if p.grad is not None:
                     p.grad = None
-            outputs = lstm_recompute_per_step_h_out(lstm, projected, lengths, chunk_size=chunk_size)
+            outputs = lstm_recompute_per_step_h_out(lstm, per_ep, chunk_size=chunk_size)
             # Take the loss only at the LAST step of each episode -- this is
             # where chunk-1 truncation differs most from full BPTT.
             loss = sum(out[-1].sum() for out in outputs)
@@ -290,18 +298,19 @@ class LstmRecomputeStrategiesBenchmark(unittest.TestCase):
                 )
                 outs.append(h_post[-1, 0, :])  # top layer
             h_out_ref.append(torch.stack(outs, dim=0))
-        h_out_fused = lstm_recompute_per_step_h_out(lstm, projected, lengths)
+        per_ep = _per_episode(projected, lengths)
+        h_out_fused = lstm_recompute_per_step_h_out(lstm, per_ep)
         for got, want in zip(h_out_fused, h_out_ref, strict=True):
             torch.testing.assert_close(got, want, rtol=1e-2, atol=1e-3)
 
         # Bench the fused path uncompiled (cross-episode batched).
         with torch.no_grad():
             for _ in range(warmup):
-                lstm_recompute_per_step_h_out(lstm, projected, lengths)
+                lstm_recompute_per_step_h_out(lstm, per_ep)
             _sync()
             t0 = time.perf_counter()
             for _ in range(n_iters):
-                lstm_recompute_per_step_h_out(lstm, projected, lengths)
+                lstm_recompute_per_step_h_out(lstm, per_ep)
             _sync()
             results["fused"] = (time.perf_counter() - t0) / n_iters
 
@@ -311,17 +320,14 @@ class LstmRecomputeStrategiesBenchmark(unittest.TestCase):
         # single fused call cover the whole rollout batch; this row shows
         # what we recover by doing that.
         with torch.no_grad():
-            per_episode_projected = [
-                projected[: lengths[i], i : i + 1, :] for i in range(n_episodes)
-            ]
             for _ in range(warmup):
                 for i in range(n_episodes):
-                    lstm_recompute_per_step_h_out(lstm, per_episode_projected[i], [lengths[i]])
+                    lstm_recompute_per_step_h_out(lstm, [per_ep[i]])
             _sync()
             t0 = time.perf_counter()
             for _ in range(n_iters):
                 for i in range(n_episodes):
-                    lstm_recompute_per_step_h_out(lstm, per_episode_projected[i], [lengths[i]])
+                    lstm_recompute_per_step_h_out(lstm, [per_ep[i]])
             _sync()
             results["fused_per_episode"] = (time.perf_counter() - t0) / n_iters
 
@@ -332,15 +338,11 @@ class LstmRecomputeStrategiesBenchmark(unittest.TestCase):
                 compiled_lstm = torch.compile(lstm, dynamic=False, mode="reduce-overhead")
                 with torch.no_grad():
                     for _ in range(warmup + 2):  # extra warmup for compile
-                        lstm_recompute_per_step_h_out(
-                            lstm, projected, lengths, compiled_lstm=compiled_lstm
-                        )
+                        lstm_recompute_per_step_h_out(lstm, per_ep, compiled_lstm=compiled_lstm)
                     _sync()
                     t0 = time.perf_counter()
                     for _ in range(n_iters):
-                        lstm_recompute_per_step_h_out(
-                            lstm, projected, lengths, compiled_lstm=compiled_lstm
-                        )
+                        lstm_recompute_per_step_h_out(lstm, per_ep, compiled_lstm=compiled_lstm)
                     _sync()
                     results["fused_compiled"] = (time.perf_counter() - t0) / n_iters
             except Exception as exc:  # pragma: no cover - compile env-dependent
