@@ -1326,15 +1326,18 @@ def take_snapshot_and_eval(
         seed_base=seed_base,
         rng=rng,
     )
-    current_rating = current_entry.rating
     for opponent in unique_opponents:
         games = int(metrics.get(f"eval/opp_{opponent.tag}_games", 0.0))
         main_win = metrics.get(f"eval/opp_{opponent.tag}_main_win_fraction", 0.0)
+        opponent_mu = metrics.get(f"eval/opp_{opponent.tag}_rating_mu", opponent.rating.mu)
+        opponent_sigma = metrics.get(
+            f"eval/opp_{opponent.tag}_rating_sigma",
+            opponent.rating.sigma,
+        )
         print(
             f"eval: snapshot_tag={tag} opponent={opponent.tag} "
             f"games={games} main_win={main_win:.2f} "
-            f"current_rating=mu={current_rating.mu:.2f},"
-            f"sigma={current_rating.sigma:.2f}",
+            f"rating=mu={opponent_mu:.2f},sigma={opponent_sigma:.2f}",
             flush=True,
         )
 
