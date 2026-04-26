@@ -283,8 +283,9 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(pool.entries[0].tag, "g000100_p010.0")
         self.assertEqual(pool.entries[1].tag, "g000200_p020.0")
         self.assertEqual(pool.entries[0].rating.mu, 31.0)
-        # New snapshot seeds from the previous entry's rating.
-        self.assertEqual(pool.entries[1].rating.mu, 31.0)
+        # New snapshot seeds from the previous entry's mean, but not confidence.
+        self.assertAlmostEqual(pool.entries[1].rating.mu, 31.0)
+        self.assertAlmostEqual(pool.entries[1].rating.sigma, 25.0 / 3.0)
 
     def test_validate_args_requires_no_validate_for_torch_compile(self) -> None:
         args = Namespace(
