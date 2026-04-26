@@ -1214,7 +1214,6 @@ class PPOPolicy(nn.Module):
             offset += t_i
         return lstm_recompute_per_step_states(self.lstm, projected, lengths, strategy=strategy)
 
-    @torch.no_grad()
     def recompute_lstm_outputs_for_episodes(
         self,
         episodes: list[list[int]],
@@ -1227,8 +1226,12 @@ class PPOPolicy(nn.Module):
         ``(T_i, hidden)`` tensors -- the top-layer LSTM hidden output at each
         replay step -- produced by a single fused ``nn.LSTM`` call. The
         consumer should pass each per-episode tensor as
-        ``hidden_override`` to :meth:`evaluate_replay_batch_per_choice`,
+        ``hidden_override`` to :meth:`evaluate_replay_batch_per_choice``,
         which skips the per-step LSTM cell.
+
+        Not ``@torch.no_grad`` -- gradient flows through the LSTM (full BPTT
+        for the online policy). Callers that don't need gradients (target /
+        regularizer policies) should wrap in ``torch.no_grad()`` themselves.
         """
 
         if not self.use_lstm:

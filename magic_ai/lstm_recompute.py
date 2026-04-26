@@ -160,7 +160,6 @@ def _slice_history(
     return out
 
 
-@torch.no_grad()
 def lstm_recompute_per_step_h_out(
     lstm: nn.LSTM,
     projected: Tensor,
@@ -174,6 +173,11 @@ def lstm_recompute_per_step_h_out(
     tensors -- the top-layer hidden output at each step. Consumer takes
     ``h_out[t]`` directly into the action heads, skipping the per-step LSTM
     cell that the per-step ``(h_in, c_in)`` interface required.
+
+    Not ``@torch.no_grad`` -- the trainer needs gradient flow through this
+    call for the *online* policy (full BPTT through the fused cuDNN
+    backward). Wrap target / regularizer calls in ``torch.no_grad()`` at
+    the call site.
 
     ``compiled_lstm`` (optional): a ``torch.compile``'d wrapper around the
     LSTM forward. Falls back to the un-compiled module when ``None``.

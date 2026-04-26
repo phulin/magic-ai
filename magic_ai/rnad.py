@@ -778,6 +778,25 @@ def _maybe_recompute_lstm(policy: Any, replay_rows: list[int]) -> tuple[Tensor, 
     return fn(list(replay_rows))
 
 
+def _maybe_recompute_lstm_h_out(policy: Any, replay_rows: list[int]) -> Tensor | None:
+    """Fused-recompute variant: returns top-layer ``h_out`` per replay step.
+
+    Returns ``None`` when the policy has no LSTM or no
+    :meth:`PPOPolicy.recompute_lstm_outputs_for_episodes` method. Caller
+    is responsible for wrapping in ``torch.no_grad()`` for non-online
+    policies (target / reg_cur / reg_prev) -- the helper itself runs
+    under whatever grad mode the caller is in.
+    """
+
+    fn = getattr(policy, "recompute_lstm_outputs_for_episodes", None)
+    if fn is None:
+        return None
+    result = fn([list(replay_rows)])
+    if result is None:
+        return None
+    return result[0]
+
+
 def _sampled_may_log_prob(pc: Any) -> Tensor:
     """Per-step Bernoulli log-prob of the sampled may decision under ``pc``.
 
@@ -883,29 +902,61 @@ def rnad_trajectory_loss(
     reg_cur_per_choice = getattr(reg_cur, "evaluate_replay_batch_per_choice")  # noqa: B009
     reg_prev_per_choice = getattr(reg_prev, "evaluate_replay_batch_per_choice")  # noqa: B009
 
-    # Issue 2: per-policy LSTM recompute. Each policy re-runs the LSTM scan
-    # from h=0 over the episode under its own parameters, so the per-step
-    # hidden state passed into the per-choice forward reflects *that policy*
-    # rather than the behavior policy that wrote the rollout buffer. Falls
-    # through to None for non-recurrent policies.
-    online_lstm = _maybe_recompute_lstm(online, replay_rows)
-    target_lstm = _maybe_recompute_lstm(target, replay_rows)
-    reg_cur_lstm = _maybe_recompute_lstm(reg_cur, replay_rows)
-    reg_prev_lstm = _maybe_recompute_lstm(reg_prev, replay_rows)
+    # Issue 2: per-policy LSTM recompute via the fused single-call path.
+    # Each policy re-runs the LSTM scan from h=0 over the episode under its
+    # own parameters; ``recompute_lstm_outputs_for_episodes`` does this in
+    # one ``nn.LSTM(seq=T, batch=1)`` call (cuDNN fuses the time loop) and
+    # returns the top-layer ``h_out`` per step. The per-choice forward then
+    # consumes ``h_out`` directly via ``hidden_override``, skipping the
+    # per-step LSTM cell. Online runs under grad (full BPTT through the
+    # fused cuDNN backward); target / reg_cur / reg_prev are no-grad.
+    # Falls through to lstm_state_override on policies that don't expose
+    # the new method (e.g. minimal stubs in tests).
+    online_h_out = _maybe_recompute_lstm_h_out(online, replay_rows)
+    if online_h_out is not None:
+        lp_online, _, v_online, pc_online = online_per_choice(
+            list(replay_rows), hidden_override=online_h_out
+        )
+    else:
+        online_lstm = _maybe_recompute_lstm(online, replay_rows)
+        lp_online, _, v_online, pc_online = online_per_choice(
+            list(replay_rows), lstm_state_override=online_lstm
+        )
 
-    lp_online, _, v_online, pc_online = online_per_choice(
-        list(replay_rows), lstm_state_override=online_lstm
-    )
     with torch.no_grad():
-        _lp_tgt_scalar, _, v_tgt, pc_tgt = target_per_choice(
-            list(replay_rows), lstm_state_override=target_lstm
-        )
-        _, _, _, pc_reg_cur = reg_cur_per_choice(
-            list(replay_rows), lstm_state_override=reg_cur_lstm
-        )
-        _, _, _, pc_reg_prev = reg_prev_per_choice(
-            list(replay_rows), lstm_state_override=reg_prev_lstm
-        )
+        target_h_out = _maybe_recompute_lstm_h_out(target, replay_rows)
+        reg_cur_h_out = _maybe_recompute_lstm_h_out(reg_cur, replay_rows)
+        reg_prev_h_out = _maybe_recompute_lstm_h_out(reg_prev, replay_rows)
+
+        if target_h_out is not None:
+            _lp_tgt_scalar, _, v_tgt, pc_tgt = target_per_choice(
+                list(replay_rows), hidden_override=target_h_out
+            )
+        else:
+            target_lstm = _maybe_recompute_lstm(target, replay_rows)
+            _lp_tgt_scalar, _, v_tgt, pc_tgt = target_per_choice(
+                list(replay_rows), lstm_state_override=target_lstm
+            )
+
+        if reg_cur_h_out is not None:
+            _, _, _, pc_reg_cur = reg_cur_per_choice(
+                list(replay_rows), hidden_override=reg_cur_h_out
+            )
+        else:
+            reg_cur_lstm = _maybe_recompute_lstm(reg_cur, replay_rows)
+            _, _, _, pc_reg_cur = reg_cur_per_choice(
+                list(replay_rows), lstm_state_override=reg_cur_lstm
+            )
+
+        if reg_prev_h_out is not None:
+            _, _, _, pc_reg_prev = reg_prev_per_choice(
+                list(replay_rows), hidden_override=reg_prev_h_out
+            )
+        else:
+            reg_prev_lstm = _maybe_recompute_lstm(reg_prev, replay_rows)
+            _, _, _, pc_reg_prev = reg_prev_per_choice(
+                list(replay_rows), lstm_state_override=reg_prev_lstm
+            )
 
     dtype = v_online.dtype
     logp_mu_dev = logp_mu.to(device=device, dtype=dtype)
