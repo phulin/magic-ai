@@ -41,6 +41,7 @@ from magic_ai.ppo import PPOStats, RolloutStep
 from magic_ai.rnad import (
     RNaDConfig,
     RNaDStats,
+    _TrajLossPieces,
     load_reg_snapshot_into,
     polyak_update_,
     rnad_trajectory_loss,
@@ -218,20 +219,8 @@ def run_rnad_update(
     if not episodes:
         raise ValueError("run_rnad_update requires at least one episode")
 
-    cl_sum: torch.Tensor | None = None
-    pl_sum: torch.Tensor | None = None
-    cl_count_total = 0
-    pl_count_total = 0
-    n_q_clipped_total = 0
-    flat_active_total = 0
-    v_hat_mean_acc = 0.0
-    transformed_mean_acc = 0.0
-    n_pieces = 0
     alpha = _alpha_for_step(state.gradient_step, state.config.delta_m)
 
-    # Per-policy LSTM recompute, batched once across the whole rollout batch
-    # so cuDNN sees one fused (N_episodes, T_max, hidden) call per policy
-    # instead of one (1, T_episode, hidden) call per (policy, episode).
     per_episode_replay_rows: list[list[int]] = []
     per_episode_perspective: list[list[int]] = []
     per_episode_logp_mu: list[list[float]] = []
@@ -253,72 +242,70 @@ def run_rnad_update(
         per_episode_logp_mu.append(lp)
         per_episode_winner_idx.append(int(episode.winner_idx))
 
-    online_h_out_per_ep: list[torch.Tensor] | None = None
-    target_h_out_per_ep: list[torch.Tensor] | None = None
-    reg_cur_h_out_per_ep: list[torch.Tensor] | None = None
-    reg_prev_h_out_per_ep: list[torch.Tensor] | None = None
-    chunk_size = state.config.bptt_chunk_size
-    if per_episode_replay_rows:
-        recompute_fn = getattr(policy, "recompute_lstm_outputs_for_episodes", None)
-        if recompute_fn is not None:
-            online_h_out_per_ep = recompute_fn(per_episode_replay_rows, chunk_size=chunk_size)
-            with torch.no_grad():
-                tgt_fn = state.target.recompute_lstm_outputs_for_episodes
-                rcr_fn = state.reg_cur.recompute_lstm_outputs_for_episodes
-                rpr_fn = state.reg_prev.recompute_lstm_outputs_for_episodes
-                target_h_out_per_ep = tgt_fn(per_episode_replay_rows, chunk_size=chunk_size)
-                reg_cur_h_out_per_ep = rcr_fn(per_episode_replay_rows, chunk_size=chunk_size)
-                reg_prev_h_out_per_ep = rpr_fn(per_episode_replay_rows, chunk_size=chunk_size)
+    if not per_episode_replay_rows:
+        raise ValueError("no non-empty episodes to update on")
 
-    for ep_idx, replay_rows in enumerate(per_episode_replay_rows):
-        perspective = per_episode_perspective[ep_idx]
-        logp_mu = per_episode_logp_mu[ep_idx]
-        online_h_out = online_h_out_per_ep[ep_idx] if online_h_out_per_ep is not None else None
-        target_h_out = target_h_out_per_ep[ep_idx] if target_h_out_per_ep is not None else None
-        reg_cur_h_out = reg_cur_h_out_per_ep[ep_idx] if reg_cur_h_out_per_ep is not None else None
-        reg_prev_h_out = (
-            reg_prev_h_out_per_ep[ep_idx] if reg_prev_h_out_per_ep is not None else None
-        )
-
-        pieces = rnad_trajectory_loss(
+    def _episode_loss(ep_idx: int) -> _TrajLossPieces:
+        return rnad_trajectory_loss(
             online=policy,
             target=state.target,
             reg_cur=state.reg_cur,
             reg_prev=state.reg_prev,
-            replay_rows=replay_rows,
-            perspective_player_idx=perspective,
+            replay_rows=per_episode_replay_rows[ep_idx],
+            perspective_player_idx=per_episode_perspective[ep_idx],
             winner_idx=per_episode_winner_idx[ep_idx],
-            logp_mu=torch.tensor(logp_mu, dtype=torch.float32),
+            logp_mu=torch.tensor(per_episode_logp_mu[ep_idx], dtype=torch.float32),
             config=state.config,
             alpha=alpha,
-            online_h_out=online_h_out,
-            target_h_out=target_h_out,
-            reg_cur_h_out=reg_cur_h_out,
-            reg_prev_h_out=reg_prev_h_out,
         )
-        cl_sum = pieces.cl_sum if cl_sum is None else cl_sum + pieces.cl_sum
-        pl_sum = pieces.pl_sum if pl_sum is None else pl_sum + pieces.pl_sum
-        cl_count_total += pieces.cl_count
-        pl_count_total += pieces.pl_count
+
+    # Per-episode forward + backward with batch-global normalization.
+    # Pass 1 (no_grad): run trajectory_loss per episode just to collect the
+    # batch-global cl_count / pl_count totals -- the paper-faithful 1/t
+    # normalizer (issue 7) divides by counts across the whole rollout
+    # batch, not per-episode. Activations are released as we go since
+    # we're under no_grad.
+    # Pass 2 (with grad): run trajectory_loss per episode under grad,
+    # scale by 1/total_count, and call .backward(retain_graph=False)
+    # immediately so that episode's activations are freed before we move
+    # on to the next. Gradients accumulate across episodes; one
+    # optimizer.step() at the end. This is the per-rollout-batch backward
+    # the paper specifies, but with episode-level memory bounding so peak
+    # activations track ONE episode at a time rather than the full
+    # rollout's worth in a single autograd graph.
+    cl_count_total = 0
+    pl_count_total = 0
+    with torch.no_grad():
+        for ep_idx in range(len(per_episode_replay_rows)):
+            pieces = _episode_loss(ep_idx)
+            cl_count_total += pieces.cl_count
+            pl_count_total += pieces.pl_count
+
+    cl_norm = max(cl_count_total, 1)
+    pl_norm = max(pl_count_total, 1)
+
+    optimizer.zero_grad(set_to_none=True)
+    cl_loss_total = 0.0
+    pl_loss_total = 0.0
+    n_q_clipped_total = 0
+    flat_active_total = 0
+    v_hat_mean_acc = 0.0
+    transformed_mean_acc = 0.0
+    n_pieces = 0
+    for ep_idx in range(len(per_episode_replay_rows)):
+        pieces = _episode_loss(ep_idx)
+        cl_part = pieces.cl_sum / cl_norm
+        pl_part = pieces.pl_sum / pl_norm
+        ep_loss = cl_part + pl_part
+        ep_loss.backward()
+        cl_loss_total += float(cl_part.detach())
+        pl_loss_total += float(pl_part.detach())
         n_q_clipped_total += pieces.n_q_clipped
         flat_active_total += pieces.pl_count
         v_hat_mean_acc += pieces.v_hat_mean
         transformed_mean_acc += pieces.transformed_mean
         n_pieces += 1
 
-    if cl_sum is None or pl_sum is None or n_pieces == 0:
-        raise ValueError("no non-empty episodes to update on")
-
-    # Issue 7: normalize by total counts across the rollout batch, not by
-    # episode count. Critic divides by total own-turn steps; policy divides
-    # by total active per-choice actions across all decision groups + may
-    # branches. Short games no longer get over-weighted.
-    cl = cl_sum / max(cl_count_total, 1)
-    pl = pl_sum / max(pl_count_total, 1)
-    total_loss = cl + pl
-
-    optimizer.zero_grad(set_to_none=True)
-    total_loss.backward()
     trainable = [p for p in policy.parameters() if p.requires_grad]
     grad_norm = float(nn.utils.clip_grad_norm_(trainable, max_norm=state.config.grad_clip))
     optimizer.step()
@@ -332,9 +319,9 @@ def run_rnad_update(
         float(n_q_clipped_total) / float(flat_active_total) if flat_active_total > 0 else 0.0
     )
     aggregate = RNaDStats(
-        loss=float(total_loss.detach()),
-        critic_loss=float(cl.detach()),
-        policy_loss=float(pl.detach()),
+        loss=cl_loss_total + pl_loss_total,
+        critic_loss=cl_loss_total,
+        policy_loss=pl_loss_total,
         v_hat_mean=v_hat_mean_acc / n_pieces,
         grad_norm=grad_norm,
         transformed_reward_mean=transformed_mean_acc / n_pieces,

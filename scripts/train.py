@@ -565,6 +565,15 @@ def parse_args() -> argparse.Namespace:
         "multiplicatively in the number of decision groups.",
     )
     parser.add_argument(
+        "--cuda-memory-snapshot",
+        type=Path,
+        default=None,
+        help="Record CUDA allocator history and dump a snapshot to this path "
+        "if the first training update OOMs. Load the resulting .pickle into "
+        "https://pytorch.org/memory_viz to see every live allocation with the "
+        "Python stack that produced it. Off by default (recording has overhead).",
+    )
+    parser.add_argument(
         "--rnad-bptt-chunk-size",
         type=int,
         default=200,
@@ -1105,12 +1114,46 @@ def train_native_batched_envs(
             rollout_returns = torch.cat(pending_returns)
             rollout_step_count = len(pending_steps)
             if rnad_state is not None:
-                stats = run_rnad_update(
-                    policy,
-                    optimizer,
-                    rnad_state,
-                    pending_episodes,
-                )
+                # If --cuda-memory-snapshot is set, also print live/reserved
+                # before each update and record the allocator history so an
+                # OOM dumps a snapshot loadable at pytorch.org/memory_viz.
+                snapshot_armed = args.cuda_memory_snapshot is not None and torch.cuda.is_available()
+                if snapshot_armed:
+                    print(
+                        f"[mem] before run_rnad_update[{total_rollout_steps}]: "
+                        f"{torch.cuda.memory_allocated() / 1e9:.2f} GB live, "
+                        f"{torch.cuda.memory_reserved() / 1e9:.2f} GB reserved",
+                        flush=True,
+                    )
+                    torch.cuda.memory._record_memory_history(max_entries=100_000)
+                try:
+                    stats = run_rnad_update(
+                        policy,
+                        optimizer,
+                        rnad_state,
+                        pending_episodes,
+                    )
+                except torch.OutOfMemoryError:
+                    if snapshot_armed:
+                        path = Path(args.cuda_memory_snapshot)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            torch.cuda.memory._dump_snapshot(str(path))
+                            print(
+                                f"[mem] OOM in run_rnad_update; allocator history dumped "
+                                f"to {path}. Load at https://pytorch.org/memory_viz",
+                                flush=True,
+                            )
+                        except Exception as dump_exc:
+                            print(
+                                f"[mem] _dump_snapshot failed: "
+                                f"{type(dump_exc).__name__}: {dump_exc}",
+                                flush=True,
+                            )
+                    raise
+                finally:
+                    if snapshot_armed:
+                        torch.cuda.memory._record_memory_history(enabled=None)
             else:
                 stats = ppo_update(
                     policy,
