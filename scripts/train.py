@@ -383,7 +383,20 @@ def main() -> None:
     native_encoder = ShardedNativeBatchEncoder.for_policy(
         policy, workers=batch_workers, pool=batch_pool
     )
-    optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
+    # Paper §199: R-NaD uses Adam with b1=0.0 (no momentum). This is
+    # load-bearing for stability: nonzero b1 lets policy updates accumulate
+    # directional drift across batches, which combined with NeuRD's raw-logit
+    # gradient and the [-beta, beta] gate causes logit saturation and
+    # frozen policies. PPO keeps the standard b1=0.9 default.
+    if args.trainer == "rnad":
+        optimizer = torch.optim.Adam(
+            policy.parameters(),
+            lr=args.learning_rate,
+            betas=(0.0, 0.999),
+            eps=1e-8,
+        )
+    else:
+        optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
     staging_decision_capacity_per_env = max(
         1,
         (policy.rollout_buffer.decision_capacity // max(1, policy.rollout_buffer.capacity))

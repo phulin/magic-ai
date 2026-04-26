@@ -125,7 +125,7 @@ class CheckpointRoundTripTests(unittest.TestCase):
         from argparse import Namespace
 
         from magic_ai.opponent_pool import OpponentPool
-        from scripts.train_ppo import (
+        from scripts.train import (
             _restore_rnad_state,
             load_training_checkpoint,
             save_checkpoint,
@@ -299,7 +299,7 @@ class RegPathRelocationTests(unittest.TestCase):
         from argparse import Namespace
 
         from magic_ai.opponent_pool import OpponentPool
-        from scripts.train_ppo import (
+        from scripts.train import (
             _restore_rnad_state,
             load_training_checkpoint,
             save_checkpoint,
