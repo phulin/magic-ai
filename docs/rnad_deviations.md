@@ -109,8 +109,6 @@ decisions.
 
 ## 8. Other deliberate deviations carried over from earlier passes
 
-- **Rollouts sample from online**, not target. The paper samples from target;
-  with Polyak tracking inside one outer iteration the two are close.
 - **The opponent pool is not used for R-NaD self-play.** Opponents are the
   current target. Snapshots still land in the pool for TrueSkill evaluation
   against PPO baselines.
