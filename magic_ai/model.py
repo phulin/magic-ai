@@ -41,6 +41,11 @@ from magic_ai.game_state import (
     ParsedGameState,
     ParsedGameStateBatch,
 )
+from magic_ai.lstm_recompute import (
+    LstmRecomputeStrategy,
+    lstm_recompute_per_step_h_out,
+    lstm_recompute_per_step_states,
+)
 from magic_ai.native_encoder import NativeEncodedBatch
 
 TraceKind = Literal[
@@ -1168,11 +1173,95 @@ class PPOPolicy(nn.Module):
         c_stack = torch.cat(c_list, dim=1).contiguous()
         return h_stack, c_stack
 
+    @torch.no_grad()
+    def recompute_lstm_states_for_episodes(
+        self,
+        episodes: list[list[int]],
+        *,
+        strategy: LstmRecomputeStrategy = "legacy",
+    ) -> list[tuple[Tensor, Tensor]] | None:
+        """Per-episode LSTM input-state recompute for a *batch* of episodes.
+
+        Returns ``None`` for non-recurrent policies. Otherwise, a list with
+        one ``(h_in, c_in)`` per episode of shape
+        ``(num_layers, T_i, hidden)`` -- matching
+        :meth:`recompute_lstm_states_for_episode`. ``strategy`` selects
+        between the per-episode reference loop and three batched variants;
+        see :mod:`magic_ai.lstm_recompute` for details. All strategies are
+        mathematically equivalent under fp32.
+        """
+
+        if not self.use_lstm:
+            return None
+        if not episodes:
+            raise ValueError("episodes must be non-empty")
+        if any(len(ep) == 0 for ep in episodes):
+            raise ValueError("each episode must contain at least one row")
+        device = self.device
+        dtype = self._compute_hidden_dtype()
+        flat_rows: list[int] = [r for ep in episodes for r in ep]
+        step_indices = torch.tensor(flat_rows, dtype=torch.long, device=device)
+        inputs, _stale_lstm_state = self._gather_from_rollout(step_indices)
+        features_flat, _option_vectors, _target_vectors = self._embed_forward_inputs(inputs)
+        proj_flat = self.feature_projection(features_flat).to(dtype=dtype)
+        n = len(episodes)
+        lengths = [len(ep) for ep in episodes]
+        t_max = max(lengths)
+        projected = torch.zeros(t_max, n, self.hidden_dim, dtype=dtype, device=device)
+        offset = 0
+        for i, t_i in enumerate(lengths):
+            projected[:t_i, i] = proj_flat[offset : offset + t_i]
+            offset += t_i
+        return lstm_recompute_per_step_states(self.lstm, projected, lengths, strategy=strategy)
+
+    @torch.no_grad()
+    def recompute_lstm_outputs_for_episodes(
+        self,
+        episodes: list[list[int]],
+        *,
+        compiled_lstm: Callable[..., Any] | None = None,
+    ) -> list[Tensor] | None:
+        """Fused per-step ``h_out`` recompute for the override-interface path.
+
+        Returns ``None`` for non-recurrent policies. Otherwise a list of
+        ``(T_i, hidden)`` tensors -- the top-layer LSTM hidden output at each
+        replay step -- produced by a single fused ``nn.LSTM`` call. The
+        consumer should pass each per-episode tensor as
+        ``hidden_override`` to :meth:`evaluate_replay_batch_per_choice`,
+        which skips the per-step LSTM cell.
+        """
+
+        if not self.use_lstm:
+            return None
+        if not episodes:
+            raise ValueError("episodes must be non-empty")
+        if any(len(ep) == 0 for ep in episodes):
+            raise ValueError("each episode must contain at least one row")
+        device = self.device
+        dtype = self._compute_hidden_dtype()
+        flat_rows: list[int] = [r for ep in episodes for r in ep]
+        step_indices = torch.tensor(flat_rows, dtype=torch.long, device=device)
+        inputs, _stale_lstm_state = self._gather_from_rollout(step_indices)
+        features_flat, _option_vectors, _target_vectors = self._embed_forward_inputs(inputs)
+        proj_flat = self.feature_projection(features_flat).to(dtype=dtype)
+        n = len(episodes)
+        lengths = [len(ep) for ep in episodes]
+        t_max = max(lengths)
+        projected = torch.zeros(t_max, n, self.hidden_dim, dtype=dtype, device=device)
+        offset = 0
+        for i, t_i in enumerate(lengths):
+            projected[:t_i, i] = proj_flat[offset : offset + t_i]
+            offset += t_i
+        return lstm_recompute_per_step_h_out(
+            self.lstm, projected, lengths, compiled_lstm=compiled_lstm
+        )
+
     def evaluate_replay_batch_per_choice(
         self,
         replay_rows: list[int],
         *,
         lstm_state_override: tuple[Tensor, Tensor] | None = None,
+        hidden_override: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice]:
         """Like :meth:`evaluate_replay_batch` but also returns per-choice tensors.
 
@@ -1194,7 +1283,11 @@ class PPOPolicy(nn.Module):
         rb = self.rollout_buffer
         step_indices = torch.tensor(replay_rows, dtype=torch.long, device=device)
         n = int(step_indices.numel())
-        if lstm_state_override is not None:
+        if hidden_override is not None and lstm_state_override is not None:
+            raise ValueError("pass at most one of hidden_override / lstm_state_override")
+        if hidden_override is not None:
+            forward = self._forward_batch_with_hidden_override(step_indices, hidden_override)
+        elif lstm_state_override is not None:
             forward = self._forward_batch_with_lstm_override(step_indices, lstm_state_override)
         else:
             forward = self._forward_batch(step_indices)
@@ -1837,6 +1930,38 @@ class PPOPolicy(nn.Module):
             h_in, c_in = lstm_state
         forward, _next_state = self._compute_forward(inputs, h_in=h_in, c_in=c_in)
         return forward
+
+    def _forward_batch_with_hidden_override(
+        self,
+        step_indices: Tensor,
+        hidden: Tensor,
+    ) -> _ForwardBatch:
+        """Forward path that takes precomputed top-layer ``hidden`` per step.
+
+        Override-interface variant for issue 2: the recompute pass produces
+        ``h_out[t]`` (top-layer hidden) per step via a single fused
+        ``nn.LSTM`` call, and the action heads consume it directly --
+        skipping the per-step LSTM cell entirely. This drops the per-step
+        recompute launch count from O(T_max) to O(1) per policy.
+        """
+
+        inputs, _stale_lstm_state = self._gather_from_rollout(step_indices)
+        dtype = self._compute_hidden_dtype()
+        hidden = hidden.to(dtype=dtype).contiguous()
+        _features, option_vectors, target_vectors = self._embed_forward_inputs(inputs)
+        query = self.action_query(hidden) / math.sqrt(float(self.game_state_encoder.d_model))
+        values = self.value_head(hidden).squeeze(-1)
+        none_logits = self.none_blocker_head(hidden).squeeze(-1)
+        may_logits = self.may_head(hidden).squeeze(-1)
+        return _ForwardBatch(
+            query=query,
+            values=values,
+            none_logits=none_logits,
+            may_logits=may_logits,
+            option_vectors=option_vectors,
+            target_vectors=target_vectors,
+            hidden=hidden,
+        )
 
     def _forward_batch_with_lstm_override(
         self,
