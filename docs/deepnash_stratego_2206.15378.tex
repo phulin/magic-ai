@@ -1,0 +1,330 @@
+\title{Mastering the Game of Stratego with Model-Free Multiagent Reinforcement Learning}
+
+\section*{Abstract}
+We introduce DeepNash, an autonomous agent capable of learning to play the imperfect information game Stratego from scratch, up to a human expert level. Stratego is one of the few iconic board games that Artificial Intelligence (AI) has not yet mastered. This popular game has an enormous game tree on the order of $10^{535}$ nodes, i.e., $10^{175}$ times larger than that of Go. It has the additional complexity of requiring decision-making under imperfect information, similar to Texas hold'em poker, which has a significantly smaller game tree (on the order of $10^{164}$ nodes). Decisions in Stratego are made over a large number of discrete actions with no obvious link between action and outcome. Episodes are long, with often hundreds of moves before a player wins, and situations in Stratego can not easily be broken down into manageably-sized sub-problems as in poker. For these reasons, Stratego has been a grand challenge for the field of AI for decades, and existing AI methods barely reach an amateur level of play. DeepNash uses a game-theoretic, model-free deep reinforcement learning method, without search, that learns to master Stratego via self-play. The Regularised Nash Dynamics (R-NaD) algorithm, a key component of DeepNash, converges to an approximate Nash equilibrium, instead of `cycling' around it, by directly modifying the underlying multi-agent learning dynamics. DeepNash beats existing state-of-the-art AI methods in Stratego and achieved a yearly (2022) and all-time top-3 rank on the Gravon games platform, competing with human expert players.
+
+\section{Introduction}
+Progress in Artificial Intelligence (AI) has been measured via mastery of board games since the inception of the field. Board games allow us to gauge and evaluate how humans and machines develop and execute strategies in a controlled environment. The ability to plan ahead has been at the heart of successes in AI for decades in perfect information games such as chess, checkers, shogi and Go, as well as in imperfect information games such as poker and Scotland Yard.
+
+For many years the Stratego board game has constituted one of the next frontiers of AI research. The game poses two key challenges. First, the game tree of Stratego has $10^{535}$ possible states, which is larger than both no-limit Texas hold'em poker, a well-researched imperfect information game with $10^{164}$ states, and the game of Go, which has $10^{360}$ states. Second, acting in a given situation in Stratego requires reasoning over $10^{66}$ possible deployments at the start of the game for each player, whereas poker has only $10^3$ possible pairs of cards. Perfect information games like Go and chess do not have a private deployment phase, therefore avoiding the complexity this challenge poses in Stratego. Currently it is not possible to use state-of-the-art model-based perfect information planning techniques, nor state-of-the-art imperfect information search techniques that break down the game into independent situations.
+
+For these reasons, Stratego provides a challenging benchmark for studying strategic interactions at an unparalleled scale. As in most board games, Stratego tests our ability to make relatively slow, deliberative, and logical decisions sequentially. Most recent successes in large imperfect information games have been achieved in real-time strategy games such as Starcraft, Dota and Capture the flag in which most decisions must be made quickly and instinctively, and are of a continuous-time nature. Stratego is a game in which little progress has been achieved by the AI research community due to many complex aspects of the game's structure. Successes in the game have been limited, with artificial agents only able to play at a level comparable to a human amateur. Developing intelligent agents that learn end-to-end to make optimal decisions under imperfect information in Stratego, from scratch, without human demonstration data, remained one of the grand challenges of AI research.
+
+Stratego is a two-player board game where each player aims to capture the opponent's flag. To do so, they each have 40 pieces of diverse strengths. The game starts with the deployment phase, where both players secretly position their pieces on the board. In a second game-play phase, the players take turns moving pieces. When two pieces are in the same location, they are revealed, and the weaker piece is removed, or both if they have the same strength. When the weakest movable piece, the Spy, attacks the 10, however, it wins and the 10 is captured. The players have only a partial view on the opponent's pieces: seeing their position but not their type.
+
+In this work we introduce DeepNash, an agent that learns to play Stratego in self-play in a model-free manner without human demonstration, beating previous state-of-the-art AI agents and achieving expert human-level performance in the most complex variant of the game, Stratego Classic. At the core of DeepNash is a principled, model-free reinforcement learning algorithm called \emph{Regularized Nash Dynamics} (R-NaD). DeepNash combines R-NaD with a deep neural network architecture and converges to an $\epsilon$-Nash equilibrium, which means it learns to play at a highly competitive level, and is robust against opponents that try to exploit it. All games of imperfect information possess a Nash equilibrium in mixed strategy, assigning a mixed (or stochastic) strategy for all the players in which no player benefits from deviating from their strategy as long as no other player deviates. While it is sufficient to take deterministic decisions that maximize the value of the equilibrium strategy in turn-taking two-player zero-sum games of full information, this approach is theoretically unsound when dealing with imperfect information games. In such games, other tactics need to be deployed, which better reflect decision-making processes in the real world. As von Neumann described it ``real life consists of bluffing, of little tactics of deception, of asking yourself what is the other man going to think I mean to do.''
+
+We lay out our new model-free reinforcement learning method DeepNash, and systematically evaluate its performance against various state-of-the-art Stratego bots and human expert players on the Gravon games platform. DeepNash convincingly beats all current state-of-the-art bots that have been developed to play Stratego with a win rate of over $97\%$ and achieves a highly competitive level of play with human expert Stratego players on Gravon, where it ranks among the top $3$ players, both on the annual (2022) and all-times leaderboards, with a win rate of $84\%$. As such, it is the first time an AI algorithm is able to learn to play at a human-expert level in a complex board game without deploying any search method in the learning algorithm, and the first time an AI achieves human-expert level in the game of Stratego.
+
+\section{Methods}
+DeepNash takes an end-to-end learning approach to solve Stratego, by incorporating the learning of the deployment phase, i.e., putting the pieces tactically on the board at the start of a game, in the learning of the game-play phase, using an integrated deep RL and game-theoretic approach. The agent's purpose is to learn an approximate Nash equilibrium through self-play. A Nash equilibrium guarantees that the agent will perform well, even against a worst case opponent. Designing a strategy to be robust in the worst case is typically a good choice to play well against humans in two-player zero-sum games, as a Nash equilibrium guarantees an unexploitable agent, and thus the best possible worst-case performance. In perfect information games, search techniques aided by reinforcement learning, i.e. model-based learning techniques, have provided state-of-the-art superhuman bots in Go and chess. However, searching for a Nash equilibrium in imperfect information games requires estimating private information of the opponent from public states. Given the vast number of such possible private configurations in a public state, Stratego computationally challenges all existing search techniques as the search space becomes intractable. We therefore chose an orthogonal route in this work, without search, and propose a new method that combines model-free reinforcement learning in self-play with a game-theoretic algorithmic idea, \emph{Regularized Nash Dynamics} (R-NaD). The model-free part implies that we don't build an explicit opponent model tracking belief space (calculating a likelihood of the opponent's state), and the game-theoretic part is based on the idea that by modifying the dynamical system underpinning our reinforcement-learning approach we can steer the learning behavior of the agent in the direction of the Nash equilibrium. The main advantage of this combined approach is that we do not need to explicitly model private states from public ones.
+
+\subsection{Learning approach}
+We learn a Nash equilibrium in Stratego through self-play and model-free reinforcement learning. The idea of combining model-free RL and self-play has been tried before, but it has been empirically challenging to stabilize such learning algorithms when scaling up to complex games, as for example Capture the flag, Dota and StarCraft. Some empirical work manages to stabilize the learning either by training against past versions of the agent, or by adding reward-shaping or expert data in the training algorithm. While these are helpful tricks, such approaches lack theoretical foundations, remain hard to tune and do not easily generalize to new games. Furthermore, in a game like Stratego, it is difficult to define a loss whose minimization would converge to a Nash equilibrium without introducing prohibitive computational obstacles at large scale. For instance, minimizing the exploitability, a well-known quantity that measures the distance to a Nash equilibrium, requires estimating an agent's best response during training, which is computationally intractable in Stratego. However, it is possible to define a learning update rule that induces a dynamical system for which there exists a so-called Lyapunov function. This function can be shown to decrease during learning and as such guarantees convergence to a fixed point. This is the central idea behind the R-NaD algorithm, and the successful recipe for DeepNash, which scales this approach using a deep neural network.
+
+\subsection{Regularized Nash Dynamics algorithm}
+The R-NaD learning algorithm used in DeepNash is based on the idea of regularization for convergence purposes, which we briefly first explain in the context of zero-sum two-player normal form games (illustrated on the matching pennies game). An NFG is an abstraction of a decision-making situation involving more than one agent. Each agent needs to simultaneously take an action, after which they receive a game reward, and the game starts a new iteration of the same situation.
+
+R-NaD relies on three key steps. First a \emph{reward transformation} step is performed based on a regularization policy $\pi_{\textrm{reg}}$ which induces a modified game with rewards:
+$$r^i(\pi^i, \pi^{-i},a^i, a^{-i}) = r^i(a^i, a^{-i}) - \eta \log\!\left(\frac{\pi^i(a^i)}{\pi^i_{\textrm{reg}}(a^i)}\right) + \eta \log\!\left(\frac{\pi^{-i}(a^{-i})}{\pi^{-i}_{\textrm{reg}}(a^{-i})}\right),$$
+with $\eta > 0$ a regularization parameter and $i$ the player index ($i\in [1, 2]$). Note that this transformed reward is policy-dependent.
+
+Second, in the \emph{dynamics} step we let the system evolve according to the replicator dynamics system on this modified game. Replicator dynamics are a descriptive learning process from evolutionary game theory, equivalent to RL algorithms, that are also known as Follow the Regularized Leader, and defined as follows:
+$$\frac{d}{d\tau}\pi^i_\tau(a^i) = \pi^i_\tau(a^i)\Big[Q^i_{\pi_\tau}(a^i)-\sum_{b^i}\pi^i_\tau(b^i)Q^i_{\pi_\tau}(b^i)\Big]$$
+with $Q^i_{\pi_\tau}(a^i)$ the quality or fitness of an action. These dynamics reinforce the probability of taking actions with high fitness (relative to other actions). Thanks to the reward transformation this system has a unique fixed point $\pi_\textrm{fix}$ and convergence to it is guaranteed, which can be proven by the Lyapunov function
+$$H_{\pi_{\textrm{fix}}}(\pi) = \sum_{i=1}^{2} \sum_{a^i \in A^i} \pi^i_{\textrm{fix}}(a^i)\log\!\left(\frac{\pi^i_{\textrm{fix}}(a^i)}{\pi^i(a^i)}\right).$$
+However, this fixed point is not yet a Nash equilibrium of the original game.
+
+In the final \emph{update} step, the fixed point obtained is used as the regularization policy for the next iteration. These three steps are applied repeatedly, generating a sequence of fixed points which can be proven to converge to a Nash equilibrium of the original (unmodified) game.
+
+\textbf{R-NaD Iteration:} Start with an arbitrary regularization policy $\pi_{0,\text{reg}}$. (1) \emph{Reward transformation}: construct the transformed game with $\pi_{n,\textrm{reg}}$. (2) \emph{Dynamics}: run the replicator dynamics until convergence to $\pi_{n,\textrm{fix}}$. (3) \emph{Update}: set $\pi_{n+1,\textrm{reg}} = \pi_{n,\textrm{fix}}$. Repeat until convergence.
+
+\subsection{DeepNash: R-NaD at scale}
+DeepNash consists of three components: (1) a core training component R-NaD, the model-free RL algorithm presented above, implemented using a deep convolutional network, (2) fine-tuning of the learnt policy to reduce the residual probabilities of taking highly improbable actions and, (3) test-time post-processing to filter out low probability actions and clear mistakes.
+
+\subsubsection{Imperfect information games}
+In a two-player zero-sum imperfect information game, two players ($i=1$ or $i=2$) sequentially interact in turns. At turn $t$ the players receive a reward signal $(r^1_t, r^2_t)$ and the current player $i=\psi_t$ observes the game state through an observation $o_t$ and selects an action $a_t$ according to a parameterized policy function $\pi(.|o_t)$. In model-free reinforcement learning the trajectories $\mathrm{T} = [(o_t, a_t, (r^1_t, r^2_t),\pi(.|o_t)), \psi_t]_{0\leq t <t_{\textrm{max}}}$ are the only data the agent will leverage to learn the parameterized policy.
+
+\subsubsection{Model-free Reinforcement Learning with Regularized Nash Dynamics}
+DeepNash scales the R-NaD algorithm by using deep learning architectures. It carries out the same three algorithmic steps as before in NFGs: (1) the reward transformation, (2) the dynamics step, and (3) the update step.
+
+\paragraph{Neural architecture and observation representation.}
+DeepNash's network consists of a U-Net torso with residual blocks and skip-connections, and four heads which are smaller replicas of the torso augmented with final layers to generate an output of the appropriate shape. The first head outputs the value function as a scalar, while the three remaining heads encode the agent's policy by outputting a probability distribution over its actions at deployment and during gameplay.
+
+The observation is encoded as a spatial tensor consisting of the following components: DeepNash's own pieces, the publicly available information about both the opponent's and DeepNash's pieces and an encoding of the $40$ last moves. This public information represents the types each piece can still have given the history of the game. In total, the observation contains $82$ stacked frames encoded in a single tensor.
+
+\paragraph{The R-NaD loop.}
+Given a trajectory, the reward transform used at turn $t$ is
+$$r^i_{t,\pi_{m,\textrm{reg}}}(a, \pi) = r^i_t - \eta \log\!\left(\frac{\pi(a|o_t)}{\pi_{m, \textrm{reg}}(a|o_t)}\right)\quad \text{if } i = \psi_t,$$
+and $r^i_t + \eta \log(\pi(a|o_t)/\pi_{m, \textrm{reg}}(a|o_t))$ if $i \neq \psi_t$, starting at the initial policy $\pi_{m=0,\textrm{reg}}$.
+
+The \emph{dynamics} step of DeepNash is composed of two parts: the first part estimates the value function which is done through an adaptation of the $v$-trace estimator to the two-player imperfect information case, and the second part learns the policy through the Neural Replicator Dynamics (NeuRD) update using an estimate of the state action value based on the $v$-trace estimator.
+
+After a fixed number of learning steps, an approximate fixed point policy $\pi_{m,\textrm{fix}}$ is obtained, which is then used as the next regularisation policy: $\pi_{m+1,\textrm{reg}}=\pi_{m,\textrm{fix}}$. The three steps are repeated using a smooth transition from the reward transformation of step $m$ to the one of step $m+1$.
+
+\paragraph{Fine-tuning.}
+Directly learning with the above-described method leads to convergence to an empirically satisfying solution, which however is slightly distorted by low-probability mistakes. Those mistakes appear because the softmax projection used to compute the policy from the logits assigns a non-zero probability to every action. In order to alleviate this issue we fine-tune during training by performing additional thresholding and discretization to the action probabilities.
+
+\section{Results}
+
+\subsection{Evaluation on Gravon}
+Gravon is an internet platform for human players, offering several online games, including Stratego. It is by far the largest online platform for Stratego, where some of the strongest players compete. The Gravon platform uses the same rating system as the International Stratego Federation for the world championship (the Kleier rating, similar to the Elo rating system).
+
+DeepNash was evaluated against top human players over the course of two weeks in the beginning of April 2022, resulting in 50 ranked matches. Of these matches, 42 (i.e.\ 84\%) were won by DeepNash. In the 2022 ranking this corresponds to a rating of 1799, which resulted in a 3rd place for DeepNash of all ranked Gravon Stratego players (the top two ratings are 1868 and 1831). In the all-time ranking this resulted in a rating of 1778 which also puts DeepNash in 3rd place (the top two ratings are 1876 and 1823). These results confirm that DeepNash reaches a human expert level in Stratego, only through self-play, without bootstrapping from existing human data.
+
+\subsection{Evaluation against state-of-the-art Stratego bots}
+DeepNash was also evaluated against several existing Stratego computer programs: \emph{Probe} (three-fold winner of the Computer Stratego World Championship 2007, 2008, 2010); \emph{Master of the Flag} (2009 winner); \emph{Demon of Ignorance} (open-source implementation with AI bot); and \emph{Asmodeus}, \emph{Celsius}, \emph{Celsius1.1}, \emph{PeternLewis}, and \emph{Vixen} from an Australian university programming competition in 2012.
+
+Win rates from DeepNash's point of view: Probe 100\% (30 games); Master of the Flag 100\% (30 games); Demon of Ignorance 97.1\% wins / 1.8\% draws / 1.1\% losses (800 games); Asmodeus 99.7\% / 0 / 0.3\%; Celsius 98.2\% / 0 / 1.8\%; Celsius1.1 97.9\% / 0 / 2.1\%; PeternLewis 99.9\% / 0 / 0.1\%; Vixen 100\%.
+
+\subsection{Illustration of DeepNash's abilities}
+DeepNash's only goal during training is to learn a Nash equilibrium policy and by doing so it learns qualitative behavior one could expect a top player to master. Indeed, the agent is able to generate a wide range of deployments which makes it difficult for a human player to find patterns to exploit by adapting their own deployment. DeepNash is able to make non-trivial trade-offs between information and material, to execute bluffs and to take gambles when needed.
+
+\subsubsection{Piece deployment}
+The imperfect information in Stratego arises during the initial phase of the game where both players place their 40 pieces on the board in a secret configuration. DeepNash learns this deployment strategy simultaneously with the regular game-play, and so both strategies co-evolve during learning. Having an unpredictable deployment is important for being unexploitable and indeed DeepNash is capable of generating billions of unique deployments. At the same time, not all possible deployments are equally strong. The Flag is almost always put on the back row, and often protected by Bombs. Occasionally, however, DeepNash will not surround the Flag with Bombs; experts believe that it is indeed good to occasionally not protect the Flag because this unpredictability makes it harder for the opponent in the end-game. The highest pieces, the 10 and 9, are often deployed on different sides of the board. Additionally, the Spy is quite often located not too far away from the 9 (or 8), which protects it against the opponent's 10. DeepNash does not often deploy Bombs on the front row, which complies with the behavior seen from strong human players. The 3's (Miner), which can defuse Bombs, are often placed on the back row. The eight 2's (Scout) are typically deployed both in the front and more in the back.
+
+\subsubsection{Trade-off between information and material}
+An important tactic in Stratego is to keep as much information as possible hidden from an opponent in order to gain an advantage. During certain game situations there will be trade-offs to be considered where a player needs to balance the value of capturing an opponent's piece (or even moving a piece), and as such revealing information on their own piece, versus not capturing a piece (or not moving), but keeping the identity of a piece hidden. DeepNash is able to make such trade-offs in remarkable ways.
+
+In an example situation where DeepNash (blue) is behind in pieces (lost a 7 and an 8) but ahead in information (opponent has its 10, 9, 8 and two 7's revealed, while almost all of DeepNash's remaining pieces have not yet moved), the value function credits this information asymmetry as an advantage for DeepNash (expected win rate around $70\%$, $v=0.403$), despite having less material. A second example: DeepNash has the opportunity of capturing the opponent's 6 with its 9, but this move is not considered, probably because protecting the identity of the 9 is deemed more important than the material gain.
+
+\subsubsection{Deceptive behavior and bluffing}
+In addition to being able to value an asymmetry of information, one can also expect the agent to occasionally bluff in order to deceive its opponent and potentially gain an advantage.
+
+\emph{Positive bluffing}: a player pretends a piece to be of a higher value than it actually is. DeepNash chases the opponent's 8 with an unknown piece, a Scout (2), pretending it to be the 10. The opponent believes this piece has a high chance of being the 10 and guides it next to its Spy. In an attempt to capture this piece, however, the opponent loses its Spy to DeepNash's Scout.
+
+\emph{Negative bluffing}: one pretends to be a lower piece. The movement of DeepNash's unknown 10 is interpreted by the opponent as a positive bluff as they try to capture it with a known 8 assuming DeepNash is moving a lower-ranked piece, potentially the Spy, bringing it closer to the opponent's 10. The opponent instead encounters DeepNash's 10 and loses an 8.
+
+A more complex bluff: DeepNash brings its unrevealed Scout (2) close to the opponent's 10, which can be easily interpreted as a Spy. This tactic actually allows Blue to capture Red's 5 with its 7 a few steps later, thereby gaining material but also preventing the 5 from capturing the Scout.
+
+\section{Conclusion}
+In this work, we have introduced a novel method called DeepNash that learns to play the imperfect information game Stratego from scratch in self-play, up to human expert-level. This model-free learning method combines a deep residual neural network with the game-theoretical \emph{Regularized Nash Dynamics} (R-NaD) multi-agent learning algorithm, without doing any form of search or explicit opponent modelling. DeepNash takes an orthogonal approach to state-of-the-art model-based learning methods that have been successfully applied to other complex games such as Go, chess, and imperfect information games such as poker and Scotland Yard, but which, due to their computational toll and the inherent complexity of the Stratego game itself are not applicable to such an elaborate game. DeepNash learns both the deployment phase of pieces at the start of the game and the actual game-play itself, end-to-end, in one approach.
+
+The core component behind DeepNash is the at-scale implementation of the R-NaD algorithm. DeepNash carries out three essential steps in an iteration of the algorithm: \emph{reward transformation} starting from a random regularised policy to define a modified game, subsequently applying the \emph{replicator dynamics} on this modified game to converge to a fixed point policy, and finally \emph{update} the regularization policy to this new fixed point. Repeatedly applying this three-fold process empirically demonstrates convergence of the learning algorithm to an $\epsilon$-Nash equilibrium in Stratego.
+
+We thoroughly evaluated DeepNash against eight state-of-the-art Stratego bots and against human-expert Stratego players on the Gravon platform. Against other AI bots we achieve a minimum win-rate of $97\%$, and in the evaluation against human-expert players we achieve an overall win-rate of $84\%$ on the Gravon platform, which places us in the top-3 rank of both the 2022 and all-times leaderboards. We believe that DeepNash can unlock further applications of RL methods in real-world multi-agent problems with astronomical state spaces, characterized by imperfect information, that are currently out of reach for state-of-the-art AI methods to be applied in an end-to-end fashion.
+
+\section{Related Work}
+
+\subsection{Regret Minimization and Regularization in Games}
+One general class of methods for (approximately) solving games uses self-play of regret-minimizing algorithms. An algorithm is said to minimize regret if the difference between the average value of the sequence of actions it generates, and that of the best alternate in hindsight, approaches zero over time. There are different regret measures based off of different sets of alternatives, with the simplest being external regret which considers static alternatives. That is, in a repeated environment with some set of actions $A$ with value $v_t(a)$ for action $a$ at time $t \in \mathbb{N}$ and a sequence of policies $\pi_t$, the external regret is $R_T := \max_{a \in A} \sum_{t=1}^T (v_t(a) - \pi_t \cdot v_t)$. An external-regret minimizing algorithm, like the regret-matching algorithm, often has a guarantee of the form $R_T \le k\sqrt{T}$ for some constant $k$, which implies $\lim_{T \rightarrow \infty} R_T/T  = 0$. In the context of zero-sum two-player games, minimizing regret is useful because if two regret-minimizing algorithms play against each other, their average policies $(1/T) \sum_t \pi_t$ approach the set of Nash equilibrium strategy profiles. However, the action set $A$ grows exponentially in the number of information sets, so game-specific regret-minimizing algorithms are needed for larger extensive form games, with sequential decisions.
+
+The Counterfactual Regret Minimization (CFR) algorithm applies regret-matching independently at each information set, with a proof that minimizing regret at all information sets also minimizes external regret. The simplicity and computational efficiency of CFR has led to many variants, like the sampling variant MCCFR, Pure CFR, CFR+, and Discounted CFR. However, CFR is a tabular method that stores regret information and action probabilities for all information sets in the game, so is limited to games which can fit in storage. Using compression, tabular CFR variants have been applied to games with up to $10^{14}$ information sets, but are incapable of scaling up over a hundred orders of magnitude to deal with games like Stratego.
+
+Follow the Regularized Leader (FoReL) is another approach to online learning. The motivation for FoReL comes from examining the behaviour of the simple rule of Follow the Leader, which looks back to find the historically best decision and follows that choice at the current time. While this is a natural and perhaps intuitive approach to sequential interactions, Follow the Leader generally lacks any interesting guarantee on performance. To get such a guarantee, there are a number of different intuitions which lead to the idea of adding a bonus (or penalty depending on the point of view) to the historically-observed values, like dampening the response or adding a strongly-convex term to the optimisation. The resulting approach, of following the historically-best decision when including an additional regularization term, describes the class of follow the regularized leader (FoReL) algorithms. Without game-specific approaches or function approximation, FoReL has the same limitations as regret-matching.
+
+\subsection{Reinforcement Learning in Two-Player Zero-Sum Games}
+Reinforcement learning methods have been applied to two-player zero-sum games going back to TD-Gammon. However until recently, most successful methods were limited to the perfect information case. New deep RL methods based on regret minimization, best responses, and policy gradients have shown success in imperfect-information games such as poker.
+
+The first category of deep RL algorithms are based on regret minimization techniques such as counterfactual regret minimization (CFR). Deep CFR approximates CFR by training a regret network on a buffer of counterfactual values. However, Deep CFR uses external sampling, which may be impractical for games with a large branching factor such as Stratego and Barrage Stratego. DREAM and ARMAC are model-free regret-based deep learning approaches that can take advantage of outcome sampling and can therefore scale to large games. However, they rely on importance sampling terms to remain unbiased, and this importance weight might become very large in games with a long horizon such as Stratego. Furthermore, all these techniques when generalized to using neural networks require generating an average strategy which is either memory heavy or error prone when using approximation.
+
+The second category of deep RL algorithms for two-player zero-sum games include best-response techniques. Neural Fictitious Self Play (NFSP) approximates extensive-form fictitious play by progressively training a best response against an average of all past policies. Policy Space Response Oracles (PSRO) iteratively adds a reinforcement learning best response to a population of policies, one for each player. AlphaStar beat top humans at Starcraft using a method inspired by PSRO. OpenAI Five beat top humans at Dota using a mixture of self-play and a dynamically-updated meta-distribution over past policies. Best response techniques remain memory-intensive because they potentially require an exponential number of different policies to represent an optimal policy.
+
+The third category, and where this work falls under, is policy gradient methods. Regret Policy Gradient (RPG) approximates CFR via a weighted policy gradient, but is not proven to converge to a Nash equilibrium. Neural Replicator Dynamics (NeuRD) approximates Replicator Dynamics with a policy gradient and is proven to converge to a Nash equilibrium in the time average. Prior to this work, neither of these algorithms have been applied to large-scale domains; this work uses NeuRD combined with the regularization idea to converge in the last iterate.
+
+\subsection{Work on Barrage Stratego}
+Recently, a smaller variant of Stratego (Barrage Stratego) has seen progress from a reinforcement learning perspective. Current Barrage Stratego bots are based on imperfect information tree search and are unable to beat intermediate-level human players. Pipeline PSRO was able to beat these handcrafted bots in Barrage Stratego (by at most 81\% win-rate), but didn't show results against top human players.
+
+\section{Methods: Additional Information}
+
+\subsection{Details on R-NaD in Two-Player Zero-Sum Normal Form Games}
+In a two-player zero-sum normal-form game, player $1$ and $2$ simultaneously play actions $a^1 \in A^1$ and $a^2 \in A^2$ with policies $\pi^1(a^1)$ and $\pi^2(a^2)$. As a result, player $1$ receives a reward $r^1(a^1, a^2)$ and player $2$ will receive the opposite reward $r^2(a^1, a^2) = -r^1(a^1, a^2)$. The \textit{reward transformation} step of R-NaD is defined based on a regularization policy $\pi_{\textrm{reg}} = (\pi^1_{\textrm{reg}}, \pi^2_{\textrm{reg}})$ which modifies the reward as follows:
+$$r^i(\pi^i, \pi^{-i},a^i, a^{-i}) = r^i(a^i, a^{-i}) - \eta \log\!\left(\frac{\pi^i(a^i)}{\pi^i_{\textrm{reg}}(a^i)}\right) + \eta \log\!\left(\frac{\pi^{-i}(a^{-i})}{\pi^{-i}_{\textrm{reg}}(a^{-i})}\right),$$
+with $\eta > 0$ a regularization parameter. We follow the convention of denoting the opponent of player $i$ as $-i$. The initial regularization policy can be chosen arbitrary (as long as all actions have a non-zero probability).
+
+The \textit{dynamics} step of R-NaD determines a new policy $\pi_{\textrm{fix}} = (\pi^1_{\textrm{fix}}, \pi^2_{\textrm{fix}})$ derived from convergence to a fixed point of the modified game by applying the replicator dynamics:
+$$\frac{d}{d\tau}\pi^i_\tau(a^i) = \pi^i_\tau(a^i)\Big[Q^i_{\pi_\tau}(a^i)-\sum_{b^i}\pi^i_\tau(b^i)Q^i_{\pi_\tau}(b^i)\Big],\quad Q^i_{\pi_\tau}(a^i) = \mathbb{E}_{a^{-i}\sim \pi^{-i}_\tau}\!\left[r^i(\pi^i_\tau, \pi^{-i}_\tau,a^i, a^{-i})\right].$$
+This dynamical system has a fixed point $\pi_{\textrm{fix}}$ and convergence to it is guaranteed through the Lyapunov function
+$$H_{\pi_{\textrm{fix}}}(\pi) = \sum_{i=1}^{2} \sum_{a^i \in A^i} \pi^i_{\textrm{fix}}(a^i)\log\!\left(\frac{\pi^i_{\textrm{fix}}(a^i)}{\pi^i(a^i)}\right).$$
+In this case it is a strong Lyapunov function of the system (in fact $(d/d\tau)H_{\pi_{\textrm{fix}}}(\pi_\tau)\leq -\eta H_{\pi_{\textrm{fix}}}(\pi_\tau)$) which means that the distance to the fixed point will decrease exponentially to $0$.
+
+Finally, in the \textit{update} step of R-NaD we use the previously-obtained fixed point as the regularization policy of the next iteration. One starts with an arbitrary regularisation policy $\pi_{0,\textrm{reg}}$. Then given any such regularization policy $\pi_{n,\textrm{reg}}$, we compute the fixed point $\pi_{n,\textrm{fix}}$ under the replicator dynamics of the game with transformed reward. Finally we choose $\pi_{n+1,\textrm{reg}} = \pi_{n,\textrm{fix}}$ and start the next iteration. This process generates a sequence of fixed points $n \rightarrow \pi_{n,\textrm{fix}}$, which is known to converge to the (unique) Nash equilibrium $\pi_{\textrm{nash}}$ of the original game, as $n \rightarrow \sum_{i=1}^2 \textrm{KL}(\pi^i_{\textrm{nash}},\pi^i_{n,\textrm{fix}})$ can be proven to decrease to $0$.
+
+The regularization parameter $\eta$ is fixed throughout this process. Its value has two effects on the dynamics step of R-NaD: on the one hand a higher value gives more stable and faster convergence to the fixed point. On the other hand a higher $\eta$ results in a fixed point that is more biased towards the regularization policy, which means one might need more overall iterations to approach the Nash equilibrium sufficiently close.
+
+\subsection{DeepNash: R-NaD at Scale}
+
+\subsubsection{Imperfect Information Games}
+In a two-player imperfect information game, each player plays in turn starting from an initial history $h_{\textrm{init}}$. The set $\mathcal{H}$ is the set of all histories and $\mathcal{A}$ is the set of all possible actions. In each history $h\in \mathcal{H}$, the current player takes an action $a\in \mathcal{A}$. As a result, player $i$ receives a reward $r^i(h, a)\in \mathbb{R}$ and the history is updated to $h'=ha$. For any given history $h$ the player's turn is noted $\psi(h) \in \{1, 2\}$. The information state $x(h)$ is the set of all histories $h' \in x(h)$, which are indistinguishable from $h$ from player $\psi(h)$'s point of view (we consider perfect recall). Each player's goal is to produce a policy $\pi^i(a|o)$ where $o$ is the observation given to the player at history $h$.
+
+For a given joint policy $\pi = (\pi^1, \pi^2)$ the value of a history $h$ for player $i$ is
+$$v^i_\pi(h) = \sum_{a \in \mathcal{A}} \pi^{\psi(h)}(a|o(h))\left[r^i(\pi, h, a) + v^i_\pi(ha)\right].$$
+The $Q$-function is defined as $Q^i_\pi(h, a) = r^i(\pi, h, a) + v^i_\pi(ha)$. The reach probability of a history $h$ is defined recursively $\rho_\pi(ha) = \pi^{\psi(h)}(a|o(h))\rho_\pi(h)$. The value given an observation is $v^i_\pi(o) = \sum_{h\in o}\rho_\pi(h) v^i_\pi(h) / \sum_{h\in o}\rho_\pi(h)$.
+
+In a self-play, model free reinforcement learning setting, the agent plays against itself using policy $\pi$ starting from $h_0 = h_{init}$. At each time $t$ the player samples an action $a_t$ according to $\pi(.|o_t)$. The following trajectories are collected: $\mathrm{T} = [(o_t, a_t, (r^1_t, r^2_t), \mu_t(.)=\pi(.|o_t)), \psi_t=\psi(h_t)]_{0\leq t <t_{\textrm{max}}}$.
+
+\subsubsection{Model-free Reinforcement Learning with Regularized Nash Dynamics}
+R-NaD's learning update generates a sequence of policy and value parameters $\theta_n$ indexed by $n$, and of target parameters $\theta_{n, \textrm{target}}$. The policy is $\pi_\theta(.|o) = \exp(l_\theta(.|o)) / \sum_b \exp(l_\theta(b|o))$.
+
+\paragraph{Transformation of the reward.}
+The reward transformation of R-NaD is done over an interval of size $\Delta_{m}$. It is based on the policy dependent reward
+$$r^i_{\pi_{m,\textrm{reg}}}(\pi, h, a) = r^i(h,a) + (1-2 \cdot \mathbf{1}_{i = \psi(h)})\,\eta \log\!\left(\frac{\pi(a|o(h))}{\pi_{m, \textrm{reg}}(a|o(h))}\right)$$
+starting with $\pi_{-1,\textrm{reg}}=\pi_{0,\textrm{reg}}$. At each step $n\in [0,\Delta_m]$ the reward transformation is an interpolation between $r^i_{\pi_{m,\textrm{reg}}}$ and $r^i_{\pi_{m-1,\textrm{reg}}}$:
+$$r^i_{\textrm{reg},n}(\pi, h, a) = \alpha_n r^i_{\pi_{m,\textrm{reg}}}(\pi, h, a) + (1-\alpha_n)r^i_{\pi_{m-1,\textrm{reg}}}(\pi, h, a),$$
+with $\alpha_n = \min(1,2n/\Delta_{m})$, to smooth the transition between one regularization policy and the next (also $\pi_{m, n, \textrm{reg}} = \alpha_n \pi_{m,\textrm{reg}} + (1-\alpha_n)\pi_{m-1,\textrm{reg}}$).
+
+\paragraph{Dynamics: estimators for the value function.}
+The fixed point $\pi_{m,\textrm{fix}}$ associated to $\pi_{m,\textrm{reg}}$ is learnt over $\Delta_{m}$ steps using two learning updates: (1) an update to learn a value function and generate an estimate of the $Q$-function and (2) an update to learn a policy from the estimated $Q$-function.
+
+It is challenging in Stratego to generate a good estimate of a $Q$-function as the action space is vast with 3600 possible actions at every step. The estimators at time $t$ and learning step $n$ adapt the $v$-trace estimator to the two-player case. This recursive backward process takes as input a joint policy $\pi$, a joint value $v$, and a trajectory $\mathrm{T}$, and outputs $\hat v^1_t, \hat v^2_t, \hat Q^1_t, \hat Q^2_t = \Upsilon(\mathrm{T}, \pi, v)$. Given a trajectory with transformed rewards, the backward update is, starting from $t=t_{\textrm{effective}}$:
+
+If $i \neq \psi_t$:
+$$\hat v^i_t = \hat v^i_{t+1},\quad V^i_{\textrm{next},t} = V^i_{\textrm{next},t+1},\quad \hat r^i_t = r^i_t + \frac{\pi(a_t|o_t)}{\mu_t(a_t)} \hat r^i_{t+1},\quad \xi_t = \frac{\pi(a_t|o_t)}{\mu_t(a_t)}\xi_{t+1}.$$
+
+If $i = \psi_t$:
+\begin{align*}
+&\hat v^i_t = v(o_{t}) + \delta_t V^i + c_t (\hat v^i_{t+1}-V^i_{\textrm{next},t+1}),\quad V^i_{\textrm{next},t} = v(o_{t}),\\
+&\delta_t V^i = \rho_t \!\left( r^i_t + \frac{\pi(a_t|o_t)}{\mu_t(a_t)} \hat r^i_{t+1} + V^i_{\textrm{next},t+1} - v(o_{t})\right),\quad \hat r^i_t = 0,\quad \xi_t = 1,\\
+&\rho_t = \min\!\left(\bar \rho, \tfrac{\pi(a_t|o_t)}{\mu_t(a_t)}\xi_{t+1}\right),\quad c_t = \min\!\left(\bar c, \tfrac{\pi(a_t|o_t)}{\mu_t(a_t)}\xi_{t+1}\right),\\
+&\hat Q^i_t (a) = -\eta\log\!\left(\tfrac{\pi_{\theta_n}(a|o_t)}{\pi_{m, n, \textrm{reg}}(a|o_t)}\right)\\
+&\qquad + \frac{\mathbf{1}_{a=a_t}}{\mu_t(a_t)}\!\left(r^i_t + \eta\log\!\left(\tfrac{\pi_{\theta_n}(a|o_t)}{\pi_{m, n, \textrm{reg}}(a|o_t)}\right) + \tfrac{\pi(a_t|o_t)}{\mu_t(a_t)} (\hat r^i_{t+1} + \hat v^i_{t+1})-v(o_{t})\right)+v(o_{t}).
+\end{align*}
+These estimators are computed over the full trajectory from the end to the beginning without any bootstrapping.
+
+\paragraph{Dynamics: learning update of the $Q$-function and of the policy.}
+First we use $\hat v^1_{t,n}, \hat v^2_{t,n}, \hat Q^1_{t,n}, \hat Q^2_{t,n} = \Upsilon(\mathrm{T}_n,  \pi_{\theta_{n, \textrm{target}}}, v_{\theta_{n, \textrm{target}}})$ as estimates. The value is learned through a regression loss
+$$l_{\textrm{critic}}(\theta) = \sum_{i=1}^2 \frac{1}{t_{\textrm{effective}}}\sum_{t=0}^{t_{\textrm{effective}}}\mathbf{1}_{i=\Psi_t}\|v_{\theta}(o_t)-\hat v^i_t\|,$$
+and the policy is updated through the Neural Replicator Dynamics (NeuRD) loss:
+$$\Lambda_n = -\Big[\textrm{lr}_n \nabla l_{\textrm{critic}}(\theta_n) + \sum_{i=1}^2 \tfrac{1}{t_{\textrm{effective}}}\sum_{t=0}^{t_{\textrm{effective}}} \sum_a \hat\nabla_\theta\big(l_{\theta_n}(a, o_t)\,\textrm{Clip}(Q^{\psi_t}_{t,n}(a, o_t), c_{\textrm{clip NeuRD}}),\, \textrm{lr}_n, \beta\big)\Big]$$
+with $\hat\nabla_\theta(z(\theta), \eta, \beta) = \eta \nabla_\theta z(\theta) \mathbf{1}_{z(\theta + \eta \nabla_\theta z(\theta))\in [-\beta, \beta]}$ and $\textrm{Clip}(.,c) = \min(\max(.,-c),c)$. Parameters are updated via Adam:
+$$\theta_{n+1}=\textrm{Adam}(\theta_n, \textrm{Clip}(\Lambda_n, c_{\textrm{clip gradient}}), b_{1,\textrm{adam}}, b_{2,\textrm{adam}}, \epsilon_{\textrm{adam}}),$$
+$$\theta_{n+1,\textrm{target}} = \gamma_{\textrm{averaging}}\theta_{n+1}+(1-\gamma_{\textrm{averaging}})\theta_{n,\textrm{target}}, \quad \gamma_{\textrm{averaging}}\in[0, 1).$$
+
+\paragraph{Updating the transformed reward and the learning parameters.}
+After the dynamics step completes we set $\pi_{m,\textrm{fix}}=\pi_{\theta_{n=\Delta_m}, \textrm{target}}$. The next regularisation policy is $\pi_{m+1,\textrm{reg}}=\pi_{m,\textrm{fix}}$ and we go on to step $m+1$. The new reward transform at step $m+1$ interpolates between $r^i_{\pi_{m+1,\textrm{reg}}}$ and $r^i_{\pi_{m,\textrm{reg}}}$.
+
+\paragraph{Fine-tuning.}
+Learning with the previous method is enough to converge to an empirically satisfying solution but limited by low probability mistakes. Those mistakes appear because the softmax projection assigns non-zero probability to every action. Although individually rare, an opponent who prolongs the game by avoiding capture and making neutral waiting moves will eventually benefit from one of these low-probability errors. In order to alleviate this issue we fine-tune with a different projection that thresholds and discretizes the action probabilities: $\pi_{\theta, \epsilon_\text{tres}, n_\text{disc}}$ where $\epsilon_\text{tres}$ is the threshold level and $n_\text{disc}$ is the number of probability quanta.
+
+Parameters used during training: $\eta=0.2$; $\Delta_m$ = 10k for $m\leq 100$, 100k for $100<m\leq 165$, 35k for $m>165$; max number of steps = 7.21M; $\textrm{lr}_n=0.00005$; $c_{\textrm{clip gradient}}=10000$; NeuRD $\beta=2.0$, $c_{\textrm{clip NeuRD}}=10000$; Adam $b_1=0.0$, $b_2=0.999$, $\epsilon=10^{-8}$; target averaging $\gamma=0.001$; $v$-trace $\bar\rho=1.0, \bar c=1.0$; $t_{\textrm{max}}=3600$; batch size 768; fine-tuning $\epsilon_\text{tres}=0.03$, $n_\text{disc}=32$.
+
+\subsubsection{Infrastructure for learning}
+The IMPALA architecture is adapted to the needs of the R-NaD algorithm, namely storing full episodes in the replay buffer. The learner reads a batch of full episodes, splits them into the sequence of ordered chunks of fixed length (mini batches), and computes the parameter updates on that sequence in reverse order. This allows computing the exact full returns and to carry over the necessary information between mini-batches.
+
+\subsection{Game Rules and Neural Network Input Representation}
+
+\subsubsection{Basic Rules}
+Stratego is a two-player board game, played between red and blue. The game board is a $10 \times 10$ grid of squares, with two $2 \times 2$ lakes which pieces may not move on or through. Each player starts with 40 pieces of 12 different types: Flag (F, 1), Spy (S, 1), Scout (2, 8), Miner (3, 5), Sergeant (4, 4), Lieutenant (5, 4), Captain (6, 4), Major (7, 3), Colonel (8, 2), General (9, 1), Marshal (10, 1), Bomb (B, 6).
+
+The game consists of a deployment phase and a play phase. During deployment, both players independently and privately position their 40 pieces on their side of the board in a $4 \times 10$ rectangular area, in any configuration they choose. In the play phase, the players take turns to move one of their pieces, starting with red. The goal is to either capture the opponent's Flag or capture all of their movable pieces.
+
+On each turn, the current player moves one of their pieces either to an empty square or to a square occupied by one of the opponent's pieces, attacking it. All pieces besides the Scout, Flag, and Bomb can move only one square at a time. The Scout can move through any number of empty spaces in one of the four directions. The Flag and Bombs are static. When an attack occurs, both players reveal their piece's type; the higher-valued piece remains, the lower-valued piece is captured. Two exceptions: Miners capture Bombs, and Spies capture Marshals if the Spy attacks.
+
+\subsubsection{Drawing rules}
+We do not offer draw negotiation to our agents, but instead trained and evaluated with the following (non-standard) rules: a game automatically ends in a draw either after 2000 total moves, or 200 consecutive moves without any attack.
+
+\subsubsection{Agent action space}
+The action space is discrete and of size 100 throughout the game, each action corresponding to a square on the board.
+
+During deployment, the player plays exactly 40 actions, one for each piece. The piece deployment order is fixed and sorted by type: Flag, Bomb, Marshal, General, Colonel, Major, Captain, Lieutenant, Sergeant, Miner, Scout and Spy.
+
+During play, a full move is decomposed into two actions. First, the agent selects the current location of one of its own pieces. Second, the agent selects a legal destination location for the selected piece.
+
+\subsubsection{Neural Network Input Representation}
+Let a \textbf{piecetype assignment} for player $i$ be an assignment of a specific piecetype to every piece of that player still on the board, represented by a $10 \times 10 \times 12$ tensor where $T_i[r, c, t] = 1$ iff square $(r, c)$ holds a piece of color $i$ of type $t$.
+
+The \textbf{private information tensor} $\textbf{Prv}_i$ is the piecetype assignment tensor corresponding to the actual board state. The \textbf{public information tensor} $\textbf{Pub}_i$ is a $10 \times 10 \times 12$ tensor such that $\textbf{Pub}_i[r, c, t]$ is the probability that square $(r,c)$ holds a piece of player $i$ of type $t$, under uniform sampling of piecetype assignments consistent with the move sequence so far. Given there are only two categories of unknown pieces (moved and non-moved):
+$$\textbf{Pub}_i[r, c, t] = \begin{cases}
+0 & \text{if no piece of player $i$ at $(r,c)$}, \\
+1 & \text{if the piece at $(r,c)$ is known to have type $t$}, \\
+\#\text{unrevealed}(t) / \sum_{k \ne B,F} \#\text{unrevealed}(k) & \text{if moved and $t \ne B,F$}, \\
+\#\text{unrevealed}(t) / \sum_{k} \#\text{unrevealed}(k) & \text{if never moved}.
+\end{cases}$$
+
+A move $m$ observed by player $i$ is encoded as a $10 \times 10$ tensor $\textbf{Mov}_i^m$:
+$$\textbf{Mov}_i^m[r, c] = \begin{cases}
+-1 & \text{regular move from $(r,c)$}, \\
+-(2 + t/12) & \text{attack from $(r,c)$ by piece of type $t$}, \\
+1 & \text{moved to or attacked $(r,c)$}, \\
+0 & \text{elsewhere}.
+\end{cases}$$
+
+The observation for player $i$ is stacked into a $10 \times 10 \times 82$ tensor: a lakes mask ($10\times10$); own private info $\textbf{Prv}_i$ ($10\times10\times12$); opponent public info $\textbf{Pub}_{-i}$ ($10\times10\times12$); own public info $\textbf{Pub}_i$ ($10\times10\times12$); last 40 moves $\textbf{Mov}_i^m$ ($10\times10\times40$); ratio of game length to max length (scalar); ratio of moves since last attack (scalar); phase of game, deploy=1/play=0 (scalar); select piece=0 / select target=1 (scalar); previously selected piece ($10\times10$).
+
+\subsubsection{Player-centric observations and actions}
+To facilitate training a single agent that can play both sides, the observation for player blue is rotated 180 degrees.
+
+\subsection{Network Architecture}
+
+\paragraph{Network Modules.}
+The agent policy is parameterized through a deep neural network. A torso module first processes the observation to produce a board game embedding of spatial dimension $10\times10$ and channel dimension $256$. This representation is provided to three policy head modules specialized by game phase and a value-head module.
+
+The deployment head takes the board embedding and outputs a $10\times10$ probability distribution (restricted to legal positions). The piece-selection head takes the concatenation of board embedding and tiled no-attack ratio, and outputs $10\times10$ distribution (restricted to playable units). The piece-displacement head takes board embedding, no-attack ratio, and one-hot representation of the selected piece (spatial $10\times10$, channel $10$ for unit-type across movable units). The value head takes board embedding, no-attack ratio, and one-hot representation of the selected piece; no-attack ratio and selected-piece one-hot are zeroed when not applicable, for a fixed input shape.
+
+\paragraph{Neural Implementation.}
+All modules are based on a pyramid-like architecture composed of resblock modules. Pyramid module from input to output: 1 convolution with $C=256$, no stride, $3\times3$ kernel, ReLU; $N$ outer-convolution resblocks with $C=256$; 1 strided-convolution resblock with $C=256$, stride 2; $M$ inner-convolution resblocks with $C=320$; $M$ inner-deconvolution resblocks with $C=320$; 1 strided-deconvolution resblock $C=256$, stride 2; $N$ outer-deconvolution resblocks with $C=256$. Includes skip-connections from conv resblock to symmetric deconv resblock. Policy heads: $N=1$, $M=0$. Value head: $N=0$, $M=0$. Forbidden actions are masked by setting logits to $-\infty$; softmax produces the distribution.
+
+Convolution resblock: skip-out connection; conv $C/2$, optional stride $S$, $3\times3$, ReLU; conv $C$, no stride, $3\times3$, ReLU; residual sum with input.
+
+Deconvolution resblock: deconv $C/2$, optional stride $S$, $3\times3$, ReLU; skip-in sum with symmetric skip-out (processed by $1\times1$ deconv); deconv $C$, no stride, $3\times3$, ReLU; residual sum.
+
+\subsection{Infrastructure and Setup}
+The DeepNash training pipeline follows the Sebulba Podracer architecture. It consists of Actors, Replay Buffer, Learner and Evaluators. Actors self-play and write full games into Replay Buffer. The Replay Buffer stores games as a queue. The Learner extracts a batch, improves weights, and periodically sends them to Actors/Evaluators. Evaluators play against fixed opponent bots.
+
+\paragraph{Deployment.}
+Actors, Learner and Buffer are deployed on the same machine, since they use different resources (CPU/small accelerator for Actors; RAM for Buffer; heavy accelerator FLOPs for Learner). Evaluators run separately as low-priority machines.
+
+\paragraph{Scalability.}
+We use SIMD parallelism (JAX \texttt{pmap}): several learner machines sync each step, reading different batches, computing gradients, averaging, applying. We used 768 TPU nodes for Learners and 256 TPU nodes for Actors.
+
+\paragraph{Differences from Sebulba Podracer.} Actors' environment-agent loop is implemented in C++ using fibers and native OpenSpiel interfaces. Full games (variable-length) are stored in the Replay Buffer, and each Learner step consumes a batch of full games. Evaluators run on a separate flock.
+
+\paragraph{Full games learning.}
+To compute exact returns on variable-length trajectories, we store full games in the Replay Buffer. When the learner samples a batch, shorter games are padded to the length of the longest. The batch is chopped into fixed-length chunks along the time-axis. The learner does two passes: (a) a forward pass to recompute the exact network (LSTM) state for each timestep and full trajectory statistics; (b) a backward pass where each chunk is reprocessed with the exact network state and full trajectory statistics. Pass (a) is outside gradient computation. Gradients computed during (b) are accumulated and applied at the end.
+
+\subsection{Test Time Improvements}
+
+\subsubsection{Post-processing of policy}
+Given Stratego is complex imperfect information, we expect the Nash policy to be non-deterministic in many states. The policy produced by R-NaD is non-deterministic in most states. However, it often gives small but non-zero probability to clear blunders. Since Stratego games can take up to 2000 moves, playing this stochastic policy results in several very-low-probability actions. We apply a heuristic post-processing to eliminate very-low-probability moves without making the policy too deterministic:
+\begin{itemize}
+\item Thresholding: actions with probability below $\epsilon_\text{tres}$ are dropped and the policy renormalized. If no actions with positive probability would remain, the policy is left unchanged.
+\item Discretization: sorted high-to-low, probabilities are rounded up to the nearest multiple of $1/n_\text{disc}$; remaining weights are discarded once a sum of 1 is reached.
+\end{itemize}
+
+\subsubsection{Avoid repetitive play}
+We observed the agent often moved a piece back-and-forth on two squares, threatening a known lower-valued opponent piece. This is allowed by the rules up to a limit but is annoying. We apply two techniques:
+\begin{itemize}
+\item Avoid pointless threats: initially the agent is allowed to threaten by moving back and forth three times between two adjacent squares. After that, for the same two pieces on the same 2x2 region, only a single threatening move is allowed.
+\item Eagerness: decreases the agent's perception of how much time remains before the game is considered a draw. The observation contains ratio $r$ indicating how close the game is to being declared a draw; we modify to $r' = 1 - (1 - r)^{\alpha_\text{eag}}$ at test time.
+\end{itemize}
+
+\subsubsection{Memory heuristic}
+The observation presented to the network does not always contain sufficient history. Our memory heuristic assumes that: a Spy would attack a known Marshal; a Marshal would attack a known General or Colonel if no recapture is possible; a General would attack a known Colonel if no recapture possible. Therefore if a player makes a non-attacking move, any piece that had the chance to attack according to the rules described is not of the corresponding type. These eliminated possibilities are tracked per piece and influence the policy by modifying the network input: corresponding entries in $\textbf{Pub}_i$ and $\textbf{Pub}_{-i}$ are set to 0.
+
+\subsubsection{Value bounds heuristic}
+Occasionally an obvious mistake still had support in the policy. We added a value bounds heuristic that uses the value function to score any state where the agent needs to act. Two-step lookahead estimates an \emph{upper bound} of the value of each action. If an estimated upper bound for an action is \emph{lower} than the current state value, the action is considered an error and removed from the policy. No probabilistic assessment of the opponent's private information is made; instead best-case private info of the opponent is assumed for attacks, and worst-case opponent response from a set of safe actions.
+
+An action is safe if all of the following hold: the piece is already known to be movable; in case of a long move/attack, the piece is already known to be a Scout; in case of an attack, it is a guaranteed win, for any private info of both players consistent with the public info; the piece cannot be subsequently captured, for any private info consistent with public info.
+
+Let $\mathcal{A}_\textrm{safe}(h)$ be the set of all safe actions at history $h$. Given information state $x$, the value upper bound for action $a$ is
+$$\widehat{v^\textrm{nn}}(x, a) = \max_{h \in x} \min_{a' \in \mathcal{A}_\textrm{safe}(ha)} v^\textrm{nn}(x(haa')).$$
+If $\widehat{v^\textrm{nn}}(x, a) + \epsilon_\text{vb} < v^\textrm{nn}(x)$ then $a$ is removed from the policy, if alternative actions exist.
+
+Test-time improvement settings: $\epsilon_\text{tres}^\text{(deploy)}=0.03$, $\epsilon_\text{tres}^\text{(play)}=0.03$, $n_\text{disc}^\text{(deploy)}=32$, $n_\text{disc}^\text{(play)}=16$, $\alpha_\text{eag}=2.0$, $\epsilon_\text{vb}=0.05$.
+
+This heuristic only occasionally intervenes; for example in the matches played on Gravon, it affected less than 1.5\% of DeepNash's turns. Both this heuristic and the memory heuristic do not significantly improve the winrate when DeepNash is evaluated against a version of itself without these heuristics; they only empirically seem to avoid some mistakes observed in matches against humans.
+
+\section{Additional Results}
+
+\subsection{Details on human evaluation on Gravon}
+DeepNash was evaluated on Gravon, beginning of April 2022, with the consent of Thorsten Jungblut, the Gravon platform owner. This resulted in roughly 50 ranked matches. The ratings in the 2022 and all-time ranking were computed on April 22\textsuperscript{nd} 2022 and three matches were ignored: two played with an earlier training snapshot, one timed out due to a human error.
+
+\subsection{Details on external Stratego program evaluation}
+\textbf{Probe}: three-fold winner of the Computer Stratego World Championship (2007, 2008, 2010); available as "Heroic Battle" app on Android. Version 2.0.37, Expert level, equal games across Conservative/Moderate/Aggressive styles.
+
+\textbf{Master of the Flag}: 2009 Computer Stratego World Championship winner. Version 5.2.0.40. Plays only as Blue.
+
+\textbf{Demon of Ignorance}: open-source Java implementation with AI bot. Version 0.13.4, AI-level 8 (performance saturates there). If the bot fails to produce a valid action 3 times in a row, the game is discarded.
+
+\textbf{Asmodeus, Celsius, Celsius1.1, PeternLewis, Vixen}: agents from Australian university programming competition 2012 (won by PeternLewis). These sometimes violate the two- and more-square rule of Stratego. Evaluated using a variant allowing such moves, but discarded matches ending in draw due to endless repetition. Commit 54f0978.
+
+\section{Quotes from Stratego Experts}
+Thorsten Jungblut, owner of the Gravon platform:
+\begin{quote}
+Many players in the past thought that there will never be an AI for Stratego that could be a real competition for human players, or even play in the top ten. Obviously, they were wrong.
+\end{quote}
+
+Vincent de Boer, former Stratego world champion:
+\begin{quote}
+The level of play of DeepNash surprised me. I had never seen or heard of an artificial Stratego player that came close to the level needed to win a match against an experienced human player, but after playing against DeepNash myself I was not surprised by the top-3 ranking it later on achieved on the Gravon internet platform. I would expect this agent to also do very well if it participated in the World Championship.
+\end{quote}

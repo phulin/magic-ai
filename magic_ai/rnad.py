@@ -81,14 +81,21 @@ class RNaDConfig:
     finetune_n_disc: int = 16
     """Number of probability quanta for fine-tune / test-time discretization."""
 
-    q_corr_rho_bar: float = 1.0
-    """Clip on the joint inverse-sampling weight ``1/mu_t`` used in the
-    full-NeuRD per-action Q estimator (paper §179-180). The paper assumes
-    a single-categorical action where ``1/mu_t`` is bounded in expectation;
-    for factored Magic actions ``mu_t = ∏_k mu_k`` so the unclipped weight
-    can blow up multiplicatively in the number of decision groups. Clipping
-    matches the standard v-trace-style IS bound and reduces to the paper's
-    estimator for single-group steps when the bound is loose."""
+    q_corr_rho_bar: float = 100.0
+    """Clip on the per-group inverse-sampling weight ``1/mu_k`` used in the
+    per-action Q estimator (paper §179-180, applied per autoregressive
+    decision group — see :func:`rnad_trajectory_loss`).
+
+    Issue 6: with the per-group decomposition introduced in issue 4 the
+    weight is bounded by ``1/min_a pi_target_k(a)`` for a single group rather
+    than the multiplicative ``1/∏_k mu_k`` of the joint formulation, so the
+    clip can be loosened substantially without risking blow-up. The default
+    100 lets policies near-deterministic on a single legal choice still
+    update without aggressive bias, while bounding the worst-case sampled-
+    correction magnitude. ``rnad_trainer`` logs how often the clip actually
+    fires (``RNaDStats.q_clip_fraction``); if that climbs above a few
+    percent, the per-action Q estimator has drifted and the clip is doing
+    real work — investigate before raising it further."""
 
     learning_rate: float = 5e-5
     """Optimizer learning rate (paper §199: 5e-5). Used by the NeuRD
@@ -420,37 +427,45 @@ def neurd_loss_per_choice(
     *,
     flat_logits: Tensor,
     flat_q: Tensor,
-    group_idx: Tensor,
-    num_groups: int,
+    flat_active_mask: Tensor | None = None,
     beta: float,
     clip: float,
     lr: float = 0.0,
-) -> Tensor:
+) -> tuple[Tensor, int, int]:
     """NeuRD loss over a flattened, ragged set of per-choice logits.
 
-    The decision-group structure of :meth:`PPOPolicy.evaluate_replay_batch`
-    produces a flat tensor of per-legal-choice logits together with a
-    ``group_idx`` mapping each entry to its source step. This form
-    supports variable-size legal-action sets without padding.
+    Returns ``(sum_loss, num_active_entries, num_clipped_entries)``. The
+    caller is responsible for global normalization by total trajectory step
+    count (issue 7). ``num_clipped_entries`` reports how many ``flat_q``
+    values were clamped by ``[-clip, clip]`` — the trainer logs this so an
+    operator can detect when the per-action Q estimator is producing
+    abnormally large values (issue 6).
 
-    ``num_groups`` is the number of decision steps in the batch (used
-    only as the averaging denominator, to keep the loss scale
-    comparable to the dense :func:`neurd_loss`).
+    ``flat_active_mask`` (default: all-ones) selects which flat entries
+    actually contribute. Use it to mask out non-own-turn steps or
+    decision groups that should not receive policy gradient.
     """
 
     if flat_logits.shape != flat_q.shape:
         raise ValueError("flat_logits and flat_q must share shape")
-    if flat_logits.shape != group_idx.shape:
-        raise ValueError("flat_logits and group_idx must share shape")
-    if num_groups < 1:
-        raise ValueError("num_groups must be >= 1")
-    q_clipped = flat_q.clamp(-clip, clip).detach()
+    if flat_active_mask is not None and flat_active_mask.shape != flat_logits.shape:
+        raise ValueError("flat_active_mask must match flat_logits shape")
+    q_pre = flat_q.detach()
+    q_clipped = q_pre.clamp(-clip, clip)
+    n_clipped = int((q_pre.abs() > clip).sum().item()) if flat_logits.numel() > 0 else 0
     with torch.no_grad():
         # Paper §189 post-update logit predicate; see :func:`neurd_loss`.
         post_update = flat_logits + lr * q_clipped
         in_range = (post_update >= -beta) & (post_update <= beta)
-    per_entry = -flat_logits * q_clipped * in_range.to(dtype=flat_logits.dtype)
-    return per_entry.sum() / max(num_groups, 1)
+    active_f = (
+        flat_active_mask.to(dtype=flat_logits.dtype)
+        if flat_active_mask is not None
+        else torch.ones_like(flat_logits)
+    )
+    per_entry = -flat_logits * q_clipped * in_range.to(dtype=flat_logits.dtype) * active_f
+    sum_loss = per_entry.sum()
+    n_active = int(active_f.sum().item()) if flat_logits.numel() > 0 else 0
+    return sum_loss, n_active, n_clipped
 
 
 # ---------------------------------------------------------------------------
@@ -463,11 +478,12 @@ def critic_loss(
     v_theta: Tensor,
     v_hat: Tensor,
     perspective_is_player_i: Tensor,
-) -> Tensor:
+) -> tuple[Tensor, int]:
     """L1 regression of the online value head against the v-trace target.
 
-    Only own-turn steps contribute (paper §186). ``v_theta`` and ``v_hat``
-    are both shape ``(T,)``; the boolean mask selects own-turn indices.
+    Only own-turn steps contribute (paper §186). Returns ``(sum_loss, count)``
+    so the caller can normalize globally over a multi-trajectory batch by
+    total own-turn step count (issue 7).
     """
 
     if v_theta.shape != v_hat.shape:
@@ -477,9 +493,9 @@ def critic_loss(
 
     mask = perspective_is_player_i.to(dtype=torch.bool)
     if not mask.any():
-        return v_theta.new_zeros(())
+        return v_theta.new_zeros(()), 0
     diff = (v_theta - v_hat.detach()).abs()
-    return diff[mask].mean()
+    return diff[mask].sum(), int(mask.sum().item())
 
 
 # ---------------------------------------------------------------------------
@@ -552,95 +568,82 @@ def threshold_discretize(
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Sampled-action NeuRD (simplified policy loss usable from the existing
-# scalar-log-prob replay pipeline — see :func:`neurd_loss` for the full
-# per-action form used with ``evaluate_replay_batch_rnad``)
-# ---------------------------------------------------------------------------
-
-
-def sampled_neurd_loss(
-    *,
-    log_prob: Tensor,
-    q_hat: Tensor,
-    own_turn_mask: Tensor,
-    clip: float,
-) -> Tensor:
-    """Sampled-action NeuRD loss.
-
-    The full NeuRD gradient (paper §188) is
-
-        -sum_a grad(logit_a) * clip(Q(a), c) * 1[logit_a in [-beta, beta]]
-
-    summed over all legal actions. This variant uses only the sampled action's
-    log-prob as a stochastic estimator:
-
-        L = - mean_{t: own-turn} log_prob(t) * clip(Q(t), [-clip, clip])
-
-    This is the policy-gradient-theorem form of NeuRD and is consistent with
-    how the PPO replay pipeline currently exposes per-step log-probs. The β
-    gate on individual logit magnitudes is not applied here; the full form
-    with per-action logits lands in a later phase once ``evaluate_replay_batch``
-    grows a per-choice-logit return mode.
-    """
-
-    if log_prob.shape != q_hat.shape:
-        raise ValueError("log_prob and q_hat must share shape")
-    if log_prob.shape != own_turn_mask.shape:
-        raise ValueError("log_prob and own_turn_mask must share shape")
-    mask = own_turn_mask.to(dtype=torch.bool)
-    if not mask.any():
-        return log_prob.new_zeros(())
-    q_clipped = q_hat.clamp(-clip, clip).detach()
-    per_step = -log_prob * q_clipped
-    return per_step[mask].mean()
-
-
 def may_neurd_loss(
     *,
     may_logits: Tensor,
-    may_selected: Tensor,
-    q_hat: Tensor,
+    q_accept: Tensor,
+    q_decline: Tensor,
     own_turn_may_mask: Tensor,
     beta: float,
     clip: float,
     lr: float = 0.0,
-) -> Tensor:
-    """β-gated NeuRD loss for the Bernoulli ``may`` head.
+) -> tuple[Tensor, int]:
+    """True two-action NeuRD loss for the Bernoulli ``may`` head.
 
-    Treats the may head as a 1-logit Bernoulli (accept vs decline). The
-    full NeuRD gradient on a Bernoulli with logit ``l`` is
+    Models accept/decline as a 2-action softmax with logits ``(l, 0)`` (the
+    canonical Bernoulli-as-softmax encoding; the all-zero second logit is a
+    constant and so receives no gradient). The full NeuRD gradient over both
+    actions is
 
-        d(loss)/dl = -(1[a=accept] - sigmoid(l)) * clip(Q, c) * gate(|l| <= beta)
+        d(loss)/dl = -[(1 - p) · Clip(Q_accept, c) - p · Clip(Q_decline, c)]
+                       · 1[|l_post| <= beta]
 
-    which matches the sampled-action policy-gradient-theorem form with a
-    per-step β-magnitude gate — the Bernoulli analogue of
-    :func:`neurd_loss_per_choice`.
+    where ``p = sigmoid(l)``. Both branches' Q values appear, so both branches
+    contribute the per-action ``-eta · log(pi/pi_reg)`` regularization term —
+    not just the sampled one. ``Q_accept`` and ``Q_decline`` must already have
+    the regularization built in (the trainer assembles them per branch).
+
+    Returns ``(sum_loss, count)`` rather than a mean so the caller can
+    normalize globally over the trajectory batch's effective step count
+    (issue 7 — paper-faithful 1/t_effective weighting).
     """
 
-    if may_logits.shape != may_selected.shape:
-        raise ValueError("may_logits and may_selected must share shape")
-    if may_logits.shape != q_hat.shape:
-        raise ValueError("may_logits and q_hat must share shape")
+    if may_logits.shape != q_accept.shape:
+        raise ValueError("may_logits and q_accept must share shape")
+    if may_logits.shape != q_decline.shape:
+        raise ValueError("may_logits and q_decline must share shape")
     mask = own_turn_may_mask.to(dtype=torch.bool)
     if not mask.any():
-        return may_logits.new_zeros(())
-    prob_accept = torch.sigmoid(may_logits)
-    advantage = may_selected.to(dtype=may_logits.dtype) - prob_accept
-    q_clipped = q_hat.clamp(-clip, clip).detach()
+        return may_logits.new_zeros(()), 0
+    p_accept = torch.sigmoid(may_logits)
+    q_accept_c = q_accept.clamp(-clip, clip).detach()
+    q_decline_c = q_decline.clamp(-clip, clip).detach()
+    # NeuRD gradient on logit l = (1-p) Q_a - p Q_d; surrogate that produces
+    # this gradient is p_accept_grad * Q_a + p_decline_grad * Q_d where the
+    # softmax-style sum is realised by the two-action log-probs.
+    log_p_accept = torch.nn.functional.logsigmoid(may_logits)
+    log_p_decline = torch.nn.functional.logsigmoid(-may_logits)
+    surrogate = log_p_accept * q_accept_c + log_p_decline * q_decline_c
     with torch.no_grad():
-        # Paper §189 post-update logit predicate. The Bernoulli NeuRD
-        # gradient on may_logits is ``advantage · Clip(Q, c)``; gate on the
-        # post-update logit ``logit + lr · advantage · Clip(Q, c)``.
-        post_update = may_logits + lr * advantage * q_clipped
+        # Gate using the worst-case post-update direction on l (paper §189).
+        grad_l = (1.0 - p_accept) * q_accept_c - p_accept * q_decline_c
+        post_update = may_logits + lr * grad_l
         in_range = post_update.abs() <= beta
-    per_step = -advantage * q_clipped * in_range.to(dtype=may_logits.dtype)
-    return per_step[mask].mean()
+    per_step = -surrogate * in_range.to(dtype=may_logits.dtype)
+    sum_loss = per_step[mask].sum()
+    count = int(mask.sum().item())
+    return sum_loss, count
 
 
 # ---------------------------------------------------------------------------
 # Polyak target network + reg snapshot persistence
 # ---------------------------------------------------------------------------
+
+
+# Buffers that hold per-actor runtime state (env-indexed LSTM cache, rollout
+# storage). They are not part of the trainable model and must NOT be Polyak-
+# averaged or copied between online and target/reg policies; doing so would
+# replace one policy's actor cache with another's (or with a stale snapshot)
+# and silently corrupt sampling for whichever module shares the buffer.
+_ACTOR_RUNTIME_BUFFER_PREFIXES: tuple[str, ...] = (
+    "live_lstm_h",
+    "live_lstm_c",
+    "rollout_buffer.",
+)
+
+
+def _is_actor_runtime_buffer(name: str) -> bool:
+    return any(name == p or name.startswith(p) for p in _ACTOR_RUNTIME_BUFFER_PREFIXES)
 
 
 @torch.no_grad()
@@ -650,6 +653,11 @@ def polyak_update_(target: nn.Module, online: nn.Module, gamma: float) -> None:
     ``gamma`` is the "target learning rate" in the DeepNash paper (§191),
     typically very small (1e-3). Only floating-point parameters and buffers
     are averaged; integer buffers (e.g. LSTM indices) are copied verbatim.
+
+    Per-actor runtime buffers (``live_lstm_h``/``live_lstm_c`` and the rollout
+    buffer) are skipped entirely: those are not model state, they are the
+    online actor's per-env LSTM cache and shared rollout storage, and copying
+    them across policies corrupts sampling.
     """
 
     if not 0.0 <= gamma <= 1.0:
@@ -663,6 +671,8 @@ def polyak_update_(target: nn.Module, online: nn.Module, gamma: float) -> None:
     target_buffers = dict(target.named_buffers())
     for name, b_online in online.named_buffers():
         if name not in target_buffers:
+            continue
+        if _is_actor_runtime_buffer(name):
             continue
         b_target = target_buffers[name]
         if b_target.dtype.is_floating_point and b_online.dtype.is_floating_point:
@@ -713,6 +723,12 @@ class RNaDStats:
     v_hat_mean: float
     grad_norm: float
     transformed_reward_mean: float
+    q_clip_fraction: float = 0.0
+    """Fraction of per-action Q values clipped by ``[-neurd_clip, +neurd_clip]``
+    in the per-choice NeuRD loss this update. Tracked because — under issue 6 —
+    the looser ``q_corr_rho_bar`` default lets the per-group sampled correction
+    grow naturally, and a high clip fraction is the signal that the estimator
+    has drifted."""
 
 
 class _ReplayEvaluator(Protocol):
@@ -730,177 +746,36 @@ class _ReplayEvaluator(Protocol):
 
 @dataclass(frozen=True)
 class _TrajLossPieces:
-    """Raw loss tensors + scalar stats for one trajectory."""
+    """Raw loss tensors + counts + scalar stats for one trajectory.
 
-    cl: Tensor
-    pl: Tensor
+    Issue 7 (paper-faithful 1/t_effective normalization): each loss is the
+    *sum* over its applicable steps/actions, paired with the count that
+    sum was taken over. Multi-trajectory batchers can then normalize by the
+    aggregate count rather than averaging per-episode means (which biases
+    short games and players with fewer own-turn decisions).
+    """
+
+    cl_sum: Tensor
+    cl_count: int
+    pl_sum: Tensor
+    pl_count: int
+    n_q_clipped: int
     v_hat_mean: float
     transformed_mean: float
 
 
-def rnad_trajectory_loss(
-    *,
-    online: _ReplayEvaluator,
-    target: _ReplayEvaluator,
-    reg_cur: _ReplayEvaluator,
-    reg_prev: _ReplayEvaluator,
-    replay_rows: list[int],
-    perspective_player_idx: Sequence[int],
-    winner_idx: int,
-    logp_mu: Tensor,
-    config: RNaDConfig,
-    alpha: float,
-) -> _TrajLossPieces:
-    """Compute the R-NaD critic + sampled-action NeuRD losses for one trajectory.
+def _maybe_recompute_lstm(policy: Any, replay_rows: list[int]) -> tuple[Tensor, Tensor] | None:
+    """Re-run the policy's LSTM scan over a single episode (issue 2).
 
-    Stateless: returns the loss tensors (with grad), leaving the backward +
-    optimizer + Polyak step to the caller. :func:`run_rnad_update` calls
-    this per episode in a rollout batch and accumulates losses for a single
-    backward/step/Polyak cycle; that amortizes optimizer overhead over many
-    short episodes and keeps GPU saturation high.
+    Returns ``None`` when the policy has no LSTM or no
+    :meth:`PPOPolicy.recompute_lstm_states_for_episode` method (e.g. a
+    minimal stub used in unit tests).
     """
 
-    if not replay_rows:
-        raise ValueError("replay_rows must be non-empty")
-    t_len = len(replay_rows)
-    if len(perspective_player_idx) != t_len:
-        raise ValueError("perspective_player_idx must match replay_rows length")
-    if logp_mu.shape != (t_len,):
-        raise ValueError(f"logp_mu must have shape ({t_len},), got {tuple(logp_mu.shape)}")
-
-    device = next(iter(online.parameters())).device
-    perspective = torch.tensor(perspective_player_idx, dtype=torch.long, device=device)
-
-    # --- forwards (one set of passes, reused across both player branches) --
-    logp_theta, _entropies_online, values_online, _ = online.evaluate_replay_batch(
-        list(replay_rows)
-    )
-    with torch.no_grad():
-        logp_tgt, _e_tgt, values_tgt, _ = target.evaluate_replay_batch(list(replay_rows))
-        logp_reg_cur, _e_rc, _v_rc, _ = reg_cur.evaluate_replay_batch(list(replay_rows))
-        logp_reg_prev, _e_rp, _v_rp, _ = reg_prev.evaluate_replay_batch(list(replay_rows))
-
-    dtype = values_online.dtype
-    logp_mu_dev = logp_mu.to(device=device, dtype=dtype)
-    logp_theta_dt = logp_theta.detach().to(dtype=dtype)
-    logp_tgt_dt = logp_tgt.detach().to(dtype=dtype)
-    logp_reg_cur_dt = logp_reg_cur.to(dtype=dtype)
-    logp_reg_prev_dt = logp_reg_prev.to(dtype=dtype)
-    values_tgt_dt = values_tgt.detach().to(dtype=dtype)
-
-    total_cl = values_online.new_zeros(())
-    total_pl = values_online.new_zeros(())
-    v_hat_means: list[float] = []
-    transformed_means: list[float] = []
-
-    for own_idx in (0, 1):
-        is_own = perspective == own_idx
-        rewards = torch.zeros(t_len, dtype=dtype, device=device)
-        if winner_idx >= 0:
-            rewards[-1] = 1.0 if winner_idx == own_idx else -1.0
-
-        transformed = transform_rewards(
-            rewards,
-            logp_theta=logp_theta_dt,
-            logp_reg_cur=logp_reg_cur_dt,
-            logp_reg_prev=logp_reg_prev_dt,
-            alpha=alpha,
-            eta=config.eta,
-            perspective_is_player_i=is_own,
-        )
-
-        v_out = two_player_vtrace(
-            rewards=transformed.detach(),
-            values=values_tgt_dt,
-            logp_theta=logp_tgt_dt,
-            logp_mu=logp_mu_dev,
-            perspective_is_player_i=is_own,
-            rho_bar=config.vtrace_rho_bar,
-            c_bar=config.vtrace_c_bar,
-        )
-
-        total_cl = total_cl + critic_loss(
-            v_theta=values_online,
-            v_hat=v_out.v_hat,
-            perspective_is_player_i=is_own,
-        )
-        total_pl = total_pl + sampled_neurd_loss(
-            log_prob=logp_theta,
-            q_hat=v_out.q_hat,
-            own_turn_mask=is_own,
-            clip=config.neurd_clip,
-        )
-        v_hat_means.append(float(v_out.v_hat.detach().mean()))
-        transformed_means.append(float(transformed.detach().mean()))
-
-    return _TrajLossPieces(
-        cl=total_cl,
-        pl=total_pl,
-        v_hat_mean=sum(v_hat_means) / len(v_hat_means),
-        transformed_mean=sum(transformed_means) / len(transformed_means),
-    )
-
-
-def rnad_update_trajectory(
-    *,
-    online: _ReplayEvaluator,
-    target: _ReplayEvaluator,
-    reg_cur: _ReplayEvaluator,
-    reg_prev: _ReplayEvaluator,
-    optimizer: torch.optim.Optimizer,
-    replay_rows: list[int],
-    perspective_player_idx: Sequence[int],
-    winner_idx: int,
-    logp_mu: Tensor,
-    config: RNaDConfig,
-    alpha: float,
-) -> RNaDStats:
-    """Single-trajectory convenience wrapper (loss + backward + step + Polyak).
-
-    Thin wrapper around :func:`rnad_trajectory_loss` kept for tests and
-    single-episode driver scripts. The production trainer
-    (:func:`magic_ai.rnad_trainer.run_rnad_update`) batches trajectories and
-    calls the loss-only helper directly to amortize optimizer + Polyak
-    overhead across a rollout batch.
-    """
-
-    pieces = rnad_trajectory_loss(
-        online=online,
-        target=target,
-        reg_cur=reg_cur,
-        reg_prev=reg_prev,
-        replay_rows=replay_rows,
-        perspective_player_idx=perspective_player_idx,
-        winner_idx=winner_idx,
-        logp_mu=logp_mu,
-        config=config,
-        alpha=alpha,
-    )
-    loss = pieces.cl + pieces.pl
-
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    trainable = [p for p in online.parameters() if p.requires_grad]
-    grad_norm = float(
-        nn.utils.clip_grad_norm_(
-            trainable,
-            max_norm=config.grad_clip,
-        )
-    )
-    optimizer.step()
-
-    assert isinstance(target, nn.Module)
-    assert isinstance(online, nn.Module)
-    polyak_update_(target, online, gamma=config.target_ema_gamma)
-
-    return RNaDStats(
-        loss=float(loss.detach()),
-        critic_loss=float(pieces.cl.detach()),
-        policy_loss=float(pieces.pl.detach()),
-        v_hat_mean=pieces.v_hat_mean,
-        grad_norm=grad_norm,
-        transformed_reward_mean=pieces.transformed_mean,
-    )
+    fn = getattr(policy, "recompute_lstm_states_for_episode", None)
+    if fn is None:
+        return None
+    return fn(list(replay_rows))
 
 
 def _sampled_may_log_prob(pc: Any) -> Tensor:
@@ -942,7 +817,7 @@ def _gather_sampled_scalar(pc: Any, may_logp: Tensor) -> Tensor:
     return out
 
 
-def rnad_trajectory_loss_full_neurd(
+def rnad_trajectory_loss(
     *,
     online: _ReplayEvaluator,
     target: _ReplayEvaluator,
@@ -955,28 +830,41 @@ def rnad_trajectory_loss_full_neurd(
     config: RNaDConfig,
     alpha: float,
 ) -> _TrajLossPieces:
-    """Loss-only variant of :func:`rnad_update_trajectory_full_neurd`.
+    """Full per-action R-NaD trajectory loss (paper §170-189) with MTG factoring.
 
-    Uses :func:`neurd_loss_per_choice` over all legal per-choice logits
-    with the paper's ``[-beta, beta]`` logit-magnitude gate, and
-    :func:`may_neurd_loss` (beta-gated) on the Bernoulli ``may`` head.
+    Production R-NaD path: full per-action NeuRD with the ``[-beta, beta]``
+    logit-magnitude gate, two-action Bernoulli NeuRD on the ``may`` head, and
+    paper §179-180 per-action Q estimation. There is no sampled-action
+    fallback — for a clean policy-gradient baseline use PPO instead.
 
-    Per-choice Q tracks the paper's estimator (§179-180) rather than the
-    sampled-action stand-in:
+    **Factored Magic actions (issue 4 — autoregressive decomposition.)**
+    The paper assumes a single-categorical action per step. Magic steps are
+    factored into one or more decision groups (each its own conditional
+    softmax) plus an optional ``may`` Bernoulli. Each group is treated as
+    its *own* paper-faithful step for purposes of NeuRD: per-group sampled
+    correction with per-group ``1/mu_k``, per-group β-gated logit update,
+    per-group ``-eta · log(pi/pi_reg)`` regularization on every legal
+    choice. The trajectory-level pieces (v-trace, reward transform,
+    critic) stay at step granularity since the reward is delivered at the
+    joint step, not per group.
 
-        Q(a) = v_tgt(o_t) - eta * log_ratio(a)
-             + 1{a = a_sampled} * (q_hat_sampled(t) - v_tgt(o_t)
-                                    + eta * log_ratio(a_sampled))
+    **Behavior policy approximation.** Per-group rollout-time log-prob is
+    not stored in the buffer; we substitute the *target* policy's per-group
+    log-prob at the sampled action as ``mu_k``. This is consistent with the
+    rnad_trainer simplification "rollouts effectively follow target via
+    Polyak tracking" and means ``mu_k = pi_target(a_k* | o, a_<k)``. The
+    joint v-trace IS ratio still uses the stored joint ``logp_mu`` from
+    rollout time. See ``docs/rnad_design.md`` deviations section.
 
-    where ``log_ratio(a) = log pi_theta(a) - log pi_reg_blend(a)`` is
-    computed per legal choice from the same per-choice forwards used for
-    the online logits, and ``q_hat_sampled`` is the v-trace scalar at the
-    sampled action. The ``v(o_t)`` additive constant preserves the
-    paper's form for the β-gated NeuRD (it is not shift-invariant under
-    the gate).
+    **May head two-action NeuRD (issue 5).** The Bernoulli ``may`` is
+    expanded to a 2-action softmax with logits ``(l, 0)``; both branches
+    contribute to the gradient and both branches receive the per-action
+    ``-eta · log(pi/pi_reg)`` regularization term (whereas the previous
+    1-logit form regularized only the sampled branch).
 
-    Requires online/target/reg policies to expose
-    ``evaluate_replay_batch_per_choice``.
+    Returns sums + counts (issue 7) so the caller can normalize globally
+    over the rollout batch's effective step / action counts rather than
+    averaging per-episode means.
     """
 
     if not replay_rows:
@@ -990,32 +878,43 @@ def rnad_trajectory_loss_full_neurd(
     device = next(iter(online.parameters())).device
     perspective = torch.tensor(perspective_player_idx, dtype=torch.long, device=device)
 
-    # Per-choice forward on online; per-choice forwards on reg policies are
-    # also required so the full-NeuRD Q estimate includes log(pi/pi_reg)[a]
-    # for every legal a, not just the sampled one.
     online_per_choice = getattr(online, "evaluate_replay_batch_per_choice")  # noqa: B009
     target_per_choice = getattr(target, "evaluate_replay_batch_per_choice")  # noqa: B009
     reg_cur_per_choice = getattr(reg_cur, "evaluate_replay_batch_per_choice")  # noqa: B009
     reg_prev_per_choice = getattr(reg_prev, "evaluate_replay_batch_per_choice")  # noqa: B009
-    lp_online, _, v_online, pc_online = online_per_choice(list(replay_rows))
+
+    # Issue 2: per-policy LSTM recompute. Each policy re-runs the LSTM scan
+    # from h=0 over the episode under its own parameters, so the per-step
+    # hidden state passed into the per-choice forward reflects *that policy*
+    # rather than the behavior policy that wrote the rollout buffer. Falls
+    # through to None for non-recurrent policies.
+    online_lstm = _maybe_recompute_lstm(online, replay_rows)
+    target_lstm = _maybe_recompute_lstm(target, replay_rows)
+    reg_cur_lstm = _maybe_recompute_lstm(reg_cur, replay_rows)
+    reg_prev_lstm = _maybe_recompute_lstm(reg_prev, replay_rows)
+
+    lp_online, _, v_online, pc_online = online_per_choice(
+        list(replay_rows), lstm_state_override=online_lstm
+    )
     with torch.no_grad():
-        _lp_tgt_scalar, _, v_tgt, pc_tgt = target_per_choice(list(replay_rows))
-        _, _, _, pc_reg_cur = reg_cur_per_choice(list(replay_rows))
-        _, _, _, pc_reg_prev = reg_prev_per_choice(list(replay_rows))
+        _lp_tgt_scalar, _, v_tgt, pc_tgt = target_per_choice(
+            list(replay_rows), lstm_state_override=target_lstm
+        )
+        _, _, _, pc_reg_cur = reg_cur_per_choice(
+            list(replay_rows), lstm_state_override=reg_cur_lstm
+        )
+        _, _, _, pc_reg_prev = reg_prev_per_choice(
+            list(replay_rows), lstm_state_override=reg_prev_lstm
+        )
 
     dtype = v_online.dtype
     logp_mu_dev = logp_mu.to(device=device, dtype=dtype)
     lp_online_dt = lp_online.detach().to(dtype=dtype)
-    # Target per-step log-prob at sampled action is needed by v-trace for
-    # the importance ratio. We reconstruct it from pc_tgt.flat_log_probs by
-    # picking the entry whose choice_col matches each step's sampled column.
     lp_tgt_scalar = _lp_tgt_scalar.detach().to(dtype=dtype)
     lp_reg_cur_scalar_flat = pc_reg_cur.flat_log_probs.to(dtype=dtype)
     lp_reg_prev_scalar_flat = pc_reg_prev.flat_log_probs.to(dtype=dtype)
     v_tgt_dt = v_tgt.detach().to(dtype=dtype)
 
-    # Scalar reg log-probs (for reward transform): pick sampled-choice entry
-    # per step; fall back to may-head log_prob for may steps.
     lp_reg_cur_scalar = _gather_sampled_scalar(
         pc_reg_cur, may_logp=_sampled_may_log_prob(pc_reg_cur)
     ).to(dtype=dtype)
@@ -1027,22 +926,47 @@ def rnad_trajectory_loss_full_neurd(
     blended_reg_flat = alpha * lp_reg_cur_scalar_flat + (1.0 - alpha) * lp_reg_prev_scalar_flat
     log_ratio_flat = pc_online.flat_log_probs.to(dtype=dtype) - blended_reg_flat
 
-    # Also build the per-step scalar log_ratio at the sampled action for the
-    # "sampled correction" term of the paper's Q estimator.
-    if pc_online.flat_logits.numel() > 0:
+    has_groups = pc_online.flat_logits.numel() > 0
+    if has_groups:
         is_sampled_flat = pc_online.is_sampled_flat
-        per_step_log_ratio_sampled = torch.zeros(t_len, dtype=dtype, device=device)
-        per_step_log_ratio_sampled.scatter_add_(
+        # Per-decision-group sampled log-ratio (sums to per-group scalar). Used
+        # by the per-group sampled-correction term in flat_q below.
+        n_groups = int(pc_online.step_for_decision_group.numel())
+        per_group_log_ratio_sampled = torch.zeros(n_groups, dtype=dtype, device=device)
+        per_group_log_ratio_sampled.scatter_add_(
             0,
-            pc_online.group_idx,
+            pc_online.decision_group_id_flat,
             torch.where(is_sampled_flat, log_ratio_flat, torch.zeros_like(log_ratio_flat)),
         )
+        # Target per-group sampled log-prob (= log mu_k under the
+        # rollouts-follow-target approximation). At training time, target's
+        # per-flat log-prob is pc_tgt.flat_log_probs; the same is_sampled_flat
+        # (selected from buffer.selected_indices, policy-independent) picks
+        # out the sampled cell per group.
+        lp_tgt_flat = pc_tgt.flat_log_probs.to(dtype=dtype)
+        per_group_lp_mu = torch.zeros(n_groups, dtype=dtype, device=device)
+        per_group_lp_mu.scatter_add_(
+            0,
+            pc_online.decision_group_id_flat,
+            torch.where(is_sampled_flat, lp_tgt_flat, torch.zeros_like(lp_tgt_flat)),
+        )
+        # 1/mu_k clipped to ``q_corr_rho_bar`` (issue 6: per-group decomposition
+        # makes blow-up far less likely than the joint 1/mu_t ever was, so the
+        # default clip is loosened in :class:`RNaDConfig`). Track how often
+        # the clip actually fires so the trainer can log it.
+        inv_mu_per_group_pre = (-per_group_lp_mu).exp()
+        inv_mu_per_group = inv_mu_per_group_pre.clamp(max=config.q_corr_rho_bar)
     else:
         is_sampled_flat = torch.zeros(0, dtype=torch.bool, device=device)
-        per_step_log_ratio_sampled = torch.zeros(t_len, dtype=dtype, device=device)
+        per_group_log_ratio_sampled = torch.zeros(0, dtype=dtype, device=device)
+        inv_mu_per_group = torch.zeros(0, dtype=dtype, device=device)
+        inv_mu_per_group_pre = inv_mu_per_group
 
-    total_cl = v_online.new_zeros(())
-    total_pl = v_online.new_zeros(())
+    cl_sum = v_online.new_zeros(())
+    pl_sum = v_online.new_zeros(())
+    cl_count_total = 0
+    pl_count_total = 0
+    n_q_clipped_total = 0
     v_hat_means: list[float] = []
     transformed_means: list[float] = []
 
@@ -1050,9 +974,6 @@ def rnad_trajectory_loss_full_neurd(
         is_own = perspective == own_idx
         rewards = torch.zeros(t_len, dtype=dtype, device=device)
         if winner_idx >= 0:
-            # Terminal reward is game-global from ``own_idx``'s POV, not
-            # perspective-sign-flipped: the zero-sum accumulator in
-            # two_player_vtrace consumes rewards in the own-player frame.
             rewards[-1] = 1.0 if winner_idx == own_idx else -1.0
 
         transformed = transform_rewards(
@@ -1074,58 +995,129 @@ def rnad_trajectory_loss_full_neurd(
             c_bar=config.vtrace_c_bar,
         )
 
-        total_cl = total_cl + critic_loss(
+        cl_part_sum, cl_part_count = critic_loss(
             v_theta=v_online,
             v_hat=v_out.v_hat,
             perspective_is_player_i=is_own,
         )
+        cl_sum = cl_sum + cl_part_sum
+        cl_count_total += cl_part_count
 
-        # beta-gated NeuRD on the Bernoulli may head (paper §188 applied to
-        # the 1-logit Bernoulli form; see :func:`may_neurd_loss`).
-        if pc_online.may_is_active.any():
-            may_and_own = pc_online.may_is_active & is_own
-            total_pl = total_pl + may_neurd_loss(
-                may_logits=pc_online.may_logits_per_step.to(dtype=dtype),
-                may_selected=pc_online.may_selected_per_step.to(dtype=dtype),
-                q_hat=v_out.q_hat,
-                own_turn_may_mask=may_and_own,
-                beta=config.neurd_beta,
-                clip=config.neurd_clip,
-                lr=config.learning_rate,
-            )
-
-        if pc_online.flat_logits.numel() > 0:
-            # Per-action Q from paper §179-180 (own-turn steps only):
-            #   Q(a) = -eta * log_ratio[a]
-            #        + 1[a=a_t] * (1/mu_t) * (
-            #              r_t + eta * log_ratio[a_t]
-            #            + (pi/mu)_t * (r̂_{t+1} + v̂_{t+1})
-            #            - v(o_t)
-            #          )
-            #        + v(o_t)
-            # The bracketed quantity uses raw (un-transformed) reward r_t,
-            # the unclipped own-turn ratio (pi/mu)_t = exp(lp_tgt - lp_mu),
-            # and the v-trace bootstrap r̂_{t+1} / v̂_{t+1} returned per
-            # step by two_player_vtrace. The leading 1/mu_t is the importance
-            # correction that converts the sampled-action contribution from
-            # mu's expectation to pi's expectation.
-            step_is_own = is_own[pc_online.group_idx]
-            v_per_choice = v_tgt_dt[pc_online.group_idx]
-            base_q_flat = -config.eta * log_ratio_flat
-            # Joint inverse-sampling weight 1/mu_t for the sampled-action
-            # correction. Clipped to ``q_corr_rho_bar`` so multi-decision-group
-            # steps (where mu_t = ∏_k mu_k can be vanishingly small) do not
-            # produce oversized policy updates.
-            inv_mu = (-logp_mu_dev).exp().clamp(max=config.q_corr_rho_bar)
+        # ---- Per-group sampled inner bracket (paper §177 adapted) ----
+        # inner_t = r_t + eta * log_ratio_at_sampled_step + (pi/mu)_t * (r̂+v̂) - v(o_t)
+        # We aggregate the per-group log_ratio sampled at the *step* level:
+        # for the inner bracket the sampled-action log_ratio is the joint
+        # over groups, since the reward is per-step. We sum per-group sampled
+        # log_ratios into per-step.
+        if has_groups:
             ratio_own_per_step = (lp_tgt_scalar - logp_mu_dev).exp()
-            sampled_inner = (
+            per_step_log_ratio_sampled = torch.zeros(t_len, dtype=dtype, device=device)
+            per_step_log_ratio_sampled.scatter_add_(
+                0, pc_online.step_for_decision_group, per_group_log_ratio_sampled
+            )
+            sampled_inner_per_step = (
                 rewards
                 + config.eta * per_step_log_ratio_sampled
                 + ratio_own_per_step * (v_out.r_hat_next + v_out.v_hat_next)
                 - v_tgt_dt
             )
-            sampled_correction_per_step = inv_mu * sampled_inner
-            sampled_correction_flat = sampled_correction_per_step[pc_online.group_idx]
+        else:
+            sampled_inner_per_step = torch.zeros(t_len, dtype=dtype, device=device)
+
+        # ---- May head: true two-action NeuRD (issue 5) ----
+        if pc_online.may_is_active.any():
+            may_and_own = pc_online.may_is_active & is_own
+            # Per-action Q for accept/decline. Both branches carry the
+            # -eta * log(pi/pi_reg) regularization for *that* branch.
+            may_logits_step = pc_online.may_logits_per_step.to(dtype=dtype)
+            log_pi_accept = torch.nn.functional.logsigmoid(may_logits_step)
+            log_pi_decline = torch.nn.functional.logsigmoid(-may_logits_step)
+            with torch.no_grad():
+                may_lp_reg_cur_accept = torch.nn.functional.logsigmoid(
+                    pc_reg_cur.may_logits_per_step.to(dtype=dtype)
+                )
+                may_lp_reg_cur_decline = torch.nn.functional.logsigmoid(
+                    -pc_reg_cur.may_logits_per_step.to(dtype=dtype)
+                )
+                may_lp_reg_prev_accept = torch.nn.functional.logsigmoid(
+                    pc_reg_prev.may_logits_per_step.to(dtype=dtype)
+                )
+                may_lp_reg_prev_decline = torch.nn.functional.logsigmoid(
+                    -pc_reg_prev.may_logits_per_step.to(dtype=dtype)
+                )
+                may_lp_reg_blend_accept = (
+                    alpha * may_lp_reg_cur_accept + (1.0 - alpha) * may_lp_reg_prev_accept
+                )
+                may_lp_reg_blend_decline = (
+                    alpha * may_lp_reg_cur_decline + (1.0 - alpha) * may_lp_reg_prev_decline
+                )
+            log_ratio_accept = log_pi_accept.detach() - may_lp_reg_blend_accept
+            log_ratio_decline = log_pi_decline.detach() - may_lp_reg_blend_decline
+            # Sampled-correction picks the sampled branch only.
+            may_sel = pc_online.may_selected_per_step.to(dtype=dtype)
+            sampled_is_accept = may_sel > 0.5
+            # 1/mu for the may step under target = 1/sigmoid(target_may_logit)
+            # for the sampled branch (target is the rollouts-follow-target
+            # approximation). We can compute mu directly:
+            with torch.no_grad():
+                tgt_may_logits = pc_tgt.may_logits_per_step.to(dtype=dtype)
+                tgt_p_accept = torch.sigmoid(tgt_may_logits)
+                may_mu_sampled = torch.where(sampled_is_accept, tgt_p_accept, 1.0 - tgt_p_accept)
+                may_inv_mu = (1.0 / may_mu_sampled.clamp_min(1e-30)).clamp(
+                    max=config.q_corr_rho_bar
+                )
+            sampled_log_ratio_step = torch.where(
+                sampled_is_accept, log_ratio_accept, log_ratio_decline
+            )
+            # Per-step sampled inner uses the same r_t + eta*log_ratio[a*]
+            # + (pi/mu)*(r̂+v̂) - v form as decision groups, but at the
+            # may granularity (1 group per may step).
+            may_sampled_inner = (
+                rewards
+                + config.eta * sampled_log_ratio_step
+                + (lp_tgt_scalar - logp_mu_dev).exp() * (v_out.r_hat_next + v_out.v_hat_next)
+                - v_tgt_dt
+            )
+            may_q_sampled_correction = may_inv_mu * may_sampled_inner
+            q_accept = (
+                -config.eta * log_ratio_accept
+                + torch.where(
+                    sampled_is_accept, may_q_sampled_correction, torch.zeros_like(rewards)
+                )
+                + v_tgt_dt
+            )
+            q_decline = (
+                -config.eta * log_ratio_decline
+                + torch.where(
+                    ~sampled_is_accept, may_q_sampled_correction, torch.zeros_like(rewards)
+                )
+                + v_tgt_dt
+            )
+            may_pl_sum, may_pl_count = may_neurd_loss(
+                may_logits=may_logits_step,
+                q_accept=q_accept,
+                q_decline=q_decline,
+                own_turn_may_mask=may_and_own,
+                beta=config.neurd_beta,
+                clip=config.neurd_clip,
+                lr=config.learning_rate,
+            )
+            pl_sum = pl_sum + may_pl_sum
+            pl_count_total += may_pl_count
+
+        # ---- Decision-group per-action NeuRD with per-group correction ----
+        if has_groups:
+            step_for_flat = pc_online.group_idx
+            step_is_own_flat = is_own[step_for_flat]
+            v_per_choice = v_tgt_dt[step_for_flat]
+            base_q_flat = -config.eta * log_ratio_flat
+            # Per-group sampled correction = 1/mu_k * inner_t, where inner_t
+            # is the *step-level* bracket (single reward per step is shared
+            # across groups). Each group still gets its own 1/mu_k weight.
+            sampled_correction_per_group = (
+                inv_mu_per_group * sampled_inner_per_step[pc_online.step_for_decision_group]
+            )
+            sampled_correction_flat = sampled_correction_per_group[pc_online.decision_group_id_flat]
             flat_q = (
                 base_q_flat
                 + torch.where(
@@ -1135,29 +1127,34 @@ def rnad_trajectory_loss_full_neurd(
                 )
                 + v_per_choice
             )
-            flat_q = torch.where(step_is_own, flat_q, torch.zeros_like(flat_q))
-            total_pl = total_pl + neurd_loss_per_choice(
+            flat_q = torch.where(step_is_own_flat, flat_q, torch.zeros_like(flat_q))
+            pl_part_sum, pl_part_count, n_q_clipped = neurd_loss_per_choice(
                 flat_logits=pc_online.flat_logits,
                 flat_q=flat_q,
-                group_idx=pc_online.group_idx,
-                num_groups=t_len,
+                flat_active_mask=step_is_own_flat,
                 beta=config.neurd_beta,
                 clip=config.neurd_clip,
                 lr=config.learning_rate,
             )
+            pl_sum = pl_sum + pl_part_sum
+            pl_count_total += pl_part_count
+            n_q_clipped_total += n_q_clipped
 
         v_hat_means.append(float(v_out.v_hat.detach().mean()))
         transformed_means.append(float(transformed.detach().mean()))
 
     return _TrajLossPieces(
-        cl=total_cl,
-        pl=total_pl,
+        cl_sum=cl_sum,
+        cl_count=cl_count_total,
+        pl_sum=pl_sum,
+        pl_count=pl_count_total,
+        n_q_clipped=n_q_clipped_total,
         v_hat_mean=sum(v_hat_means) / len(v_hat_means),
         transformed_mean=sum(transformed_means) / len(transformed_means),
     )
 
 
-def rnad_update_trajectory_full_neurd(
+def rnad_update_trajectory(
     *,
     online: _ReplayEvaluator,
     target: _ReplayEvaluator,
@@ -1171,9 +1168,9 @@ def rnad_update_trajectory_full_neurd(
     config: RNaDConfig,
     alpha: float,
 ) -> RNaDStats:
-    """Single-trajectory convenience wrapper for the full-NeuRD variant."""
+    """Single-trajectory wrapper: loss + backward + optimizer + Polyak."""
 
-    pieces = rnad_trajectory_loss_full_neurd(
+    pieces = rnad_trajectory_loss(
         online=online,
         target=target,
         reg_cur=reg_cur,
@@ -1185,7 +1182,9 @@ def rnad_update_trajectory_full_neurd(
         config=config,
         alpha=alpha,
     )
-    loss = pieces.cl + pieces.pl
+    cl = pieces.cl_sum / max(pieces.cl_count, 1)
+    pl = pieces.pl_sum / max(pieces.pl_count, 1)
+    loss = cl + pl
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     trainable = [p for p in online.parameters() if p.requires_grad]
@@ -1203,8 +1202,8 @@ def rnad_update_trajectory_full_neurd(
 
     return RNaDStats(
         loss=float(loss.detach()),
-        critic_loss=float(pieces.cl.detach()),
-        policy_loss=float(pieces.pl.detach()),
+        critic_loss=float(cl.detach()),
+        policy_loss=float(pl.detach()),
         v_hat_mean=pieces.v_hat_mean,
         grad_norm=grad_norm,
         transformed_reward_mean=pieces.transformed_mean,

@@ -1,0 +1,272 @@
+\title{Data-Efficient Reinforcement Learning with Self-Predictive Representations}
+
+\author{Max Schwarzer, Ankesh Anand, Rishab Goel, R Devon Hjelm, Aaron Courville, Philip Bachman}
+
+\begin{abstract}
+While deep reinforcement learning excels at solving tasks where large amounts of data can be collected through virtually unlimited interaction with the environment, learning from limited interaction remains a key challenge. We posit that an agent can learn more efficiently if we augment reward maximization with self-supervised objectives based on structure in its visual input and sequential interaction with the environment. Our method, Self-Predictive Representations (SPR), trains an agent to predict its own latent state representations multiple steps into the future. We compute \emph{target} representations for future states using an encoder which is an exponential moving average of the agent's parameters and we make predictions using a learned transition model. On its own, this future prediction objective outperforms prior methods for sample-efficient deep RL from pixels. We further improve performance by adding data augmentation to the future prediction loss, which forces the agent's representations to be consistent across multiple views of an observation. Our full self-supervised objective, which combines future prediction and data augmentation, achieves a median human-normalized score of 0.415 on Atari in a setting limited to 100k steps of environment interaction, which represents a 55\% relative improvement over the previous state-of-the-art. Notably, even in this limited data regime, SPR exceeds expert human scores on 7 out of 26 games. We've made the code associated with this work available at \url{https://github.com/mila-iqia/spr}.
+\end{abstract}
+
+\section{Introduction}
+Deep Reinforcement Learning~\citep[deep RL,][]{franccois2018introduction} has proven to be an indispensable tool for training successful agents on difficult sequential decision-making problems~\citep{ALE, dm_control}. The success of deep RL is particularly noteworthy in highly complex, strategic games such as StarCraft~\citep{vinyals2019grandmaster} and DoTA2 \citep{dota2}, where deep RL agents now surpass expert human performance in some scenarios.
+
+Deep RL involves training agents based on large neural networks using large amounts of data~\citep{sutton2019bitter}, a trend evident across both model-based~\citep{muzero} and model-free \citep{agent57} learning. The sample complexity of such state-of-the-art agents is often incredibly high: MuZero~\citep{muzero} and Agent-57~\citep{agent57} use 10-50 years of experience per Atari game, and OpenAI Five~\citep{dota2} uses \emph{45,000 years} of experience to accomplish its remarkable performance.
+This is clearly impractical: unlike easily-simulated environments such as video games, collecting interaction data for many real-world tasks is costly, making improved \emph{data efficiency} a prerequisite for successful use of deep RL in these settings~\citep{dulac2019challenges}.
+
+\begin{figure}[t]
+\centering
+\begin{subfigure}{.5\textwidth}
+  \centering
+  \includegraphics[width=.99\linewidth]{figures/median-scores.png}
+  \label{fig:sub1}
+\end{subfigure}%
+\begin{subfigure}{.5\textwidth}
+  \centering
+  \includegraphics[width=.99\linewidth]{figures/mean-scores.png}
+  \label{fig:sub2}
+\end{subfigure}
+\caption{Median and Mean Human-Normalized scores of different methods across 26 games in the Atari 100k benchmark \citep{simple}, averaged over 10 random seeds for SPR, and 5 seeds for most other methods except CURL, which uses 20. Each method is allowed access to only 100k environment steps or 400k frames per game. (*) indicates that the method uses data augmentation. SPR achieves state-of-art results on both mean and median human-normalized scores. Note that, even without data augmentation, SPR still outperforms all prior methods on both metrics.}
+\label{fig:test}
+\end{figure}
+
+Meanwhile, new self-supervised representation learning methods have significantly improved data efficiency when learning new vision and language tasks, particularly in low data regimes or semi-supervised learning \citep{uda, cpcv2, simCLRv2}.
+Self-supervised methods improve data efficiency by leveraging a nearly limitless supply of training signal from tasks generated on-the-fly, based on ``views" drawn from the natural structure of the data~\citep[e.g., image patches, data augmentation or temporal proximity, see][]{jigsaw, cpc, dim, cmc, amdim, moco, simCLR}.
+
+Motivated by successes in semi-supervised and self-supervised learning~\citep{tarvainen2017mean, uda, BYOL}, we train better state representations for RL by forcing representations to be temporally predictive and consistent when subject to data augmentation. Specifically, we extend a strong model-free agent by adding a dynamics model which predicts future latent representations provided by a parameter-wise exponential moving average of the agent itself. We also add data augmentation to the future prediction task, which enforces consistency across different views of each observation. Contrary to some methods \citep{simple, hafner2019learning}, our dynamics model operates entirely in the latent space and does not rely on reconstructing raw states.
+
+We evaluate our method, which we call Self-Predictive Representations (SPR), on the 26 games in the Atari 100k benchmark~\citep{simple}, where agents are allowed only 100k steps of environment interaction (producing 400k frames of input) per game, which roughly corresponds to two hours of real-time experience. Notably, the human experts in \citet{dqn} and \citet{doubledqn} were given the same amount of time to learn these games, so a budget of 100k steps permits a reasonable comparison in terms of data efficiency.
+
+In our experiments, we augment a modified version of Data-Efficient Rainbow (DER) \citep{der} with the SPR loss, and evaluate versions of SPR with and without data augmentation. We find that each version is superior to controlled baselines. When coupled with data augmentation, SPR achieves a median score of 0.415, which is a state-of-the-art result on this benchmark, outperforming prior methods by a significant margin. Notably, SPR also outperforms human expert scores on $7$ out of $26$ games while using roughly the same amount of in-game experience.
+
+\section{Method}
+We consider reinforcement learning (RL) in the standard Markov Decision Process (MDP) setting where an agent interacts with its environment in \textit{episodes}, each consisting of sequences of observations, actions and rewards.  We use $s_t$, $a_t$ and $r_t$ to denote the state, the action taken by the agent and the reward received at timestep $t$. We seek to train an agent whose expected cumulative reward in each episode is maximized.
+To do this, we combine a strong model-free RL algorithm, Rainbow~\citep{hessel2018rainbow}, with Self-Predictive Representations as an auxiliary loss to improve sample efficiency. We now describe our overall approach in detail.
+
+\subsection{Deep Q-Learning}
+We focus on the Atari Learning Environment \citep{ALE}, a challenging setting where the agent takes discrete actions while receiving purely visual, pixel-based observations.
+A prominent method for solving Atari, Deep Q Networks~\citep{dqn}, trains a neural network $Q_\theta$ to approximate the agent's current \textit{Q-function} (policy evaluation) while updating the agent's policy greedily with respect to this Q-function (policy improvement). This involves minimizing the error between predictions from $Q_{\theta}$ and a target value estimated by $Q_{\xi}$, an earlier version of the network:
+\begin{align}
+    \mathcal{L}_\theta^{DQN} = \left (Q_\theta(s_t, a_t) - (r_t + \gamma \max_{a} Q_\xi (s_{t+1}, a))  \right )^2.
+\end{align}
+
+Various improvements have been made over the original DQN: Distributional RL \citep{bellemare2017distributional} models the full distribution of future reward rather than just the mean, Dueling DQN \citep{wang2016dueling} decouples the \textit{value} of a state from the \textit{advantage} of taking a given action in that state, Double DQN \citep{doubledqn} modifies the Q-learning update to avoid overestimation due to the $\max$ operation, among many others.
+Rainbow~\citep{hessel2018rainbow} consolidates these improvements into a single combined algorithm and has been adapted to work well in data-limited regimes \citep{der}.
+
+\subsection{Self-Predictive Representations}
+\begin{figure}
+\centering
+\includegraphics[width=0.99\textwidth]{figures/mop.pdf}
+\caption{An illustration of the full SPR method. Representations from the online encoder are used in the reinforcement learning task and for prediction of future representations from the target encoder via the transition model. The target encoder and projection head are defined as an exponential moving average of their online counterparts and are not updated via gradient descent. For brevity, we illustrate only the $k^{\text{th}}$ step of future prediction, but in practice we compute the loss over all steps from $1$ to $K$. Note: our implementation for this paper includes $g_o$ in the Q-learning head.}
+\label{fig:main}
+\end{figure}
+
+For our auxiliary loss, we start with the intuition that encouraging state representations to be predictive of future states given future actions should improve the data efficiency of RL algorithms.
+Let $(s_{t:t+K}, a_{t:t+K})$ denote a sequence of $K + 1$ previously experienced states and actions sampled from a replay buffer, where $K$ is the maximum number of steps into the future which we want to predict. Our method has four main components which we describe below:
+\begin{itemize}[leftmargin=*]
+    \item \textbf{Online and Target networks}: We use an \emph{online encoder} $f_o$ to transform observed states $s_t$ into representations $z_{t} \triangleq f_o(s_t)$.
+We use these representations in an objective that encourages them to be \emph{predictive} of future observations up to some fixed temporal offset $K$, given a sequence of $K$ actions to perform.
+We augment each observation $s_t$ independently when using data augmentation.
+Rather than predicting representations produced by the online encoder, we follow prior work~\citep{tarvainen2017mean, BYOL} by computing target representations for future states using a \emph{target encoder} $f_\mathrm{m}$, whose parameters are an exponential moving average (EMA) of the online encoder parameters.
+Denoting the parameters of $f_\mathrm{o}$ as $\theta_\mathrm{o}$, those of $f_\mathrm{m}$ as $\theta_\mathrm{m}$, and the EMA coefficient as $\tau \in[0,1)$,  the update rule for $\theta_\mathrm{m}$ is:
+\begin{align}
+    \theta_{\mathrm{m}} \leftarrow \tau \theta_{\mathrm{m}}+(1-\tau) \theta_{\mathrm{o}}.
+\end{align}
+The target encoder is not updated via gradient descent.  The special case $\tau=0, \; \theta_m=\theta_o$ is noteworthy, as it performs well when regularization is already provided by data augmentation.
+
+    \item \textbf{Transition Model:} For the prediction objective, we generate a sequence of $K$ predictions $\hat{z}_{t+1:t+K}$ of future state representations $\tilde{z}_{t+1:t+K}$ using an action-conditioned \emph{transition model} $h$.
+    We compute $\hat{z}_{t+1:t+K}$ iteratively: $\hat{z}_{t+k+1} \triangleq h(\hat{z}_{t+k}, a_{t+k})$, starting from $\hat{z}_t \triangleq z_t \triangleq f_o(s_t)$.
+    We compute $\tilde{z}_{t+1:t+K}$ by applying the target encoder $f_m$ to the observed future states $s_{t+1:t+K}$: $\tilde{z}_{t+k} \triangleq f_m(s_{t+k})$.
+    The transition model and prediction loss operate in the latent space, thus avoiding pixel-based reconstruction objectives. We describe the architecture of $h$ in section \ref{sec:transition_model}.
+
+    \item \textbf{Projection Heads:}  We use online and target projection heads $g_o$ and $g_m$ \citep{simCLR} to project online and target representations to a smaller latent space, and apply an additional \textit{prediction head} $q$ \citep{BYOL} to the online projections to predict the target projections:
+    \begin{equation}
+    \hat{y}_{t+k} \triangleq q(g_o(\hat{z}_{t+k})), \; \forall \hat{z}_{t+k} \in \hat{z}_{t+1:t+K}; \quad \tilde{y}_{t+k} \triangleq g_m(\tilde{z}_{t+k}), \; \forall \tilde{z}_{t+k} \in \tilde{z}_{t+1:t+K}.
+    \end{equation}
+    The target projection head parameters are given by an EMA of the online projection head parameters, using the same update as the online and target encoders.
+
+\item \textbf{Prediction Loss}: We compute the future prediction loss for SPR by summing over cosine similarities\footnote{Cosine similarity is linearly related to the ``normalized L2" loss used in BYOL \citep{BYOL}.} between the predicted and observed representations at timesteps $t + k$ for $1 \leq k \leq K$:
+\begin{align}{
+    \mathcal{L}_\theta^{\text{SPR}}(s_{t:t+K}, a_{t:t+K}) = -\sum_{k=1}^K  \left ( \frac{\tilde{y}_{t+k}}{||\tilde{y}_{t+k}||_2} \right)^{\top} \left ( \frac{{\hat{y}}_{t+k}}{||{\hat{y}}_{t+k}||_2} \right ),
+}
+\end{align}
+where $\tilde{y}_{t+k}$ and $\hat{y}_{t+k}$ are computed from $(s_{t:t+K}, a_{t:t+K})$ as we just described.
+
+\end{itemize}
+
+We call our method Self-Predictive Representations (SPR), following the predictive nature of the objective and the use of an exponential moving average target network similar to \citep{tarvainen2017mean, moco}.
+During training, we combine the SPR loss with the Q-learning loss for Rainbow.
+The SPR loss affects $f_o$, $g_o$, $q$ and $h$. The Q-learning loss affects $f_o$ and the Q-learning head, which contains additional layers specific to Rainbow.
+Denoting the Q-learning loss from Rainbow as $\mathcal{L}^{\text{RL}}_\theta$, our full optimization objective is:
+$\mathcal{L}^{\text{total}}_\theta = \mathcal{L}^{\text{RL}}_\theta + \lambda \mathcal{L}^{\text{SPR}}_\theta$.
+
+Unlike some other proposed methods for representation learning in reinforcement learning~\citep{curl}, SPR can be used with or without data augmentation, including in contexts where data augmentation is unavailable or counterproductive.  Moreover, compared to related work on contrastive representation learning, SPR does not use negative samples, which may require careful design of contrastive tasks, large batch sizes~\citep{simCLR}, or the use of a buffer to emulate large batch sizes~\citep{moco}.
+
+\begin{algorithm}[ht]
+\DontPrintSemicolon
+\SetKwInOut{Input}{Inputs}
+\SetKwInOut{Output}{Output}
+\SetAlgoLined
+ Denote parameters of online encoder $f_o$ and projection $g_o$ as $\theta_o$\;
+ Denote parameters of target encoder $f_m$ and projection $g_m$ as $\theta_\text{m}$\;
+ Denote parameters of transition model $h$, predictor $q$ and Q-learning head as $\phi$\;
+ Denote the maximum prediction depth as $K$, batch size as $N$\;
+ initialize replay buffer $B$\;
+ \While{Training}{
+ collect experience $(s, a, r, s')$ with $(\theta_o, \phi)$ and add to buffer $B$\;
+ sample a minibatch of sequences of $(s, a, r, s') \sim B$\;
+ \For{$i$ in range$(0, N)$}{
+  \If{augmentation}{
+   $s^i \gets \text{augment}(s^i); {s'}^i \gets \text{augment}({s'}^i)$
+  }
+  $z^i_0 \gets f_\theta(s^i_0)$ \tcp*{online representations}
+  $l^i \gets 0$\;
+  \For{k in (1, \ldots, K)}{
+    $\hat{z}^i_k \gets h(\hat{z}^i_{k-1}, a^i_{k-1})$ \tcp*{latent states via transition model}
+    $\tilde{z}^i_k \gets f_{m}(s^i_k)$ \tcp*{target representations}
+    $\hat{y}^i_k \gets q(g_o(\hat{z}^i_k))$,
+    $\tilde{y}^i_k \gets g_m(\tilde{z}^i_k)$ \tcp*{projections}
+    $l^i \gets l^i - \left ( \frac{\tilde{y}^i_{k}}{||\tilde{y}^i_{k}||_2} \right)^{\top}\left ( \frac{{\hat{y}^i}_{k}}{||{\hat{y}^i}_{k}||_2} \right )$ \tcp*{SPR loss at step  $k$}
+  }
+  $l^i \gets \lambda l^i + \text{RL loss}(s^i, a^i, r^i, {s'}^i; \theta_o)$ \tcp*{Add RL loss for batch with $\theta_o$}
+  }
+  $l \gets \frac{1}{N}\sum_{i=0}^{N} l^i$ \tcp*{average loss over minibatch}
+  $\theta_o, \phi \gets \text{optimize}((\theta_o, \phi), l)$ \tcp*{update online parameters}
+  $\theta_m \gets \tau\theta_o + (1 - \tau)\theta_m$ \tcp*{update target parameters}
+}
+ \caption{Self-Predictive Representations}
+\end{algorithm}
+
+\subsection{Transition Model Architecture}
+\label{sec:transition_model}
+For the transition model $h$, we apply a convolutional network directly to the $64\times7\times7$ spatial output of the convolutional encoder $f_o$. The network comprises two 64-channel convolutional layers with $3\times3$ filters, with batch normalization \citep{ioffe2015batch} after the first convolution and ReLU nonlinearities after each convolution.  We append a one-hot vector representing the action taken to each location in the input to the first convolutional layer, similar to \citet{muzero}.  We use a maximum prediction depth of $K=5$, and we truncate calculation of the SPR loss at episode boundaries to avoid encoding environment reset dynamics into the model.
+
+\subsection{Data Augmentation}
+When using augmentation,
+we use the same set of image augmentations as in DrQ from \citet{drq}, consisting of small random shifts and color jitter. We normalize activations to lie in $[0, 1]$ at the output of the convolutional encoder and transition model, as in \cite{muzero}. We use Kornia \citep{riba2020kornia} for efficient GPU-based data augmentations.
+
+When not using augmentation, we find that SPR performs better when dropout \citep{srivastava2014dropout} with probability $0.5$ is applied at each layer in the online and target encoders.  This is consistent with \citet{laine2016temporal, tarvainen2017mean}, who find that adding noise inside the network is important when not using image-specific augmentation, as proposed by \citet{bachman2014}.
+
+\subsection{Implementation Details}
+For our Atari experiments, we largely follow \cite{der} for DQN hyperparameters, with four exceptions. We follow DrQ  \citep{drq} by: using the 3-layer convolutional encoder from \cite{dqn}, using 10-step returns instead of 20-step returns for Q-learning, and not using a separate DQN target network when using augmentation.
+We also perform two gradient steps per environment step instead of one. We show results for this configuration with and without augmentation in Table \ref{tab:controlled_baselines}, and confirm that these changes are not themselves responsible for our performance.  We reuse the first layer of the DQN MLP head as the SPR projection head $g_o$. When using dueling DQN \citep{wang2016dueling}, $g_o$ concatenates the outputs of the first layers of the value and advantage heads.  When these layers are noisy  \citep{fortunato2018noisy}, $g_o$ does not use the noisy parameters.  Finally, we parameterize the predictor $q$ as a linear layer.  We use $\tau=0.99$ when augmentation is disabled and $\tau=0$ when enabled. For $\mathcal{L}^{\text{total}}_\theta = \mathcal{L}^{\text{RL}}_\theta + \lambda \mathcal{L}^{\text{SPR}}_\theta$, we use $\lambda=2$. Hyperparameters were tuned over a subset of games~\citep[following][]{dqn, machado2018revisiting}. We list the complete hyperparameters in Table \ref{tab:parameters}.
+
+Our implementation uses \texttt{rlpyt} \citep{rlpyt} and \texttt{PyTorch} \citep{pytorch}.  We find that SPR modestly increases the time required for training, which we discuss in more detail in Appendix~\ref{sec:runtimes}.
+
+\section{Related Work}
+
+\subsection{Data-Efficient RL:}
+A number of works have sought to improve sample efficiency in deep RL. SiMPLe \citep{simple} learns a pixel-level transition model for Atari to generate simulated training data, achieving strong results on several games in the 100k frame setting, at the cost of requiring several weeks for training.  However, \cite{der} and \cite{kielak2020do} introduce variants of Rainbow \citep{hessel2018rainbow} tuned for sample efficiency, Data-Efficient Rainbow (DER) and OTRainbow, which achieve comparable or superior performance with far less computation.
+
+In the context of continuous control, several works propose to leverage a latent-space model trained on reconstruction loss to improve sample efficiency \citep{hafner2019learning, lee2019stochastic, hafner2019dream}.
+Most recently, DrQ \citep{drq} and RAD \citep{rad} have found that applying modest image augmentation can substantially improve sample efficiency in reinforcement learning, yielding better results than prior model-based methods. Data augmentation has also been found to improve generalization of reinforcement learning methods \citep{combes2018learning, rad} in multi-task and transfer settings. We show that data augmentation can be more effectively leveraged in reinforcement learning by forcing representations to be consistent between different augmented views of an observation while also predicting future latent states.
+
+\subsection{Representation Learning in RL:}
+Representation learning has a long history of use in RL -- see \cite{lesort2018state}. For example, CURL \citep{curl} proposed a combination of image augmentation and a contrastive loss to perform representation learning for RL.  However, follow-up results from RAD \citep{rad} suggest that most of the benefits of CURL come from image augmentation, not its contrastive loss.
+
+CPC \citep{cpc}, CPC|Action \citep{guo2018neural}, ST-DIM \citep{stdim} and DRIML~\citep{mazoure2020deep} propose to optimize various temporal contrastive losses in reinforcement learning environments. We perform an ablation comparing such temporal contrastive losses to our method in Section \ref{sec:contrastive_ablation}. \cite{kipf2019contrastive} propose to learn object-oriented contrastive representations by training a structured transition model based on a graph neural network.
+
+SPR bears some resemblance to DeepMDP \citep{deepMDP}, which trains a transition model with an unnormalized L2 loss to predict representations of future states, along with a reward prediction objective. However, DeepMDP uses its online encoder to generate prediction targets rather than employing a target encoder, and is thus prone to representational collapse (sec. C.5 in \cite{deepMDP}). To mitigate this issue, DeepMDP relies on an additional observation reconstruction objective. In contrast, our model is self-supervised, trained entirely in the latent space, and uses a normalized loss. Our ablations (sec. \ref{sec:momentum_ablations}) demonstrate that using a target encoder has a large impact on our method.
+
+SPR is also similar to PBL \citep{pbl}, which directly predicts representations of future states. However, PBL uses two separate target networks trained via gradient descent, whereas SPR uses a single target encoder, updated without backpropagation. Moreover, PBL studies multi-task generalization in the asymptotic limits of data, whereas SPR is concerned with single-task performance in low data regimes, using $0.01\%$ as much data as PBL.  Unlike PBL, SPR additionally enforces consistency across augmentations, which empirically provides a large boost in performance.
+
+\section{Results}
+
+We test SPR on the sample-efficient Atari setting introduced by \cite{simple} and \cite{der}.  In this task, only 100,000 environment steps of training data are available -- equivalent to 400,000 frames, or just under two hours -- compared to the typical standard of 50,000,000 environment steps, or roughly 39 days of experience.  When used without data augmentation, SPR demonstrates scores comparable to the previous best result from \cite{drq}.  When combined with data augmentation, SPR achieves a median human-normalized score of 0.415, which is a new state-of-the-art result on this task.  SPR achieves super-human performance on seven games in this data-limited setting: Boxing, Krull, Kangaroo, Road Runner, James Bond and Crazy Climber, compared to a maximum of two for any previous methods, and achieves scores higher than DrQ (the previous state-of-the-art method) on 23 out of 26 games.  See Table \ref{tab:atari_results} for aggregate metrics and Figure~\ref{fig:boxplot} for a visualization of results.  A full list of scores is presented in Table~\ref{tab:atari_results_full} in the appendix.  For consistency with previous works, we report human and random scores from \cite{wang2016dueling}.
+
+\begin{table}[ht]
+    \caption{Performance of different methods on the 26 Atari games considered by \cite{simple} after 100k environment steps. Results are recorded at the end of training and averaged over 10 random seeds for SPR, 20 for CURL, and 5 for other methods. SPR outperforms prior methods on all aggregate metrics, and exceeds expert human performance on 7 out of 26 games. }
+    \label{tab:atari_results}
+\begin{center}
+\begin{small}
+\centering
+\scalebox{0.8}{
+\centering
+\begin{tabular}{lccccccccr}
+\toprule
+Metric &   Random &    Human &   SimPLe &      DER & OTRainbow &     CURL &      DrQ &      SPR (no Aug) &  SPR \\
+\midrule
+Mean Human-Norm'd   &    0.000 &    1.000 &    0.443 &    0.285 &     0.264 &    0.381 &    0.357 &    0.463 &        \textbf{0.704} \\
+Median Human-Norm'd &    0.000 &    1.000 &    0.144 &    0.161 &     0.204 &    0.175 &    0.268 &    0.307 &        \textbf{0.415} \\
+Mean DQN@50M-Norm'd     &    0.000 &   23.382 &    0.232 &    0.239 &     0.197 &    0.325 &    0.171 &    0.336 &        \textbf{0.510} \\
+Median DQN@50M-Norm'd  &    0.000 &    0.994 &    0.118 &    0.142 &     0.103 &    0.142 &    0.131 &    0.225 &        \textbf{0.361} \\\midrule
+\# Games Superhuman        &        0 &       N/A &        2 &        2 &         1 &        2 &        2 &        5 &            \textbf{7} \\
+\bottomrule
+\end{tabular}
+}
+\end{small}\end{center}
+\end{table}
+
+\begin{figure}[ht]
+    \centering
+    \includegraphics[width=0.7\textwidth]{figures/results_boxplot.pdf}
+    \caption{A boxplot of the distribution of human-normalized scores across the 26 Atari games under consideration, after 100k environment steps. The whiskers represent the interquartile range of human-normalized scores over the 26 games.  Scores for each game are recorded at the end of training and averaged over 10 random seeds for SPR, 20 for CURL, and 5 for other methods.}
+    \label{fig:boxplot}
+\end{figure}
+
+\subsection{Evaluation}
+We evaluate the performance of different methods by computing the average episodic return at the end of training. We normalize scores with respect to expert human scores to account for different scales of scores in each game, as done in previous works. The human-normalized score of an agent on a game is calculated as $\frac{\text{agent score} - \text{random score}}{\text{human score} - \text{random score}}$ and aggregated across the 26 games by mean or median.
+
+We find that human scores on some games are so high that differences between methods are washed out by normalization, making it hard for these games to influence aggregate metrics.  Moreover, we find that the median score is typically only influenced by a handful of games.  Both these factors compound together to make the median human-normalized score an unreliable metric for judging overall performance.  To address this, we also report DQN-normalized scores, defined analogously to human-normalized scores and calculated using scores from DQN agents \citep{dqn} trained over 50 million steps, and report both mean and median of those metrics in all results and ablations, and plot the distribution of scores over all the games in Figure \ref{fig:boxplot}.
+
+Additionally, we note that the standard evaluation protocol of evaluating over only 500,000 frames per game is problematic, as the quantity we are trying to measure is expected return over episodes.  Because episodes may last up to up to 108,000 frames, this method may collect as few as four complete episodes.  As variance of results is already a concern in deep RL \cite[see][]{drlthatmatters}, we recommend evaluating over 100 episodes irrespective of their length.  Moreover, to address findings from \cite{drlthatmatters} that comparisons based on small numbers of random seeds are unreliable, we average our results over ten random seeds, twice as many as most previous works.
+
+\section{Analysis}
+
+\begin{table}
+    \caption{Scores on the 26 Atari games under consideration for ablated variants of SPR. All variants listed here use data augmentation.}
+    \label{tab:temporal_ablations}
+    \centering
+    \scalebox{0.95}{
+    \begin{tabular}{l r r r r}
+    \toprule
+    Variant & \multicolumn{2}{c}{Human-Normalized Score} & \multicolumn{2}{c}{DQN@50M-Normalized Score} \\
+    {} & mean & median & mean & median \\
+    \midrule
+    SPR               &    \textbf{0.704}  & \textbf{0.415}& \textbf{0.510}  &  \textbf{0.361} \\ \midrule
+    1-step SPR   &        0.570 & 0.301  &  0.337  &  0.346 \\
+    Non-temporal SPR   &  0.507 & 0.271  &  0.326  &  0.295 \\ \midrule
+    Quadratic SPR &        0.047 & 0.040 & -0.016 & 0.031 \\
+    SPR without projections &          0.437 & 0.171 & 0.247  & 0.174 \\
+    \midrule
+    Rainbow (controlled, w/ aug.)    &            0.480 & 0.346  &  0.284  &  0.278 \\
+    \bottomrule
+    \end{tabular}
+    }
+\end{table}
+
+\paragraph{The target encoder}
+\label{sec:momentum_ablations}
+We find that using a separate target encoder is vital in all cases.  A variant of SPR in which target representations are generated by the online encoder without a stopgradient~\citep[as done by e.g.,][]{deepMDP} exhibits catastrophically reduced performance, with median human-normalized score of $0.278$ with augmentation versus $0.415$ for SPR.  However, there is more flexibility in the EMA constant used for the target encoder.  When using augmentation, a value of $\tau=0$ performs best, while without augmentation we use $\tau=0.99$.  The success of $\tau=0$ is interesting, since the related method BYOL reports very poor representation learning performance in this case.  We hypothesize that optimizing a reinforcement learning objective in parallel with the SPR loss explains this difference, as it provides an additional gradient which discourages representational collapse.  Full results for these experiments are presented in Appendix~\ref{app:momentum_ablations}.
+
+\begin{wrapfigure}[21]{l}{7.5cm}
+    \centering
+    \includegraphics[width=0.5\textwidth]{figures/temporal_ablation.pdf}
+    \caption{Performance of SPR with various prediction depths. Results are averaged across ten seeds per game, for all 26 games.  To equalize the importance of games, we calculate an SPR-normalized score analogously to human-normalized scores, and show its mean and median across all 26 games.  All other hyperparameters are identical to those used for SPR with augmentation.}
+    \label{fig:temporal_ablations}
+\end{wrapfigure}
+
+\paragraph{Dynamics modeling is key}
+A key distinction between SPR and other recent approaches leveraging representation learning for reinforcement learning, such as CURL \citep{curl} and DRIML \citep{mazoure2020deep}, is our use of an explicit multi-step dynamics model.  To illustrate the impact of dynamics modeling, we test SPR with a variety of prediction depths $K$.  Two of these ablations, one with no dynamics modeling and one that models only a single step of dynamics, are presented in Table~\ref{tab:temporal_ablations} (as \textit{Non-temporal SPR} and \textit{1-step SPR}), and all are visualized in Figure~\ref{fig:temporal_ablations}.  We find that extended dynamics modeling consistently improves performance up to roughly $K=5$.  Moving beyond this continues to improve performance on a subset of games, at the cost of increased computation.  Note that the non-temporal ablation we test is similar to using BYOL~\citep{BYOL} as an auxiliary task, with particular architecture choices made for the projection layer and predictor.
+
+\paragraph{Comparison with contrastive losses}
+\label{sec:contrastive_ablation}
+Though many recent works in representation learning employ contrastive learning, we find that SPR consistently outperforms both temporal and non-temporal variants of contrastive losses (see Table \ref{table:contrastive_controls}, appendix), including CURL \citep{curl}.
+
+\paragraph{Using a quadratic loss causes collapse}
+SPR's use of a cosine similarity objective (or a normalized L2 loss) sets it in contrast to some previous works, such as DeepMDP~\citep{deepMDP}, which have learned latent dynamics models by minimizing an un-normalized L2 loss over predictions of future latents. To examine the importance of this objective, we test a variant of SPR that minimizes un-normalized L2 loss (\textit{Quadratic SPR} in Table~\ref{tab:temporal_ablations}), and find that it performs only slightly better than random.  This is consistent with results from~\cite{deepMDP}, who find that DeepMDP's representations are prone to collapse, and use an auxiliary reconstruction objective to prevent this.
+
+\paragraph{Projections are critical}
+Another distinguishing feature of SPR is its use of projection and prediction networks.  We test a variant of SPR that uses neither, instead computing the SPR loss directly over the $64\times 7 \times 7$ convolutional feature map used by the transition model (\textit{SPR without projections} in Table~\ref{tab:temporal_ablations}).  We find that this variant has inferior performance, and suggest two possible explanations.  First, the convolutional network represents only a small fraction of the capacity of SPR's network, containing only some 80,000 parameters out of a total of three to four million.  Employing the first layer of the DQN head as a projection thus allows the SPR objective to affect far more of the network, while in this variant its impact is limited.  Second, the effects of SPR in forcing invariance to augmentation may be undesirable at this level; as the convolutional feature map is the product of only three layers, it may be challenging to learn features that are simultaneously rich and invariant.
+
+\section{Future Work}
+Recent work in both visual \citep{simCLRv2} and language representation learning \citep{gpt3} has suggested that self-supervised models trained on large datasets perform exceedingly well on downstream problems with limited data, often outperforming methods trained using only task-specific data. Future works could similarly exploit large corpora of unlabelled data, perhaps from multiple MDPs or raw videos, to further improve the performance of RL methods in low-data regimes.  As the SPR objective is unsupervised, it could be directly applied in such settings.
+
+Another interesting direction is to use the transition model learned by SPR for planning. MuZero \citep{muzero} has demonstrated that planning with a model supervised via reward and value prediction can work extremely well given sufficient (massive) amounts of data. It remains unclear whether such models can work well in low-data regimes, and whether augmenting such models with self-supervised objectives such as SPR can improve their data efficiency.
+
+It would also be interesting to examine whether self-supervised methods like SPR can improve generalization to unseen tasks or changes in environment, similar to how unsupervised pretraining on ImageNet can generalize to other datasets \citep{moco, BYOL}.
+
+\section{Conclusion}
+In this paper we introduced Self-Predictive Representations (SPR), a self-supervised representation learning algorithm designed to improve the data efficiency of deep reinforcement learning agents.
+SPR learns representations that are both temporally predictive and consistent across different views of environment observations, by directly predicting representations of future states produced by a target encoder.
+SPR achieves state-of-the-art performance on the 100k steps Atari benchmark, demonstrating significant improvements over prior work.
+Our experiments show that SPR is highly robust, and is able to outperform the previous state of the art when either data augmentation or temporal prediction is disabled.
+We identify important directions for future work, and hope continued research at the intersection of self-supervised learning and reinforcement learning leads to algorithms which rival the efficiency and robustness of humans.

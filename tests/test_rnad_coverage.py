@@ -204,57 +204,48 @@ class NeuRDPerChoiceTests(unittest.TestCase):
         grad_dense = logits_dense.grad
         assert grad_dense is not None
 
-        # Same data in flat per-choice form.
+        # Same data in flat per-choice form. The ragged form returns
+        # ``(sum_loss, n_active, n_clipped)`` (issue 7); divide by ``t_len``
+        # to match the dense form's per-step normalization.
         logits_flat = logits_dense.detach().clone().reshape(-1).requires_grad_(True)
         q_flat = q_dense.reshape(-1)
-        group_idx = torch.arange(t_len).repeat_interleave(a_len)
-        loss_flat = neurd_loss_per_choice(
+        loss_flat_sum, _n_active, _n_clipped = neurd_loss_per_choice(
             flat_logits=logits_flat,
             flat_q=q_flat,
-            group_idx=group_idx,
-            num_groups=t_len,
             beta=100.0,
             clip=1e6,
         )
-        loss_flat.backward()
+        (loss_flat_sum / t_len).backward()
         grad_flat = logits_flat.grad
         assert grad_flat is not None
         self.assertTrue(torch.allclose(grad_flat.reshape(t_len, a_len), grad_dense, atol=1e-6))
 
-    def test_ragged_groups_distribute_normalization(self) -> None:
-        """With unequal group sizes, each step's contribution is still
-        averaged by 1/T so variance from ragged batches stays comparable."""
+    def test_ragged_groups_emit_per_action_gradient(self) -> None:
         # 2 decision steps, first has 2 legal choices, second has 5.
-        group_idx = torch.tensor([0, 0, 1, 1, 1, 1, 1])
         logits = torch.zeros(7, requires_grad=True)
         q = torch.tensor([1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0])
-        loss = neurd_loss_per_choice(
+        loss_sum, n_active, _n_clipped = neurd_loss_per_choice(
             flat_logits=logits,
             flat_q=q,
-            group_idx=group_idx,
-            num_groups=2,
             beta=100.0,
             clip=1e6,
         )
-        loss.backward()
+        self.assertEqual(n_active, 7)
+        loss_sum.backward()
         assert logits.grad is not None
-        # Expected: -q / num_groups (same shape as dense case, just flat).
-        expected = -q / 2
-        self.assertTrue(torch.allclose(logits.grad, expected, atol=1e-6))
+        # Sum form gradient is just -q (no per-group division).
+        self.assertTrue(torch.allclose(logits.grad, -q, atol=1e-6))
 
     def test_per_choice_respects_beta_gate(self) -> None:
         logits = torch.full((4,), 100.0, requires_grad=True)
         q = torch.ones(4)
-        group_idx = torch.zeros(4, dtype=torch.long)
-        loss = neurd_loss_per_choice(
+        loss_sum, _n_active, _n_clipped = neurd_loss_per_choice(
             flat_logits=logits,
             flat_q=q,
-            group_idx=group_idx,
-            num_groups=1,
             beta=2.0,
             clip=1e6,
         )
-        loss.backward()
+        loss_sum.backward()
         assert logits.grad is not None
         self.assertTrue(torch.allclose(logits.grad, torch.zeros_like(logits)))
 

@@ -10,17 +10,16 @@ Glue between :mod:`magic_ai.rnad` (algorithmic primitives) and the
   (advance ``reg_prev <- reg_cur``, ``reg_cur <- target`` every
   ``config.delta_m`` steps).
 
-First-cut simplifications (see ``docs/rnad_design.md`` for rationale):
+First-cut simplifications (see ``docs/rnad_deviations.md`` for rationale):
 
 - Rollouts sample from the **online** policy, not the target. The paper
-  samples from target; we keep the existing training-loop action-sampling
-  code unchanged for this pass. Moving to target-sampled rollouts is a
-  later phase.
-- NeuRD is the sampled-action variant
-  (:func:`magic_ai.rnad.sampled_neurd_loss`). The full per-action form
-  (§188 with the ``[-beta, beta]`` logit gate) lands when
-  :meth:`PPOPolicy.evaluate_replay_batch` grows a per-choice-logit return
-  mode.
+  samples from target; with Polyak tracking inside one outer iteration the
+  two are close, and the trainer treats target as the behavior policy when
+  computing per-group ``1/mu_k`` corrections (issue 4 — autoregressive
+  decomposition).
+- NeuRD is always the full per-action form (paper §188 with the
+  ``[-beta, beta]`` logit gate); there is no sampled-action fallback in
+  this trainer.
 - The opponent pool is not used for R-NaD self-play; opponents are the
   current target (equivalent here to the online policy under the first
   simplification above). Snapshots continue to land in the pool for
@@ -45,7 +44,6 @@ from magic_ai.rnad import (
     load_reg_snapshot_into,
     polyak_update_,
     rnad_trajectory_loss,
-    rnad_trajectory_loss_full_neurd,
     save_reg_snapshot,
 )
 
@@ -79,6 +77,13 @@ def _clone_policy_sharing_buffer(src: PPOPolicy) -> PPOPolicy:
     The target/reg policies only need to run forward over the rollout buffer
     populated by the online policy; by sharing the buffer instance we avoid
     duplicating gigabytes of ingested trajectory tensors.
+
+    The live LSTM env-state cache (``live_lstm_h``/``live_lstm_c``) is *not*
+    cloned: it is the online actor's per-env runtime sampling cache, not
+    trainable model state. The clone gets empty cache buffers; target/reg
+    policies do not sample so they never need to read it, and recurrent-state
+    recomputation during R-NaD updates explicitly re-runs the LSTM from a
+    zero initial hidden state per policy.
     """
 
     # Deepcopy everything except the rollout buffer, which we splice back in.
@@ -89,6 +94,14 @@ def _clone_policy_sharing_buffer(src: PPOPolicy) -> PPOPolicy:
     finally:
         object.__setattr__(src, "rollout_buffer", original_buffer)
     object.__setattr__(clone, "rollout_buffer", original_buffer)
+    if getattr(clone, "use_lstm", False):
+        # Replace the deep-copied live LSTM cache (which mirrors src's per-env
+        # state at clone time) with empty buffers. Target/reg never sample
+        # from a live env, so this is the right starting state.
+        empty_h = torch.zeros(clone.hidden_layers, 0, clone.hidden_dim, dtype=torch.float32)
+        empty_c = empty_h.clone()
+        clone.live_lstm_h = empty_h.to(clone.live_lstm_h.device)
+        clone.live_lstm_c = empty_c.to(clone.live_lstm_c.device)
     return clone
 
 
@@ -181,15 +194,18 @@ def run_rnad_update(
     episodes: Sequence[EpisodeBatch],
     *,
     entropy_coef: float = 0.0,
-    full_neurd: bool = False,
 ) -> PPOStats:
     """Run R-NaD on a batch of freshly-finished episodes.
 
-    Each episode becomes one :func:`rnad_update_trajectory` call; per-call
-    stats are averaged into a :class:`PPOStats` so the existing logger
-    continues to work unchanged. ``entropy_coef`` is unused for R-NaD (the
-    reward transform already injects an entropy bonus) but kept in the
-    signature for parity with :func:`magic_ai.ppo.ppo_update`.
+    Each episode becomes one :func:`rnad_trajectory_loss` call; the resulting
+    sums/counts are aggregated and a single backward + Adam + Polyak step is
+    taken (issue 7 — paper-faithful 1/t_effective normalization, where
+    ``t_effective`` is the total own-turn step / per-choice-action count
+    across the batch, not the episode count).
+
+    ``entropy_coef`` is unused for R-NaD (the reward transform already
+    injects an entropy bonus) but kept in the signature for parity with
+    :func:`magic_ai.ppo.ppo_update`.
     """
 
     del entropy_coef  # parity-only arg
@@ -197,14 +213,15 @@ def run_rnad_update(
     if not episodes:
         raise ValueError("run_rnad_update requires at least one episode")
 
-    # Batched update: accumulate losses across all episodes in this rollout
-    # batch, then do ONE backward + Adam + Polyak. Amortizes optimizer and
-    # target-network averaging overhead over the (often dozens of) short
-    # episodes a single rollout produces. Each episode still runs its own
-    # forwards + v-trace (those are trajectory-dependent by construction).
-    loss_fn = rnad_trajectory_loss_full_neurd if full_neurd else rnad_trajectory_loss
-    total_loss: torch.Tensor | None = None
-    per_episode_stats: list[tuple[float, float, float, float]] = []
+    cl_sum: torch.Tensor | None = None
+    pl_sum: torch.Tensor | None = None
+    cl_count_total = 0
+    pl_count_total = 0
+    n_q_clipped_total = 0
+    flat_active_total = 0
+    v_hat_mean_acc = 0.0
+    transformed_mean_acc = 0.0
+    n_pieces = 0
     alpha = _alpha_for_step(state.gradient_step, state.config.delta_m)
 
     for episode in episodes:
@@ -220,7 +237,7 @@ def run_rnad_update(
             perspective.append(int(step.perspective_player_idx))
             logp_mu.append(float(step.old_log_prob))
 
-        pieces = loss_fn(
+        pieces = rnad_trajectory_loss(
             online=policy,
             target=state.target,
             reg_cur=state.reg_cur,
@@ -232,24 +249,26 @@ def run_rnad_update(
             config=state.config,
             alpha=alpha,
         )
-        episode_loss = pieces.cl + pieces.pl
-        total_loss = episode_loss if total_loss is None else total_loss + episode_loss
-        per_episode_stats.append(
-            (
-                float(episode_loss.detach()),
-                float(pieces.cl.detach()),
-                float(pieces.pl.detach()),
-                pieces.v_hat_mean,
-            )
-        )
+        cl_sum = pieces.cl_sum if cl_sum is None else cl_sum + pieces.cl_sum
+        pl_sum = pieces.pl_sum if pl_sum is None else pl_sum + pieces.pl_sum
+        cl_count_total += pieces.cl_count
+        pl_count_total += pieces.pl_count
+        n_q_clipped_total += pieces.n_q_clipped
+        flat_active_total += pieces.pl_count
+        v_hat_mean_acc += pieces.v_hat_mean
+        transformed_mean_acc += pieces.transformed_mean
+        n_pieces += 1
 
-    if total_loss is None:
+    if cl_sum is None or pl_sum is None or n_pieces == 0:
         raise ValueError("no non-empty episodes to update on")
 
-    # Mean over episodes keeps the loss magnitude comparable to the
-    # single-trajectory variant; Adam's update step stays well-scaled.
-    n_episodes = max(1, len(per_episode_stats))
-    total_loss = total_loss / n_episodes
+    # Issue 7: normalize by total counts across the rollout batch, not by
+    # episode count. Critic divides by total own-turn steps; policy divides
+    # by total active per-choice actions across all decision groups + may
+    # branches. Short games no longer get over-weighted.
+    cl = cl_sum / max(cl_count_total, 1)
+    pl = pl_sum / max(pl_count_total, 1)
+    total_loss = cl + pl
 
     optimizer.zero_grad(set_to_none=True)
     total_loss.backward()
@@ -258,38 +277,31 @@ def run_rnad_update(
     optimizer.step()
     polyak_update_(state.target, policy, gamma=state.config.target_ema_gamma)
 
-    # One gradient step per rollout batch (not per episode) -> one outer-loop
-    # tick per batch. This matches the paper's §163 "one step per iteration".
     state.gradient_step += 1
     if state.gradient_step >= state.config.delta_m:
         _advance_outer_iteration(state)
 
-    per_episode = [
-        RNaDStats(
-            loss=loss_val,
-            critic_loss=cl_val,
-            policy_loss=pl_val,
-            v_hat_mean=v_hat_mean,
-            grad_norm=grad_norm,
-            transformed_reward_mean=0.0,
-        )
-        for loss_val, cl_val, pl_val, v_hat_mean in per_episode_stats
-    ]
-    state.last_stats = per_episode
+    q_clip_fraction = (
+        float(n_q_clipped_total) / float(flat_active_total) if flat_active_total > 0 else 0.0
+    )
+    aggregate = RNaDStats(
+        loss=float(total_loss.detach()),
+        critic_loss=float(cl.detach()),
+        policy_loss=float(pl.detach()),
+        v_hat_mean=v_hat_mean_acc / n_pieces,
+        grad_norm=grad_norm,
+        transformed_reward_mean=transformed_mean_acc / n_pieces,
+        q_clip_fraction=q_clip_fraction,
+    )
+    state.last_stats = [aggregate]
 
-    # Aggregate for PPO-shaped logging. Leave PPO-specific fields at zero;
-    # the three R-NaD-specific numbers populate the closest analogues.
-    n = max(1, len(per_episode))
-    mean_loss = sum(s.loss for s in per_episode) / n
-    mean_critic = sum(s.critic_loss for s in per_episode) / n
-    mean_policy = sum(s.policy_loss for s in per_episode) / n
     return PPOStats(
-        loss=mean_loss,
-        policy_loss=mean_policy,
-        value_loss=mean_critic,
+        loss=aggregate.loss,
+        policy_loss=aggregate.policy_loss,
+        value_loss=aggregate.critic_loss,
         entropy=0.0,
         approx_kl=0.0,
-        clip_fraction=0.0,
+        clip_fraction=q_clip_fraction,
         spr_loss=0.0,
     )
 

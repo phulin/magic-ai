@@ -1,0 +1,306 @@
+\title{From Poincar\'e Recurrence to Convergence in Imperfect Information Games: Finding Equilibrium via Regularization}
+
+\section*{Abstract}
+In this paper we investigate the Follow the Regularized Leader dynamics in sequential imperfect information games (IIG). We generalize existing results of Poincar\'e recurrence from normal-form games to zero-sum two-player imperfect information games and other sequential game settings. We then investigate how adapting the reward (by adding a regularization term) of the game can give strong convergence guarantees in monotone games. We continue by showing how this reward adaptation technique can be leveraged to build algorithms that converge exactly to the Nash equilibrium. Finally, we show how these insights can be directly used to build state-of-the-art model-free algorithms for zero-sum two-player Imperfect Information Games (IIG).
+
+\section{Introduction}
+This paper addresses the problem of learning a Nash equilibrium in several classes of games. Learning Nash equilibria in competitive games is complex as agents no longer share information but behave independently. Various techniques have been proposed to solve these games, with the current state-of-the-art usually guaranteeing average-time convergence of the learned policy to a Nash equilibrium, but not necessarily convergence of the policy itself to Nash. Unfortunately, these convergence guarantees are not conducive to learning in large games, which rely on general function approximation techniques (e.g., deep neural networks) that are inherently difficult to time-average. Moreover, the real-time behaviors of the policy can be quite distinctive from its time-average counterpart, and can even diverge away from Nash equilibria.
+
+In some adversarial games, Follow the Regularized Leader (FoReL) is known to be convergent if the equilibrium is deterministic, and recurrent if the equilibrium is mixed with full support. A special case of FoReL dynamics is replicator dynamics, the main dynamic of evolutionary game theory, whose recurrent behavior in zero-sum games and generalizations is well studied. More generally, value-based methods have been well-studied in multi-agent RL but numerous issues of convergence have been noticed. A notable empirical finding shows that regularization of $Q$-learning in matrix games can induce the policy to converge in real-time to a Nash equilibrium or in the replicator dynamics to Quantal-Response-Equilibrium. Other theoretical investigations show that softmax best response can guarantee convergence in $Q$-learning.
+
+Motivated by these findings, this paper formally analyzes the impact of regularization on learning dynamics, extending beyond the simple case of matrix games and focusing particularly on the application of FoReL to imperfect information games. Contributions:
+\begin{itemize}
+\item We generalize the Poincar\'e recurrence result to the case of sequential imperfect information games. This proves that strategies can cycle in IIG when using FoReL.
+\item We prove that changing the reward structure of the game improves convergence guarantees at the cost of slightly modifying the equilibrium of the game.
+\item We show that this reward adaptation method can be used to build a sequence of closer and closer pseudo-solutions converging onto a Nash equilibrium.
+\item We illustrate that by using these theoretical findings, we improve the state-of-the-art of deep reinforcement learning in imperfect information games.
+\end{itemize}
+
+\subsection{Related Work}
+
+\paragraph{FoReL and regret minimization in Games.}
+There exists a large corpus of literature providing evidence that minimax equilibria (or Nash equilibria) in normal form zero-sum two-player games are often unstable rest points of FoReL (or at best neutrally stable). In evolutionary game theory, the replicator dynamics are known to be unstable in the case of an interior equilibrium in zero-sum two-player normal form games. Many machine learning approaches can be used in self-play to learn an equilibrium: regret minimization methods have been extensively studied in zero-sum games, for which the average policy played over time converges to an equilibrium, but the actual policy is known to be recurrent. The convergence of the actual policy can be obtained when the opponent plays a best response but not in the self-play setting. The best response sequences of Fictitious Play and smoother variants converge in time-average. Polymatrix games can be solved by linear programming. Regret minimization techniques can be used to learn a Nash equilibrium (since for a coarse correlated equilibrium, the marginals w.r.t.\ the players are a Nash equilibrium), but the convergence requires a time-average policy and the policy itself is recurrent.
+
+\paragraph{Gradient Based Methods in Differentiable Games.}
+Differentiable games (e.g.\ GANs) trained by gradient descent present many failure modes. Learning dynamics of gradient descent can cycle in some classes of games. This problem can be resolved by introducing second-order optimization, negative momentum or game-theoretic algorithms.
+
+\paragraph{Reinforcement Learning in Games.}
+In sequential imperfect information games, RL methods have been applied with mild success. Independent reinforcement learning has many failure modes in these settings. In zero-sum sequential IIG, the policy can cycle around the minimax equilibrium without ever converging, even in simple single-state games. In cooperative settings, players tend to overfit to the opponent while learning, without being able to generalize. In the sequential setting, learning can be addressed by either approximate dynamic programming in the perfect information case, regret minimization algorithms (which suffer from time-averaging), best response algorithms, model-free RL methods, or policy gradient in the worst case. The previous model-free RL methods are not flawless: NFSP maintains two data sets of respectively $600$ and $2000$ times the size of the game; some methods empirically show a convergence in time-average without formal proof; others require exact computation of a best response.
+
+\section{Warming up: Normal Form Games}
+We first sketch our main results in repeated zero-sum two-player normal form games.
+
+\paragraph{Background.}
+In a zero-sum two-player normal form game, two players select actions $a^i \in A$ according to policies $\pi^i \in \Delta A$, and receive reward $r_\pi^i(a^1, a^2)$. The reward is policy-independent ($r^i(a^1, a^2)$) if it is only a function of actions. If $\pi$ is played, define
+$$Q^i_\pi(a^i) = \mathbb{E}_{a^{-i} \sim \pi^{-i}}[r_\pi^i(a^i, a^{-i})],\qquad V^i_\pi = \mathbb{E}_{a \sim \pi}[r_\pi^i(a)].$$
+A policy $\pi^*$ is a \textbf{Nash equilibrium} if for all $\pi$ and all $i$, $V^i_{\pi^i, \pi^{*-i}} - V^i_{\pi^*} \leq 0$.
+
+\paragraph{Follow the Regularized Leader (FoReL).}
+FoReL is an exploration-exploitation algorithm that maximizes cumulative payoff (exploitation) minus a regularization term (exploration). Continuous time version:
+$$y_t^i(a^i) = \int_0^t Q^i_{\pi_s}(a^i)\, ds,\qquad \pi^i_t=\argmax_{p \in \Delta A} \Lambda^i(p, y_t^i),$$
+where $\Lambda^i(p, y) = \langle y, p \rangle - \phi_i(p)$ and $\phi_i$ is the regularizer: continuous and strictly convex on $\Delta A$, smooth on the relative interior of every face. Standard choices: entropy $\phi_i(p)=\sum_a p(a) \log p(a)$, and $\ell_2$-norm $\phi_i(p)=\sum_a |p(a)|^2$. Entropy yields replicator dynamics; $\ell_2$-norm yields projection dynamics. We write $\phi_i^*(y) = \max_p \Lambda^i(p, y)$, and $\argmax_p \Lambda^i(p, y) = \nabla_y \phi_i^*(y)$.
+
+If $\pi^*$ is a Nash equilibrium, a measure of distance is
+$$J(y) = \sum_{i=1}^2 \big[ \phi_i^*(y_i) - \langle y_i, \pi^*_i \rangle\big].$$
+
+\paragraph{Recurrence.}
+If the reward is policy-independent and there exists an interior equilibrium, the policy under FoReL is recurrent. This strong negative result indicates that convergence cannot be achieved with FoReL in games with a mixed strategy equilibrium, so long as the reward is policy-independent.
+
+\paragraph{Reward transformation and convergence in normal-form games.}
+If the reward is not policy-independent:
+$$\frac{d}{dt}J(y) = \sum_{i=1}^2 \underbrace{[V^i_{\pi^i_t, \pi^{*-i}} - V^i_{\pi^*}]}_{\leq 0} + \sum_{i=1}^2 \mathbb{E}_{a \sim (\pi^{*i}, \pi_t^{-i})}\!\left[r^i_{\pi^{*i}, \pi_t^{-i}}(a) - r^i_{\pi_t}(a)\right].$$
+Consider the following policy-dependent reward, which preserves the zero-sum property for any policy $\mu$ of full support:
+$$r^i_\pi(a) = r^i(a^i, a^{-i}) - \eta \log \frac{\pi^i(a^i)}{\mu^i(a^i)} + \eta \log \frac{\pi^{-i}(a^{-i})}{\mu^{-i}(a^{-i})}.$$
+Then
+$$\frac{d}{dt}J(y) = \sum_{i=1}^2 \underbrace{[V^i_{\pi^i_t, \pi^{*-i}} - V^i_{\pi^*}]}_{\leq 0} - \eta \sum_{i=1}^2 \textrm{KL}(\pi^{*i}, \pi^{i}_t).$$
+This ensures convergence of $\pi_t$ to $\pi^*$, the Nash of the game defined by $r^i_\pi(a)$, by Lyapunov arguments. Note $\pi^*$ depends on $\mu$ and $\eta$.
+
+\paragraph{Direct Convergence.}
+Solving the original game can be achieved by iteratively solving the game with reward
+$$r^i_{k,\pi}(h, a) = r^i(a^i, a^{-i}) - \eta \log \frac{\pi^i(a^i)}{\pi_{k-1}^i(a^i)} + \eta \log \frac{\pi^{-i}(a^{-i})}{\pi_{k-1}^{-i}(a^{-i})}$$
+and using the Nash $\pi_k$ of that game to modify the reward next (starting with $\pi_0$ uniform). The sequence $(\pi_k)_{k\geq 0}$ converges to $\pi^*$. Specifically:
+$$\sum_{i=1}^2 \left[\textrm{KL}(\pi^{*i}, \pi^{i}_k) - \textrm{KL}(\pi^{*i}, \pi^{i}_{k-1})\right]\leq - \sum_{i=1}^2 \textrm{KL}(\pi^{i}_{k}, \pi^{i}_{k-1}).$$
+
+\section{Background in Sequential Imperfect Information Games}
+
+In a sequential IIG, $N$ players and a chance player ($c$) interact sequentially from history $h_{\textrm{init}}$. The set of all histories $H = \cup_{i \in \{1,\dots,N, c\}} H_i$, with terminal subset $\mathcal{Z}_i \subset H_i$. In history $h$ the current player observes information state $x \in \mathcal{X}=\cup_i \mathcal{X}_i$. The turn function $\tau(h) \mapsto i$ gives whose turn. We write $x(h)$ for the info state of $h$, and $h \in x$ if $x(h)=x$.
+
+At $h\in H\backslash\mathcal{Z}$ the current player plays $a \in A$; each player $i$ gets reward $r^i(h, a)$ and the state becomes $h'=ha$. We write $h \sqsubset h'$ if $h'$ is reachable from $h$ by a sequence of actions.
+
+A policy $\pi(a|x)$ maps info states to $\Delta A$. Write $\pi = (\pi^i, \pi^{-i})$. We consider \textbf{policy-dependent reward} $r_\pi^i(h,a)$.
+
+\paragraph{Value function on histories.}
+$$V^i_{\pi} (h) = \mathbb{E}\Big[\sum_{n \geq 0} r_\pi^i(h_n,a_n) \,\Big|\, h_0=h\Big] = \sum_a \pi(a|x(h))\left[r_\pi^i(h,a) + V^i_{\pi} (ha)\right].$$
+$$Q^i_{\pi} (h, a) = r_\pi^i(h,a) + V^i_{\pi} (ha).$$
+
+\paragraph{Reach probabilities.}
+$$\rho^{\pi} (h) = \prod_{h'a \sqsubset h} \pi(a|x(h')),\quad \rho^{\pi^i} (h) = \prod_{h'a \sqsubset h,\, \tau(h')=i} \pi(a|x(h')),\quad \rho^{\pi^{-i}} (h) = \prod_{h'a \sqsubset h,\, \tau(h') \neq i} \pi(a|x(h')).$$
+Under perfect recall, for any $h\in x$: $\rho^{\pi} (x) = \rho^{\pi^i} (h) \rho^{\pi^{-i}} (x)$, and we write $\rho^{\pi^i} (x) = \rho^{\pi^i} (h)$. Furthermore $V^i_{\pi} (h_{\textrm{init}}) = \sum_h \rho^{\pi} (h) \sum_a \pi(a|x(h)) r^i_{\pi}(h, a)$.
+
+\paragraph{Value functions on information states.}
+$$V^i_{\pi} (x) = \frac{\sum_{h \in x} \rho^{\pi} (h) V^i_{\pi} (h)}{\sum_{h \in x} \rho^{\pi} (h)}\underbrace{=}_{\text{perfect recall}} \frac{\sum_{h \in x} \rho^{\pi^{-i}} (h) V^i_{\pi} (h)}{\sum_{h \in x} \rho^{\pi^{-i}} (h)},\qquad Q^i_{\pi} (x,a) \text{ similarly}.$$
+
+\textbf{Definition (Nash).} A strategy $\pi$ is a Nash equilibrium if for all $i$ and all $\pi'^i$: $V^i_{\pi'^i, \pi^{-i}}(h_{\textrm{init}}) \leq V^i_{\pi^i, \pi^{-i}}(h_{\textrm{init}})$.
+
+\subsection{Monotone Games}
+We are interested in: (i) zero-sum two-player games, $V^1_{\pi} = -V^2_{\pi}$; (ii) zero-sum $N$-player polymatrix games, $V^i_{\pi} = \sum_{j \neq i} \tilde V^i_{\pi^i, \pi^j}$ with $\tilde V^i_{\pi^i, \pi^j} = -\tilde V^j_{\pi^j, \pi^i}$; (iii) games where the profit is decoupled from opponents, $V^i_{\pi} = \bar V^i_{\pi^i} + \bar V^i_{\pi^{-i}}$. All are captured by:
+
+\textbf{Definition (Monotone).} Let
+$$\Omega^i(\pi, \mu) = V^i_{\pi^i, \pi^{-i}} - V^i_{\mu^i, \pi^{-i}} - V^i_{\pi^i, \mu^{-i}} + V^i_{\mu^i, \mu^{-i}}\quad(\text{all at } h_{\textrm{init}}).$$
+A game is monotone if for all $\pi \neq \mu$: $\sum_{i} \Omega^i(\pi, \mu) \leq 0$.
+
+\subsection{Follow the Regularized Leader}
+FoReL in IIG: for all $i$ and $x\in\mathcal{X}_i$,
+$$y_t^i(x, a) = \int_0^t \rho^{\pi_s^{-i}}(x) Q^i_{\pi_s}(x, a)\, ds,\qquad \pi^i_t(.|x)=\argmax_{p \in \Delta A} \Lambda^i(p, y_t^i(x,.)).$$
+Define
+$$J(y) = \sum_{i=1}^N \sum_{x \in \mathcal{X}_i} \rho^{\pi^{*i}}(x)\left[\phi_i^*(y^i(x, .)) - \langle \pi^*(.|x), y^i(x, .) \rangle\right].$$
+
+\textbf{Lemma.} Under FoReL,
+\begin{align*}
+\frac{d}{dt}J(y) &= \sum_{i=1}^N \underbrace{[V^i_{\pi^i_t, \pi^{*-i}} - V^i_{\pi^*}]}_{\leq 0} + \underbrace{\sum_{i=1}^N \Omega^i(\pi, \pi^*)}_{\leq 0 \text{ monotone}}\\
+&\quad + \sum_{i=1}^N \sum_{h \in H\backslash\mathcal{Z}} \rho^{\pi_t^{-i}}(h) \rho^{\pi^{*i}}(h) \,\mathbb{E}_{a \sim (\pi^{*i}, \pi_t^{-i})(\cdot|x(h))}\!\left[r^i_{\pi^{*i}, \pi_t^{-i}}(h,a) - r^i_{\pi_t}(h,a)\right].
+\end{align*}
+
+\section{Recurrence of FoReL}
+This section generalizes classical results to FoReL in monotone IIG with policy-independent reward and full-support equilibrium. Two steps: (a) an equivalent learning dynamic is \textbf{divergence-free} (preserves volume); (b) all trajectories are \textbf{bounded}. This establishes Poincar\'e recurrence.
+
+\textbf{Theorem (Poincar\'e recurrence).} If a flow preserves volume and has only bounded orbits, then for each open set there exist orbits that intersect it infinitely often.
+
+Fix an action $a_x$ for all $x$ and consider the bounded dynamical system:
+$$\dot w_t^i(x, a) = \rho^{\pi_t^{-i}}(x)\left[Q^i_{\pi_t}(x, a) - Q^i_{\pi_t}(x, a_x)\right],\qquad \pi^i_t(.|x)=\argmax_{p \in \Delta A} \Lambda^i(p, w_t^i(x,.)).$$
+
+\textbf{Lemma.} This system is autonomous, divergence-free, and the dynamics of $\pi_t$ is equivalent to the original FoReL when the reward is policy-independent. This implies there is no attractor.
+
+\textbf{Remark.} This does not mean the policy cannot converge. If $w$ diverges, the policy might converge to a deterministic strategy. But if the Nash is full-support, it is not an attractor.
+
+\textbf{Lemma.} If the equilibrium is interior, $\sum_i [V^i_{\pi^i_t, \pi^{*-i}} - V^i_{\pi^*}] = 0$.
+
+\textbf{Corollary.} In a monotone game with policy-independent reward and interior equilibrium, under FoReL, $(d/dt)J(y) \leq 0$. The trajectories are bounded, so the flow is divergence-free with bounded orbits, hence Poincar\'e recurrent.
+
+\section{Reward Transformation and Convergence in IIG}
+In recurrence results, policy-independent reward leads to recurrence. Now we modify the reward so that the Nash of the new game is an attractor.
+
+\paragraph{Lyapunov method.}
+For ODE $(d/dt)y_t = \xi(y_t)$, look at $\mathcal{F}(y)\geq 0$, $\mathcal{F}(y^*)=0$. $\mathcal{F}$ is a strict Lyapunov function if for all $y \neq y^*$, $(d/dt)\mathcal{F}(y_t) < 0$; strong Lyapunov if $(d/dt)\mathcal{F}(y_t) \leq -\beta \mathcal{F}(y_t)$, with $\mathcal{F}(y_t) \leq \mathcal{F}(y_0) \exp(-\beta t)$.
+
+\paragraph{Monotone games.}
+Reward that preserves monotonicity for any $\mu$:
+$$r^i_\pi(h, a) = r^i(h, a) - \frac{\eta\, \mathbf{1}_{i=\tau(h)}}{\rho^{\pi^{-i}}(h)} \log \frac{\pi(a|x(h))}{\mu(a|x(h))}.$$
+
+\textbf{Corollary.} Under this reward, in monotone games:
+$$\frac{d}{dt}J(y)  \leq - \eta \sum_{i=1}^N \sum_{h \in H_i} \rho^{\pi^{*i}}(h)\, \textrm{KL}(\pi^*(.|x(h)), \pi_t(.|x(h))).$$
+
+\textbf{Theorem.} If $\phi_i$ is the entropy, with
+$$\Xi(\pi^*, \pi_t) = \sum_{i=1}^N \sum_{h \in H_i} \rho^{\pi^{*i}}(h)\, \textrm{KL}(\pi^*(.|x(h)), \pi_t(.|x(h))),$$
+we have $(d/dt)\Xi(\pi^*,\pi_t)\leq -\eta \Xi(\pi^*,\pi_t)$, so $\Xi(\pi^*,\pi_t) \leq \Xi(\pi^*,\pi_0) \exp(-\eta t)$.
+
+This introduces a tradeoff between convergence speed and equilibrium shift.
+
+\paragraph{Zero-sum two-player games.}
+A reward specific to zero-sum games, amenable to sample-based methods (no $1/\rho^{\pi^{-i}}(h)$ factor):
+$$r^i_\pi(h, a) = r^i(h, a) - \mathbf{1}_{i=\tau(h)}\, \eta \log \frac{\pi(a|x(h))}{\mu(a|x(h))} + \mathbf{1}_{i\neq\tau(h)}\, \eta \log \frac{\pi(a|x(h))}{\mu(a|x(h))}.$$
+
+\textbf{Corollary.}
+$$\frac{d}{dt}J(y) \leq - \eta \sum_{i=1}^N \sum_{h \in H_i} \rho^{\pi^{*i}}(h)\,\rho^{\pi_t^{-i}}(h)\, \textrm{KL}(\pi^*(.|x(h)), \pi_t(.|x(h))).$$
+
+\textbf{Theorem.} With entropy regularizer, $(d/dt)\Xi(\pi^*, \pi_t) \leq -\eta \zeta \Xi(\pi^*, \pi_t)$ where $\zeta = \min_{x} \min_{\pi, J(y)\leq J(y_0)} \sum_{h \in x} \rho^{\pi^{-i}}(h)$. Hence $\Xi(\pi^*, \pi_t) \leq \Xi(\pi^*, \pi_0) \exp(-\zeta\eta t)$.
+
+\textbf{Remark.} These corollaries hold for all Nash of the transformed game, so the Nash of the transformed game is unique (needed for the next section).
+
+\section{Convergence to an Exact Equilibrium}
+The reward transformation ensures exponential convergence to the Nash of the transformed game, but not the original. Now consider the sequence starting from $\pi_0$ uniform, where $\pi_k$ is the solution of the game with
+$$r^i_\pi(h, a) = r^i(h, a) - \frac{\eta \mathbf{1}_{i=\tau(h)}}{\rho^{\pi^{-i}}(h)} \log \frac{\pi(a|x(h))}{\pi_{k-1}(a|x(h))},$$
+written $\pi_k = F(\pi_{k-1})$.
+
+\textbf{Lemma.} For any Nash $\pi^*$:
+$$\Xi(\pi^*, \pi_k) - \Xi(\pi^*, \pi_{k-1}) = -\Xi(\pi_k, \pi_{k-1}) + \tfrac{1}{\eta}\sum_{i=1}^N (m_k^i + \delta_k^i + \kappa_k^i),$$
+where
+\begin{align*}
+\Xi(\mu,\pi) &= \sum_{i=1}^N \sum_{h \in H_i} \rho^{\mu^i}(h)\, \textrm{KL}(\mu(.|x(h)), \pi(.|x(h))),\\
+\kappa^i_k &= \sum_{x \in \mathcal{X}^i}\rho^{\pi^{*i}}(x)\rho^{\pi_k^{-i}}(x)\sum_a\left[\pi^{*i}(a|x)-\pi_k(a|x)\right]\,{}^k\!Q^i_{\pi_k}(x,a) \leq 0,\\
+\delta^i_k &= V^i_{\pi^i_k, \pi^{*-i}}(h_{\textrm{init}}) - V^i_{\pi^*}(h_{\textrm{init}}) \leq 0,\\
+m^i_k &= V^i_{\pi_k} - V^i_{\pi^{*i}, \pi^{-i}_k} - V^i_{\pi^i_k, \pi^{*-i}} + V^i_{\pi^*}\quad(\text{at } h_{\textrm{init}}),
+\end{align*}
+and $\sum_i m^i_k \leq 0$ if the game is monotone.
+
+\textbf{Theorem.} In a monotone game with all Nash equilibria interior, $\pi_{k+1}=F^k(\pi_0)$ converges to a Nash equilibrium.
+
+\textbf{Remark.} Proved for interior Nash; conjectured to hold more generally.
+
+\section{Empirical Evaluation}
+It has been empirically noted that regularization helps convergence in games. Earlier work also provides experiments where the current policy converges in Leduc Poker, though only average-policy convergence was proven. Our theory sheds light on such results as possibly due to high regularization. We show how reward transform improves state-of-the-art RL in IIG. We use the NeuRD policy update, a retrace update to estimate $Q$, and use the learned $Q$ as a control variate to keep the return estimate unbiased. Results on four games: Kuhn Poker, Leduc Poker, Goofspiel, Liar's Dice (12, 936, 162, 24576 information states respectively). Evaluation metric:
+$$\mathrm{NashConv}(\pi) = \sum_{i=1}^N \max_{\pi'^i}V^i_{\pi'^i,\pi^{-i}}(h_{\textrm{init}}) - V^i_{\pi}(h_{\textrm{init}}).$$
+
+\subsection{Experiment with Decaying Regularization}
+Decaying $\eta$ exponentially from $\eta_{\max}=1$ to a target in $\{1.0, 0.5, 0.2, 0.05, 0.01, 0.0\}$ is effective. Best performance at $\eta=0.05$ with NashConv $0.10$, outperforming NFSP (best $0.12$) and OpenSpiel state-of-the-art ($>0.2$). For too-low $\eta$ the algorithm may diverge.
+
+\subsection{Iteration over the Regularization}
+Convergence to an exact equilibrium is achieved by iteratively adapting the reward. Change the reward periodically every $N$-steps: between $[kN, kN+N/2]$ linearly interpolate between
+$$r^i_\pi(h, a) = r^i(h, a) - \frac{\eta \mathbf{1}_{i=\tau(h)}}{\rho^{\pi^{-i}}(h)} \log \frac{\pi(a|x(h))}{\pi_{kN}(a|x(h))}$$
+and the analogous expression with $\pi_{(k-1)N}$; in $[kN+N/2, (k+1)N]$ use the former. This allows convergence for very high $\eta$, making the method more robust to the hyper-parameter.
+
+\section{Conclusion}
+We generalize the Poincar\'e recurrence result for FoReL from 2-player normal-form zero-sum games to sequential IIG with a monotonicity condition. Although this is a generalization of a negative convergence result, we show that several reward transformations can guarantee convergence to a slightly modified equilibrium, and we show how to recover the original equilibrium of the game (when interior). Based on these techniques we improve the state-of-the-art in model-free deep RL in IIG. Since this work focuses on FoReL, we aim to analyze other dynamics (fictitious play, softmax $Q$-learning) in the sequential case. Ideas like regularization could also be studied in GANs.
+
+\section{Appendix: Proofs}
+
+\subsection{Proof of Main FoReL Lemma}
+\begin{align*}
+\frac{d}{dt}J(y) &= \sum_{i=1}^N \sum_{x \in \mathcal{X}_i} \rho^{\pi^{*i}}(x) \rho^{\pi_t^{-i}}(x) \langle\pi_t(.|x)-\pi^*(.|x), Q^i_{\pi_t}(x,.)\rangle\\
+&= \sum_{i=1}^N \sum_{h \in H_i} \rho^{\pi_t^{-i}}(h)\rho^{\pi^{*i}}(h) \langle\pi_t(.|x(h))-\pi^*(.|x(h)), Q^i_{\pi_t}(h,.)\rangle.
+\end{align*}
+Writing ${}^i\bar\pi_t = (\pi^{*i}, \pi^{-i}_t)$, noting $\langle \pi_t - {}^i\bar\pi_t, \cdot\rangle = 0$ at opponent histories, one derives
+\begin{align*}
+\frac{d}{dt}J(y) &= \Bigg[\sum_{i=1}^N V^i_{(\pi^i_t, \pi^{*-i})}(h_{\textrm{init}}) - V^i_{\pi^*}(h_{\textrm{init}})\Bigg] + \sum_{i=1}^N \Omega^i(\pi_t, \pi^*)\\
+&\quad + \sum_{i=1}^N \sum_{h \in H\backslash\mathcal{Z}} \rho^{\pi_t^{-i}}(h)\rho^{\pi^{*i}}(h) \mathbb{E}_{a \sim (\pi^{*i}, \pi_t^{-i})(\cdot|x(h))}\!\left[r^i_{\pi^{*i}, \pi_t^{-i}}(h,a) - r^i_{\pi_t}(h,a)\right].
+\end{align*}
+
+\subsection{Equivalence to FoReL and Divergence-Freeness}
+The systems
+$$\dot w_t^i(x, a) = \rho^{\pi_t^{-i}}(x)[Q^i_{\pi_t}(x, a) - Q^i_{\pi_t}(x, a_x)],\quad \pi^i_t(.|x)=\argmax_p \Lambda^i(p, w_t^i(x,.))$$
+and
+$$\dot y_t^i(x, a) = \rho^{\tilde \pi_t^{-i}}(x) Q^i_{\tilde \pi_t}(x, a),\quad \tilde\pi^i_t(.|x)=\argmax_p \Lambda^i(p, y_t^i(x,.))$$
+generate the same policies. Proof: $\tilde y_t^i(x,a) = y_t^i(x,a) - y_t^i(x,a_x)$ satisfies the $w$ equation with the same $\argmax$ (since adding a constant in $a$ doesn't change $\argmax$). Both $w$ and $\tilde y$ follow the same ODE with the same initial conditions.
+
+The $w$ dynamics is autonomous, $\dot w_t = \xi(w_t)$, with
+$$\xi(w)(i,x,a) = \rho^{\pi^{-i}}(x)[Q^i_{\pi}(x,a)-Q^i_{\pi}(x,a_x)].$$
+Crucially, $\rho^{\pi^{-i}}(x) Q^i_{\pi}(x, a) = \sum_{h \in x}[r^i(h,a) + V^i_\pi(ha)]$ does not depend on $\pi^i(.|x)$, so $\partial \xi(w)(i,x,a) / \partial w^i(x,a) = 0$, hence $\mathrm{div}_w \xi = 0$.
+
+\subsection{Proof of Strong Lyapunov Function (entropy case)}
+$$J(y) + \sum_{i=1}^N \sum_{x \in \mathcal{X}_i} \rho^{\pi^{*i}}(x)\phi_i(\pi^*(.|x)) = \sum_{i=1}^N \sum_{x \in \mathcal{X}_i} \rho^{\pi^{*i}}(x) D_{\phi_i}(\pi^*(.|x), \pi^i(.|x)),$$
+where $D_{\phi_i}$ is the Bregman divergence. For entropy regularizer, this equals $\sum_i \sum_x \rho^{\pi^{*i}}(x) \textrm{KL}(\pi^*(.|x), \pi^i(.|x)) = \Xi(\pi^*,\pi)$. Hence $(d/dt)J(y) = (d/dt)\Xi(\pi^*,\pi)$.
+
+\subsection{Proof of the Iteration Lemma (sketch)}
+Writing ${}^k r^i_\pi(h, a) = r^i(h, a) - (\eta\mathbf{1}_{i=\tau(h)}/\rho^{\pi^{-i}}(h)) \log(\pi(a|x(h))/\pi_{k-1}(a|x(h)))$ and ${}^i\bar\pi_k=(\pi^{*i}, \pi_k^{-i})$, decompose
+$$\sum_h \rho^{\pi_k}(h) \sum_a \pi_k(a|x(h)){}^k r^i_{\pi_k}(h,a) = (2) = (3) + (1),$$
+with
+\begin{align*}
+(1) &= {}^k V^i_{\pi_k}(h_{\textrm{init}}) - \sum_h \rho^{{}^i\bar\pi_k}(h)\sum_a {}^i\bar\pi_k(a|x(h)){}^k r^i_{\pi_k}(h,a)\\
+&= \sum_{x\in\mathcal{X}^i}\rho^{\pi^{*i}}(x)\rho^{\pi_k^{-i}}(x)\sum_a\left[\pi_k(a|x)-\pi^{*i}(a|x)\right]{}^k Q^i_{\pi_k}(x,a) = -\kappa^i_k \geq 0,\\
+(2) &= V^i_{\pi_k}(h_{\textrm{init}}) - \eta\sum_{h\in H^i}\rho^{\pi^i_k}(h)\,\textrm{KL}(\pi^i_k(.|x(h)), \pi^i_{k-1}(.|x(h))),\\
+(3) &= V^i_{\pi^{*i}, \pi^{-i}_k}(h_{\textrm{init}}) - \eta\sum_{h\in H^i}\rho^{\pi^{*i}}(h)\left[\textrm{KL}(\pi^{*i}, \pi_{k-1}) - \textrm{KL}(\pi^{*i}, \pi_k)\right].
+\end{align*}
+Combining $(2)=(3)+(1)$ and simplifying yields the stated identity.
+
+\subsection{Proof of the Interior-Nash Lemma}
+For all $i,\pi^i$:
+$$V^i_{\pi^i, \pi^{*-i}} - V^i_{\pi^*} = \sum_{x\in\mathcal{X}_i}\rho^{\pi^i}(x)\rho^{\pi^{*-i}}(x)\sum_a(\pi^{*i}(a|x)-\pi^i(a|x))Q^i_{\pi^*}(x,a).$$
+Since $\pi^*$ is Nash, LHS $\leq 0$. If equilibrium is full-support and some $Q^i_{\pi^*}(x,\cdot)$ differed across actions, a greedy deviation on that $x$ would strictly improve—contradiction. So $Q^i_{\pi^*}(x,\cdot)$ is constant over actions, and the RHS vanishes.
+
+\subsection{Reward Transformation in Monotone Games}
+Candidate reward transformations:
+\begin{align*}
+&r^i_\pi(h,a) = r^i(h,a) - \mathbf{1}_{i=\tau(h)}\eta\frac{\log\pi(a|x(h))}{\rho^{\pi^{-i}}(h)},\\
+&r^i_\pi(h,a) = r^i(h,a) - \mathbf{1}_{i=\tau(h)}\eta\frac{\log\pi(a|x(h))}{\rho^{\pi^{-i}}(x(h))},\\
+&r^i_\pi(h,a) = r^i(h,a) - \frac{\eta\mathbf{1}_{i=\tau(h)}}{\rho^{\pi^{-i}}(h)}\log\frac{\pi(a|x(h))}{\mu(a|x(h))},\\
+&r^i_\pi(h,a) = r^i(h,a) - \frac{\eta\mathbf{1}_{i=\tau(h)}}{\rho^{\pi^{-i}}(x(h))}\log\frac{\pi(a|x(h))}{\mu(a|x(h))}.
+\end{align*}
+All preserve monotonicity. In the third:
+$$V^i_\pi(h_{\textrm{init}}) = \sum_h \rho^\pi(h)\sum_a \pi(a|x(h))r^i(h,a) - \eta\sum_{h\in H^i}\rho^{\pi^i}(h)\sum_a \pi^i(a|x(h))\log\frac{\pi^i(a|x(h))}{\mu^i(a|x(h))},$$
+with the second term depending only on $\pi^i$, preserving $\sum_i \Omega^i=0$.
+
+\subsection{Reward Transformation in Zero-Sum Games}
+For any $\mu$:
+$$r^i_\pi(h,a) = r^i(h,a) - \mathbf{1}_{i=\tau(h)}\eta\log\frac{\pi(a|x(h))}{\mu(a|x(h))} + \mathbf{1}_{i\neq\tau(h)}\eta\log\frac{\pi(a|x(h))}{\mu(a|x(h))}.$$
+The game remains zero-sum, so $\sum_i\Omega^i=0$, and
+$$\frac{d}{dt}J(y) = \sum_{i}[V^i_{\pi^i_t,\pi^{*-i}} - V^i_{\pi^*}] - \eta\sum_i\sum_{h\in H_i}\rho^{\pi^{*i}}(h)\rho^{\pi_t^{-i}}(h)\textrm{KL}(\pi^*(.|x(h)),\pi_t(.|x(h))).$$
+
+\subsection{Convergence to a Nash}
+We show $\pi_k=F^k(\pi_0)$ converges to a Nash, assuming all Nash are interior. Three steps:
+\begin{itemize}
+\item $F$ is continuous on the interior of the simplex. Given $\mu,\mu'\in D_0$ (open, bounded away from simplex boundary) and using Pinsker and locally Lipschitz $\log$, one shows $\Xi(\pi^*_{\mu'},\pi^*_\mu) \leq T_{\max}[\sup_{\mu''\in D_0}\max_h 1/\rho^{\pi^{*-i}_{\mu''}}(h)]K\|\mu-\mu'\|$, so $\mu\mapsto\pi^*_\mu$ is continuous.
+\item $\min_{\pi^*\in\Pi^*}\Xi(\pi^*, F(\mu)) - \min_{\pi^*\in\Pi^*}\Xi(\pi^*, \mu) < 0$ for all $\mu\notin\Pi^*$. Key: if $F(\mu)=\mu$ then $\mu$ is a Nash of the original game. Suppose not; then there exist $i,\tilde x,\hat\pi$ with $\sum_a(\pi^*_\mu(a|\tilde x)-\hat\pi(a|\tilde x))Q^i_{\pi^*_\mu}(\tilde x,a)<0$. Constructing $\hat\pi_\alpha = (1-\alpha)\pi^*_\mu + \alpha\hat\pi$ on $\tilde x$ and using Pinsker yields $V^i_{\mu,\pi^*_\mu}(h_{\textrm{init}}) - V^i_{\mu,\hat\pi_\alpha}(h_{\textrm{init}}) \leq c\alpha^2 + d\alpha$ with $d<0$, so for small enough $\alpha$ this is negative, contradicting $\pi^*_\mu$ being a Nash of the transformed reward.
+\item Since $\Delta V(\mu) = \min_{\pi^*}\Xi(\pi^*, F(\mu)) - \min_{\pi^*}\Xi(\pi^*,\mu) < 0$ for $\mu\notin\Pi^*$, the sequence $\min_{\pi^*}\Xi(\pi^*,\pi_k)$ is decreasing and converges to some $c\geq 0$. If $c>0$, the $\pi_k$ remain in a compact set $\Omega_{C,c}$, on which the continuous $\Delta V$ attains a negative maximum $k_{\max}<0$. Then $\min_{\pi^*}\Xi(\pi^*,\pi_k) \leq C + k \cdot k_{\max}$, which eventually falls below $c$, contradiction. So $c=0$ and $\pi_k \to \Pi^*$.
+\end{itemize}
+
+\subsection{Monotone Games: Proofs}
+(i) Zero-sum 2-player: $\Omega^1(\pi,\mu) = -\Omega^2(\pi,\mu)$ since $V^1 = -V^2$, so $\sum_i\Omega^i=0$.\\
+(ii) Polymatrix zero-sum: decompose and pair off terms, each $[\tilde V^i_{\pi^i,\pi^j} - \ldots] + [\tilde V^j_{\pi^j,\pi^i} - \ldots] = 0$, so $\sum_i\Omega^i=0$.\\
+(iii) Decoupled profit: $\Omega^i$ expansion collapses to 0 by decomposition $V^i = \bar V^i_{\pi^i} + \bar V^i_{\pi^{-i}}$.
+
+\section{Empirical Setup}
+Hyperparameters: batch size; actor batch size (we use actor-critic setup with 512 actors, each producing batches of trajectories); $\eta$ (reward-transform parameter); retrace $\lambda$; $\epsilon$-greedy; gradient clipping value; max steps; reward re-centering period; policy learning rate start and end (exponential decay); NeuRD threshold; network MLP with 2 hidden layers of 128 units.
+
+\subsection{Estimation of the Critic}
+Update $Q$ to minimize $\ell_2$ between $\hat Q^i_w(x_l,a_l)$ and a retrace target $Q^i_\text{retrace target}$:
+$$w_i \leftarrow w_i + \alpha\sum_{l=0}^K \tau(x_l)\big[Q^i_\text{retrace target}(x_l,a_l) - \hat Q^i_w(x_l,a_l)\big]\partial_{w_i}\hat Q^i_w(x_l,a_l).$$
+
+\subsection{Low-Variance Unbiased Estimate of the Expected Payoff}
+The policy $\pi^i_{\theta_i}(a^i|x_l)$ may differ from the sampling policy $\nu^i_{\theta_i}(a^i|x_l)$. For the zero-sum reward transform:
+
+If $\tau(x_l)=i$:
+$$\bar Q^i_w(x_l, a) = \begin{cases}
+-\eta\log(\pi(a|x_l)) + \hat Q^i_w(x_l,a) & a\neq a_l,\\
+-\eta\log(\pi(a|x_l)) + \hat Q^i_w(x_l,a) + \tfrac{1}{\nu(a^i|x_l)}[r^i(x_l,a_l) + \mathbb{E}_{b\sim\pi(.|x_{l+1})}[\bar Q^i_w(x_{l+1},b)] - \hat Q^i_w(x_l,a)] & a=a_l.
+\end{cases}$$
+
+If $\tau(x_l)\neq i$:
+$$\bar Q^i_w(x_l, a) = \begin{cases}
+\eta\log(\pi(a|x_l)) & a\neq a_l,\\
+\eta\log(\pi(a|x_l)) + \tfrac{1}{\nu(a^i|x_l)}[r^i(x_l,a_l) + \mathbb{E}_{b\sim\pi(.|x_{l+1})}[\bar Q^i_w(x_{l+1},b)]] & a=a_l.
+\end{cases}$$
+By convention $\bar Q^i_w(x_{K+1},a)=0$.
+
+\subsection{NeuRD Update}
+Correct for reach probability:
+$$\tilde Q^i_w(x_l,a) = \left(\prod_{k=0}^{l-1}\frac{\mathbf{1}_{\tau(x_l)\neq i}\pi(a_k|x_l) + \mathbf{1}_{\tau(x_l)=i}}{\nu(a_k|x_l)}\right)\bar Q^i_w(x_l,a).$$
+Policy update:
+$$\theta_i \leftarrow \theta_i + \alpha\sum_{l=0}^K \mathbf{1}_{\tau(x_l)=i}\sum_{a^i}\partial_{\theta_i}\xi^i_{\theta_i}(a^i|x_l)\,\tilde Q^i_w(x_l,a^i),$$
+where $\xi^i_{\theta_i}$ is the logit ($\mathrm{softmax}(\xi^i_{\theta_i}) = \pi^i_{\theta_i}$). NeuRD requires an additional clipping parameter to avoid numerical instabilities. The exploration policy $\nu$ is obtained by $\epsilon$-greedy on $\pi$.
+
+\section{Deep RL Experimental Configurations}
+
+\paragraph{Player-only regularization, adaptive (reward re-centered every 75000 steps).}
+Batch size 256; actor batch 32; $\eta\in\{1.0, 0.5, 0.2, 0.05, 0.02, 0.0\}$; retrace $\lambda=1.0$; $\epsilon$-greedy $0.1$; gradient clipping 1000; max steps $4\cdot 10^6$; policy lr $10^{-2}\to 10^{-5}$ exponential; NeuRD threshold 2; 2-hidden-layer-128 MLP. Experiments run on Liar's Dice, Leduc Poker, Kuhn Poker, Goofspiel (4 cards).
+
+\paragraph{Player-only regularization, constant (no re-centering).}
+Same as above but reward never re-centered.
+
+\paragraph{Player-only regularization, exponential decay $\eta$ from 1.0 to target.}
+Same as above but no re-centering, $\eta$ decays exponentially from $1.0$ toward a target.
+
+\paragraph{Two-player regularization (zero-sum reward transform), exponential decay $\eta$.}
+As above; experiments on all four games.
+
+\paragraph{Two-player regularization, large batch.}
+Same as above with batch size 2048 (listed as 2018 in the source table).

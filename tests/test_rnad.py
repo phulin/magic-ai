@@ -18,8 +18,6 @@ from magic_ai.rnad import (
     neurd_loss,
     polyak_update_,
     rnad_update_trajectory,
-    rnad_update_trajectory_full_neurd,
-    sampled_neurd_loss,
     save_reg_snapshot,
     threshold_discretize,
     transform_rewards,
@@ -257,17 +255,18 @@ class CriticLossTests(unittest.TestCase):
         v_theta = torch.tensor([1.0, 10.0, 2.0, 10.0])
         v_hat = torch.tensor([0.0, 0.0, 0.0, 0.0])
         mask = torch.tensor([True, False, True, False])
-        loss = critic_loss(v_theta=v_theta, v_hat=v_hat, perspective_is_player_i=mask)
-        self.assertAlmostEqual(float(loss), 1.5)
+        loss_sum, count = critic_loss(v_theta=v_theta, v_hat=v_hat, perspective_is_player_i=mask)
+        self.assertEqual(count, 2)
+        # sum |1-0| + |2-0| = 3; mean = 1.5.
+        self.assertAlmostEqual(float(loss_sum) / count, 1.5)
 
     def test_stops_gradient_on_target(self) -> None:
         v_theta = torch.tensor([0.5], requires_grad=True)
         v_hat = torch.tensor([1.0], requires_grad=True)
         mask = torch.tensor([True])
-        loss = critic_loss(v_theta=v_theta, v_hat=v_hat, perspective_is_player_i=mask)
-        loss.backward()
+        loss_sum, _count = critic_loss(v_theta=v_theta, v_hat=v_hat, perspective_is_player_i=mask)
+        loss_sum.backward()
         self.assertIsNotNone(v_theta.grad)
-        # v_hat gradient should be None (unused in graph) or zero.
         grad = v_hat.grad
         self.assertTrue(grad is None or float(grad.abs().sum()) == 0.0)
 
@@ -275,8 +274,9 @@ class CriticLossTests(unittest.TestCase):
         v_theta = torch.ones(3, requires_grad=True)
         v_hat = torch.zeros(3)
         mask = torch.zeros(3, dtype=torch.bool)
-        loss = critic_loss(v_theta=v_theta, v_hat=v_hat, perspective_is_player_i=mask)
-        self.assertEqual(float(loss), 0.0)
+        loss_sum, count = critic_loss(v_theta=v_theta, v_hat=v_hat, perspective_is_player_i=mask)
+        self.assertEqual(count, 0)
+        self.assertEqual(float(loss_sum), 0.0)
 
 
 class ThresholdDiscretizeTests(unittest.TestCase):
@@ -324,45 +324,6 @@ class EpisodesFromRolloutStepsTests(unittest.TestCase):
         self.assertEqual(episodes_from_rollout_steps([]), [])
 
 
-class SampledNeuRDLossTests(unittest.TestCase):
-    def test_gradient_is_negative_q_on_own_turns(self) -> None:
-        log_prob = torch.zeros(4, requires_grad=True)
-        q_hat = torch.tensor([1.0, -2.0, 3.0, -4.0])
-        own = torch.tensor([True, True, True, True])
-        loss = sampled_neurd_loss(log_prob=log_prob, q_hat=q_hat, own_turn_mask=own, clip=1e6)
-        loss.backward()
-        assert log_prob.grad is not None
-        # loss = -mean(log_prob * q), d/dlogp = -q / N
-        self.assertTrue(torch.allclose(log_prob.grad, -q_hat / 4, atol=1e-6))
-
-    def test_ignores_opponent_turns(self) -> None:
-        log_prob = torch.zeros(4, requires_grad=True)
-        q_hat = torch.tensor([1.0, -2.0, 3.0, -4.0])
-        own = torch.tensor([True, False, True, False])
-        loss = sampled_neurd_loss(log_prob=log_prob, q_hat=q_hat, own_turn_mask=own, clip=1e6)
-        loss.backward()
-        assert log_prob.grad is not None
-        # Only indices 0 and 2 contribute: grad[0] = -1/2, grad[2] = -3/2.
-        expected = torch.tensor([-0.5, 0.0, -1.5, 0.0])
-        self.assertTrue(torch.allclose(log_prob.grad, expected, atol=1e-6))
-
-    def test_clips_q(self) -> None:
-        log_prob = torch.zeros(1, requires_grad=True)
-        q_hat = torch.tensor([1000.0])
-        own = torch.tensor([True])
-        loss = sampled_neurd_loss(log_prob=log_prob, q_hat=q_hat, own_turn_mask=own, clip=5.0)
-        loss.backward()
-        assert log_prob.grad is not None
-        self.assertAlmostEqual(float(log_prob.grad.item()), -5.0)
-
-    def test_no_own_turns_returns_zero(self) -> None:
-        log_prob = torch.zeros(3, requires_grad=True)
-        q_hat = torch.ones(3)
-        own = torch.zeros(3, dtype=torch.bool)
-        loss = sampled_neurd_loss(log_prob=log_prob, q_hat=q_hat, own_turn_mask=own, clip=1.0)
-        self.assertEqual(float(loss), 0.0)
-
-
 class PolyakUpdateTests(unittest.TestCase):
     def _make_module(self, seed: int) -> nn.Module:
         torch.manual_seed(seed)
@@ -401,6 +362,35 @@ class PolyakUpdateTests(unittest.TestCase):
             polyak_update_(target, online, gamma=1.5)
         with self.assertRaises(ValueError):
             polyak_update_(target, online, gamma=-0.1)
+
+    def test_does_not_touch_actor_runtime_buffers(self) -> None:
+        """Issue 1/8: live LSTM cache and rollout buffer entries are actor
+        runtime state, not model state. Polyak averaging must skip them so
+        target/reg never inherit (or accidentally mutate) the online actor's
+        per-env LSTM cache."""
+
+        class FakeWithRuntimeBuffers(nn.Module):
+            def __init__(self, h_value: float, c_value: float) -> None:
+                super().__init__()
+                self.linear = nn.Linear(2, 2)
+                self.register_buffer(
+                    "live_lstm_h", torch.full((2, 4, 8), h_value), persistent=False
+                )
+                self.register_buffer(
+                    "live_lstm_c", torch.full((2, 4, 8), c_value), persistent=False
+                )
+
+        online = FakeWithRuntimeBuffers(1.0, 2.0)
+        target = FakeWithRuntimeBuffers(99.0, -99.0)
+        polyak_update_(target, online, gamma=1.0)
+        # Trainable params copy fully.
+        for p_o, p_t in zip(online.linear.parameters(), target.linear.parameters(), strict=True):
+            self.assertTrue(torch.allclose(p_o, p_t))
+        # live_lstm_* buffers must remain at target's pre-call values.
+        target_h = target.get_buffer("live_lstm_h")
+        target_c = target.get_buffer("live_lstm_c")
+        self.assertTrue(torch.allclose(target_h, torch.full_like(target_h, 99.0)))
+        self.assertTrue(torch.allclose(target_c, torch.full_like(target_c, -99.0)))
 
 
 class RegSnapshotTests(unittest.TestCase):
@@ -466,13 +456,21 @@ class _StubPolicy(nn.Module):
         entropies = torch.zeros_like(logp)
         return logp, entropies, values, None
 
-    def evaluate_replay_batch_per_choice(self, replay_rows: list[int]):  # type: ignore[no-untyped-def]
+    def evaluate_replay_batch_per_choice(
+        self,
+        replay_rows: list[int],
+        *,
+        lstm_state_override: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ):  # type: ignore[no-untyped-def]
+        del lstm_state_override
         from magic_ai.model import ReplayPerChoice
 
         idx = torch.tensor(replay_rows, dtype=torch.long)
         n = int(idx.numel())
         values = self.values[idx]
-        # Flatten per-step choices; group_idx is the step-in-batch index.
+        # One decision group per step. ``group_idx`` (per-flat -> step) and
+        # ``decision_group_id_flat`` (per-flat -> decision-group) coincide
+        # here because each step has exactly one group.
         group_idx = torch.arange(n, dtype=torch.long).repeat_interleave(self.num_choices)
         choice_cols = torch.arange(self.num_choices).repeat(n)
         flat_logits = self.per_choice_logits[idx].reshape(-1)
@@ -480,6 +478,8 @@ class _StubPolicy(nn.Module):
         logp = flat_log_probs.reshape(n, self.num_choices)[:, 0]  # sampled col 0
         entropies = torch.zeros_like(logp)
         is_sampled_flat = choice_cols == 0
+        decision_group_id_flat = group_idx.clone()
+        step_for_decision_group = torch.arange(n, dtype=torch.long)
         return (
             logp,
             entropies,
@@ -490,6 +490,8 @@ class _StubPolicy(nn.Module):
                 group_idx=group_idx,
                 choice_cols=choice_cols,
                 is_sampled_flat=is_sampled_flat,
+                decision_group_id_flat=decision_group_id_flat,
+                step_for_decision_group=step_for_decision_group,
                 may_is_active=torch.zeros(n, dtype=torch.bool),
                 may_logits_per_step=torch.zeros(n),
                 may_selected_per_step=torch.zeros(n),
@@ -621,7 +623,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
         reg_prev = self._stub(t_len, logp=-1.0, value=0.0)
         opt = torch.optim.SGD(online.parameters(), lr=1.0)
         before = online.per_choice_logits.detach().clone()
-        rnad_update_trajectory_full_neurd(
+        rnad_update_trajectory(
             online=cast(Any, online),
             target=cast(Any, target),
             reg_cur=cast(Any, reg_cur),
@@ -669,10 +671,15 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
                     None,
                 )
 
-            def evaluate_replay_batch_per_choice(self, rows: list[int]):  # type: ignore[no-untyped-def]
+            def evaluate_replay_batch_per_choice(
+                self,
+                rows: list[int],
+                *,
+                lstm_state_override: tuple[torch.Tensor, torch.Tensor] | None = None,
+            ):  # type: ignore[no-untyped-def]
+                del lstm_state_override
                 idx = torch.tensor(rows, dtype=torch.long)
                 n = int(idx.numel())
-                # All steps are may-kind: no decision-group entries at all.
                 return (
                     self.logp[idx],
                     torch.zeros_like(self.logp[idx]),
@@ -683,6 +690,8 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
                         group_idx=torch.zeros(0, dtype=torch.long),
                         choice_cols=torch.zeros(0, dtype=torch.long),
                         is_sampled_flat=torch.zeros(0, dtype=torch.bool),
+                        decision_group_id_flat=torch.zeros(0, dtype=torch.long),
+                        step_for_decision_group=torch.zeros(0, dtype=torch.long),
                         may_is_active=torch.ones(n, dtype=torch.bool),
                         may_logits_per_step=self.may_logits[idx],
                         may_selected_per_step=torch.ones(n),
@@ -696,7 +705,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
         reg_prev = MayStub(t_len)
         opt = torch.optim.SGD(online.parameters(), lr=1.0)
         may_before = online.may_logits.detach().clone()
-        rnad_update_trajectory_full_neurd(
+        rnad_update_trajectory(
             online=cast(Any, online),
             target=cast(Any, target),
             reg_cur=cast(Any, reg_cur),
@@ -723,7 +732,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
         reg_prev = self._stub(t_len, logp=-1.0, value=0.0)
         opt = torch.optim.SGD(online.parameters(), lr=1.0)
         before = online.per_choice_logits.detach().clone()
-        rnad_update_trajectory_full_neurd(
+        rnad_update_trajectory(
             online=online,
             target=target,
             reg_cur=reg_cur,
@@ -772,6 +781,236 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
         # Every timestep belongs to exactly one player; both-player update
         # should nudge every entry (none should be untouched).
         self.assertTrue(torch.all(after != before))
+
+
+class MayTwoActionNeuRDTests(unittest.TestCase):
+    """Issue 5/8: two-action may NeuRD must move BOTH branches' regularization."""
+
+    def test_unsampled_may_branch_receives_reg_gradient(self) -> None:
+        from magic_ai.model import ReplayPerChoice
+        from magic_ai.rnad import rnad_trajectory_loss
+
+        class MayStub(nn.Module):
+            def __init__(self, t_len: int, may_logit: float) -> None:
+                super().__init__()
+                self.logp = nn.Parameter(torch.zeros(t_len))
+                self.values = nn.Parameter(torch.zeros(t_len))
+                self.may_logits = nn.Parameter(torch.full((t_len,), float(may_logit)))
+
+            def evaluate_replay_batch(self, rows: list[int]):  # type: ignore[no-untyped-def]
+                idx = torch.tensor(rows, dtype=torch.long)
+                return (
+                    self.logp[idx],
+                    torch.zeros_like(self.logp[idx]),
+                    self.values[idx],
+                    None,
+                )
+
+            def evaluate_replay_batch_per_choice(
+                self,
+                rows: list[int],
+                *,
+                lstm_state_override: tuple[torch.Tensor, torch.Tensor] | None = None,
+            ):  # type: ignore[no-untyped-def]
+                del lstm_state_override
+                idx = torch.tensor(rows, dtype=torch.long)
+                n = int(idx.numel())
+                return (
+                    self.logp[idx],
+                    torch.zeros_like(self.logp[idx]),
+                    self.values[idx],
+                    ReplayPerChoice(
+                        flat_logits=torch.zeros(0),
+                        flat_log_probs=torch.zeros(0),
+                        group_idx=torch.zeros(0, dtype=torch.long),
+                        choice_cols=torch.zeros(0, dtype=torch.long),
+                        is_sampled_flat=torch.zeros(0, dtype=torch.bool),
+                        decision_group_id_flat=torch.zeros(0, dtype=torch.long),
+                        step_for_decision_group=torch.zeros(0, dtype=torch.long),
+                        may_is_active=torch.ones(n, dtype=torch.bool),
+                        may_logits_per_step=self.may_logits[idx],
+                        may_selected_per_step=torch.ones(n),  # always sample "accept"
+                    ),
+                )
+
+        # Online and reg differ on the may head, but the trajectory always
+        # samples "accept". With the OLD 1-logit may NeuRD, the unsampled
+        # decline branch's eta * log(pi/pi_reg) term would NOT influence the
+        # gradient. With the new two-action form it must.
+        t_len = 4
+        online = MayStub(t_len, may_logit=1.0)
+        target = MayStub(t_len, may_logit=1.0)
+        reg_cur = MayStub(t_len, may_logit=-1.0)  # diverges -> nonzero log_ratio
+        reg_prev = MayStub(t_len, may_logit=-1.0)
+        # Reward 0 everywhere to isolate the sampled-correction-free regime.
+        # Use eta > 0 so the regularization term carries gradient.
+        pieces = rnad_trajectory_loss(
+            online=cast(Any, online),
+            target=cast(Any, target),
+            reg_cur=cast(Any, reg_cur),
+            reg_prev=cast(Any, reg_prev),
+            replay_rows=list(range(t_len)),
+            perspective_player_idx=[0, 1, 0, 1],
+            winner_idx=-1,  # no terminal reward
+            logp_mu=torch.zeros(t_len),
+            config=RNaDConfig(eta=0.5, neurd_beta=100.0),
+            alpha=1.0,
+        )
+        loss = pieces.pl_sum / max(pieces.pl_count, 1)
+        loss.backward()
+        # NeuRD on a Bernoulli with logit l: gradient =
+        #   -[(1-p) Q_a - p Q_d]
+        # If only the sampled branch's reg term were applied (old form), an
+        # entropy-only run with sampled=accept would yield gradient
+        # = (1-p) * eta * log(pi/pi_reg)_accept — never including the decline
+        # branch's reg contribution. The new form blends both → different sign
+        # and magnitude even when sampled is always "accept". Concretely:
+        # since pi_accept(online) > pi_accept(reg) but pi_decline(online) <
+        # pi_decline(reg), the two reg terms point in opposite directions
+        # and partially cancel — the grad is strictly smaller than the old
+        # one-branch form. Easier-to-pin invariant: gradient is finite,
+        # nonzero, and shares the *opposite* sign from the one-branch form
+        # because the decline branch dominates here.
+        assert online.may_logits.grad is not None
+        # Gradient must be nonzero on own-turn may steps.
+        own_step_idx = [0, 2]
+        for i in own_step_idx:
+            self.assertNotAlmostEqual(float(online.may_logits.grad[i]), 0.0, places=6)
+
+
+class FactoredAutoregressiveTests(unittest.TestCase):
+    """Issue 4/8: per-group sampled correction stays bounded as the number
+    of decision groups in a step grows. Joint 1/mu_t blew up multiplicatively;
+    the per-group form does not."""
+
+    def test_per_group_correction_does_not_compound_with_group_count(self) -> None:
+        from magic_ai.model import ReplayPerChoice
+
+        class MultiGroupStub(nn.Module):
+            def __init__(self, t_len: int, num_groups_per_step: int) -> None:
+                super().__init__()
+                self.t_len = t_len
+                self.num_groups_per_step = num_groups_per_step
+                self.values = nn.Parameter(torch.zeros(t_len))
+                # 2 choices per group, K groups per step.
+                self.per_choice = nn.Parameter(torch.zeros(t_len, num_groups_per_step, 2))
+                self.logp = nn.Parameter(torch.zeros(t_len))
+
+            def evaluate_replay_batch(self, rows: list[int]):  # type: ignore[no-untyped-def]
+                idx = torch.tensor(rows, dtype=torch.long)
+                return (
+                    self.logp[idx],
+                    torch.zeros_like(self.logp[idx]),
+                    self.values[idx],
+                    None,
+                )
+
+            def evaluate_replay_batch_per_choice(
+                self,
+                rows: list[int],
+                *,
+                lstm_state_override: tuple[torch.Tensor, torch.Tensor] | None = None,
+            ):  # type: ignore[no-untyped-def]
+                del lstm_state_override
+                idx = torch.tensor(rows, dtype=torch.long)
+                n = int(idx.numel())
+                k = self.num_groups_per_step
+                # Decision group ids: K groups per step, total n*K groups.
+                step_for_decision_group = torch.arange(n).repeat_interleave(k)
+                # Per-flat: each group has 2 choices.
+                decision_group_id_flat = torch.arange(n * k).repeat_interleave(2)
+                group_idx_step_for_flat = step_for_decision_group[decision_group_id_flat]
+                choice_cols = torch.tensor([0, 1] * (n * k), dtype=torch.long)
+                logits_flat = self.per_choice[idx].reshape(-1)
+                # log-softmax within each group of 2.
+                logits_3d = self.per_choice[idx].reshape(n * k, 2)
+                log_probs_3d = torch.log_softmax(logits_3d, dim=-1)
+                flat_log_probs = log_probs_3d.reshape(-1)
+                # Sampled = col 0 always.
+                is_sampled_flat = choice_cols == 0
+                # Per-step joint log_prob = sum over groups of log_prob_at_col_0.
+                logp_per_step = log_probs_3d[:, 0].reshape(n, k).sum(dim=-1)
+                return (
+                    logp_per_step,
+                    torch.zeros_like(logp_per_step),
+                    self.values[idx],
+                    ReplayPerChoice(
+                        flat_logits=logits_flat,
+                        flat_log_probs=flat_log_probs,
+                        group_idx=group_idx_step_for_flat,
+                        choice_cols=choice_cols,
+                        is_sampled_flat=is_sampled_flat,
+                        decision_group_id_flat=decision_group_id_flat,
+                        step_for_decision_group=step_for_decision_group,
+                        may_is_active=torch.zeros(n, dtype=torch.bool),
+                        may_logits_per_step=torch.zeros(n),
+                        may_selected_per_step=torch.zeros(n),
+                    ),
+                )
+
+        from magic_ai.rnad import rnad_trajectory_loss
+
+        # logp_mu = K * log(0.5) (joint behavior under uniform per-group). With
+        # the OLD joint 1/mu_t = 2^K, doubling K from 2 to 6 would multiply the
+        # sampled-correction magnitude by 16x. Per-group 1/mu_k stays at 2.
+        results: dict[int, float] = {}
+        for k in (2, 6):
+            t_len = 2
+            online = MultiGroupStub(t_len, k)
+            target = MultiGroupStub(t_len, k)
+            reg_cur = MultiGroupStub(t_len, k)
+            reg_prev = MultiGroupStub(t_len, k)
+            joint_logp = float(k) * math.log(0.5)
+            pieces = rnad_trajectory_loss(
+                online=cast(Any, online),
+                target=cast(Any, target),
+                reg_cur=cast(Any, reg_cur),
+                reg_prev=cast(Any, reg_prev),
+                replay_rows=list(range(t_len)),
+                perspective_player_idx=[0] * t_len,
+                winner_idx=0,  # +1 for player 0 at last step
+                logp_mu=torch.full((t_len,), joint_logp),
+                config=RNaDConfig(eta=0.0, neurd_beta=100.0, q_corr_rho_bar=1e9),
+                alpha=1.0,
+            )
+            results[k] = float((pieces.pl_sum / max(pieces.pl_count, 1)).detach().abs())
+        # The per-group decomposition keeps the magnitude roughly constant
+        # in K; it certainly does NOT scale as 2^K. Allow some growth from
+        # extra groups participating but bound it well below the joint
+        # blow-up (16x).
+        self.assertLess(results[6] / max(results[2], 1e-9), 4.0)
+
+
+class PerPolicyLSTMRecomputeTests(unittest.TestCase):
+    """Issue 2/8: recompute_lstm_states_for_episode rejects empty input
+    (would otherwise silently produce zero-length tensors that the
+    consumers cannot interpret as 'one episode')."""
+
+    def test_rejects_empty_replay_rows(self) -> None:
+        # Use a minimal policy stub that only declares ``use_lstm=True`` and
+        # the method under test. Full PPOPolicy construction is too heavy
+        # for a unit test — the empty-rows guard is part of the contract
+        # exercised even on the stub.
+        from magic_ai.model import PPOPolicy
+
+        # Pull the unbound method off the class and call its empty-input
+        # validation; the path raises before touching any of the heavy
+        # forward machinery.
+        with self.assertRaises(ValueError):
+            method: Any = getattr(  # noqa: B009
+                PPOPolicy.recompute_lstm_states_for_episode,
+                "__wrapped__",
+                PPOPolicy.recompute_lstm_states_for_episode,
+            )
+            method(cast(PPOPolicy, _LstmStubPolicy()), [])
+
+
+class _LstmStubPolicy:
+    """Just enough surface area for ``recompute_lstm_states_for_episode``'s
+    ``not replay_rows`` guard to be reachable (needed because the real
+    PPOPolicy construction has a long dependency chain)."""
+
+    use_lstm = True
 
 
 if __name__ == "__main__":

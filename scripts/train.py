@@ -564,13 +564,6 @@ def parse_args() -> argparse.Namespace:
         "mu_t = ∏_k mu_k so the unclipped weight can blow up "
         "multiplicatively in the number of decision groups.",
     )
-    parser.add_argument(
-        "--rnad-full-neurd",
-        action="store_true",
-        help="use the full per-action NeuRD loss (paper §188 with the "
-        "beta-magnitude logit gate) instead of the sampled-action "
-        "policy-gradient estimator",
-    )
     parser.add_argument("--episodes", type=int, default=65536)
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--rollout-steps", type=int, default=4096)
@@ -1103,7 +1096,6 @@ def train_native_batched_envs(
                     optimizer,
                     rnad_state,
                     pending_episodes,
-                    full_neurd=bool(getattr(args, "rnad_full_neurd", False)),
                 )
             else:
                 stats = ppo_update(
@@ -1202,7 +1194,6 @@ def train_native_batched_envs(
                 optimizer,
                 rnad_state,
                 pending_episodes,
-                full_neurd=bool(getattr(args, "rnad_full_neurd", False)),
             )
         else:
             stats = ppo_update(

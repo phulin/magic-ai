@@ -1121,9 +1121,58 @@ class PPOPolicy(nn.Module):
             )
         return log_probs, entropies, forward.values, extras
 
+    @torch.no_grad()
+    def recompute_lstm_states_for_episode(
+        self,
+        replay_rows: list[int],
+    ) -> tuple[Tensor, Tensor] | None:
+        """Re-run the LSTM scan from h=c=0 over an episode using *this* policy.
+
+        Returns per-step (h_in, c_in) of shape ``(num_layers, T, hidden)`` so
+        the caller can override the rollout buffer's stored hidden states
+        (which were written by the *behavior* policy at rollout time) when
+        calling :meth:`evaluate_replay_batch_per_choice` on this policy.
+
+        ``replay_rows`` must list a single episode in forward order — h starts
+        at zero and threads through, so cross-episode rows would silently
+        carry state across the wrong boundary. Returns ``None`` if the policy
+        is not recurrent.
+
+        Issue 2: each R-NaD policy (online/target/reg_cur/reg_prev) has its
+        own parameters and thus its own hidden-state trajectory through a
+        replayed episode. Evaluating target or reg from the behavior-policy
+        hidden state (the buffer's stored ``lstm_h_in``) would silently mix
+        policies. Each policy must own its replay-time hidden states.
+        """
+
+        if not self.use_lstm:
+            return None
+        if not replay_rows:
+            raise ValueError("replay_rows must be non-empty")
+        device = self.device
+        step_indices = torch.tensor(replay_rows, dtype=torch.long, device=device)
+        n = int(step_indices.numel())
+        inputs, _stale_lstm_state = self._gather_from_rollout(step_indices)
+        features, _option_vectors, _target_vectors = self._embed_forward_inputs(inputs)
+        dtype = self._compute_hidden_dtype()
+        h = torch.zeros(self.hidden_layers, 1, self.hidden_dim, dtype=dtype, device=device)
+        c = torch.zeros_like(h)
+        h_list: list[Tensor] = []
+        c_list: list[Tensor] = []
+        for t in range(n):
+            h_list.append(h)
+            c_list.append(c)
+            projected = self.feature_projection(features[t : t + 1]).unsqueeze(1)
+            _output, (h, c) = self.lstm(projected, (h.contiguous(), c.contiguous()))
+        h_stack = torch.cat(h_list, dim=1).contiguous()  # (num_layers, T, hidden)
+        c_stack = torch.cat(c_list, dim=1).contiguous()
+        return h_stack, c_stack
+
     def evaluate_replay_batch_per_choice(
         self,
         replay_rows: list[int],
+        *,
+        lstm_state_override: tuple[Tensor, Tensor] | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice]:
         """Like :meth:`evaluate_replay_batch` but also returns per-choice tensors.
 
@@ -1145,7 +1194,10 @@ class PPOPolicy(nn.Module):
         rb = self.rollout_buffer
         step_indices = torch.tensor(replay_rows, dtype=torch.long, device=device)
         n = int(step_indices.numel())
-        forward = self._forward_batch(step_indices)
+        if lstm_state_override is not None:
+            forward = self._forward_batch_with_lstm_override(step_indices, lstm_state_override)
+        else:
+            forward = self._forward_batch(step_indices)
         log_probs = torch.zeros(n, dtype=forward.values.dtype, device=device)
         entropies = torch.zeros(n, dtype=forward.values.dtype, device=device)
 
@@ -1176,6 +1228,8 @@ class PPOPolicy(nn.Module):
         group_idx_out = torch.zeros(0, dtype=torch.long, device=device)
         choice_cols_out = torch.zeros(0, dtype=torch.long, device=device)
         is_sampled_flat_out = torch.zeros(0, dtype=torch.bool, device=device)
+        decision_group_id_flat_out = torch.zeros(0, dtype=torch.long, device=device)
+        step_for_decision_group_out = torch.zeros(0, dtype=torch.long, device=device)
 
         if active_mask.any():
             pos_t = active_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -1224,6 +1278,8 @@ class PPOPolicy(nn.Module):
             group_idx_out = step_for_flat
             choice_cols_out = choice_cols
             is_sampled_flat_out = selected_mask
+            decision_group_id_flat_out = group_idx
+            step_for_decision_group_out = pos_t_flat
 
         per_choice = ReplayPerChoice(
             flat_logits=flat_logits,
@@ -1231,6 +1287,8 @@ class PPOPolicy(nn.Module):
             group_idx=group_idx_out,
             choice_cols=choice_cols_out,
             is_sampled_flat=is_sampled_flat_out,
+            decision_group_id_flat=decision_group_id_flat_out,
+            step_for_decision_group=step_for_decision_group_out,
             may_is_active=may_mask,
             may_logits_per_step=may_logits_per_step,
             may_selected_per_step=may_selected_per_step,
@@ -1777,6 +1835,31 @@ class PPOPolicy(nn.Module):
         c_in: Tensor | None = None
         if lstm_state is not None:
             h_in, c_in = lstm_state
+        forward, _next_state = self._compute_forward(inputs, h_in=h_in, c_in=c_in)
+        return forward
+
+    def _forward_batch_with_lstm_override(
+        self,
+        step_indices: Tensor,
+        lstm_state: tuple[Tensor, Tensor],
+    ) -> _ForwardBatch:
+        """Run the batched forward but with caller-supplied per-step LSTM state.
+
+        Supports issue 2 (per-policy recurrent recompute): the caller's
+        ``lstm_state`` was generated by re-running the LSTM scan from h=0
+        through the episode under *this* policy's parameters, and overrides
+        the rollout buffer's stored ``lstm_h_in/c_in`` (which are the
+        behavior policy's hidden states).
+        """
+
+        inputs, _stale_lstm_state = self._gather_from_rollout(step_indices)
+        if not self.use_lstm:
+            forward, _next_state = self._compute_forward(inputs)
+            return forward
+        dtype = self._compute_hidden_dtype()
+        h_in, c_in = lstm_state
+        h_in = h_in.to(dtype=dtype).contiguous()
+        c_in = c_in.to(dtype=dtype).contiguous()
         forward, _next_state = self._compute_forward(inputs, h_in=h_in, c_in=c_in)
         return forward
 
@@ -2442,6 +2525,15 @@ class ReplayPerChoice:
     may_is_active: Tensor
     may_logits_per_step: Tensor
     may_selected_per_step: Tensor
+    # Per-flat-entry, the index of the decision group it belongs to (unique
+    # across the whole batch — multiple decision groups in the same step get
+    # distinct values, unlike ``group_idx`` which maps to step index). Length
+    # = total number of decision groups in the batch.
+    decision_group_id_flat: Tensor
+    # Per-decision-group, the batch step index it lives in. Length = total
+    # number of decision groups in the batch. ``group_idx[f] = step_for_flat[
+    # decision_group_id_flat[f]]`` by construction.
+    step_for_decision_group: Tensor
 
 
 @dataclass(frozen=True)
