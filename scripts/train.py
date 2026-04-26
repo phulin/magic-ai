@@ -353,7 +353,7 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
     game_state_encoder = GameStateEncoder.from_embedding_json(args.embeddings, d_model=args.d_model)
     rollout_capacity = args.rollout_buffer_capacity or max(
-        4096, args.rollout_steps + 400 * args.num_envs
+        4096, args.rollout_steps + args.max_steps_per_game * args.num_envs
     )
     policy = PPOPolicy(
         game_state_encoder,
@@ -564,6 +564,16 @@ def parse_args() -> argparse.Namespace:
         "mu_t = ∏_k mu_k so the unclipped weight can blow up "
         "multiplicatively in the number of decision groups.",
     )
+    parser.add_argument(
+        "--rnad-bptt-chunk-size",
+        type=int,
+        default=200,
+        help="R-NaD chunked-BPTT chunk length (DeepNash R-NaD §'Full games "
+        "learning'): trajectories are split into chunks of this many steps; "
+        "each chunk runs as one fused cuDNN nn.LSTM call with full BPTT "
+        "inside the chunk, state detached at chunk boundaries. Default 200 "
+        "matches --max-steps-per-game so the whole trace is one chunk.",
+    )
     parser.add_argument("--episodes", type=int, default=65536)
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--rollout-steps", type=int, default=4096)
@@ -571,9 +581,12 @@ def parse_args() -> argparse.Namespace:
         "--rollout-buffer-capacity",
         type=int,
         default=None,
-        help="rows in the rollout GPU buffer; default max(4096, rollout-steps + 400*num-envs)",
+        help=(
+            "rows in the rollout GPU buffer; default "
+            "max(4096, rollout-steps + max-steps-per-game * num-envs)"
+        ),
     )
-    parser.add_argument("--max-steps-per-game", type=int, default=400)
+    parser.add_argument("--max-steps-per-game", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--hand-size", type=int, default=7)
     parser.add_argument("--name-a", default="A")
@@ -845,6 +858,7 @@ def train_native_batched_envs(
                 finetune_n_disc=args.rnad_finetune_ndisc,
                 learning_rate=args.learning_rate,
                 q_corr_rho_bar=args.rnad_q_corr_rho_bar,
+                bptt_chunk_size=args.rnad_bptt_chunk_size,
             ),
             reg_snapshot_dir=args.output.parent / "rnad",
             device=policy.device,

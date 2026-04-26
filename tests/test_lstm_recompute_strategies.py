@@ -138,6 +138,80 @@ class LstmRecomputeStrategiesCorrectness(unittest.TestCase):
             )
 
 
+class LstmRecomputeChunkedBptt(unittest.TestCase):
+    """Chunked-BPTT semantics: forward output is invariant to chunk size."""
+
+    def test_forward_invariant_to_chunk_size(self) -> None:
+        device = torch.device("cpu")
+        dtype = torch.float32
+        hidden = 24
+        num_layers = 2
+        torch.manual_seed(2)
+        lstm = _make_lstm(hidden, num_layers, dtype, device)
+        projected, lengths = _make_workload(
+            n_episodes=4,
+            t_max=20,
+            t_min=5,
+            hidden=hidden,
+            seed=11,
+            dtype=dtype,
+            device=device,
+        )
+        # Reference: chunk_size = T_max (single chunk, full BPTT).
+        ref = lstm_recompute_per_step_h_out(lstm, projected, lengths, chunk_size=max(lengths))
+        # All other chunk sizes -- including ones that don't evenly divide
+        # T_max -- must produce identical forward output. Gradient flow is
+        # truncated at chunk boundaries, but the forward computation is
+        # exact.
+        for chunk_size in (1, 2, 3, 7, 10, 19, 100):
+            with self.subTest(chunk_size=chunk_size):
+                got = lstm_recompute_per_step_h_out(lstm, projected, lengths, chunk_size=chunk_size)
+                for g, r in zip(got, ref, strict=True):
+                    torch.testing.assert_close(g, r, rtol=1e-5, atol=1e-6)
+
+    def test_chunk_size_one_truncates_gradient(self) -> None:
+        # chunk_size=1 detaches state every step, so a gradient on h_out[t]
+        # cannot reach LSTM weights via h_out[t-1]. Verify the gradient is
+        # nonzero (the in-chunk one-step path still flows) but smaller than
+        # full BPTT.
+        device = torch.device("cpu")
+        torch.manual_seed(3)
+        lstm = _make_lstm(16, 2, torch.float32, device)
+        projected, lengths = _make_workload(
+            n_episodes=2,
+            t_max=8,
+            t_min=8,
+            hidden=16,
+            seed=5,
+            dtype=torch.float32,
+            device=device,
+        )
+        projected = projected.detach().requires_grad_(False)
+
+        def grad_norm(chunk_size: int) -> float:
+            for p in lstm.parameters():
+                if p.grad is not None:
+                    p.grad = None
+            outputs = lstm_recompute_per_step_h_out(lstm, projected, lengths, chunk_size=chunk_size)
+            # Take the loss only at the LAST step of each episode -- this is
+            # where chunk-1 truncation differs most from full BPTT.
+            loss = sum(out[-1].sum() for out in outputs)
+            assert isinstance(loss, torch.Tensor)
+            loss.backward()
+            total = 0.0
+            for p in lstm.parameters():
+                if p.grad is not None:
+                    total += float(p.grad.detach().pow(2).sum())
+            return total**0.5
+
+        full_bptt_norm = grad_norm(chunk_size=max(lengths))
+        truncated_norm = grad_norm(chunk_size=1)
+        self.assertGreater(full_bptt_norm, 0.0)
+        self.assertGreater(truncated_norm, 0.0)
+        # Chunk=1 must lose gradient signal compared to full BPTT.
+        self.assertLess(truncated_norm, full_bptt_norm)
+
+
 class LstmRecomputeStrategiesBenchmark(unittest.TestCase):
     """Wall-time comparison; opt in with ``RNAD_LSTM_BENCH=1``."""
 

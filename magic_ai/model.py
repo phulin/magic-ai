@@ -1218,6 +1218,7 @@ class PPOPolicy(nn.Module):
         self,
         episodes: list[list[int]],
         *,
+        chunk_size: int = 200,
         compiled_lstm: Callable[..., Any] | None = None,
     ) -> list[Tensor] | None:
         """Fused per-step ``h_out`` recompute for the override-interface path.
@@ -1256,7 +1257,7 @@ class PPOPolicy(nn.Module):
             projected[:t_i, i] = proj_flat[offset : offset + t_i]
             offset += t_i
         return lstm_recompute_per_step_h_out(
-            self.lstm, projected, lengths, compiled_lstm=compiled_lstm
+            self.lstm, projected, lengths, chunk_size=chunk_size, compiled_lstm=compiled_lstm
         )
 
     def evaluate_replay_batch_per_choice(

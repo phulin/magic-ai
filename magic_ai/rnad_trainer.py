@@ -257,17 +257,18 @@ def run_rnad_update(
     target_h_out_per_ep: list[torch.Tensor] | None = None
     reg_cur_h_out_per_ep: list[torch.Tensor] | None = None
     reg_prev_h_out_per_ep: list[torch.Tensor] | None = None
+    chunk_size = state.config.bptt_chunk_size
     if per_episode_replay_rows:
         recompute_fn = getattr(policy, "recompute_lstm_outputs_for_episodes", None)
         if recompute_fn is not None:
-            online_h_out_per_ep = recompute_fn(per_episode_replay_rows)
+            online_h_out_per_ep = recompute_fn(per_episode_replay_rows, chunk_size=chunk_size)
             with torch.no_grad():
                 tgt_fn = state.target.recompute_lstm_outputs_for_episodes
                 rcr_fn = state.reg_cur.recompute_lstm_outputs_for_episodes
                 rpr_fn = state.reg_prev.recompute_lstm_outputs_for_episodes
-                target_h_out_per_ep = tgt_fn(per_episode_replay_rows)
-                reg_cur_h_out_per_ep = rcr_fn(per_episode_replay_rows)
-                reg_prev_h_out_per_ep = rpr_fn(per_episode_replay_rows)
+                target_h_out_per_ep = tgt_fn(per_episode_replay_rows, chunk_size=chunk_size)
+                reg_cur_h_out_per_ep = rcr_fn(per_episode_replay_rows, chunk_size=chunk_size)
+                reg_prev_h_out_per_ep = rpr_fn(per_episode_replay_rows, chunk_size=chunk_size)
 
     for ep_idx, replay_rows in enumerate(per_episode_replay_rows):
         perspective = per_episode_perspective[ep_idx]

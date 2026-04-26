@@ -165,19 +165,27 @@ def lstm_recompute_per_step_h_out(
     projected: Tensor,
     lengths: Sequence[int],
     *,
+    chunk_size: int = 200,
     compiled_lstm: Callable[..., Any] | None = None,
 ) -> list[Tensor]:
-    """Single fused cuDNN call returning per-step top-layer h_out.
+    """Chunked-BPTT fused cuDNN recompute returning per-step top-layer h_out.
+
+    Implements the DeepNash R-NaD recipe (arxiv 2206.15378 §"Full games
+    learning"): pad to ``T_max``, chop along the time axis into chunks of
+    ``chunk_size`` steps, and process chunk-by-chunk. Within each chunk the
+    LSTM runs as one fused cuDNN call (full BPTT inside the chunk); the
+    state crossing each chunk boundary is detached so gradients do not
+    flow across boundaries. Pass-(a)/pass-(b) are merged here -- if the
+    caller is in ``torch.no_grad`` mode the whole thing is forward-only;
+    otherwise gradients are captured within each chunk.
+
+    Default ``chunk_size=200`` matches the production
+    ``--max-steps-per-game=200`` cap, so by default the whole trajectory
+    is one chunk (full BPTT through the fused call). Smaller values cap
+    activation memory at the cost of truncating gradient flow.
 
     ``projected``: ``(T_max, N, hidden)``. Returns a list of ``(T_i, hidden)``
-    tensors -- the top-layer hidden output at each step. Consumer takes
-    ``h_out[t]`` directly into the action heads, skipping the per-step LSTM
-    cell that the per-step ``(h_in, c_in)`` interface required.
-
-    Not ``@torch.no_grad`` -- the trainer needs gradient flow through this
-    call for the *online* policy (full BPTT through the fused cuDNN
-    backward). Wrap target / regularizer calls in ``torch.no_grad()`` at
-    the call site.
+    tensors -- the top-layer hidden output at each step.
 
     ``compiled_lstm`` (optional): a ``torch.compile``'d wrapper around the
     LSTM forward. Falls back to the un-compiled module when ``None``.
@@ -187,6 +195,8 @@ def lstm_recompute_per_step_h_out(
         raise ValueError("lengths must be non-empty")
     if any(t <= 0 for t in lengths):
         raise ValueError("each length must be >= 1")
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1 (got {chunk_size})")
     t_max, n, h = projected.shape
     if n != len(lengths):
         raise ValueError(f"projected dim 1 ({n}) must match len(lengths) ({len(lengths)})")
@@ -196,14 +206,24 @@ def lstm_recompute_per_step_h_out(
         raise ValueError(f"projected dim 2 ({h}) must equal lstm.hidden_size ({lstm.hidden_size})")
 
     # nn.LSTM with batch_first=True wants (N, T, hidden). cuDNN fuses the
-    # T loop internally -- one launch instead of T_max launches.
+    # T loop internally -- one launch per chunk instead of T_chunk launches.
     inputs = projected.transpose(0, 1).contiguous()
-    h0 = torch.zeros(
+    h_state = torch.zeros(
         lstm.num_layers, n, lstm.hidden_size, dtype=projected.dtype, device=projected.device
     )
-    c0 = torch.zeros_like(h0)
+    c_state = torch.zeros_like(h_state)
     runner = compiled_lstm if compiled_lstm is not None else lstm
-    outputs, _final_state = runner(inputs, (h0, c0))
+    chunk_outputs: list[Tensor] = []
+    for start in range(0, t_max, chunk_size):
+        stop = min(start + chunk_size, t_max)
+        chunk_in = inputs[:, start:stop, :].contiguous()
+        chunk_out, (h_state, c_state) = runner(chunk_in, (h_state, c_state))
+        chunk_outputs.append(chunk_out)
+        # Detach state crossing the chunk boundary so the next chunk's
+        # backward stops here. Within a chunk, BPTT is full.
+        h_state = h_state.detach()
+        c_state = c_state.detach()
+    outputs = chunk_outputs[0] if len(chunk_outputs) == 1 else torch.cat(chunk_outputs, dim=1)
     out: list[Tensor] = []
     for i, t_i in enumerate(lengths):
         out.append(outputs[i, :t_i, :].contiguous())

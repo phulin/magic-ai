@@ -103,6 +103,17 @@ class RNaDConfig:
     ``|logit + lr · Clip(Q, c)| <= beta`` rather than the looser
     current-logit predicate ``|logit| <= beta``."""
 
+    bptt_chunk_size: int = 200
+    """Chunk length for the chunked-BPTT recompute (DeepNash R-NaD paper
+    arxiv 2206.15378 §"Full games learning"): trajectories are split along
+    the time axis into chunks of this many steps, each chunk processed in
+    one fused cuDNN ``nn.LSTM`` call, with state detached at chunk
+    boundaries so gradients don't flow across them. Default 200 matches
+    the production ``--max-steps-per-game=200`` cap, so the full trace is
+    one chunk by default (full BPTT through the fused call). Lower this to
+    cap activation memory at the cost of truncating gradient flow at
+    chunk boundaries."""
+
 
 # ---------------------------------------------------------------------------
 # Reward transformation
