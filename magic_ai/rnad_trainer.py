@@ -29,6 +29,7 @@ First-cut simplifications (see ``docs/rnad_deviations.md`` for rationale):
 from __future__ import annotations
 
 import copy
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,7 +37,8 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from magic_ai.model import PPOPolicy
+from magic_ai.buffer import RolloutBuffer
+from magic_ai.model import TRACE_KIND_TO_ID, PPOPolicy
 from magic_ai.ppo import PPOStats, RolloutStep
 from magic_ai.rnad import (
     RNaDConfig,
@@ -193,6 +195,56 @@ def _advance_outer_iteration(state: RNaDTrainerState) -> None:
         state.is_finetuning = True
 
 
+def _count_active_steps(
+    rb: RolloutBuffer,
+    per_episode_replay_rows: Sequence[Sequence[int]],
+) -> tuple[int, int]:
+    """Compute the issue-7 ``cl_count`` / ``pl_count`` normalizer totals from
+    rollout-buffer fields alone -- no policy forward required.
+
+    Mirrors the counts that :func:`rnad_trajectory_loss` would accumulate by
+    summing each per-episode loss helper's ``count`` return value across
+    both ``own_idx`` perspectives:
+
+    - ``cl_count`` = ``critic_loss`` count summed over ``own_idx`` =
+      total number of (step, perspective) pairs where ``perspective ==
+      own_idx``. Since every step has exactly one perspective in
+      ``{0, 1}``, this collapses to the total replay-step count.
+    - ``pl_count`` = ``may_neurd_loss`` count + ``neurd_loss_per_choice``
+      count, both summed over ``own_idx``. The may count collapses to
+      the total number of may-active steps in the batch; the per-choice
+      count collapses to the total number of valid (decision-group,
+      choice-column) cells across all active decision-group entries
+      (``rb.decision_mask[idx_t].sum()``).
+    """
+
+    if not per_episode_replay_rows:
+        return 0, 0
+
+    flat_rows: list[int] = [r for ep in per_episode_replay_rows for r in ep]
+    device = rb.trace_kind_id.device
+    step_indices = torch.tensor(flat_rows, dtype=torch.long, device=device)
+    cl_count_total = int(step_indices.numel())
+    trace_kind = rb.trace_kind_id[step_indices]
+    may_count_total = int((trace_kind == TRACE_KIND_TO_ID["may"]).sum().item())
+
+    decision_starts = rb.decision_start[step_indices]
+    decision_counts = rb.decision_count[step_indices]
+    active_mask = decision_counts > 0
+    flat_count_total = 0
+    if active_mask.any():
+        pos_t = active_mask.nonzero(as_tuple=False).squeeze(-1)
+        active_counts = decision_counts[pos_t]
+        max_count = int(active_counts.max().item())
+        offsets = torch.arange(max_count, dtype=torch.long, device=device).unsqueeze(0)
+        expanded_offsets = offsets.expand(pos_t.shape[0], -1)
+        valid_offsets = expanded_offsets < active_counts.unsqueeze(1)
+        idx_t = (decision_starts[pos_t].unsqueeze(1) + offsets)[valid_offsets]
+        flat_count_total = int(rb.decision_mask[idx_t].sum().item())
+
+    return cl_count_total, may_count_total + flat_count_total
+
+
 def run_rnad_update(
     policy: PPOPolicy,
     optimizer: torch.optim.Optimizer,
@@ -245,6 +297,11 @@ def run_rnad_update(
     if not per_episode_replay_rows:
         raise ValueError("no non-empty episodes to update on")
 
+    cl_count_total, pl_count_total = _count_active_steps(
+        policy.rollout_buffer,
+        per_episode_replay_rows,
+    )
+
     def _episode_loss(ep_idx: int) -> _TrajLossPieces:
         return rnad_trajectory_loss(
             online=policy,
@@ -259,28 +316,30 @@ def run_rnad_update(
             alpha=alpha,
         )
 
-    # Per-episode forward + backward with batch-global normalization.
-    # Pass 1 (no_grad): run trajectory_loss per episode just to collect the
-    # batch-global cl_count / pl_count totals -- the paper-faithful 1/t
-    # normalizer (issue 7) divides by counts across the whole rollout
-    # batch, not per-episode. Activations are released as we go since
-    # we're under no_grad.
-    # Pass 2 (with grad): run trajectory_loss per episode under grad,
-    # scale by 1/total_count, and call .backward(retain_graph=False)
-    # immediately so that episode's activations are freed before we move
-    # on to the next. Gradients accumulate across episodes; one
-    # optimizer.step() at the end. This is the per-rollout-batch backward
-    # the paper specifies, but with episode-level memory bounding so peak
-    # activations track ONE episode at a time rather than the full
-    # rollout's worth in a single autograd graph.
-    cl_count_total = 0
-    pl_count_total = 0
-    with torch.no_grad():
-        for ep_idx in range(len(per_episode_replay_rows)):
-            pieces = _episode_loss(ep_idx)
-            cl_count_total += pieces.cl_count
-            pl_count_total += pieces.pl_count
+    if os.environ.get("RNAD_VERIFY_COUNTS"):
+        # Cross-check: run a no_grad trajectory_loss pass per episode and
+        # confirm the buffer-derived counts match its accumulated cl_count
+        # / pl_count totals exactly.
+        cl_check = 0
+        pl_check = 0
+        with torch.no_grad():
+            for ep_idx in range(len(per_episode_replay_rows)):
+                pieces = _episode_loss(ep_idx)
+                cl_check += pieces.cl_count
+                pl_check += pieces.pl_count
+        assert cl_check == cl_count_total, (cl_check, cl_count_total)
+        assert pl_check == pl_count_total, (pl_check, pl_count_total)
 
+    # Per-episode forward + backward with batch-global normalization.
+    # ``_count_active_steps`` derives the issue-7 1/t normalizer counts
+    # directly from rollout-buffer fields -- no policy forward needed --
+    # so we can scale per-episode losses by the global counts while only
+    # ever running each episode through the policy once. After each
+    # episode's loss is computed, we call .backward(retain_graph=False)
+    # so its activations are freed before the next episode starts.
+    # Gradients accumulate across episodes; one optimizer.step() at the
+    # end. Mathematically identical to a single backward over the
+    # summed loss, but peak activations track ONE episode at a time.
     cl_norm = max(cl_count_total, 1)
     pl_norm = max(pl_count_total, 1)
 
