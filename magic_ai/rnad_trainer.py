@@ -87,13 +87,18 @@ def _clone_policy_sharing_buffer(src: PPOPolicy) -> PPOPolicy:
     """
 
     # Deepcopy everything except the rollout buffer, which we splice back in.
+    # Use normal attribute assignment so nn.Module updates ``_modules`` in
+    # lockstep with ``__dict__``: ``object.__setattr__`` would leave the old
+    # buffer registered in ``_modules`` and silently deep-copy it anyway via
+    # ``nn.Module.__deepcopy__``'s traversal of submodules, defeating the
+    # whole point of sharing the buffer.
     original_buffer = src.rollout_buffer
-    object.__setattr__(src, "rollout_buffer", None)
+    src.rollout_buffer = None  # ty: ignore[invalid-assignment]
     try:
         clone = copy.deepcopy(src)
     finally:
-        object.__setattr__(src, "rollout_buffer", original_buffer)
-    object.__setattr__(clone, "rollout_buffer", original_buffer)
+        src.rollout_buffer = original_buffer
+    clone.rollout_buffer = original_buffer
     if getattr(clone, "use_lstm", False):
         # Replace the deep-copied live LSTM cache (which mirrors src's per-env
         # state at clone time) with empty buffers. Target/reg never sample

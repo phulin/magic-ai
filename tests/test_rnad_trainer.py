@@ -46,6 +46,11 @@ class ClonePolicyTests(unittest.TestCase):
         policy = _make_policy()
         clone = _clone_policy_sharing_buffer(policy)
         self.assertIs(clone.rollout_buffer, policy.rollout_buffer)
+        # nn.Module tracks submodules in ``_modules``; if the buffer is only
+        # spliced into ``__dict__`` then ``.to(device)`` and ``named_buffers``
+        # still walk a hidden deep-copy, defeating the memory sharing.
+        self.assertIs(clone._modules["rollout_buffer"], policy.rollout_buffer)
+        self.assertIs(policy._modules["rollout_buffer"], policy.rollout_buffer)
 
     def test_clone_parameters_are_independent(self) -> None:
         policy = _make_policy()

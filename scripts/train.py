@@ -558,7 +558,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rnad-q-corr-rho-bar",
         type=float,
-        default=1.0,
+        default=100.0,
         help="R-NaD full-NeuRD clip on the joint inverse sampling weight "
         "1/mu_t in the per-action Q estimator. Magic actions factor as "
         "mu_t = ∏_k mu_k so the unclipped weight can blow up "
