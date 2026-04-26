@@ -224,18 +224,55 @@ def run_rnad_update(
     n_pieces = 0
     alpha = _alpha_for_step(state.gradient_step, state.config.delta_m)
 
+    # Per-policy LSTM recompute, batched once across the whole rollout batch
+    # so cuDNN sees one fused (N_episodes, T_max, hidden) call per policy
+    # instead of one (1, T_episode, hidden) call per (policy, episode).
+    per_episode_replay_rows: list[list[int]] = []
+    per_episode_perspective: list[list[int]] = []
+    per_episode_logp_mu: list[list[float]] = []
+    per_episode_winner_idx: list[int] = []
     for episode in episodes:
         if not episode.steps:
             continue
-        replay_rows: list[int] = []
-        perspective: list[int] = []
-        logp_mu: list[float] = []
+        rows: list[int] = []
+        persp: list[int] = []
+        lp: list[float] = []
         for step in episode.steps:
             if step.replay_idx is None:
                 raise ValueError("R-NaD requires replay_idx on every rollout step")
-            replay_rows.append(int(step.replay_idx))
-            perspective.append(int(step.perspective_player_idx))
-            logp_mu.append(float(step.old_log_prob))
+            rows.append(int(step.replay_idx))
+            persp.append(int(step.perspective_player_idx))
+            lp.append(float(step.old_log_prob))
+        per_episode_replay_rows.append(rows)
+        per_episode_perspective.append(persp)
+        per_episode_logp_mu.append(lp)
+        per_episode_winner_idx.append(int(episode.winner_idx))
+
+    online_h_out_per_ep: list[torch.Tensor] | None = None
+    target_h_out_per_ep: list[torch.Tensor] | None = None
+    reg_cur_h_out_per_ep: list[torch.Tensor] | None = None
+    reg_prev_h_out_per_ep: list[torch.Tensor] | None = None
+    if per_episode_replay_rows:
+        recompute_fn = getattr(policy, "recompute_lstm_outputs_for_episodes", None)
+        if recompute_fn is not None:
+            online_h_out_per_ep = recompute_fn(per_episode_replay_rows)
+            with torch.no_grad():
+                tgt_fn = state.target.recompute_lstm_outputs_for_episodes
+                rcr_fn = state.reg_cur.recompute_lstm_outputs_for_episodes
+                rpr_fn = state.reg_prev.recompute_lstm_outputs_for_episodes
+                target_h_out_per_ep = tgt_fn(per_episode_replay_rows)
+                reg_cur_h_out_per_ep = rcr_fn(per_episode_replay_rows)
+                reg_prev_h_out_per_ep = rpr_fn(per_episode_replay_rows)
+
+    for ep_idx, replay_rows in enumerate(per_episode_replay_rows):
+        perspective = per_episode_perspective[ep_idx]
+        logp_mu = per_episode_logp_mu[ep_idx]
+        online_h_out = online_h_out_per_ep[ep_idx] if online_h_out_per_ep is not None else None
+        target_h_out = target_h_out_per_ep[ep_idx] if target_h_out_per_ep is not None else None
+        reg_cur_h_out = reg_cur_h_out_per_ep[ep_idx] if reg_cur_h_out_per_ep is not None else None
+        reg_prev_h_out = (
+            reg_prev_h_out_per_ep[ep_idx] if reg_prev_h_out_per_ep is not None else None
+        )
 
         pieces = rnad_trajectory_loss(
             online=policy,
@@ -244,10 +281,14 @@ def run_rnad_update(
             reg_prev=state.reg_prev,
             replay_rows=replay_rows,
             perspective_player_idx=perspective,
-            winner_idx=int(episode.winner_idx),
+            winner_idx=per_episode_winner_idx[ep_idx],
             logp_mu=torch.tensor(logp_mu, dtype=torch.float32),
             config=state.config,
             alpha=alpha,
+            online_h_out=online_h_out,
+            target_h_out=target_h_out,
+            reg_cur_h_out=reg_cur_h_out,
+            reg_prev_h_out=reg_prev_h_out,
         )
         cl_sum = pieces.cl_sum if cl_sum is None else cl_sum + pieces.cl_sum
         pl_sum = pieces.pl_sum if pl_sum is None else pl_sum + pieces.pl_sum

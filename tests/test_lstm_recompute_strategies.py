@@ -220,33 +220,55 @@ class LstmRecomputeStrategiesBenchmark(unittest.TestCase):
         for got, want in zip(h_out_fused, h_out_ref, strict=True):
             torch.testing.assert_close(got, want, rtol=1e-2, atol=1e-3)
 
-        # Bench the fused path uncompiled.
-        for _ in range(warmup):
-            lstm_recompute_per_step_h_out(lstm, projected, lengths)
-        _sync()
-        t0 = time.perf_counter()
-        for _ in range(n_iters):
-            lstm_recompute_per_step_h_out(lstm, projected, lengths)
-        _sync()
-        results["fused"] = (time.perf_counter() - t0) / n_iters
+        # Bench the fused path uncompiled (cross-episode batched).
+        with torch.no_grad():
+            for _ in range(warmup):
+                lstm_recompute_per_step_h_out(lstm, projected, lengths)
+            _sync()
+            t0 = time.perf_counter()
+            for _ in range(n_iters):
+                lstm_recompute_per_step_h_out(lstm, projected, lengths)
+            _sync()
+            results["fused"] = (time.perf_counter() - t0) / n_iters
+
+        # Also bench the *per-episode* fused path -- the previous wiring
+        # in rnad_trajectory_loss called the fused recompute once per
+        # episode (batch=1). Lifting the call up to run_rnad_update lets a
+        # single fused call cover the whole rollout batch; this row shows
+        # what we recover by doing that.
+        with torch.no_grad():
+            per_episode_projected = [
+                projected[: lengths[i], i : i + 1, :] for i in range(n_episodes)
+            ]
+            for _ in range(warmup):
+                for i in range(n_episodes):
+                    lstm_recompute_per_step_h_out(lstm, per_episode_projected[i], [lengths[i]])
+            _sync()
+            t0 = time.perf_counter()
+            for _ in range(n_iters):
+                for i in range(n_episodes):
+                    lstm_recompute_per_step_h_out(lstm, per_episode_projected[i], [lengths[i]])
+            _sync()
+            results["fused_per_episode"] = (time.perf_counter() - t0) / n_iters
 
         # Bench the fused path with torch.compile around the LSTM forward.
         compile_disabled = os.environ.get("RNAD_LSTM_BENCH_NO_COMPILE")
         if not compile_disabled:
             try:
                 compiled_lstm = torch.compile(lstm, dynamic=False, mode="reduce-overhead")
-                for _ in range(warmup + 2):  # extra warmup for compile
-                    lstm_recompute_per_step_h_out(
-                        lstm, projected, lengths, compiled_lstm=compiled_lstm
-                    )
-                _sync()
-                t0 = time.perf_counter()
-                for _ in range(n_iters):
-                    lstm_recompute_per_step_h_out(
-                        lstm, projected, lengths, compiled_lstm=compiled_lstm
-                    )
-                _sync()
-                results["fused_compiled"] = (time.perf_counter() - t0) / n_iters
+                with torch.no_grad():
+                    for _ in range(warmup + 2):  # extra warmup for compile
+                        lstm_recompute_per_step_h_out(
+                            lstm, projected, lengths, compiled_lstm=compiled_lstm
+                        )
+                    _sync()
+                    t0 = time.perf_counter()
+                    for _ in range(n_iters):
+                        lstm_recompute_per_step_h_out(
+                            lstm, projected, lengths, compiled_lstm=compiled_lstm
+                        )
+                    _sync()
+                    results["fused_compiled"] = (time.perf_counter() - t0) / n_iters
             except Exception as exc:  # pragma: no cover - compile env-dependent
                 print(f"  (torch.compile failed: {type(exc).__name__}: {exc})")
 
@@ -258,7 +280,7 @@ class LstmRecomputeStrategiesBenchmark(unittest.TestCase):
         )
         print(f"  total padded steps  = {n_episodes * max(lengths)}")
         print(f"  total real steps    = {sum(lengths)}")
-        ordered = list(STRATEGIES) + ["fused"]
+        ordered = list(STRATEGIES) + ["fused_per_episode", "fused"]
         if "fused_compiled" in results:
             ordered.append("fused_compiled")
         for strategy in ordered:

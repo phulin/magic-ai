@@ -848,6 +848,10 @@ def rnad_trajectory_loss(
     logp_mu: Tensor,
     config: RNaDConfig,
     alpha: float,
+    online_h_out: Tensor | None = None,
+    target_h_out: Tensor | None = None,
+    reg_cur_h_out: Tensor | None = None,
+    reg_prev_h_out: Tensor | None = None,
 ) -> _TrajLossPieces:
     """Full per-action R-NaD trajectory loss (paper §170-189) with MTG factoring.
 
@@ -905,14 +909,15 @@ def rnad_trajectory_loss(
     # Issue 2: per-policy LSTM recompute via the fused single-call path.
     # Each policy re-runs the LSTM scan from h=0 over the episode under its
     # own parameters; ``recompute_lstm_outputs_for_episodes`` does this in
-    # one ``nn.LSTM(seq=T, batch=1)`` call (cuDNN fuses the time loop) and
-    # returns the top-layer ``h_out`` per step. The per-choice forward then
-    # consumes ``h_out`` directly via ``hidden_override``, skipping the
-    # per-step LSTM cell. Online runs under grad (full BPTT through the
-    # fused cuDNN backward); target / reg_cur / reg_prev are no-grad.
-    # Falls through to lstm_state_override on policies that don't expose
-    # the new method (e.g. minimal stubs in tests).
-    online_h_out = _maybe_recompute_lstm_h_out(online, replay_rows)
+    # one fused ``nn.LSTM`` call and returns the top-layer ``h_out`` per
+    # step. The per-choice forward then consumes ``h_out`` directly via
+    # ``hidden_override``, skipping the per-step LSTM cell. Online runs
+    # under grad (full BPTT through the fused cuDNN backward); target /
+    # reg_cur / reg_prev are no-grad. Callers (e.g. ``run_rnad_update``)
+    # may precompute ``*_h_out`` once across the whole rollout batch -- if
+    # provided, we skip recompute here and use them directly.
+    if online_h_out is None:
+        online_h_out = _maybe_recompute_lstm_h_out(online, replay_rows)
     if online_h_out is not None:
         lp_online, _, v_online, pc_online = online_per_choice(
             list(replay_rows), hidden_override=online_h_out
@@ -924,9 +929,12 @@ def rnad_trajectory_loss(
         )
 
     with torch.no_grad():
-        target_h_out = _maybe_recompute_lstm_h_out(target, replay_rows)
-        reg_cur_h_out = _maybe_recompute_lstm_h_out(reg_cur, replay_rows)
-        reg_prev_h_out = _maybe_recompute_lstm_h_out(reg_prev, replay_rows)
+        if target_h_out is None:
+            target_h_out = _maybe_recompute_lstm_h_out(target, replay_rows)
+        if reg_cur_h_out is None:
+            reg_cur_h_out = _maybe_recompute_lstm_h_out(reg_cur, replay_rows)
+        if reg_prev_h_out is None:
+            reg_prev_h_out = _maybe_recompute_lstm_h_out(reg_prev, replay_rows)
 
         if target_h_out is not None:
             _lp_tgt_scalar, _, v_tgt, pc_tgt = target_per_choice(
