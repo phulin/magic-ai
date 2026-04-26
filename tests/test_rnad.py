@@ -479,7 +479,7 @@ class _StubPolicy(nn.Module):
         flat_log_probs = torch.log_softmax(self.per_choice_logits[idx], dim=-1).reshape(-1)
         logp = flat_log_probs.reshape(n, self.num_choices)[:, 0]  # sampled col 0
         entropies = torch.zeros_like(logp)
-        sampled_col_per_step = torch.zeros(n, dtype=torch.long)
+        is_sampled_flat = choice_cols == 0
         return (
             logp,
             entropies,
@@ -489,7 +489,7 @@ class _StubPolicy(nn.Module):
                 flat_log_probs=flat_log_probs,
                 group_idx=group_idx,
                 choice_cols=choice_cols,
-                sampled_col_per_step=sampled_col_per_step,
+                is_sampled_flat=is_sampled_flat,
                 may_is_active=torch.zeros(n, dtype=torch.bool),
                 may_logits_per_step=torch.zeros(n),
                 may_selected_per_step=torch.zeros(n),
@@ -682,7 +682,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
                         flat_log_probs=torch.zeros(0),
                         group_idx=torch.zeros(0, dtype=torch.long),
                         choice_cols=torch.zeros(0, dtype=torch.long),
-                        sampled_col_per_step=torch.full((n,), -1, dtype=torch.long),
+                        is_sampled_flat=torch.zeros(0, dtype=torch.bool),
                         may_is_active=torch.ones(n, dtype=torch.bool),
                         may_logits_per_step=self.may_logits[idx],
                         may_selected_per_step=torch.ones(n),

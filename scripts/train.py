@@ -308,6 +308,8 @@ def _restore_rnad_state(
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    if args.learning_rate is None:
+        args.learning_rate = 5e-5 if args.trainer == "rnad" else 3e-4
     if args.trainer == "rnad" and args.draw_penalty != 0.0:
         print(
             "[rnad] --draw-penalty forced to 0.0 under R-NaD trainer; the "
@@ -554,6 +556,15 @@ def parse_args() -> argparse.Namespace:
         help="R-NaD fine-tune / test-time probability quanta",
     )
     parser.add_argument(
+        "--rnad-q-corr-rho-bar",
+        type=float,
+        default=1.0,
+        help="R-NaD full-NeuRD clip on the joint inverse sampling weight "
+        "1/mu_t in the per-action Q estimator. Magic actions factor as "
+        "mu_t = ∏_k mu_k so the unclipped weight can blow up "
+        "multiplicatively in the number of decision groups.",
+    )
+    parser.add_argument(
         "--rnad-full-neurd",
         action="store_true",
         help="use the full per-action NeuRD loss (paper §188 with the "
@@ -608,7 +619,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spr-proj-dim", type=int, default=256)
     parser.add_argument("--max-options", type=int, default=64)
     parser.add_argument("--max-targets-per-option", type=int, default=4)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="optimizer learning rate; default depends on --trainer "
+        "(rnad: 5e-5 per paper §199; ppo: 3e-4)",
+    )
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae-lambda", type=float, default=0.97)
     parser.add_argument(
@@ -834,6 +851,7 @@ def train_native_batched_envs(
                 finetune_eps=args.rnad_finetune_eps,
                 finetune_n_disc=args.rnad_finetune_ndisc,
                 learning_rate=args.learning_rate,
+                q_corr_rho_bar=args.rnad_q_corr_rho_bar,
             ),
             reg_snapshot_dir=args.output.parent / "rnad",
             device=policy.device,

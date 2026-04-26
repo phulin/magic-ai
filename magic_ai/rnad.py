@@ -81,6 +81,15 @@ class RNaDConfig:
     finetune_n_disc: int = 16
     """Number of probability quanta for fine-tune / test-time discretization."""
 
+    q_corr_rho_bar: float = 1.0
+    """Clip on the joint inverse-sampling weight ``1/mu_t`` used in the
+    full-NeuRD per-action Q estimator (paper §179-180). The paper assumes
+    a single-categorical action where ``1/mu_t`` is bounded in expectation;
+    for factored Magic actions ``mu_t = ∏_k mu_k`` so the unclipped weight
+    can blow up multiplicatively in the number of decision groups. Clipping
+    matches the standard v-trace-style IS bound and reduces to the paper's
+    estimator for single-group steps when the bound is loose."""
+
     learning_rate: float = 5e-5
     """Optimizer learning rate (paper §199: 5e-5). Used by the NeuRD
     gradient gate (paper §189) to evaluate the post-update logit predicate
@@ -922,10 +931,8 @@ def _gather_sampled_scalar(pc: Any, may_logp: Tensor) -> Tensor:
     n = may_logp.shape[0]
     out = may_logp.clone()
     if pc.flat_logits.numel() > 0:
-        sampled_col_flat = pc.sampled_col_per_step[pc.group_idx]
-        is_sampled = pc.choice_cols == sampled_col_flat
         contributions = torch.where(
-            is_sampled,
+            pc.is_sampled_flat,
             pc.flat_log_probs,
             torch.zeros_like(pc.flat_log_probs),
         )
@@ -1023,8 +1030,7 @@ def rnad_trajectory_loss_full_neurd(
     # Also build the per-step scalar log_ratio at the sampled action for the
     # "sampled correction" term of the paper's Q estimator.
     if pc_online.flat_logits.numel() > 0:
-        sampled_col_flat = pc_online.sampled_col_per_step[pc_online.group_idx]
-        is_sampled_flat = pc_online.choice_cols == sampled_col_flat
+        is_sampled_flat = pc_online.is_sampled_flat
         per_step_log_ratio_sampled = torch.zeros(t_len, dtype=dtype, device=device)
         per_step_log_ratio_sampled.scatter_add_(
             0,
@@ -1106,7 +1112,11 @@ def rnad_trajectory_loss_full_neurd(
             step_is_own = is_own[pc_online.group_idx]
             v_per_choice = v_tgt_dt[pc_online.group_idx]
             base_q_flat = -config.eta * log_ratio_flat
-            inv_mu = (-logp_mu_dev).exp()
+            # Joint inverse-sampling weight 1/mu_t for the sampled-action
+            # correction. Clipped to ``q_corr_rho_bar`` so multi-decision-group
+            # steps (where mu_t = ∏_k mu_k can be vanishingly small) do not
+            # produce oversized policy updates.
+            inv_mu = (-logp_mu_dev).exp().clamp(max=config.q_corr_rho_bar)
             ratio_own_per_step = (lp_tgt_scalar - logp_mu_dev).exp()
             sampled_inner = (
                 rewards

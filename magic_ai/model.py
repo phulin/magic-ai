@@ -1132,7 +1132,10 @@ class PPOPolicy(nn.Module):
         every legal decision-group choice across the batch, plus the
         mapping back to batch-step indices and the sampled column per step.
         ``may``-kind steps have no decision group and get a ``-1`` sentinel
-        in ``sampled_col_per_step``.
+        in ``is_sampled_flat`` (a boolean mask over the flat axis,
+        ``True`` at exactly the sampled cell within each decision
+        group; this preserves per-group sampled identity for
+        multi-decision-group steps).
         """
 
         if not replay_rows:
@@ -1145,7 +1148,6 @@ class PPOPolicy(nn.Module):
         forward = self._forward_batch(step_indices)
         log_probs = torch.zeros(n, dtype=forward.values.dtype, device=device)
         entropies = torch.zeros(n, dtype=forward.values.dtype, device=device)
-        sampled_col_per_step = torch.full((n,), -1, dtype=torch.long, device=device)
 
         trace_kind_ids = rb.trace_kind_id[step_indices]
         may_mask = trace_kind_ids == TRACE_KIND_TO_ID["may"]
@@ -1173,6 +1175,7 @@ class PPOPolicy(nn.Module):
         flat_log_probs = forward.values.new_zeros(0)
         group_idx_out = torch.zeros(0, dtype=torch.long, device=device)
         choice_cols_out = torch.zeros(0, dtype=torch.long, device=device)
+        is_sampled_flat_out = torch.zeros(0, dtype=torch.bool, device=device)
 
         if active_mask.any():
             pos_t = active_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -1188,7 +1191,6 @@ class PPOPolicy(nn.Module):
             masks = rb.decision_mask[idx_t]
             uses_none = rb.uses_none_head[idx_t]
             selected = rb.selected_indices[idx_t]
-            sampled_col_per_step[pos_t_flat] = selected
 
             group_idx, choice_cols, flat_logits_all, flat_log_probs_all, group_entropies = (
                 self._flat_decision_distribution(
@@ -1221,13 +1223,14 @@ class PPOPolicy(nn.Module):
             flat_log_probs = flat_log_probs_all
             group_idx_out = step_for_flat
             choice_cols_out = choice_cols
+            is_sampled_flat_out = selected_mask
 
         per_choice = ReplayPerChoice(
             flat_logits=flat_logits,
             flat_log_probs=flat_log_probs,
             group_idx=group_idx_out,
             choice_cols=choice_cols_out,
-            sampled_col_per_step=sampled_col_per_step,
+            is_sampled_flat=is_sampled_flat_out,
             may_is_active=may_mask,
             may_logits_per_step=may_logits_per_step,
             may_selected_per_step=may_selected_per_step,
@@ -2413,9 +2416,12 @@ class ReplayPerChoice:
     indexing space as ``values``), so downstream code can align per-step
     v-trace targets with per-choice logits in one lookup. ``choice_cols``
     is the original decision-choice index (0..max_cached_choices) for
-    each flat entry. ``sampled_col_per_step`` is the column that was
-    actually sampled at each step at rollout time (or ``-1`` for ``may``
-    steps with no decision group).
+    each flat entry. ``is_sampled_flat`` is a boolean mask over the same
+    flat axis as ``flat_logits``: it is ``True`` at exactly the cells
+    whose ``(decision-group, choice_col)`` pair was sampled at rollout
+    time. For multi-decision-group steps this preserves the per-group
+    sampled identity (one ``True`` per decision group), which a single
+    per-step column cannot represent.
 
     ``may_is_active`` is a boolean mask of shape ``(n,)`` flagging steps
     whose action came from the Bernoulli may head rather than a
@@ -2432,7 +2438,7 @@ class ReplayPerChoice:
     flat_log_probs: Tensor
     group_idx: Tensor
     choice_cols: Tensor
-    sampled_col_per_step: Tensor
+    is_sampled_flat: Tensor
     may_is_active: Tensor
     may_logits_per_step: Tensor
     may_selected_per_step: Tensor
