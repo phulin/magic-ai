@@ -24,8 +24,62 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import importlib.util  # noqa: E402
+import threading  # noqa: E402
 
 import magic_ai.rnad_trainer as rt  # noqa: E402
+from magic_ai.model import PPOPolicy  # noqa: E402
+from magic_ai.sharded_native import (  # noqa: E402
+    ShardedNativeBatchEncoder,
+    ShardedNativeRolloutDriver,
+)
+
+# --- rollout phase timing -------------------------------------------------
+_phase_lock = threading.Lock()
+_phase_totals: dict[str, float] = {"poll": 0.0, "encode": 0.0, "sample": 0.0, "step": 0.0}
+_phase_counts: dict[str, int] = {"poll": 0, "encode": 0, "sample": 0, "step": 0}
+
+
+def _reset_phase_counters() -> None:
+    with _phase_lock:
+        for k in _phase_totals:
+            _phase_totals[k] = 0.0
+            _phase_counts[k] = 0
+
+
+def _add_phase(name: str, dt: float) -> None:
+    with _phase_lock:
+        _phase_totals[name] += dt
+        _phase_counts[name] += 1
+
+
+def _phase_summary(rollout_wall: float) -> str:
+    with _phase_lock:
+        parts = [f"rollout {rollout_wall:.3f}s"]
+        for name in ("poll", "encode", "sample", "step"):
+            parts.append(f"{name}={_phase_totals[name]:.3f}s/{_phase_counts[name]}c")
+        unaccounted = rollout_wall - sum(_phase_totals.values())
+        parts.append(f"other={unaccounted:.3f}s")
+        return " ".join(parts)
+
+
+def _wrap_phase(obj: Any, attr: str, name: str) -> None:
+    orig = getattr(obj, attr)
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        t0 = time.perf_counter()
+        try:
+            return orig(*args, **kwargs)
+        finally:
+            _add_phase(name, time.perf_counter() - t0)
+
+    setattr(obj, attr, wrapper)
+
+
+_wrap_phase(ShardedNativeRolloutDriver, "poll", "poll")
+_wrap_phase(ShardedNativeRolloutDriver, "step_by_choice", "step")
+_wrap_phase(ShardedNativeBatchEncoder, "encode_handles", "encode")
+_wrap_phase(PPOPolicy, "sample_native_batch", "sample")
+# --------------------------------------------------------------------------
 
 _train_spec = importlib.util.spec_from_file_location("train_mod", _ROOT / "scripts" / "train.py")
 assert _train_spec is not None and _train_spec.loader is not None
@@ -33,9 +87,9 @@ train_mod = importlib.util.module_from_spec(_train_spec)
 sys.modules["train_mod"] = train_mod
 _train_spec.loader.exec_module(train_mod)
 
-N_PROFILE = 2
+N_PROFILE = 4
 WARMUP = 1
-WITH_STACK = True
+WITH_STACK = False
 
 
 @dataclass
@@ -75,6 +129,7 @@ def main() -> None:
             state.n = 1
             state.iter_start = time.perf_counter()
             state.prof = start_prof()
+            _reset_phase_counters()
             return out
 
         # Profiler is active — it has been running since the previous wrapped
@@ -94,11 +149,14 @@ def main() -> None:
         state.wall_iter += iter_wall
         state.wall_update += update_wall
         state.captures.append(prof)
+        rollout_wall = iter_wall - update_wall
         print(
             f"[profile] iter #{n}: total {iter_wall:.3f}s "
-            f"(rollout {iter_wall - update_wall:.3f}s + update {update_wall:.3f}s)",
+            f"(rollout {rollout_wall:.3f}s + update {update_wall:.3f}s)",
             flush=True,
         )
+        print(f"[profile]    phases: {_phase_summary(rollout_wall)}", flush=True)
+        _reset_phase_counters()
 
         state.n = n + 1
         if n >= N_PROFILE:
