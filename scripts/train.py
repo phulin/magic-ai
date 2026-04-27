@@ -10,6 +10,7 @@ import json
 import random
 import re
 import sys
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -995,6 +996,7 @@ def train_native_batched_envs(
             completed_games += 1
 
     maybe_start_games()
+    last_step_time = time.monotonic()
     while live_games:
         ready_t, over_t, player_t, winner_t = native_rollout.poll([env.game for env in live_games])
         ready_envs: list[LiveGame] = []
@@ -1163,19 +1165,29 @@ def train_native_batched_envs(
                     max_grad_norm=args.max_grad_norm,
                     spr_coef=args.spr_coef if args.spr else 0.0,
                 )
-            print(
+            now = time.monotonic()
+            elapsed = now - last_step_time
+            last_step_time = now
+            fields = [
                 f"update[{args.trainer}]",
                 f"games={completed_games}",
                 f"steps={rollout_step_count}",
+                f"dt={elapsed:.1f}s",
                 f"loss={stats.loss:.4f}",
                 f"policy={stats.policy_loss:.4f}",
                 f"value={stats.value_loss:.4f}",
-                f"entropy={stats.entropy:.4f}",
-                f"kl={stats.approx_kl:.4f}",
-                f"clip={stats.clip_fraction:.3f}",
-                (f"rnad_m={rnad_state.outer_iteration}" if rnad_state is not None else ""),
-                flush=True,
-            )
+            ]
+            if rnad_state is None:
+                fields.extend(
+                    [
+                        f"entropy={stats.entropy:.4f}",
+                        f"kl={stats.approx_kl:.4f}",
+                        f"clip={stats.clip_fraction:.3f}",
+                    ]
+                )
+            else:
+                fields.append(f"rnad_m={rnad_state.outer_iteration}")
+            print(*fields, flush=True)
             total_rollout_steps += rollout_step_count
             value_metrics = rollout_value_metrics(pending_steps, rollout_returns)
             if rnad_state is not None and rnad_state.last_stats:
