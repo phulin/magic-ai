@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ctypes
+import threading
+from ctypes import POINTER, Structure, byref, c_char_p, c_int64
 from dataclasses import dataclass
 from typing import Any
 
@@ -8,6 +11,58 @@ import torch
 
 class NativeRolloutUnavailable(RuntimeError):
     pass
+
+
+# ctypes binding for MageBatchStepByChoice. The mage package loads the
+# library via cffi in ABI mode, which holds the GIL across foreign calls
+# and serialises step_by_choice across worker threads. ctypes' default is
+# to release the GIL around foreign calls, so opening the same .so via
+# ctypes lets ShardedNativeRolloutDriver actually run shards in parallel.
+class _MageStepChoiceRequestC(Structure):
+    _fields_ = [
+        ("n", c_int64),
+        ("max_options", c_int64),
+        ("max_targets_per_option", c_int64),
+        ("handles", POINTER(c_int64)),
+        ("decision_start", POINTER(c_int64)),
+        ("decision_count", POINTER(c_int64)),
+        ("selected_choice_cols", POINTER(c_int64)),
+        ("may_selected", POINTER(c_int64)),
+    ]
+
+
+class _MageEncodeResultC(Structure):
+    _fields_ = [
+        ("decision_rows_written", c_int64),
+        ("error_code", c_int64),
+        ("error_message", c_char_p),
+    ]
+
+
+_step_lib_lock = threading.Lock()
+_step_lib: ctypes.CDLL | None = None
+
+
+def _load_step_ctypes_lib(mage: Any) -> ctypes.CDLL | None:
+    """Open the mage shared library via ctypes for GIL-releasing step calls."""
+
+    global _step_lib
+    with _step_lib_lock:
+        if _step_lib is not None:
+            return _step_lib
+        path = getattr(mage, "_lib_path_used", None)
+        if not path:
+            return None
+        try:
+            lib = ctypes.CDLL(path)
+            lib.MageBatchStepByChoice.argtypes = [POINTER(_MageStepChoiceRequestC)]
+            lib.MageBatchStepByChoice.restype = _MageEncodeResultC
+            lib.MageFreeString.argtypes = [c_char_p]
+            lib.MageFreeString.restype = None
+        except OSError, AttributeError:
+            return None
+        _step_lib = lib
+        return lib
 
 
 REQUIRED_NATIVE_ROLLOUT_SYMBOLS = (
@@ -83,6 +138,10 @@ class NativeRolloutDriver:
 
     lib: Any
     ffi: Any
+    # Populated by __post_init__ / for_mage via object.__setattr__ since the
+    # dataclass is not actually frozen but the assignment-by-init pattern is
+    # only used for `lib` and `ffi`.
+    _step_ctypes_lib: ctypes.CDLL | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "_poll_capacity", 0)
@@ -98,6 +157,7 @@ class NativeRolloutDriver:
         object.__setattr__(self, "_step_selected_capacity", 0)
         object.__setattr__(self, "_step_selected", torch.empty((0,), dtype=torch.int64))
         object.__setattr__(self, "_step_may", torch.empty((0,), dtype=torch.int64))
+        object.__setattr__(self, "_step_ctypes_lib", None)
 
     @classmethod
     def for_mage(cls, mage: Any) -> NativeRolloutDriver:
@@ -115,7 +175,9 @@ class NativeRolloutDriver:
             raise NativeRolloutUnavailable(
                 "native no-JSON rollout requires missing mage symbols: " + ", ".join(missing)
             )
-        return cls(lib=lib, ffi=ffi)
+        driver = cls(lib=lib, ffi=ffi)
+        object.__setattr__(driver, "_step_ctypes_lib", _load_step_ctypes_lib(mage))
+        return driver
 
     @staticmethod
     def require_available(mage: Any) -> None:
@@ -192,6 +254,33 @@ class NativeRolloutDriver:
         may.copy_(torch.tensor(may_selected, dtype=torch.int64))
         if selected_n:
             selected.copy_(torch.tensor(selected_choice_cols, dtype=torch.int64))
+
+        ctypes_lib = self._step_ctypes_lib
+        if ctypes_lib is not None:
+            # ctypes path: releases the GIL across the C call so that worker
+            # threads in ShardedNativeRolloutDriver can run the engine in
+            # parallel. cffi (ABI mode) holds the GIL, which serialises them.
+            req_c = _MageStepChoiceRequestC(
+                n=n,
+                max_options=max_options,
+                max_targets_per_option=max_targets_per_option,
+                handles=ctypes.cast(handles.data_ptr(), POINTER(c_int64)),
+                decision_start=ctypes.cast(starts.data_ptr(), POINTER(c_int64)),
+                decision_count=ctypes.cast(counts.data_ptr(), POINTER(c_int64)),
+                selected_choice_cols=ctypes.cast(selected.data_ptr(), POINTER(c_int64)),
+                may_selected=ctypes.cast(may.data_ptr(), POINTER(c_int64)),
+            )
+            result_c = ctypes_lib.MageBatchStepByChoice(byref(req_c))
+            if result_c.error_code != 0:
+                msg = "MageBatchStepByChoice failed"
+                if result_c.error_message:
+                    try:
+                        msg = result_c.error_message.decode("utf-8")
+                    finally:
+                        ctypes_lib.MageFreeString(result_c.error_message)
+                raise NativeRolloutUnavailable(msg)
+            return
+
         req = self.ffi.new(
             "MageStepChoiceRequest *",
             {
