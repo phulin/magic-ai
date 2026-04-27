@@ -74,6 +74,18 @@ DEFAULT_DECK = {
 }
 
 
+# Optional subphase profiling hook. The profile script binds this to a
+# real recorder; in normal runs it stays a no-op (one Python attribute
+# read + branch per call site, negligible).
+_subphase_record: Callable[[str, float], None] | None = None
+
+
+def _record_phase(name: str, t0: float) -> None:
+    rec = _subphase_record
+    if rec is not None:
+        rec(name, time.perf_counter() - t0)
+
+
 @dataclass(frozen=True)
 class TranscriptAction:
     state: GameStateSnapshot
@@ -1019,6 +1031,7 @@ def train_native_batched_envs(
     last_step_time = time.monotonic()
     while live_games:
         ready_t, over_t, player_t, winner_t = native_rollout.poll([env.game for env in live_games])
+        _t = time.perf_counter()
         # Pull poll results to host once. Each .tolist() is one transfer; the
         # alternative (int(t[idx]) per env) issues 4*N tiny syncs per poll.
         ready_l = ready_t.tolist()
@@ -1039,12 +1052,18 @@ def train_native_batched_envs(
                 ready_envs.append(env)
                 ready_players.append(int(player_l[idx]))
         live_games = still_live
+        _record_phase("partition", _t)
+        _t = time.perf_counter()
         finish_games(finished_games)
+        _record_phase("finish", _t)
 
         if ready_envs:
+            _t = time.perf_counter()
             ready_env_indices = [env.slot_idx for env in ready_envs]
+            ready_games = [env.game for env in ready_envs]
+            _record_phase("ready_lists", _t)
             parsed_batch = native_encoder.encode_handles(
-                [env.game for env in ready_envs],
+                ready_games,
                 perspective_player_indices=ready_players,
             )
             lstm_state_inputs = sampling_policy.lstm_env_state_inputs(ready_env_indices)
@@ -1059,14 +1078,17 @@ def train_native_batched_envs(
                     finetune_eps=finetune_eps,
                     finetune_n_disc=finetune_n_disc,
                 )
+            _t = time.perf_counter()
             log_probs = torch.stack([policy_step.log_prob for policy_step in policy_steps])
             values = torch.stack([policy_step.value for policy_step in policy_steps])
+            _record_phase("stack_steps", _t)
 
             # Batch the per-env bookkeeping with comprehensions, then walk
             # the envs once for the rare per-env work (transcripts and the
             # action_count bump). The hot path is now a few torch ops on
             # CPU + one async H2D copy, instead of N Python list-extends and
             # a synchronous torch.tensor(..., device=cuda) build.
+            _t = time.perf_counter()
             counts = [len(s.selected_choice_cols) for s in policy_steps]
             may_selected = [s.may_selected for s in policy_steps]
             starts: list[int] = list(itertools.accumulate(counts, initial=0))[:-1]
@@ -1074,7 +1096,9 @@ def train_native_batched_envs(
             selected_choice_cols_flat = torch.tensor(selected_cols, dtype=torch.long).to(
                 policy.device, non_blocking=True
             )
+            _record_phase("build_cols", _t)
 
+            _t = time.perf_counter()
             for env, policy_step in zip(ready_envs, policy_steps, strict=True):
                 env.action_count += 1
                 if not env.transcript_enabled:
@@ -1101,6 +1125,7 @@ def train_native_batched_envs(
                         env,
                         f"{exc} while snapshotting live game for action {policy_step.action!r}",
                     )
+            _record_phase("env_loop", _t)
 
             staging_buffer.stage_batch(
                 ready_env_indices,
@@ -1207,6 +1232,7 @@ def train_native_batched_envs(
                 fields.append(f"rnad_m={rnad_state.outer_iteration}")
             print(*fields, flush=True)
             total_rollout_steps += rollout_step_count
+            _t = time.perf_counter()
             value_metrics = rollout_value_metrics(pending_steps, rollout_returns)
             if rnad_state is not None and rnad_state.last_stats:
                 rs = rnad_state.last_stats[0]
@@ -1239,6 +1265,7 @@ def train_native_batched_envs(
             pending_returns.clear()
             pending_episodes.clear()
             win_stats.reset()
+            _record_phase("post_update", _t)
 
         if (
             args.save_every
@@ -1283,7 +1310,9 @@ def train_native_batched_envs(
                     rng=eval_rng,
                 )
 
+        _t = time.perf_counter()
         maybe_start_games()
+        _record_phase("maybe_start", _t)
 
     if pending_steps:
         rollout_returns = torch.cat(pending_returns)

@@ -35,8 +35,26 @@ from magic_ai.sharded_native import (  # noqa: E402
 
 # --- rollout phase timing -------------------------------------------------
 _phase_lock = threading.Lock()
-_phase_totals: dict[str, float] = {"poll": 0.0, "encode": 0.0, "sample": 0.0, "step": 0.0}
-_phase_counts: dict[str, int] = {"poll": 0, "encode": 0, "sample": 0, "step": 0}
+_PHASES = (
+    "poll",
+    "encode",
+    "sample",
+    "step",
+    "stage",
+    "lstm_in",
+    "append_episodes",
+    "gae",
+    "partition",
+    "finish",
+    "ready_lists",
+    "stack_steps",
+    "build_cols",
+    "env_loop",
+    "maybe_start",
+    "post_update",
+)
+_phase_totals: dict[str, float] = dict.fromkeys(_PHASES, 0.0)
+_phase_counts: dict[str, int] = dict.fromkeys(_PHASES, 0)
 
 
 def _reset_phase_counters() -> None:
@@ -55,7 +73,7 @@ def _add_phase(name: str, dt: float) -> None:
 def _phase_summary(rollout_wall: float) -> str:
     with _phase_lock:
         parts = [f"rollout {rollout_wall:.3f}s"]
-        for name in ("poll", "encode", "sample", "step"):
+        for name in _PHASES:
             parts.append(f"{name}={_phase_totals[name]:.3f}s/{_phase_counts[name]}c")
         unaccounted = rollout_wall - sum(_phase_totals.values())
         parts.append(f"other={unaccounted:.3f}s")
@@ -79,6 +97,28 @@ _wrap_phase(ShardedNativeRolloutDriver, "poll", "poll")
 _wrap_phase(ShardedNativeRolloutDriver, "step_by_choice", "step")
 _wrap_phase(ShardedNativeBatchEncoder, "encode_handles", "encode")
 _wrap_phase(PPOPolicy, "sample_native_batch", "sample")
+
+# Sub-phases of "other": these are the heaviest things called between
+# the four wrapped phases on the rollout hot path.
+from magic_ai.buffer import NativeTrajectoryBuffer  # noqa: E402
+from magic_ai.ppo import gae_returns as _gae_returns_orig  # noqa: E402
+
+_wrap_phase(NativeTrajectoryBuffer, "stage_batch", "stage")
+_wrap_phase(PPOPolicy, "lstm_env_state_inputs", "lstm_in")
+_wrap_phase(PPOPolicy, "append_staged_episodes_to_rollout", "append_episodes")
+
+import magic_ai.ppo as _ppo_mod  # noqa: E402
+
+
+def _gae_wrapper(*args: Any, **kwargs: Any) -> Any:
+    t0 = time.perf_counter()
+    try:
+        return _gae_returns_orig(*args, **kwargs)
+    finally:
+        _add_phase("gae", time.perf_counter() - t0)
+
+
+setattr(_ppo_mod, "gae_returns", _gae_wrapper)
 # --------------------------------------------------------------------------
 
 _train_spec = importlib.util.spec_from_file_location("train_mod", _ROOT / "scripts" / "train.py")
@@ -86,6 +126,12 @@ assert _train_spec is not None and _train_spec.loader is not None
 train_mod = importlib.util.module_from_spec(_train_spec)
 sys.modules["train_mod"] = train_mod
 _train_spec.loader.exec_module(train_mod)
+
+# train.py imported gae_returns at module load, so we have to rebind that
+# attribute on the train module itself for the wrapper to be visible.
+setattr(train_mod, "gae_returns", _gae_wrapper)
+# Bind the inline subphase recorder on train.py.
+setattr(train_mod, "_subphase_record", _add_phase)
 
 N_PROFILE = 4
 WARMUP = 1
