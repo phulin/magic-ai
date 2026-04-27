@@ -265,6 +265,7 @@ class PPOPolicy(nn.Module):
         )
         self._compiled_compute_forward_impl: Callable[..., Any] | None = None
         self._compiled_compute_hidden_target_impl: Callable[..., Any] | None = None
+        self._compiled_flat_decision_distribution_impl: Callable[..., Any] | None = None
 
     @property
     def device(self) -> torch.device:
@@ -1905,6 +1906,10 @@ class PPOPolicy(nn.Module):
                 self._compute_hidden_target_impl,
                 dynamic=True,
             )
+        self._compiled_flat_decision_distribution_impl = torch.compile(
+            PPOPolicy._flat_decision_distribution_impl,
+            dynamic=True,
+        )
 
     def _call_compute_hidden_target(
         self,
@@ -2144,6 +2149,77 @@ class PPOPolicy(nn.Module):
 
         return logits.masked_fill(~masks, -torch.inf)
 
+    @staticmethod
+    def _flat_decision_distribution_impl(
+        step_positions: Tensor,
+        option_idx: Tensor,
+        target_idx: Tensor,
+        masks: Tensor,
+        uses_none: Tensor,
+        option_vectors: Tensor,
+        target_vectors: Tensor,
+        query: Tensor,
+        none_logits: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Compile-friendly body of :meth:`_flat_decision_distribution`.
+
+        Drops the host-side ``.any()`` early-outs (they were forcing CUDA
+        syncs that broke graph capture) and the ``self.validate`` /
+        ``self._validate_flat_scored_indices`` references so this can be
+        ``torch.compile``'d. Empty boolean masks make the index_put / gather
+        ops no-ops, so dropping the early-outs is semantically equivalent.
+        """
+
+        valid = masks.nonzero(as_tuple=False)
+        device = masks.device
+        group_idx = valid[:, 0]
+        choice_cols = valid[:, 1]
+        flat_step_positions = step_positions[group_idx]
+        flat_logits = torch.empty(valid.shape[0], dtype=query.dtype, device=device)
+
+        # Force bool dtype: callers may pass uses_none as uint8 (the encoder
+        # stores it as u8); torch.compile's fake-tensor pass rejects uint8
+        # mask indexing even though eager accepts it with a deprecation
+        # warning.
+        is_none = uses_none[group_idx].bool() & (choice_cols == 0)
+        flat_logits[is_none] = none_logits[flat_step_positions[is_none]]
+
+        is_scored = ~is_none
+        scored_groups = group_idx[is_scored]
+        scored_steps = flat_step_positions[is_scored]
+        scored_cols = choice_cols[is_scored]
+
+        scored_option_idx = option_idx[scored_groups, scored_cols]
+        scored_target_idx = target_idx[scored_groups, scored_cols]
+
+        scored_option_vectors = option_vectors[scored_steps, scored_option_idx]
+        scored_target_vectors = torch.zeros_like(scored_option_vectors)
+        has_target = scored_target_idx >= 0
+        scored_target_vectors[has_target] = target_vectors[
+            scored_steps[has_target],
+            scored_option_idx[has_target],
+            scored_target_idx[has_target],
+        ]
+
+        decision_vectors = scored_option_vectors + scored_target_vectors
+        flat_logits[is_scored] = (decision_vectors * query[scored_steps]).sum(dim=-1)
+
+        group_count = step_positions.shape[0]
+        group_max = torch.full((group_count,), -torch.inf, dtype=query.dtype, device=device)
+        group_max.scatter_reduce_(0, group_idx, flat_logits, reduce="amax", include_self=True)
+
+        stabilized = flat_logits - group_max[group_idx]
+        exp_logits = stabilized.exp()
+        group_exp_sum = torch.zeros(group_count, dtype=query.dtype, device=device)
+        group_exp_sum.scatter_add_(0, group_idx, exp_logits)
+        flat_log_probs = stabilized - group_exp_sum[group_idx].log()
+
+        probs = flat_log_probs.exp()
+        group_entropies = torch.zeros(group_count, dtype=query.dtype, device=device)
+        group_entropies.scatter_add_(0, group_idx, -(probs * flat_log_probs))
+
+        return group_idx, choice_cols, flat_logits, flat_log_probs, group_entropies
+
     def _flat_decision_distribution(
         self,
         *,
@@ -2163,64 +2239,38 @@ class PPOPolicy(nn.Module):
         if valid.numel() == 0:
             raise ValueError("decision groups must include at least one valid choice")
 
-        device = masks.device
-        group_idx = valid[:, 0]
-        choice_cols = valid[:, 1]
-        flat_step_positions = step_positions[group_idx]
-        flat_logits = torch.empty(valid.shape[0], dtype=query.dtype, device=device)
+        if self.validate:
+            group_idx_v = valid[:, 0]
+            choice_cols_v = valid[:, 1]
+            is_none_v = uses_none[group_idx_v] & (choice_cols_v == 0)
+            is_scored_v = ~is_none_v
+            scored_groups_v = group_idx_v[is_scored_v]
+            scored_cols_v = choice_cols_v[is_scored_v]
+            scored_steps_v = step_positions[group_idx_v][is_scored_v]
+            self._validate_flat_scored_indices(
+                scored_groups=scored_groups_v,
+                scored_cols=scored_cols_v,
+                scored_steps=scored_steps_v,
+                scored_option_idx=option_idx[scored_groups_v, scored_cols_v],
+                scored_target_idx=target_idx[scored_groups_v, scored_cols_v],
+                max_steps=option_vectors.shape[0],
+                max_options=option_vectors.shape[1],
+                max_targets=target_vectors.shape[2],
+            )
 
-        is_none = uses_none[group_idx] & (choice_cols == 0)
-        if is_none.any():
-            flat_logits[is_none] = none_logits[flat_step_positions[is_none]]
-
-        is_scored = ~is_none
-        if is_scored.any():
-            scored_groups = group_idx[is_scored]
-            scored_steps = flat_step_positions[is_scored]
-            scored_cols = choice_cols[is_scored]
-
-            scored_option_idx = option_idx[scored_groups, scored_cols]
-            scored_target_idx = target_idx[scored_groups, scored_cols]
-            if self.validate:
-                self._validate_flat_scored_indices(
-                    scored_groups=scored_groups,
-                    scored_cols=scored_cols,
-                    scored_steps=scored_steps,
-                    scored_option_idx=scored_option_idx,
-                    scored_target_idx=scored_target_idx,
-                    max_steps=option_vectors.shape[0],
-                    max_options=option_vectors.shape[1],
-                    max_targets=target_vectors.shape[2],
-                )
-
-            scored_option_vectors = option_vectors[scored_steps, scored_option_idx]
-            scored_target_vectors = torch.zeros_like(scored_option_vectors)
-            has_target = scored_target_idx >= 0
-            if has_target.any():
-                scored_target_vectors[has_target] = target_vectors[
-                    scored_steps[has_target],
-                    scored_option_idx[has_target],
-                    scored_target_idx[has_target],
-                ]
-
-            decision_vectors = scored_option_vectors + scored_target_vectors
-            flat_logits[is_scored] = (decision_vectors * query[scored_steps]).sum(dim=-1)
-
-        group_count = step_positions.shape[0]
-        group_max = torch.full((group_count,), -torch.inf, dtype=query.dtype, device=device)
-        group_max.scatter_reduce_(0, group_idx, flat_logits, reduce="amax", include_self=True)
-
-        stabilized = flat_logits - group_max[group_idx]
-        exp_logits = stabilized.exp()
-        group_exp_sum = torch.zeros(group_count, dtype=query.dtype, device=device)
-        group_exp_sum.scatter_add_(0, group_idx, exp_logits)
-        flat_log_probs = stabilized - group_exp_sum[group_idx].log()
-
-        probs = flat_log_probs.exp()
-        group_entropies = torch.zeros(group_count, dtype=query.dtype, device=device)
-        group_entropies.scatter_add_(0, group_idx, -(probs * flat_log_probs))
-
-        return group_idx, choice_cols, flat_logits, flat_log_probs, group_entropies
+        self._maybe_init_compiled_functions()
+        fn = self._compiled_flat_decision_distribution_impl or self._flat_decision_distribution_impl
+        return fn(
+            step_positions,
+            option_idx,
+            target_idx,
+            masks,
+            uses_none,
+            option_vectors,
+            target_vectors,
+            query,
+            none_logits,
+        )
 
     @staticmethod
     def _validate_flat_scored_indices(
