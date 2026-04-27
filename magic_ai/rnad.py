@@ -112,6 +112,19 @@ class RNaDConfig:
     Trainers that want this signal should enable it at a low cadence (e.g.
     50) so the cost is amortized."""
 
+    step_minibatch_size: int = 0
+    """Approximate per-chunk replay-step budget for the batched R-NaD
+    update (0 disables mini-batching: all episodes go through one fused
+    forward + one backward). With mini-batching, episodes are packed
+    greedily into chunks until cumulative replay-step count would exceed
+    this budget; each chunk runs its own batched forward and
+    ``.backward()``, gradients accumulate across chunks, and a single
+    ``optimizer.step()`` runs at the end of the update. Mathematically
+    identical to the all-at-once path (per-episode sums are normalized
+    by the *global* cl/pl counts in both cases) but caps peak activation
+    memory at one chunk's worth of episodes. Wired to ``--minibatch-size``
+    on the CLI to share the PPO step budget."""
+
     bptt_chunk_size: int = 200
     """Chunk length for the chunked-BPTT recompute (DeepNash R-NaD paper
     arxiv 2206.15378 §"Full games learning"): trajectories are split along

@@ -864,6 +864,7 @@ def train_native_batched_envs(
                 learning_rate=args.learning_rate,
                 q_corr_rho_bar=args.rnad_q_corr_rho_bar,
                 bptt_chunk_size=args.rnad_bptt_chunk_size,
+                step_minibatch_size=args.minibatch_size,
             ),
             reg_snapshot_dir=args.output.parent / "rnad",
             device=policy.device,
@@ -999,18 +1000,25 @@ def train_native_batched_envs(
     last_step_time = time.monotonic()
     while live_games:
         ready_t, over_t, player_t, winner_t = native_rollout.poll([env.game for env in live_games])
+        # Pull poll results to host once. Each .tolist() is one transfer; the
+        # alternative (int(t[idx]) per env) issues 4*N tiny syncs per poll.
+        ready_l = ready_t.tolist()
+        over_l = over_t.tolist()
+        player_l = player_t.tolist()
+        winner_l = winner_t.tolist()
         ready_envs: list[LiveGame] = []
         ready_players: list[int] = []
         still_live: list[LiveGame] = []
         finished_games: list[tuple[LiveGame, int]] = []
         for idx, env in enumerate(live_games):
-            if int(over_t[idx]) or env.action_count >= args.max_steps_per_game:
-                finished_games.append((env, int(winner_t[idx]) if int(over_t[idx]) else -1))
+            is_over = bool(over_l[idx])
+            if is_over or env.action_count >= args.max_steps_per_game:
+                finished_games.append((env, int(winner_l[idx]) if is_over else -1))
                 continue
             still_live.append(env)
-            if int(ready_t[idx]):
+            if ready_l[idx]:
                 ready_envs.append(env)
-                ready_players.append(int(player_t[idx]))
+                ready_players.append(int(player_l[idx]))
         live_games = still_live
         finish_games(finished_games)
 

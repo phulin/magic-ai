@@ -306,16 +306,35 @@ def run_rnad_update(
     diag_every = state.config.diagnostic_v_target_reg_share_every
     compute_v_target_reg_share = diag_every > 0 and (state.gradient_step % diag_every == 0)
 
-    def _all_pieces() -> list:
+    n_episodes = len(per_episode_replay_rows)
+    step_budget = state.config.step_minibatch_size
+    if step_budget <= 0:
+        chunks = [(0, n_episodes)]
+    else:
+        # Greedy step-budgeted packing: extend the chunk while it fits,
+        # but never split an episode (chunk granularity is whole episodes).
+        chunks = []
+        lo = 0
+        cum = 0
+        for i, ep in enumerate(per_episode_replay_rows):
+            ep_len = len(ep)
+            if cum > 0 and cum + ep_len > step_budget:
+                chunks.append((lo, i))
+                lo = i
+                cum = 0
+            cum += ep_len
+        chunks.append((lo, n_episodes))
+
+    def _chunk_pieces(lo: int, hi: int) -> list:
         return rnad_batched_trajectory_loss(
             online=policy,
             target=state.target,
             reg_cur=state.reg_cur,
             reg_prev=state.reg_prev,
-            episodes_replay_rows=per_episode_replay_rows,
-            episodes_perspective=per_episode_perspective,
-            episodes_winner_idx=per_episode_winner_idx,
-            episodes_logp_mu=episodes_logp_mu,
+            episodes_replay_rows=per_episode_replay_rows[lo:hi],
+            episodes_perspective=per_episode_perspective[lo:hi],
+            episodes_winner_idx=per_episode_winner_idx[lo:hi],
+            episodes_logp_mu=episodes_logp_mu[lo:hi],
             config=state.config,
             alpha=alpha,
             compute_v_target_reg_share=compute_v_target_reg_share,
@@ -327,27 +346,29 @@ def run_rnad_update(
         cl_check = 0
         pl_check = 0
         with torch.no_grad():
-            for pieces in _all_pieces():
-                cl_check += pieces.cl_count
-                pl_check += pieces.pl_count
+            for lo, hi in chunks:
+                for pieces in _chunk_pieces(lo, hi):
+                    cl_check += pieces.cl_count
+                    pl_check += pieces.pl_count
         assert cl_check == cl_count_total, (cl_check, cl_count_total)
         assert pl_check == pl_count_total, (pl_check, pl_count_total)
 
-    # Single batched forward across all episodes, single backward.
+    # Mini-batched forward + backward, with batch-global normalization.
     # ``rnad_batched_trajectory_loss`` runs each policy's LSTM scan and
-    # per-choice forward exactly once over the concatenated batch (4 forward
-    # calls total instead of 4 × N_episodes), then assembles per-episode
-    # loss pieces by slicing the batched outputs. ``_count_active_steps``
-    # supplies the issue-7 1/t normalizer counts from the rollout buffer.
-    # Activations for all episodes are alive simultaneously during backward;
-    # if memory becomes a constraint, mini-batch ``per_episode_replay_rows``.
+    # per-choice forward once per chunk (4 forwards per chunk instead of
+    # 4 × n_episodes_per_chunk). Each chunk's loss is normalized by the
+    # *global* cl/pl counts from ``_count_active_steps`` and backwarded
+    # independently so activations free between chunks; gradients
+    # accumulate across chunks and a single ``optimizer.step()`` runs
+    # at the end. With ``episode_minibatch_size <= 0`` (default) the
+    # whole batch is one chunk -- maximum throughput, peak activation
+    # memory ∝ n_episodes. Lower it to cap activation memory.
     cl_norm = max(cl_count_total, 1)
     pl_norm = max(pl_count_total, 1)
 
     optimizer.zero_grad(set_to_none=True)
-    pieces_list = _all_pieces()
-    cl_sum_total = pieces_list[0].cl_sum.new_zeros(())
-    pl_sum_total = pieces_list[0].pl_sum.new_zeros(())
+    cl_loss_total = 0.0
+    pl_loss_total = 0.0
     n_q_clipped_total = 0
     flat_active_total = 0
     v_hat_mean_acc = 0.0
@@ -362,29 +383,33 @@ def run_rnad_update(
     diag_isdn_count = 0
     diag_vshare_sum = 0.0
     diag_vshare_count = 0
-    for pieces in pieces_list:
-        cl_sum_total = cl_sum_total + pieces.cl_sum
-        pl_sum_total = pl_sum_total + pieces.pl_sum
-        n_q_clipped_total += pieces.n_q_clipped
-        flat_active_total += pieces.pl_count
-        v_hat_mean_acc += pieces.v_hat_mean
-        transformed_mean_acc += pieces.transformed_mean
-        n_pieces += 1
-        diag_lr_sum += pieces.sampled_log_ratio_sum
-        diag_lr_count += pieces.sampled_log_ratio_count
-        if pieces.sampled_log_ratio_absmax > diag_lr_absmax:
-            diag_lr_absmax = pieces.sampled_log_ratio_absmax
-        diag_isup_sum += pieces.is_bias_up_sum
-        diag_isup_count += pieces.is_bias_up_count
-        diag_isdn_sum += pieces.is_bias_down_sum
-        diag_isdn_count += pieces.is_bias_down_count
-        diag_vshare_sum += pieces.v_target_reg_share_sum
-        diag_vshare_count += pieces.v_target_reg_share_count
-    cl_part = cl_sum_total / cl_norm
-    pl_part = pl_sum_total / pl_norm
-    (cl_part + pl_part).backward()
-    cl_loss_total = float(cl_part.detach())
-    pl_loss_total = float(pl_part.detach())
+    for lo, hi in chunks:
+        pieces_list = _chunk_pieces(lo, hi)
+        cl_chunk = pieces_list[0].cl_sum.new_zeros(())
+        pl_chunk = pieces_list[0].pl_sum.new_zeros(())
+        for pieces in pieces_list:
+            cl_chunk = cl_chunk + pieces.cl_sum
+            pl_chunk = pl_chunk + pieces.pl_sum
+            n_q_clipped_total += pieces.n_q_clipped
+            flat_active_total += pieces.pl_count
+            v_hat_mean_acc += pieces.v_hat_mean
+            transformed_mean_acc += pieces.transformed_mean
+            n_pieces += 1
+            diag_lr_sum += pieces.sampled_log_ratio_sum
+            diag_lr_count += pieces.sampled_log_ratio_count
+            if pieces.sampled_log_ratio_absmax > diag_lr_absmax:
+                diag_lr_absmax = pieces.sampled_log_ratio_absmax
+            diag_isup_sum += pieces.is_bias_up_sum
+            diag_isup_count += pieces.is_bias_up_count
+            diag_isdn_sum += pieces.is_bias_down_sum
+            diag_isdn_count += pieces.is_bias_down_count
+            diag_vshare_sum += pieces.v_target_reg_share_sum
+            diag_vshare_count += pieces.v_target_reg_share_count
+        cl_part = cl_chunk / cl_norm
+        pl_part = pl_chunk / pl_norm
+        (cl_part + pl_part).backward()
+        cl_loss_total += float(cl_part.detach())
+        pl_loss_total += float(pl_part.detach())
 
     trainable = [p for p in policy.parameters() if p.requires_grad]
     grad_norm = float(nn.utils.clip_grad_norm_(trainable, max_norm=state.config.grad_clip))
