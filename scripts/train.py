@@ -1182,6 +1182,24 @@ def train_native_batched_envs(
                 flush=True,
             )
             total_rollout_steps += rollout_step_count
+            value_metrics = rollout_value_metrics(pending_steps, rollout_returns)
+            if rnad_state is not None and rnad_state.last_stats:
+                rs = rnad_state.last_stats[0]
+                value_metrics.update(
+                    {
+                        "rnad/sampled_log_ratio_mean": rs.sampled_log_ratio_mean,
+                        "rnad/sampled_log_ratio_absmax": rs.sampled_log_ratio_absmax,
+                        "rnad/is_bias_up_mean": rs.is_bias_up_mean,
+                        "rnad/is_bias_down_mean": rs.is_bias_down_mean,
+                        "rnad/v_target_reg_share": rs.v_target_reg_share,
+                        "rnad/q_clip_fraction": rs.q_clip_fraction,
+                        "rnad/v_hat_mean": rs.v_hat_mean,
+                        "rnad/transformed_reward_mean": rs.transformed_reward_mean,
+                        "rnad/grad_norm": rs.grad_norm,
+                        "rnad/outer_iteration": rnad_state.outer_iteration,
+                        "rnad/gradient_step": rnad_state.gradient_step,
+                    }
+                )
             log_ppo_stats(
                 stats,
                 games=completed_games,
@@ -1189,7 +1207,7 @@ def train_native_batched_envs(
                 total_rollout_steps=total_rollout_steps,
                 total_generated_rollout_steps=total_generated_rollout_steps,
                 win_stats=win_stats,
-                value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
+                value_metrics=value_metrics,
             )
             policy.reset_rollout_buffer()
             pending_steps.clear()
