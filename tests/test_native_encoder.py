@@ -198,6 +198,7 @@ class NativeEncoderTests(unittest.TestCase):
             old_log_probs=torch.stack([policy_step.log_prob for policy_step in policy_steps]),
             values=torch.stack([policy_step.value for policy_step in policy_steps]),
             perspective_player_indices=[0, 0],
+            decision_counts=[len(step.selected_choice_cols) for step in policy_steps],
             lstm_h_in=state_inputs[0],
             lstm_c_in=state_inputs[1],
         )
@@ -270,6 +271,7 @@ class NativeEncoderTests(unittest.TestCase):
                 old_log_probs=torch.stack([step.log_prob for step in policy_steps]),
                 values=torch.stack([step.value for step in policy_steps]),
                 perspective_player_indices=[0],
+                decision_counts=[len(step.selected_choice_cols) for step in policy_steps],
                 lstm_h_in=state_inputs[0],
                 lstm_c_in=state_inputs[1],
             )

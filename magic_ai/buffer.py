@@ -165,6 +165,7 @@ class NativeTrajectoryBuffer(nn.Module):
         old_log_probs: Tensor,
         values: Tensor,
         perspective_player_indices: list[int],
+        decision_counts: list[int],
         lstm_h_in: Tensor | None = None,
         lstm_c_in: Tensor | None = None,
     ) -> None:
@@ -178,33 +179,25 @@ class NativeTrajectoryBuffer(nn.Module):
             raise ValueError("values length must match native batch length")
         if len(env_indices) != len(perspective_player_indices):
             raise ValueError("perspective_player_indices length must match native batch length")
+        if len(decision_counts) != len(env_indices):
+            raise ValueError("decision_counts length must match native batch length")
+
+        # Host-side totals: callers already know counts/selected length, so we
+        # avoid forcing CUDA syncs to read counts_t.sum()/.max()/etc.
+        total_decisions = sum(decision_counts)
+        max_decisions = max(decision_counts) if decision_counts else 0
+        if int(selected_choice_cols_flat.numel()) != total_decisions:
+            raise ValueError("selected_choice_cols_flat length must match total decision_count")
 
         device = self.device
         env_idx_t = torch.tensor(env_indices, dtype=torch.long, device=device)
         step_idx_t = self.step_count[env_idx_t]
-        if bool((step_idx_t >= self.max_steps_per_trajectory).any()):
-            bad_env = env_indices[
-                int((step_idx_t >= self.max_steps_per_trajectory).nonzero()[0].item())
-            ]
-            raise RuntimeError(
-                f"staging step capacity {self.max_steps_per_trajectory} exceeded for env {bad_env}"
-            )
 
         player_idx_t = torch.tensor(perspective_player_indices, dtype=torch.long, device=device)
         may_selected_t = torch.tensor(may_selected, dtype=torch.float32, device=device)
         counts_t = native_batch.decision_count.to(device=device, dtype=torch.long)
         starts_t = self.decision_cursor[env_idx_t]
         selected_choice_cols_flat = selected_choice_cols_flat.to(device=device, dtype=torch.long)
-        if int(selected_choice_cols_flat.numel()) != int(counts_t.sum().item()):
-            raise ValueError("selected_choice_cols_flat length must match total decision_count")
-        if bool(((starts_t + counts_t) > self.decision_capacity_per_env).any()):
-            bad_env = env_indices[
-                int((((starts_t + counts_t) > self.decision_capacity_per_env).nonzero())[0].item())
-            ]
-            raise RuntimeError(
-                "staging decision capacity "
-                f"{self.decision_capacity_per_env} exceeded for env {bad_env}"
-            )
 
         self.slot_card_rows[env_idx_t, step_idx_t] = native_batch.slot_card_rows.to(device)
         self.slot_occupied[env_idx_t, step_idx_t] = native_batch.slot_occupied.to(device)
@@ -257,9 +250,7 @@ class NativeTrajectoryBuffer(nn.Module):
         self.decision_count[env_idx_t, step_idx_t] = counts_t
 
         source_starts_t = native_batch.decision_start.to(device=device, dtype=torch.long)
-        total_decisions = int(counts_t.sum().item())
         if total_decisions:
-            max_decisions = int(counts_t.max().item())
             decision_pos = torch.arange(max_decisions, device=device).expand(
                 len(env_indices), max_decisions
             )

@@ -644,25 +644,36 @@ class PPOPolicy(nn.Module):
             per_step_entropy_sum.scatter_add_(0, pos_t, group_entropies)
             decision_selected_cpu = decision_selected.detach().cpu().tolist()
 
+        # Unbind once into Python lists so the per-env loop below indexes into
+        # plain lists instead of issuing N aten::select calls per tensor field.
+        values_list = list(forward.values.unbind(0))
+        may_log_probs_list = list(may_log_probs.unbind(0)) if may_log_probs is not None else []
+        may_entropies_list = list(may_entropies.unbind(0)) if may_entropies is not None else []
+        per_step_log_prob_sum_list = (
+            list(per_step_log_prob_sum.unbind(0)) if per_step_log_prob_sum is not None else []
+        )
+        per_step_entropy_sum_list = (
+            list(per_step_entropy_sum.unbind(0)) if per_step_entropy_sum is not None else []
+        )
+
         may_lookup = {step_idx: pos for pos, step_idx in enumerate(may_positions)}
         results: list[PolicyStep] = []
         offset = 0
         for step_idx, trace_kind_id in enumerate(trace_kind_ids):
             trace_kind = TRACE_KIND_VALUES[trace_kind_id]
-            value = forward.values[step_idx]
+            value = values_list[step_idx]
             decision_count = decision_counts[step_idx]
 
             if trace_kind == "may":
                 pos = may_lookup[step_idx]
-                assert may_log_probs is not None and may_entropies is not None
                 sel_scalar = may_selected_cpu[pos]
                 results.append(
                     PolicyStep(
                         action=action_from_choice_accepted(bool(sel_scalar >= 0.5)),
                         trace=ActionTrace("may", binary=(float(sel_scalar),)),
-                        log_prob=may_log_probs[pos],
+                        log_prob=may_log_probs_list[pos],
                         value=value,
-                        entropy=may_entropies[pos],
+                        entropy=may_entropies_list[pos],
                         replay_idx=None,
                         may_selected=int(sel_scalar >= 0.5),
                     )
@@ -683,7 +694,6 @@ class PPOPolicy(nn.Module):
                 )
                 continue
 
-            assert per_step_log_prob_sum is not None and per_step_entropy_sum is not None
             step_selected = decision_selected_cpu[offset : offset + decision_count]
             offset += decision_count
             trace, action = self._trace_action_without_pending(trace_kind, step_selected)
@@ -691,9 +701,9 @@ class PPOPolicy(nn.Module):
                 PolicyStep(
                     action=action,
                     trace=trace,
-                    log_prob=per_step_log_prob_sum[step_idx],
+                    log_prob=per_step_log_prob_sum_list[step_idx],
                     value=value,
-                    entropy=per_step_entropy_sum[step_idx],
+                    entropy=per_step_entropy_sum_list[step_idx],
                     replay_idx=None,
                     selected_choice_cols=tuple(step_selected),
                 )
@@ -1073,7 +1083,9 @@ class PPOPolicy(nn.Module):
         if active_mask.any():
             pos_t = active_mask.nonzero(as_tuple=False).squeeze(-1)
             active_counts = decision_counts[pos_t]
-            max_count = int(active_counts.max().item())
+            # Static upper bound (decision-cache width); valid_offsets masks
+            # unused positions. Avoids a per-call sync on active_counts.max().
+            max_count = int(rb.decision_option_idx.shape[1])
             offsets = torch.arange(max_count, dtype=torch.long, device=device).unsqueeze(0)
             expanded_offsets = offsets.expand(pos_t.shape[0], -1)
             valid_offsets = expanded_offsets < active_counts.unsqueeze(1)
@@ -1300,19 +1312,21 @@ class PPOPolicy(nn.Module):
         may_mask = trace_kind_ids == TRACE_KIND_TO_ID["may"]
         may_logits_per_step = forward.values.new_zeros(n)
         may_selected_per_step = forward.values.new_zeros(n)
-        if may_mask.any():
-            may_pos_t = may_mask.nonzero(as_tuple=False).squeeze(-1)
-            may_buf_t = step_indices[may_pos_t]
-            may_logits = forward.may_logits[may_pos_t]
-            may_selected_t = rb.may_selected[may_buf_t].to(dtype=forward.values.dtype)
-            may_dist = Bernoulli(logits=may_logits)
-            log_probs[may_pos_t] = may_dist.log_prob(may_selected_t)
-            entropies[may_pos_t] = may_dist.entropy()
-            # Preserve differentiability on may_logits_per_step so downstream
-            # losses applied to it (e.g. beta-gated NeuRD) receive gradient.
-            may_logits_per_step = may_logits_per_step.clone()
-            may_logits_per_step[may_pos_t] = may_logits
-            may_selected_per_step[may_pos_t] = may_selected_t
+        # Always run the may-head path; downstream uses are gated by may_mask
+        # via scatters, so an empty may_pos_t is a no-op. This avoids a sync
+        # on `may_mask.any()` per call.
+        may_pos_t = may_mask.nonzero(as_tuple=False).squeeze(-1)
+        may_buf_t = step_indices[may_pos_t]
+        may_logits = forward.may_logits[may_pos_t]
+        may_selected_t = rb.may_selected[may_buf_t].to(dtype=forward.values.dtype)
+        may_dist = Bernoulli(logits=may_logits)
+        log_probs[may_pos_t] = may_dist.log_prob(may_selected_t)
+        entropies[may_pos_t] = may_dist.entropy()
+        # Preserve differentiability on may_logits_per_step so downstream
+        # losses applied to it (e.g. beta-gated NeuRD) receive gradient.
+        may_logits_per_step = may_logits_per_step.clone()
+        may_logits_per_step[may_pos_t] = may_logits
+        may_selected_per_step[may_pos_t] = may_selected_t
 
         decision_starts = rb.decision_start[step_indices]
         decision_counts = rb.decision_count[step_indices]
@@ -1329,7 +1343,9 @@ class PPOPolicy(nn.Module):
         if active_mask.any():
             pos_t = active_mask.nonzero(as_tuple=False).squeeze(-1)
             active_counts = decision_counts[pos_t]
-            max_count = int(active_counts.max().item())
+            # Static upper bound (decision-cache width); valid_offsets masks
+            # unused positions. Avoids a per-call sync on active_counts.max().
+            max_count = int(rb.decision_option_idx.shape[1])
             offsets = torch.arange(max_count, dtype=torch.long, device=device).unsqueeze(0)
             expanded_offsets = offsets.expand(pos_t.shape[0], -1)
             valid_offsets = expanded_offsets < active_counts.unsqueeze(1)
@@ -1505,7 +1521,9 @@ class PPOPolicy(nn.Module):
             if active_mask.any():
                 pos_t = active_mask.nonzero(as_tuple=False).squeeze(-1)
                 active_counts = decision_counts_all[pos_t]
-                max_count = int(active_counts.max().item())
+                # Static upper bound (decision-cache width); valid_offsets
+                # masks unused positions. Avoids a per-call sync on max().
+                max_count = int(rb.decision_option_idx.shape[1])
                 offsets = torch.arange(max_count, dtype=torch.long, device=device).unsqueeze(0)
                 expanded_offsets = offsets.expand(pos_t.shape[0], -1)
                 valid_offsets = expanded_offsets < active_counts.unsqueeze(1)

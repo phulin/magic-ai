@@ -1101,6 +1101,7 @@ def train_native_batched_envs(
                 old_log_probs=log_probs,
                 values=values,
                 perspective_player_indices=ready_players,
+                decision_counts=counts,
                 lstm_h_in=lstm_state_inputs[0] if lstm_state_inputs is not None else None,
                 lstm_c_in=lstm_state_inputs[1] if lstm_state_inputs is not None else None,
             )
