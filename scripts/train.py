@@ -310,14 +310,6 @@ def main() -> None:
     validate_args(args)
     if args.learning_rate is None:
         args.learning_rate = 5e-5 if args.trainer == "rnad" else 3e-4
-    if args.trainer == "rnad" and args.draw_penalty != 0.0:
-        print(
-            "[rnad] --draw-penalty forced to 0.0 under R-NaD trainer; the "
-            "reward transform already injects an entropy bonus and any ± "
-            "draw signal is absorbed.",
-            flush=True,
-        )
-        args.draw_penalty = 0.0
     deck_pool = load_deck_pool(args.deck_json, args.deck_dir)
     validate_deck_embeddings(args.embeddings, deck_pool)
     if args.torch_threads is not None:
@@ -643,13 +635,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae-lambda", type=float, default=0.97)
+    # Default treats a draw as equivalent to a loss for both players so that
+    # agents don't learn to drag out games (e.g. mill stalls, infinite loops)
+    # to avoid losing.
     parser.add_argument(
         "--draw-penalty",
         type=float,
-        default=0.1,
+        default=1.0,
         help=(
             "terminal reward magnitude applied to both players on a draw "
-            "(default 0.1 = 1/10 of win/loss)"
+            "(default 1.0 = treat draw as a loss)"
         ),
     )
     parser.add_argument("--ppo-epochs", type=int, default=4)
