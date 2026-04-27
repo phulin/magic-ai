@@ -104,6 +104,14 @@ class RNaDConfig:
     ``|logit + lr · Clip(Q, c)| <= beta`` rather than the looser
     current-logit predicate ``|logit| <= beta``."""
 
+    diagnostic_v_target_reg_share_every: int = 0
+    """Compute the ``v_target_reg_share`` diagnostic every K gradient steps
+    (0 disables it entirely; default off). The diagnostic requires a *second*
+    full ``two_player_vtrace`` pass per perspective per episode (fed only
+    the terminal ±1 reward), which doubles v-trace work in the R-NaD loss.
+    Trainers that want this signal should enable it at a low cadence (e.g.
+    50) so the cost is amortized."""
+
     bptt_chunk_size: int = 200
     """Chunk length for the chunked-BPTT recompute (DeepNash R-NaD paper
     arxiv 2206.15378 §"Full games learning"): trajectories are split along
@@ -906,6 +914,7 @@ def rnad_trajectory_loss(
     target_h_out: Tensor | None = None,
     reg_cur_h_out: Tensor | None = None,
     reg_prev_h_out: Tensor | None = None,
+    compute_v_target_reg_share: bool = False,
 ) -> _TrajLossPieces:
     """Full per-action R-NaD trajectory loss (paper §170-189) with MTG factoring.
 
@@ -1034,6 +1043,7 @@ def rnad_trajectory_loss(
         logp_mu=logp_mu,
         config=config,
         alpha=alpha,
+        compute_v_target_reg_share=compute_v_target_reg_share,
     )
 
 
@@ -1052,6 +1062,7 @@ def _trajectory_loss_from_forwards(
     logp_mu: Tensor,
     config: RNaDConfig,
     alpha: float,
+    compute_v_target_reg_share: bool = False,
 ) -> _TrajLossPieces:
     """Episode-local R-NaD loss from pre-computed per-policy forward outputs.
 
@@ -1152,6 +1163,50 @@ def _trajectory_loss_from_forwards(
     v_target_reg_share_sum_t = 0.0
     v_target_reg_share_count_t = 0
 
+    # ---- Perspective-independent setup (hoisted out of the (0, 1) loop) ----
+    # Everything below is a function only of the per-policy forwards and
+    # rollout-time data — none depends on which player's value we're
+    # estimating. Computing once and reusing across both perspectives
+    # halves the loop's work for these tensors.
+    ratio_own_per_step = (lp_tgt_scalar - logp_mu_dev).exp()
+
+    if has_groups:
+        per_step_log_ratio_sampled = torch.zeros(t_len, dtype=dtype, device=device)
+        per_step_log_ratio_sampled.scatter_add_(
+            0, pc_online.step_for_decision_group, per_group_log_ratio_sampled
+        )
+        step_for_flat = pc_online.group_idx
+        v_per_choice = v_tgt_dt[step_for_flat]
+        base_q_flat = -config.eta * log_ratio_flat
+    else:
+        per_step_log_ratio_sampled = torch.zeros(0, dtype=dtype, device=device)
+        step_for_flat = torch.zeros(0, dtype=torch.long, device=device)
+        v_per_choice = torch.zeros(0, dtype=dtype, device=device)
+        base_q_flat = torch.zeros(0, dtype=dtype, device=device)
+
+    may_active_any = bool(pc_online.may_is_active.any().item())
+    if may_active_any:
+        may_logits_step = pc_online.may_logits_per_step.to(dtype=dtype)
+        log_pi_accept = torch.nn.functional.logsigmoid(may_logits_step)
+        log_pi_decline = torch.nn.functional.logsigmoid(-may_logits_step)
+        with torch.no_grad():
+            may_reg_cur_logits = pc_reg_cur.may_logits_per_step.to(dtype=dtype)
+            may_reg_prev_logits = pc_reg_prev.may_logits_per_step.to(dtype=dtype)
+            may_lp_reg_blend_accept = alpha * torch.nn.functional.logsigmoid(may_reg_cur_logits) + (
+                1.0 - alpha
+            ) * torch.nn.functional.logsigmoid(may_reg_prev_logits)
+            may_lp_reg_blend_decline = alpha * torch.nn.functional.logsigmoid(
+                -may_reg_cur_logits
+            ) + (1.0 - alpha) * torch.nn.functional.logsigmoid(-may_reg_prev_logits)
+        log_ratio_accept = log_pi_accept.detach() - may_lp_reg_blend_accept
+        log_ratio_decline = log_pi_decline.detach() - may_lp_reg_blend_decline
+        sampled_is_accept = pc_online.may_selected_per_step > 0.5
+        with torch.no_grad():
+            tgt_p_accept = torch.sigmoid(pc_tgt.may_logits_per_step.to(dtype=dtype))
+            may_mu_sampled = torch.where(sampled_is_accept, tgt_p_accept, 1.0 - tgt_p_accept)
+            may_inv_mu = (1.0 / may_mu_sampled.clamp_min(1e-30)).clamp(max=config.q_corr_rho_bar)
+        may_sampled_log_ratio = torch.where(sampled_is_accept, log_ratio_accept, log_ratio_decline)
+
     for own_idx in (0, 1):
         is_own = perspective == own_idx
         rewards = torch.zeros(t_len, dtype=dtype, device=device)
@@ -1180,23 +1235,27 @@ def _trajectory_loss_from_forwards(
         # Diagnostic: v-trace fed only the terminal ±1 reward (no per-step
         # regularization injection). Comparing |v_hat_reg - v_hat_terminal|
         # against |v_hat_terminal| tells us how much of the value target is
-        # the regularization landscape vs the win/loss landscape.
-        with torch.no_grad():
-            v_out_term = two_player_vtrace(
-                rewards=rewards.detach(),
-                values=v_tgt_dt,
-                logp_theta=lp_tgt_scalar,
-                logp_mu=logp_mu_dev,
-                perspective_is_player_i=is_own,
-                rho_bar=config.vtrace_rho_bar,
-                c_bar=config.vtrace_c_bar,
-            )
-            if is_own.any():
-                v_reg_part = (v_out.v_hat - v_out_term.v_hat)[is_own].abs()
-                v_term_part = v_out_term.v_hat[is_own].abs()
-                share = v_reg_part / (v_term_part + v_reg_part + 1e-8)
-                v_target_reg_share_sum_t += float(share.sum())
-                v_target_reg_share_count_t += int(is_own.sum().item())
+        # the regularization landscape vs the win/loss landscape. This is a
+        # full extra v-trace pass per perspective per episode -- gated to
+        # opt-in via ``compute_v_target_reg_share``; the trainer typically
+        # enables it once per N gradient steps so the cost is amortized.
+        if compute_v_target_reg_share:
+            with torch.no_grad():
+                v_out_term = two_player_vtrace(
+                    rewards=rewards.detach(),
+                    values=v_tgt_dt,
+                    logp_theta=lp_tgt_scalar,
+                    logp_mu=logp_mu_dev,
+                    perspective_is_player_i=is_own,
+                    rho_bar=config.vtrace_rho_bar,
+                    c_bar=config.vtrace_c_bar,
+                )
+                if is_own.any():
+                    v_reg_part = (v_out.v_hat - v_out_term.v_hat)[is_own].abs()
+                    v_term_part = v_out_term.v_hat[is_own].abs()
+                    share = v_reg_part / (v_term_part + v_reg_part + 1e-8)
+                    v_target_reg_share_sum_t += float(share.sum())
+                    v_target_reg_share_count_t += int(is_own.sum().item())
 
         cl_part_sum, cl_part_count = critic_loss(
             v_theta=v_online,
@@ -1208,16 +1267,10 @@ def _trajectory_loss_from_forwards(
 
         # ---- Per-group sampled inner bracket (paper §177 adapted) ----
         # inner_t = r_t + eta * log_ratio_at_sampled_step + (pi/mu)_t * (r̂+v̂) - v(o_t)
-        # We aggregate the per-group log_ratio sampled at the *step* level:
-        # for the inner bracket the sampled-action log_ratio is the joint
-        # over groups, since the reward is per-step. We sum per-group sampled
-        # log_ratios into per-step.
+        # ``per_step_log_ratio_sampled``, ``ratio_own_per_step``, and
+        # ``v_per_choice`` are perspective-independent and hoisted above; only
+        # ``rewards`` and ``v_out`` change between perspectives.
         if has_groups:
-            ratio_own_per_step = (lp_tgt_scalar - logp_mu_dev).exp()
-            per_step_log_ratio_sampled = torch.zeros(t_len, dtype=dtype, device=device)
-            per_step_log_ratio_sampled.scatter_add_(
-                0, pc_online.step_for_decision_group, per_group_log_ratio_sampled
-            )
             sampled_inner_per_step = (
                 rewards
                 + config.eta * per_step_log_ratio_sampled
@@ -1228,57 +1281,14 @@ def _trajectory_loss_from_forwards(
             sampled_inner_per_step = torch.zeros(t_len, dtype=dtype, device=device)
 
         # ---- May head: true two-action NeuRD (issue 5) ----
-        if pc_online.may_is_active.any():
+        # Reg blends, log-ratios, and 1/mu are perspective-independent and
+        # hoisted above; only rewards / v_out / is_own change here.
+        if may_active_any:
             may_and_own = pc_online.may_is_active & is_own
-            # Per-action Q for accept/decline. Both branches carry the
-            # -eta * log(pi/pi_reg) regularization for *that* branch.
-            may_logits_step = pc_online.may_logits_per_step.to(dtype=dtype)
-            log_pi_accept = torch.nn.functional.logsigmoid(may_logits_step)
-            log_pi_decline = torch.nn.functional.logsigmoid(-may_logits_step)
-            with torch.no_grad():
-                may_lp_reg_cur_accept = torch.nn.functional.logsigmoid(
-                    pc_reg_cur.may_logits_per_step.to(dtype=dtype)
-                )
-                may_lp_reg_cur_decline = torch.nn.functional.logsigmoid(
-                    -pc_reg_cur.may_logits_per_step.to(dtype=dtype)
-                )
-                may_lp_reg_prev_accept = torch.nn.functional.logsigmoid(
-                    pc_reg_prev.may_logits_per_step.to(dtype=dtype)
-                )
-                may_lp_reg_prev_decline = torch.nn.functional.logsigmoid(
-                    -pc_reg_prev.may_logits_per_step.to(dtype=dtype)
-                )
-                may_lp_reg_blend_accept = (
-                    alpha * may_lp_reg_cur_accept + (1.0 - alpha) * may_lp_reg_prev_accept
-                )
-                may_lp_reg_blend_decline = (
-                    alpha * may_lp_reg_cur_decline + (1.0 - alpha) * may_lp_reg_prev_decline
-                )
-            log_ratio_accept = log_pi_accept.detach() - may_lp_reg_blend_accept
-            log_ratio_decline = log_pi_decline.detach() - may_lp_reg_blend_decline
-            # Sampled-correction picks the sampled branch only.
-            may_sel = pc_online.may_selected_per_step.to(dtype=dtype)
-            sampled_is_accept = may_sel > 0.5
-            # 1/mu for the may step under target = 1/sigmoid(target_may_logit)
-            # for the sampled branch (target is the rollouts-follow-target
-            # approximation). We can compute mu directly:
-            with torch.no_grad():
-                tgt_may_logits = pc_tgt.may_logits_per_step.to(dtype=dtype)
-                tgt_p_accept = torch.sigmoid(tgt_may_logits)
-                may_mu_sampled = torch.where(sampled_is_accept, tgt_p_accept, 1.0 - tgt_p_accept)
-                may_inv_mu = (1.0 / may_mu_sampled.clamp_min(1e-30)).clamp(
-                    max=config.q_corr_rho_bar
-                )
-            sampled_log_ratio_step = torch.where(
-                sampled_is_accept, log_ratio_accept, log_ratio_decline
-            )
-            # Per-step sampled inner uses the same r_t + eta*log_ratio[a*]
-            # + (pi/mu)*(r̂+v̂) - v form as decision groups, but at the
-            # may granularity (1 group per may step).
             may_sampled_inner = (
                 rewards
-                + config.eta * sampled_log_ratio_step
-                + (lp_tgt_scalar - logp_mu_dev).exp() * (v_out.r_hat_next + v_out.v_hat_next)
+                + config.eta * may_sampled_log_ratio
+                + ratio_own_per_step * (v_out.r_hat_next + v_out.v_hat_next)
                 - v_tgt_dt
             )
             may_q_sampled_correction = may_inv_mu * may_sampled_inner
@@ -1310,13 +1320,7 @@ def _trajectory_loss_from_forwards(
 
         # ---- Decision-group per-action NeuRD with per-group correction ----
         if has_groups:
-            step_for_flat = pc_online.group_idx
             step_is_own_flat = is_own[step_for_flat]
-            v_per_choice = v_tgt_dt[step_for_flat]
-            base_q_flat = -config.eta * log_ratio_flat
-            # Per-group sampled correction = 1/mu_k * inner_t, where inner_t
-            # is the *step-level* bracket (single reward per step is shared
-            # across groups). Each group still gets its own 1/mu_k weight.
             sampled_correction_per_group = (
                 inv_mu_per_group * sampled_inner_per_step[pc_online.step_for_decision_group]
             )
@@ -1442,6 +1446,7 @@ def rnad_batched_trajectory_loss(
     episodes_logp_mu: Sequence[Tensor],
     config: RNaDConfig,
     alpha: float,
+    compute_v_target_reg_share: bool = False,
 ) -> list[_TrajLossPieces]:
     """Batched per-policy forwards across all episodes; per-episode loss assembly.
 
@@ -1588,6 +1593,7 @@ def rnad_batched_trajectory_loss(
             logp_mu=episodes_logp_mu[ep_idx],
             config=config,
             alpha=alpha,
+            compute_v_target_reg_share=compute_v_target_reg_share,
         )
         pieces_list.append(pieces)
 

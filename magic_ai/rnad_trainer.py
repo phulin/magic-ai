@@ -303,6 +303,9 @@ def run_rnad_update(
 
     episodes_logp_mu = [torch.tensor(lp, dtype=torch.float32) for lp in per_episode_logp_mu]
 
+    diag_every = state.config.diagnostic_v_target_reg_share_every
+    compute_v_target_reg_share = diag_every > 0 and (state.gradient_step % diag_every == 0)
+
     def _all_pieces() -> list:
         return rnad_batched_trajectory_loss(
             online=policy,
@@ -315,6 +318,7 @@ def run_rnad_update(
             episodes_logp_mu=episodes_logp_mu,
             config=state.config,
             alpha=alpha,
+            compute_v_target_reg_share=compute_v_target_reg_share,
         )
 
     if os.environ.get("RNAD_VERIFY_COUNTS"):
