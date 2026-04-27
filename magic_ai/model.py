@@ -6,7 +6,7 @@ import copy
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, NamedTuple, cast
 
 import torch
 from torch import Tensor, nn
@@ -117,8 +117,10 @@ class ParsedBatch:
     decision_counts: list[int]
 
 
-@dataclass(frozen=True)
-class PolicyStep:
+class PolicyStep(NamedTuple):
+    # NamedTuple instead of @dataclass: ~3-5x faster to construct, which
+    # matters because the rollout sampling path builds ~80 of these per
+    # poll (~5k per profiled iter).
     action: ActionRequest
     trace: ActionTrace
     log_prob: Tensor
@@ -572,16 +574,22 @@ class PPOPolicy(nn.Module):
 
         device = self.device
         forward = self._forward_native_batch(native_batch, env_indices=env_indices)
+        # native_batch fields are CPU-side from the encoder; .tolist() is the
+        # single host transfer (detach()/cpu() are no-ops for grad-free CPU
+        # tensors and were costing ~5% of this function in line_profiler).
         may_positions = native_batch.may_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
-        decision_starts = native_batch.decision_start.detach().cpu().tolist()
-        decision_counts = native_batch.decision_count.detach().cpu().tolist()
+        decision_starts = native_batch.decision_start.tolist()
+        decision_counts = native_batch.decision_count.tolist()
         decision_option_idx = native_batch.decision_option_idx.to(device)
         decision_target_idx = native_batch.decision_target_idx.to(device)
-        decision_mask = native_batch.decision_mask.to(device=device, dtype=torch.bool)
-        uses_none_head = native_batch.uses_none_head.to(device=device, dtype=torch.bool)
+        # PyTorch indexing / nonzero / & accept uint8 masks the same way as
+        # bool, so skip the dtype conversion (was 1.8% of sample_native_batch
+        # by itself). Move to device only.
+        decision_mask = native_batch.decision_mask.to(device)
+        uses_none_head = native_batch.uses_none_head.to(device)
         group_step_positions: list[int] = []
         group_decision_indices: list[int] = []
-        trace_kind_ids = native_batch.trace_kind_id.detach().cpu().tolist()
+        trace_kind_ids = native_batch.trace_kind_id.tolist()
         for step_idx, trace_kind_id in enumerate(trace_kind_ids):
             if trace_kind_id == TRACE_KIND_TO_ID["may"]:
                 continue
@@ -2173,16 +2181,17 @@ class PPOPolicy(nn.Module):
 
             scored_option_idx = option_idx[scored_groups, scored_cols]
             scored_target_idx = target_idx[scored_groups, scored_cols]
-            self._validate_flat_scored_indices(
-                scored_groups=scored_groups,
-                scored_cols=scored_cols,
-                scored_steps=scored_steps,
-                scored_option_idx=scored_option_idx,
-                scored_target_idx=scored_target_idx,
-                max_steps=option_vectors.shape[0],
-                max_options=option_vectors.shape[1],
-                max_targets=target_vectors.shape[2],
-            )
+            if self.validate:
+                self._validate_flat_scored_indices(
+                    scored_groups=scored_groups,
+                    scored_cols=scored_cols,
+                    scored_steps=scored_steps,
+                    scored_option_idx=scored_option_idx,
+                    scored_target_idx=scored_target_idx,
+                    max_steps=option_vectors.shape[0],
+                    max_options=option_vectors.shape[1],
+                    max_targets=target_vectors.shape[2],
+                )
 
             scored_option_vectors = option_vectors[scored_steps, scored_option_idx]
             scored_target_vectors = torch.zeros_like(scored_option_vectors)
