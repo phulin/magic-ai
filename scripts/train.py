@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import importlib
+import itertools
 import json
 import random
 import re
@@ -937,20 +938,38 @@ def train_native_batched_envs(
             staging_buffer,
             [env.slot_idx for env in envs],
         )
-        for (env, winner_idx), replay_rows in zip(finished, replay_rows_by_env, strict=True):
+
+        # Batch the per-episode D2H: previously this issued 3 .cpu().tolist()
+        # calls per finished episode (3*N CUDA syncs). Instead, gather the
+        # three fields across every finished env on-device, stack them once,
+        # and do a single host transfer.
+        slot_idxs = [env.slot_idx for env in envs]
+        device = staging_buffer.device
+        slot_t = torch.tensor(slot_idxs, dtype=torch.long, device=device)
+        step_counts = staging_buffer.step_count[slot_t]
+        step_counts_h = step_counts.tolist()
+        max_steps = int(staging_buffer.max_steps_per_trajectory)
+        step_arange = torch.arange(max_steps, device=device).unsqueeze(0)
+        valid_mask = step_arange < step_counts.unsqueeze(1)
+        flat_player = staging_buffer.perspective_player_idx[slot_t][valid_mask]
+        flat_log = staging_buffer.old_log_prob[slot_t][valid_mask]
+        flat_val = staging_buffer.value[slot_t][valid_mask]
+        host = torch.stack([flat_player.to(torch.float32), flat_log, flat_val], dim=0).cpu()
+        host_player = host[0].long().tolist()
+        host_log = host[1].tolist()
+        host_val = host[2].tolist()
+
+        cursor = 0
+        for (env, winner_idx), replay_rows, step_count in zip(
+            finished, replay_rows_by_env, step_counts_h, strict=True
+        ):
             env.game.close()
-            step_count = staging_buffer.active_step_count(env.slot_idx)
             if step_count:
-                player_indices = (
-                    staging_buffer.perspective_player_idx[env.slot_idx, :step_count]
-                    .detach()
-                    .cpu()
-                    .tolist()
-                )
-                old_log_probs = (
-                    staging_buffer.old_log_prob[env.slot_idx, :step_count].detach().cpu().tolist()
-                )
-                values = staging_buffer.value[env.slot_idx, :step_count].detach().cpu().tolist()
+                end = cursor + step_count
+                player_indices = host_player[cursor:end]
+                old_log_probs = host_log[cursor:end]
+                values = host_val[cursor:end]
+                cursor = end
                 env.episode_steps = [
                     RolloutStep(
                         perspective_player_idx=int(player_idx),
@@ -1043,55 +1062,45 @@ def train_native_batched_envs(
             log_probs = torch.stack([policy_step.log_prob for policy_step in policy_steps])
             values = torch.stack([policy_step.value for policy_step in policy_steps])
 
-            starts: list[int] = []
-            counts: list[int] = []
-            selected_cols: list[int] = []
-            may_selected: list[int] = []
-            cursor = 0
-            for env, player_idx, policy_step in zip(
-                ready_envs,
-                ready_players,
-                policy_steps,
-                strict=True,
-            ):
-                cols = list(policy_step.selected_choice_cols)
-                if env.transcript_enabled:
-                    try:
-                        transcript_state, transcript_pending = _current_transcript_snapshot(
-                            env.game
-                        )
-                        transcript_action = copy.deepcopy(policy_step.action)
-                        if policy_step.trace.kind != "may":
-                            _trace, decoded_action = policy._decode_action(
-                                policy_step.trace.kind,
-                                transcript_pending,
-                                cols,
-                            )
-                            transcript_action = copy.deepcopy(decoded_action)
-                        env.transcript.append(
-                            TranscriptAction(
-                                state=transcript_state,
-                                pending=transcript_pending,
-                                action=transcript_action,
-                            )
-                        )
-                    except Exception as exc:
-                        disable_transcript(
-                            env,
-                            f"{exc} while snapshotting live game for action {policy_step.action!r}",
-                        )
-                starts.append(cursor)
-                counts.append(len(cols))
-                selected_cols.extend(cols)
-                may_selected.append(policy_step.may_selected)
-                cursor += len(cols)
-                env.action_count += 1
-
-            selected_choice_cols_flat = torch.tensor(
-                selected_cols,
-                dtype=torch.long,
-                device=policy.device,
+            # Batch the per-env bookkeeping with comprehensions, then walk
+            # the envs once for the rare per-env work (transcripts and the
+            # action_count bump). The hot path is now a few torch ops on
+            # CPU + one async H2D copy, instead of N Python list-extends and
+            # a synchronous torch.tensor(..., device=cuda) build.
+            counts = [len(s.selected_choice_cols) for s in policy_steps]
+            may_selected = [s.may_selected for s in policy_steps]
+            starts: list[int] = list(itertools.accumulate(counts, initial=0))[:-1]
+            selected_cols: list[int] = [c for s in policy_steps for c in s.selected_choice_cols]
+            selected_choice_cols_flat = torch.tensor(selected_cols, dtype=torch.long).to(
+                policy.device, non_blocking=True
             )
+
+            for env, policy_step in zip(ready_envs, policy_steps, strict=True):
+                env.action_count += 1
+                if not env.transcript_enabled:
+                    continue
+                try:
+                    transcript_state, transcript_pending = _current_transcript_snapshot(env.game)
+                    transcript_action = copy.deepcopy(policy_step.action)
+                    if policy_step.trace.kind != "may":
+                        _trace, decoded_action = policy._decode_action(
+                            policy_step.trace.kind,
+                            transcript_pending,
+                            list(policy_step.selected_choice_cols),
+                        )
+                        transcript_action = copy.deepcopy(decoded_action)
+                    env.transcript.append(
+                        TranscriptAction(
+                            state=transcript_state,
+                            pending=transcript_pending,
+                            action=transcript_action,
+                        )
+                    )
+                except Exception as exc:
+                    disable_transcript(
+                        env,
+                        f"{exc} while snapshotting live game for action {policy_step.action!r}",
+                    )
 
             staging_buffer.stage_batch(
                 ready_env_indices,

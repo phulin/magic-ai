@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import importlib
 import json
+import threading
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -14,6 +15,40 @@ from magic_ai.game_state import PendingState
 
 class NativeEncodingError(RuntimeError):
     pass
+
+
+# Parallel ctypes handle for MageEncodeBatch. The mage package's cffi (ABI
+# mode) loader holds the GIL across foreign calls; ctypes releases it. We
+# open the same shared library a second time via ctypes so encoder shards
+# launched on a thread pool can actually run in parallel.
+_encode_lib_lock = threading.Lock()
+_encode_lib: ctypes.CDLL | None = None
+
+
+def _load_encode_ctypes_lib() -> ctypes.CDLL | None:
+    global _encode_lib
+    with _encode_lib_lock:
+        if _encode_lib is not None:
+            return _encode_lib
+        try:
+            mage = importlib.import_module("mage")
+        except ImportError:
+            return None
+        path = getattr(mage, "_lib_path_used", None)
+        if not path:
+            try:
+                cast(Any, mage).load()
+            except Exception:
+                return None
+            path = getattr(mage, "_lib_path_used", None)
+        if not path:
+            return None
+        try:
+            lib = ctypes.CDLL(path)
+        except OSError:
+            return None
+        _encode_lib = lib
+        return lib
 
 
 @dataclass(frozen=True)
@@ -234,6 +269,26 @@ class NativeBatchEncoder:
             return
         if self.ffi is None:
             self._configure_ctypes()
+        self._ctypes_lib: ctypes.CDLL | None = None
+        if self.ffi is not None:
+            # cffi is the primary path, but cffi (ABI mode) holds the GIL
+            # across the C call. Load the same .so via ctypes so the hot
+            # MageEncodeBatch invocation can release the GIL and let
+            # encoder shards in ShardedNativeBatchEncoder run in parallel.
+            ctypes_lib = _load_encode_ctypes_lib()
+            if ctypes_lib is not None:
+                try:
+                    ctypes_lib.MageEncodeBatch.argtypes = [
+                        ctypes.POINTER(_MageBatchRequest),
+                        ctypes.POINTER(_MageEncodeConfig),
+                        ctypes.POINTER(_MageEncodeOutputs),
+                    ]
+                    ctypes_lib.MageEncodeBatch.restype = _MageEncodeResult
+                    ctypes_lib.MageFreeString.argtypes = [ctypes.c_void_p]
+                    ctypes_lib.MageFreeString.restype = None
+                    self._ctypes_lib = ctypes_lib
+                except AttributeError:
+                    self._ctypes_lib = None
         self.is_available = True
         self._scratch = _EncoderScratch()
         if card_name_to_row is not None:
@@ -688,16 +743,78 @@ class NativeBatchEncoder:
                 "uses_none_head": ffi.cast("uint8_t *", buffers.uses_none_head_u8.data_ptr()),
             },
         )
-        result = lib.MageEncodeBatch(req, cfg, out)
-        if result.error_code != 0:
-            message = "native encoder failed"
-            if result.error_message != ffi.NULL:
-                try:
-                    message = ffi.string(result.error_message).decode("utf-8")
-                finally:
-                    lib.MageFreeString(result.error_message)
-            raise NativeEncodingError(message)
-        decision_rows_written = int(result.decision_rows_written)
+        ctypes_lib = self._ctypes_lib
+        if ctypes_lib is not None:
+            # Build ctypes mirrors of the same buffers and call via the
+            # GIL-releasing ctypes binding.
+            req_c = _MageBatchRequest(
+                n=len(games),
+                handles=_ptr(handles_t, ctypes.c_int64),
+                perspective_player_idx=_ptr(perspectives_t, ctypes.c_int64),
+            )
+            cfg_c = _MageEncodeConfig(
+                max_options=self.max_options,
+                max_targets_per_option=self.max_targets_per_option,
+                max_cached_choices=self.max_cached_choices,
+                zone_slot_count=cast(int, self.zone_slot_count),
+                game_info_dim=cast(int, self.game_info_dim),
+                option_scalar_dim=cast(int, self.option_scalar_dim),
+                target_scalar_dim=cast(int, self.target_scalar_dim),
+                decision_capacity=decision_capacity,
+            )
+            out_c = _MageEncodeOutputs(
+                trace_kind_id=_ptr(buffers.trace_kind_id, ctypes.c_int64),
+                slot_card_rows=_ptr(buffers.slot_card_rows, ctypes.c_int64),
+                slot_occupied=_ptr(buffers.slot_occupied, ctypes.c_float),
+                slot_tapped=_ptr(buffers.slot_tapped, ctypes.c_float),
+                game_info=_ptr(buffers.game_info, ctypes.c_float),
+                pending_kind_id=_ptr(buffers.pending_kind_id, ctypes.c_int64),
+                num_present_options=_ptr(buffers.num_present_options, ctypes.c_int64),
+                option_kind_ids=_ptr(buffers.option_kind_ids, ctypes.c_int64),
+                option_scalars=_ptr(buffers.option_scalars, ctypes.c_float),
+                option_mask=_ptr(buffers.option_mask, ctypes.c_float),
+                option_ref_slot_idx=_ptr(buffers.option_ref_slot_idx, ctypes.c_int64),
+                option_ref_card_row=_ptr(buffers.option_ref_card_row, ctypes.c_int64),
+                target_mask=_ptr(buffers.target_mask, ctypes.c_float),
+                target_type_ids=_ptr(buffers.target_type_ids, ctypes.c_int64),
+                target_scalars=_ptr(buffers.target_scalars, ctypes.c_float),
+                target_overflow=_ptr(buffers.target_overflow, ctypes.c_float),
+                target_ref_slot_idx=_ptr(buffers.target_ref_slot_idx, ctypes.c_int64),
+                target_ref_is_player=_ptr(buffers.target_ref_is_player_u8, ctypes.c_uint8),
+                target_ref_is_self=_ptr(buffers.target_ref_is_self_u8, ctypes.c_uint8),
+                may_mask=_ptr(buffers.may_mask_u8, ctypes.c_uint8),
+                decision_start=_ptr(buffers.decision_start, ctypes.c_int64),
+                decision_count=_ptr(buffers.decision_count, ctypes.c_int64),
+                decision_option_idx=_ptr(buffers.decision_option_idx, ctypes.c_int64),
+                decision_target_idx=_ptr(buffers.decision_target_idx, ctypes.c_int64),
+                decision_mask=_ptr(buffers.decision_mask_u8, ctypes.c_uint8),
+                uses_none_head=_ptr(buffers.uses_none_head_u8, ctypes.c_uint8),
+            )
+            result_c = ctypes_lib.MageEncodeBatch(
+                ctypes.byref(req_c), ctypes.byref(cfg_c), ctypes.byref(out_c)
+            )
+            if result_c.error_code != 0:
+                message = "native encoder failed"
+                if result_c.error_message:
+                    try:
+                        raw = ctypes.cast(result_c.error_message, ctypes.c_char_p).value
+                        if raw is not None:
+                            message = raw.decode("utf-8")
+                    finally:
+                        ctypes_lib.MageFreeString(result_c.error_message)
+                raise NativeEncodingError(message)
+            decision_rows_written = int(result_c.decision_rows_written)
+        else:
+            result = lib.MageEncodeBatch(req, cfg, out)
+            if result.error_code != 0:
+                message = "native encoder failed"
+                if result.error_message != ffi.NULL:
+                    try:
+                        message = ffi.string(result.error_message).decode("utf-8")
+                    finally:
+                        lib.MageFreeString(result.error_message)
+                raise NativeEncodingError(message)
+            decision_rows_written = int(result.decision_rows_written)
         batch = self._slice_batch_buffers(buffers, batch_size)
         trace_kind_id = batch["trace_kind_id"]
         trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
