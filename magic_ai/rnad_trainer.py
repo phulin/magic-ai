@@ -43,10 +43,9 @@ from magic_ai.ppo import PPOStats, RolloutStep
 from magic_ai.rnad import (
     RNaDConfig,
     RNaDStats,
-    _TrajLossPieces,
     load_reg_snapshot_into,
     polyak_update_,
-    rnad_trajectory_loss,
+    rnad_batched_trajectory_loss,
     save_reg_snapshot,
 )
 
@@ -302,68 +301,86 @@ def run_rnad_update(
         per_episode_replay_rows,
     )
 
-    def _episode_loss(ep_idx: int) -> _TrajLossPieces:
-        return rnad_trajectory_loss(
+    episodes_logp_mu = [torch.tensor(lp, dtype=torch.float32) for lp in per_episode_logp_mu]
+
+    def _all_pieces() -> list:
+        return rnad_batched_trajectory_loss(
             online=policy,
             target=state.target,
             reg_cur=state.reg_cur,
             reg_prev=state.reg_prev,
-            replay_rows=per_episode_replay_rows[ep_idx],
-            perspective_player_idx=per_episode_perspective[ep_idx],
-            winner_idx=per_episode_winner_idx[ep_idx],
-            logp_mu=torch.tensor(per_episode_logp_mu[ep_idx], dtype=torch.float32),
+            episodes_replay_rows=per_episode_replay_rows,
+            episodes_perspective=per_episode_perspective,
+            episodes_winner_idx=per_episode_winner_idx,
+            episodes_logp_mu=episodes_logp_mu,
             config=state.config,
             alpha=alpha,
         )
 
     if os.environ.get("RNAD_VERIFY_COUNTS"):
-        # Cross-check: run a no_grad trajectory_loss pass per episode and
-        # confirm the buffer-derived counts match its accumulated cl_count
-        # / pl_count totals exactly.
+        # Cross-check: rerun under no_grad and confirm the buffer-derived
+        # counts match the per-policy forward's accumulated cl/pl totals.
         cl_check = 0
         pl_check = 0
         with torch.no_grad():
-            for ep_idx in range(len(per_episode_replay_rows)):
-                pieces = _episode_loss(ep_idx)
+            for pieces in _all_pieces():
                 cl_check += pieces.cl_count
                 pl_check += pieces.pl_count
         assert cl_check == cl_count_total, (cl_check, cl_count_total)
         assert pl_check == pl_count_total, (pl_check, pl_count_total)
 
-    # Per-episode forward + backward with batch-global normalization.
-    # ``_count_active_steps`` derives the issue-7 1/t normalizer counts
-    # directly from rollout-buffer fields -- no policy forward needed --
-    # so we can scale per-episode losses by the global counts while only
-    # ever running each episode through the policy once. After each
-    # episode's loss is computed, we call .backward(retain_graph=False)
-    # so its activations are freed before the next episode starts.
-    # Gradients accumulate across episodes; one optimizer.step() at the
-    # end. Mathematically identical to a single backward over the
-    # summed loss, but peak activations track ONE episode at a time.
+    # Single batched forward across all episodes, single backward.
+    # ``rnad_batched_trajectory_loss`` runs each policy's LSTM scan and
+    # per-choice forward exactly once over the concatenated batch (4 forward
+    # calls total instead of 4 × N_episodes), then assembles per-episode
+    # loss pieces by slicing the batched outputs. ``_count_active_steps``
+    # supplies the issue-7 1/t normalizer counts from the rollout buffer.
+    # Activations for all episodes are alive simultaneously during backward;
+    # if memory becomes a constraint, mini-batch ``per_episode_replay_rows``.
     cl_norm = max(cl_count_total, 1)
     pl_norm = max(pl_count_total, 1)
 
     optimizer.zero_grad(set_to_none=True)
-    cl_loss_total = 0.0
-    pl_loss_total = 0.0
+    pieces_list = _all_pieces()
+    cl_sum_total = pieces_list[0].cl_sum.new_zeros(())
+    pl_sum_total = pieces_list[0].pl_sum.new_zeros(())
     n_q_clipped_total = 0
     flat_active_total = 0
     v_hat_mean_acc = 0.0
     transformed_mean_acc = 0.0
     n_pieces = 0
-    for ep_idx in range(len(per_episode_replay_rows)):
-        pieces = _episode_loss(ep_idx)
-        cl_part = pieces.cl_sum / cl_norm
-        pl_part = pieces.pl_sum / pl_norm
-        ep_loss = cl_part + pl_part
-        ep_loss.backward()
-        cl_loss_total += float(cl_part.detach())
-        pl_loss_total += float(pl_part.detach())
+    diag_lr_sum = 0.0
+    diag_lr_count = 0
+    diag_lr_absmax = 0.0
+    diag_isup_sum = 0.0
+    diag_isup_count = 0
+    diag_isdn_sum = 0.0
+    diag_isdn_count = 0
+    diag_vshare_sum = 0.0
+    diag_vshare_count = 0
+    for pieces in pieces_list:
+        cl_sum_total = cl_sum_total + pieces.cl_sum
+        pl_sum_total = pl_sum_total + pieces.pl_sum
         n_q_clipped_total += pieces.n_q_clipped
         flat_active_total += pieces.pl_count
         v_hat_mean_acc += pieces.v_hat_mean
         transformed_mean_acc += pieces.transformed_mean
         n_pieces += 1
+        diag_lr_sum += pieces.sampled_log_ratio_sum
+        diag_lr_count += pieces.sampled_log_ratio_count
+        if pieces.sampled_log_ratio_absmax > diag_lr_absmax:
+            diag_lr_absmax = pieces.sampled_log_ratio_absmax
+        diag_isup_sum += pieces.is_bias_up_sum
+        diag_isup_count += pieces.is_bias_up_count
+        diag_isdn_sum += pieces.is_bias_down_sum
+        diag_isdn_count += pieces.is_bias_down_count
+        diag_vshare_sum += pieces.v_target_reg_share_sum
+        diag_vshare_count += pieces.v_target_reg_share_count
+    cl_part = cl_sum_total / cl_norm
+    pl_part = pl_sum_total / pl_norm
+    (cl_part + pl_part).backward()
+    cl_loss_total = float(cl_part.detach())
+    pl_loss_total = float(pl_part.detach())
 
     trainable = [p for p in policy.parameters() if p.requires_grad]
     grad_norm = float(nn.utils.clip_grad_norm_(trainable, max_norm=state.config.grad_clip))
@@ -385,6 +402,13 @@ def run_rnad_update(
         grad_norm=grad_norm,
         transformed_reward_mean=transformed_mean_acc / n_pieces,
         q_clip_fraction=q_clip_fraction,
+        sampled_log_ratio_mean=(diag_lr_sum / diag_lr_count) if diag_lr_count > 0 else 0.0,
+        sampled_log_ratio_absmax=diag_lr_absmax,
+        is_bias_up_mean=(diag_isup_sum / diag_isup_count) if diag_isup_count > 0 else 0.0,
+        is_bias_down_mean=(diag_isdn_sum / diag_isdn_count) if diag_isdn_count > 0 else 0.0,
+        v_target_reg_share=(
+            (diag_vshare_sum / diag_vshare_count) if diag_vshare_count > 0 else 0.0
+        ),
     )
     state.last_stats = [aggregate]
 

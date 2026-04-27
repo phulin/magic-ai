@@ -22,6 +22,7 @@ top of these primitives in the trainer module. See ``docs/rnad_design.md`` and
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -741,6 +742,36 @@ class RNaDStats:
     grow naturally, and a high clip fraction is the signal that the estimator
     has drifted."""
 
+    sampled_log_ratio_mean: float = 0.0
+    """Mean over own-turn sampled actions of ``log(π_θ(a*|o) / π_reg_blend(a*|o))``.
+    This is the per-step regularization signal magnitude. If it grows over an
+    inner loop, the online policy is drifting from the (frozen) reg snapshots
+    faster than NeuRD's gradient is pulling it back — the regularization term
+    is dominating the value target."""
+
+    sampled_log_ratio_absmax: float = 0.0
+    """Max over own-turn sampled actions of ``|log(π_θ(a*) / π_reg_blend(a*))|``.
+    Outliers here directly produce huge transformed-reward injections per step."""
+
+    is_bias_up_mean: float = 0.0
+    """Mean of ``lp_target − logp_mu`` on steps where the online log-prob
+    increased relative to the rollout-time log-prob (``lp_online > logp_mu``).
+    A consistently *negative* value here means the target lags online's recent
+    learning, so v-trace's IS ratio under-weights newly-discovered good actions
+    in the value target — newly-learned wins get systematically discounted."""
+
+    is_bias_down_mean: float = 0.0
+    """Mean of ``lp_target − logp_mu`` on steps where ``lp_online < logp_mu``.
+    Symmetric to :attr:`is_bias_up_mean`."""
+
+    v_target_reg_share: float = 0.0
+    """Mean over own-turn steps of ``|v_hat_reg − v_hat_terminal| /
+    (|v_hat_terminal| + |v_hat_reg − v_hat_terminal| + 1e-8)``, where
+    ``v_hat_terminal`` is v-trace fed only the terminal ±1 reward and
+    ``v_hat_reg`` (= ``v_hat`` in the actual loss) is v-trace fed the full
+    transformed reward. >> 0.5 means the value head is fitting the
+    regularization landscape rather than the win/loss landscape."""
+
 
 class _ReplayEvaluator(Protocol):
     """Structural type for the policy callable into :func:`rnad_update_trajectory`.
@@ -773,6 +804,18 @@ class _TrajLossPieces:
     n_q_clipped: int
     v_hat_mean: float
     transformed_mean: float
+    # Diagnostics (issue: within-inner-loop policy degradation). All are sums
+    # / maxes paired with their counts so the trainer can aggregate across
+    # episodes without weighting bias.
+    sampled_log_ratio_sum: float = 0.0
+    sampled_log_ratio_absmax: float = 0.0
+    sampled_log_ratio_count: int = 0
+    is_bias_up_sum: float = 0.0
+    is_bias_up_count: int = 0
+    is_bias_down_sum: float = 0.0
+    is_bias_down_count: int = 0
+    v_target_reg_share_sum: float = 0.0
+    v_target_reg_share_count: int = 0
 
 
 def _maybe_recompute_lstm(policy: Any, replay_rows: list[int]) -> tuple[Tensor, Tensor] | None:
@@ -977,10 +1020,54 @@ def rnad_trajectory_loss(
                 list(replay_rows), lstm_state_override=reg_prev_lstm
             )
 
+    return _trajectory_loss_from_forwards(
+        lp_online=lp_online,
+        v_online=v_online,
+        pc_online=pc_online,
+        lp_tgt_scalar=_lp_tgt_scalar,
+        v_tgt=v_tgt,
+        pc_tgt=pc_tgt,
+        pc_reg_cur=pc_reg_cur,
+        pc_reg_prev=pc_reg_prev,
+        perspective=perspective,
+        winner_idx=winner_idx,
+        logp_mu=logp_mu,
+        config=config,
+        alpha=alpha,
+    )
+
+
+def _trajectory_loss_from_forwards(
+    *,
+    lp_online: Tensor,
+    v_online: Tensor,
+    pc_online: Any,
+    lp_tgt_scalar: Tensor,
+    v_tgt: Tensor,
+    pc_tgt: Any,
+    pc_reg_cur: Any,
+    pc_reg_prev: Any,
+    perspective: Tensor,
+    winner_idx: int,
+    logp_mu: Tensor,
+    config: RNaDConfig,
+    alpha: float,
+) -> _TrajLossPieces:
+    """Episode-local R-NaD loss from pre-computed per-policy forward outputs.
+
+    Split out of :func:`rnad_trajectory_loss` so that
+    :func:`rnad_batched_trajectory_loss` can run the four per-policy forwards
+    once across an entire rollout batch and then assemble per-episode losses
+    by slicing the batched outputs (issue: per-episode forwards dominated R-NaD
+    update wall time).
+    """
+
+    t_len = int(lp_online.shape[0])
+    device = v_online.device
     dtype = v_online.dtype
     logp_mu_dev = logp_mu.to(device=device, dtype=dtype)
     lp_online_dt = lp_online.detach().to(dtype=dtype)
-    lp_tgt_scalar = _lp_tgt_scalar.detach().to(dtype=dtype)
+    lp_tgt_scalar = lp_tgt_scalar.detach().to(dtype=dtype)
     lp_reg_cur_scalar_flat = pc_reg_cur.flat_log_probs.to(dtype=dtype)
     lp_reg_prev_scalar_flat = pc_reg_prev.flat_log_probs.to(dtype=dtype)
     v_tgt_dt = v_tgt.detach().to(dtype=dtype)
@@ -1040,6 +1127,31 @@ def rnad_trajectory_loss(
     v_hat_means: list[float] = []
     transformed_means: list[float] = []
 
+    # ---- Diagnostics: per-step sampled log-ratio + IS bias ----
+    # Both are per-step (one row per step), perspective-independent.
+    with torch.no_grad():
+        blended_reg_scalar = alpha * lp_reg_cur_scalar + (1.0 - alpha) * lp_reg_prev_scalar
+        sampled_log_ratio_step = lp_online_dt - blended_reg_scalar
+        sampled_log_ratio_sum_t = float(sampled_log_ratio_step.sum())
+        sampled_log_ratio_absmax_t = float(sampled_log_ratio_step.abs().max()) if t_len > 0 else 0.0
+        sampled_log_ratio_count_t = int(t_len)
+
+        is_bias_step = lp_tgt_scalar - logp_mu_dev
+        online_moved_up = lp_online_dt > logp_mu_dev
+        up_count = int(online_moved_up.sum().item())
+        down_count = t_len - up_count
+        if up_count > 0:
+            is_bias_up_sum_t = float(is_bias_step[online_moved_up].sum())
+        else:
+            is_bias_up_sum_t = 0.0
+        if down_count > 0:
+            is_bias_down_sum_t = float(is_bias_step[~online_moved_up].sum())
+        else:
+            is_bias_down_sum_t = 0.0
+
+    v_target_reg_share_sum_t = 0.0
+    v_target_reg_share_count_t = 0
+
     for own_idx in (0, 1):
         is_own = perspective == own_idx
         rewards = torch.zeros(t_len, dtype=dtype, device=device)
@@ -1064,6 +1176,27 @@ def rnad_trajectory_loss(
             rho_bar=config.vtrace_rho_bar,
             c_bar=config.vtrace_c_bar,
         )
+
+        # Diagnostic: v-trace fed only the terminal ±1 reward (no per-step
+        # regularization injection). Comparing |v_hat_reg - v_hat_terminal|
+        # against |v_hat_terminal| tells us how much of the value target is
+        # the regularization landscape vs the win/loss landscape.
+        with torch.no_grad():
+            v_out_term = two_player_vtrace(
+                rewards=rewards.detach(),
+                values=v_tgt_dt,
+                logp_theta=lp_tgt_scalar,
+                logp_mu=logp_mu_dev,
+                perspective_is_player_i=is_own,
+                rho_bar=config.vtrace_rho_bar,
+                c_bar=config.vtrace_c_bar,
+            )
+            if is_own.any():
+                v_reg_part = (v_out.v_hat - v_out_term.v_hat)[is_own].abs()
+                v_term_part = v_out_term.v_hat[is_own].abs()
+                share = v_reg_part / (v_term_part + v_reg_part + 1e-8)
+                v_target_reg_share_sum_t += float(share.sum())
+                v_target_reg_share_count_t += int(is_own.sum().item())
 
         cl_part_sum, cl_part_count = critic_loss(
             v_theta=v_online,
@@ -1221,7 +1354,244 @@ def rnad_trajectory_loss(
         n_q_clipped=n_q_clipped_total,
         v_hat_mean=sum(v_hat_means) / len(v_hat_means),
         transformed_mean=sum(transformed_means) / len(transformed_means),
+        sampled_log_ratio_sum=sampled_log_ratio_sum_t,
+        sampled_log_ratio_absmax=sampled_log_ratio_absmax_t,
+        sampled_log_ratio_count=sampled_log_ratio_count_t,
+        is_bias_up_sum=is_bias_up_sum_t,
+        is_bias_up_count=up_count,
+        is_bias_down_sum=is_bias_down_sum_t,
+        is_bias_down_count=down_count,
+        v_target_reg_share_sum=v_target_reg_share_sum_t,
+        v_target_reg_share_count=v_target_reg_share_count_t,
     )
+
+
+def _slice_per_choice(
+    pc: Any,
+    *,
+    step_lo: int,
+    step_hi: int,
+    flat_lo: int,
+    flat_hi: int,
+    dg_lo: int,
+    dg_hi: int,
+) -> Any:
+    """Slice a batched ``ReplayPerChoice`` to a single episode.
+
+    Re-bases ``group_idx`` (per-flat-entry → step), ``decision_group_id_flat``
+    (per-flat-entry → unique decision-group id), and ``step_for_decision_group``
+    (per-decision-group → step) into the episode-local index space [0, T_ep)
+    and [0, n_dg_ep). Caller is responsible for supplying the correct
+    boundary indices (``rnad_batched_trajectory_loss`` derives them via
+    one ``torch.searchsorted`` per pc).
+    """
+
+    flat_logits = pc.flat_logits[flat_lo:flat_hi]
+    flat_log_probs = pc.flat_log_probs[flat_lo:flat_hi]
+    group_idx = pc.group_idx[flat_lo:flat_hi]
+    if group_idx.numel() > 0:
+        group_idx = group_idx - step_lo
+    decision_group_id_flat = pc.decision_group_id_flat[flat_lo:flat_hi]
+    if decision_group_id_flat.numel() > 0:
+        decision_group_id_flat = decision_group_id_flat - dg_lo
+    step_for_decision_group = pc.step_for_decision_group[dg_lo:dg_hi]
+    if step_for_decision_group.numel() > 0:
+        step_for_decision_group = step_for_decision_group - step_lo
+
+    return dataclasses.replace(
+        pc,
+        flat_logits=flat_logits,
+        flat_log_probs=flat_log_probs,
+        group_idx=group_idx,
+        choice_cols=pc.choice_cols[flat_lo:flat_hi],
+        is_sampled_flat=pc.is_sampled_flat[flat_lo:flat_hi],
+        decision_group_id_flat=decision_group_id_flat,
+        step_for_decision_group=step_for_decision_group,
+        may_is_active=pc.may_is_active[step_lo:step_hi],
+        may_logits_per_step=pc.may_logits_per_step[step_lo:step_hi],
+        may_selected_per_step=pc.may_selected_per_step[step_lo:step_hi],
+    )
+
+
+def _maybe_recompute_lstm_h_out_episodes(
+    policy: Any, episodes: Sequence[Sequence[int]]
+) -> list[Tensor] | None:
+    """Batched LSTM-output recompute over a list of episodes.
+
+    Calls :meth:`PPOPolicy.recompute_lstm_outputs_for_episodes` once with the
+    full episode list -- the model-side helper performs a single fused
+    ``nn.LSTM`` call for the whole batch. Returns ``None`` for non-recurrent
+    policies or stubs lacking the helper.
+    """
+
+    fn = getattr(policy, "recompute_lstm_outputs_for_episodes", None)
+    if fn is None:
+        return None
+    return fn([list(ep) for ep in episodes])
+
+
+def rnad_batched_trajectory_loss(
+    *,
+    online: _ReplayEvaluator,
+    target: _ReplayEvaluator,
+    reg_cur: _ReplayEvaluator,
+    reg_prev: _ReplayEvaluator,
+    episodes_replay_rows: Sequence[Sequence[int]],
+    episodes_perspective: Sequence[Sequence[int]],
+    episodes_winner_idx: Sequence[int],
+    episodes_logp_mu: Sequence[Tensor],
+    config: RNaDConfig,
+    alpha: float,
+) -> list[_TrajLossPieces]:
+    """Batched per-policy forwards across all episodes; per-episode loss assembly.
+
+    Replaces the per-episode forward pattern of :func:`rnad_trajectory_loss`
+    when called once per episode (4 small per-choice forwards × N episodes ×
+    4 LSTM scans). This function:
+
+    1. Concatenates all episode replay rows into one flat batch.
+    2. Runs one fused LSTM scan per policy (online with grad, target/reg
+       no-grad) over the concatenated batch.
+    3. Runs one ``evaluate_replay_batch_per_choice`` per policy on the
+       full flat batch.
+    4. Slices the batched outputs per episode and reuses the existing
+       :func:`_trajectory_loss_from_forwards` to assemble per-episode
+       loss pieces.
+
+    Memory: holds activations for *all* episodes simultaneously. The caller
+    is expected to size the rollout batch accordingly; if memory becomes a
+    constraint, mini-batch the episode list and call this function multiple
+    times per optimizer step.
+    """
+
+    if not episodes_replay_rows:
+        raise ValueError("episodes_replay_rows must be non-empty")
+    n_eps = len(episodes_replay_rows)
+    if len(episodes_perspective) != n_eps:
+        raise ValueError("episodes_perspective length mismatch")
+    if len(episodes_winner_idx) != n_eps:
+        raise ValueError("episodes_winner_idx length mismatch")
+    if len(episodes_logp_mu) != n_eps:
+        raise ValueError("episodes_logp_mu length mismatch")
+
+    flat_rows: list[int] = []
+    ep_offsets: list[int] = [0]
+    for ep in episodes_replay_rows:
+        if not ep:
+            raise ValueError("each episode must contain at least one row")
+        flat_rows.extend(int(r) for r in ep)
+        ep_offsets.append(ep_offsets[-1] + len(ep))
+
+    device = next(iter(online.parameters())).device
+
+    # 1) Single fused LSTM recompute per policy.
+    online_h_list = _maybe_recompute_lstm_h_out_episodes(online, episodes_replay_rows)
+    with torch.no_grad():
+        target_h_list = _maybe_recompute_lstm_h_out_episodes(target, episodes_replay_rows)
+        reg_cur_h_list = _maybe_recompute_lstm_h_out_episodes(reg_cur, episodes_replay_rows)
+        reg_prev_h_list = _maybe_recompute_lstm_h_out_episodes(reg_prev, episodes_replay_rows)
+
+    online_h_concat = torch.cat(online_h_list, dim=0) if online_h_list is not None else None
+    target_h_concat = torch.cat(target_h_list, dim=0) if target_h_list is not None else None
+    reg_cur_h_concat = torch.cat(reg_cur_h_list, dim=0) if reg_cur_h_list is not None else None
+    reg_prev_h_concat = torch.cat(reg_prev_h_list, dim=0) if reg_prev_h_list is not None else None
+
+    online_per_choice = getattr(online, "evaluate_replay_batch_per_choice")  # noqa: B009
+    target_per_choice = getattr(target, "evaluate_replay_batch_per_choice")  # noqa: B009
+    reg_cur_per_choice = getattr(reg_cur, "evaluate_replay_batch_per_choice")  # noqa: B009
+    reg_prev_per_choice = getattr(reg_prev, "evaluate_replay_batch_per_choice")  # noqa: B009
+
+    def _forward(per_choice: Any, h_concat: Tensor | None) -> Any:
+        if h_concat is not None:
+            return per_choice(list(flat_rows), hidden_override=h_concat)
+        return per_choice(list(flat_rows))
+
+    # 2) Single per-choice forward per policy across the full batch.
+    lp_online_b, _, v_online_b, pc_online_b = _forward(online_per_choice, online_h_concat)
+    with torch.no_grad():
+        lp_tgt_b, _, v_tgt_b, pc_tgt_b = _forward(target_per_choice, target_h_concat)
+        _, _, _, pc_reg_cur_b = _forward(reg_cur_per_choice, reg_cur_h_concat)
+        _, _, _, pc_reg_prev_b = _forward(reg_prev_per_choice, reg_prev_h_concat)
+
+    # 3) Episode-boundary slice indices (one searchsorted + one .tolist()
+    # sync per policy, instead of 4 .item() syncs per episode per policy).
+    boundaries_t = torch.tensor(ep_offsets, dtype=torch.long, device=device)
+
+    def _slice_bounds(pc: Any) -> tuple[list[int], list[int]]:
+        if pc.flat_logits.numel() == 0:
+            zeros = [0] * (n_eps + 1)
+            return zeros, zeros
+        flat_bounds = torch.searchsorted(pc.group_idx, boundaries_t).tolist()
+        dg_bounds = torch.searchsorted(pc.step_for_decision_group, boundaries_t).tolist()
+        return flat_bounds, dg_bounds
+
+    fb_on, dg_on = _slice_bounds(pc_online_b)
+    fb_tg, dg_tg = _slice_bounds(pc_tgt_b)
+    fb_rc, dg_rc = _slice_bounds(pc_reg_cur_b)
+    fb_rp, dg_rp = _slice_bounds(pc_reg_prev_b)
+
+    # 4) Per-episode loss assembly via slicing.
+    pieces_list: list[_TrajLossPieces] = []
+    for ep_idx in range(n_eps):
+        step_lo = ep_offsets[ep_idx]
+        step_hi = ep_offsets[ep_idx + 1]
+        ep_perspective = torch.tensor(
+            list(episodes_perspective[ep_idx]), dtype=torch.long, device=device
+        )
+        pc_online_ep = _slice_per_choice(
+            pc_online_b,
+            step_lo=step_lo,
+            step_hi=step_hi,
+            flat_lo=fb_on[ep_idx],
+            flat_hi=fb_on[ep_idx + 1],
+            dg_lo=dg_on[ep_idx],
+            dg_hi=dg_on[ep_idx + 1],
+        )
+        pc_tgt_ep = _slice_per_choice(
+            pc_tgt_b,
+            step_lo=step_lo,
+            step_hi=step_hi,
+            flat_lo=fb_tg[ep_idx],
+            flat_hi=fb_tg[ep_idx + 1],
+            dg_lo=dg_tg[ep_idx],
+            dg_hi=dg_tg[ep_idx + 1],
+        )
+        pc_reg_cur_ep = _slice_per_choice(
+            pc_reg_cur_b,
+            step_lo=step_lo,
+            step_hi=step_hi,
+            flat_lo=fb_rc[ep_idx],
+            flat_hi=fb_rc[ep_idx + 1],
+            dg_lo=dg_rc[ep_idx],
+            dg_hi=dg_rc[ep_idx + 1],
+        )
+        pc_reg_prev_ep = _slice_per_choice(
+            pc_reg_prev_b,
+            step_lo=step_lo,
+            step_hi=step_hi,
+            flat_lo=fb_rp[ep_idx],
+            flat_hi=fb_rp[ep_idx + 1],
+            dg_lo=dg_rp[ep_idx],
+            dg_hi=dg_rp[ep_idx + 1],
+        )
+        pieces = _trajectory_loss_from_forwards(
+            lp_online=lp_online_b[step_lo:step_hi],
+            v_online=v_online_b[step_lo:step_hi],
+            pc_online=pc_online_ep,
+            lp_tgt_scalar=lp_tgt_b[step_lo:step_hi],
+            v_tgt=v_tgt_b[step_lo:step_hi],
+            pc_tgt=pc_tgt_ep,
+            pc_reg_cur=pc_reg_cur_ep,
+            pc_reg_prev=pc_reg_prev_ep,
+            perspective=ep_perspective,
+            winner_idx=int(episodes_winner_idx[ep_idx]),
+            logp_mu=episodes_logp_mu[ep_idx],
+            config=config,
+            alpha=alpha,
+        )
+        pieces_list.append(pieces)
+
+    return pieces_list
 
 
 def rnad_update_trajectory(
