@@ -10,6 +10,8 @@ tables and exits.
 
 from __future__ import annotations
 
+import cProfile
+import pstats
 import sys
 import time
 from dataclasses import dataclass, field
@@ -96,7 +98,6 @@ def _wrap_phase(obj: Any, attr: str, name: str) -> None:
 _wrap_phase(ShardedNativeRolloutDriver, "poll", "poll")
 _wrap_phase(ShardedNativeRolloutDriver, "step_by_choice", "step")
 _wrap_phase(ShardedNativeBatchEncoder, "encode_handles", "encode")
-_wrap_phase(PPOPolicy, "sample_native_batch", "sample")
 
 # Sub-phases of "other": these are the heaviest things called between
 # the four wrapped phases on the rollout hot path.
@@ -121,6 +122,12 @@ def _gae_wrapper(*args: Any, **kwargs: Any) -> Any:
 setattr(_ppo_mod, "gae_returns", _gae_wrapper)
 # --------------------------------------------------------------------------
 
+N_PROFILE = 2
+WARMUP = 1
+WITH_STACK = False
+CPROFILE_ITER = 0  # cProfile only this iteration index (0 = disabled)
+LINE_PROFILE = False  # use line_profiler for per-line wall in train_native_batched_envs
+
 _train_spec = importlib.util.spec_from_file_location("train_mod", _ROOT / "scripts" / "train.py")
 assert _train_spec is not None and _train_spec.loader is not None
 train_mod = importlib.util.module_from_spec(_train_spec)
@@ -133,9 +140,28 @@ setattr(train_mod, "gae_returns", _gae_wrapper)
 # Bind the inline subphase recorder on train.py.
 setattr(train_mod, "_subphase_record", _add_phase)
 
-N_PROFILE = 4
-WARMUP = 1
-WITH_STACK = False
+_line_profiler: Any = None
+if LINE_PROFILE:
+    import line_profiler  # noqa: E402
+
+    _line_profiler = line_profiler.LineProfiler()
+    # Register sample_native_batch and a few of its inner methods so the
+    # whole sampling path shows up in the line profile.
+    for _attr in (
+        "sample_native_batch",
+        "_forward_native_batch",
+        "_flat_decision_distribution",
+        "_sample_flat_decisions",
+        "_trace_action_without_pending",
+    ):
+        if hasattr(PPOPolicy, _attr):
+            _orig = getattr(PPOPolicy, _attr)
+            _line_profiler.add_function(_orig)
+            setattr(PPOPolicy, _attr, _line_profiler(_orig))
+
+    _train_fn = cast(Any, train_mod).train_native_batched_envs
+    _line_profiler.add_function(_train_fn)
+    setattr(train_mod, "train_native_batched_envs", _line_profiler(_train_fn))
 
 
 @dataclass
@@ -146,6 +172,7 @@ class ProfileState:
     iter_start: float | None = None
     prof: Any | None = None
     captures: list[Any] = field(default_factory=list)
+    cprofile: cProfile.Profile | None = None
 
 
 def main() -> None:
@@ -190,6 +217,14 @@ def main() -> None:
             torch.cuda.synchronize()
             update_wall = time.perf_counter() - t_u0
         prof.__exit__(None, None, None)
+        if state.cprofile is not None:
+            state.cprofile.disable()
+            print("\n[profile] === cProfile (rollout iter, by tottime) ===", flush=True)
+            ps = pstats.Stats(state.cprofile).sort_stats("tottime")
+            ps.print_stats(40)
+            print("\n[profile] === cProfile (by cumulative) ===", flush=True)
+            ps.sort_stats("cumulative").print_stats(40)
+            state.cprofile = None
 
         iter_wall = time.perf_counter() - iter_start
         state.wall_iter += iter_wall
@@ -219,6 +254,11 @@ def main() -> None:
                 print(ka.table(sort_by="cuda_time_total", row_limit=25), flush=True)
                 print("\n--- by CPU time ---", flush=True)
                 print(ka.table(sort_by="cpu_time_total", row_limit=25), flush=True)
+                if _line_profiler is not None:
+                    print(
+                        "\n[profile] === line_profiler (train_native_batched_envs) ===", flush=True
+                    )
+                    _line_profiler.print_stats(stripzeros=True)
                 if WITH_STACK:
                     print(
                         "\n--- by CPU time, grouped by source stack (top-3 frames) ---", flush=True
@@ -233,6 +273,10 @@ def main() -> None:
         # Open a fresh profiler for the next iteration boundary.
         state.iter_start = time.perf_counter()
         state.prof = start_prof()
+        if n + 1 == CPROFILE_ITER:
+            cp = cProfile.Profile()
+            cp.enable()
+            state.cprofile = cp
         return out
 
     rt.run_rnad_update = cast(Any, wrapped)
