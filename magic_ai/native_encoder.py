@@ -192,6 +192,14 @@ class _EncoderScratch:
     buffers: _BufferSet | None = None
     handles_t: Tensor | None = None
     perspectives_t: Tensor | None = None
+    handles_np: Any = None
+    perspectives_np: Any = None
+    # Cached request/config/output structs for the ctypes path; rebuilt
+    # only when buffers are reallocated. Per-call work is just updating
+    # `n` and `decision_capacity`.
+    req_c: _MageBatchRequest | None = None
+    cfg_c: _MageEncodeConfig | None = None
+    out_c: _MageEncodeOutputs | None = None
 
 
 def _ptr(tensor: Tensor, ctype: Any) -> Any:
@@ -446,13 +454,67 @@ class NativeBatchEncoder:
             or batch_size > scratch.batch_size
             or decision_capacity > scratch.decision_capacity
         ):
-            scratch.batch_size = batch_size
-            scratch.decision_capacity = decision_capacity
-            scratch.buffers = self._alloc(batch_size, decision_capacity)
-            scratch.handles_t = torch.empty((batch_size,), dtype=torch.int64)
-            scratch.perspectives_t = torch.empty((batch_size,), dtype=torch.int64)
+            scratch.batch_size = max(batch_size, scratch.batch_size * 2 or 64)
+            scratch.decision_capacity = max(decision_capacity, scratch.decision_capacity * 2 or 64)
+            scratch.buffers = self._alloc(scratch.batch_size, scratch.decision_capacity)
+            scratch.handles_t = torch.empty((scratch.batch_size,), dtype=torch.int64)
+            scratch.perspectives_t = torch.empty((scratch.batch_size,), dtype=torch.int64)
+            scratch.handles_np = scratch.handles_t.numpy()
+            scratch.perspectives_np = scratch.perspectives_t.numpy()
+            if self._ctypes_lib is not None:
+                self._rebuild_encode_structs()
         assert scratch.buffers is not None
         return scratch.buffers
+
+    def _rebuild_encode_structs(self) -> None:
+        scratch = self._scratch
+        buffers = scratch.buffers
+        handles_t = scratch.handles_t
+        perspectives_t = scratch.perspectives_t
+        assert buffers is not None and handles_t is not None and perspectives_t is not None
+        scratch.req_c = _MageBatchRequest(
+            n=0,
+            handles=_ptr(handles_t, ctypes.c_int64),
+            perspective_player_idx=_ptr(perspectives_t, ctypes.c_int64),
+        )
+        scratch.cfg_c = _MageEncodeConfig(
+            max_options=self.max_options,
+            max_targets_per_option=self.max_targets_per_option,
+            max_cached_choices=self.max_cached_choices,
+            zone_slot_count=cast(int, self.zone_slot_count),
+            game_info_dim=cast(int, self.game_info_dim),
+            option_scalar_dim=cast(int, self.option_scalar_dim),
+            target_scalar_dim=cast(int, self.target_scalar_dim),
+            decision_capacity=0,
+        )
+        scratch.out_c = _MageEncodeOutputs(
+            trace_kind_id=_ptr(buffers.trace_kind_id, ctypes.c_int64),
+            slot_card_rows=_ptr(buffers.slot_card_rows, ctypes.c_int64),
+            slot_occupied=_ptr(buffers.slot_occupied, ctypes.c_float),
+            slot_tapped=_ptr(buffers.slot_tapped, ctypes.c_float),
+            game_info=_ptr(buffers.game_info, ctypes.c_float),
+            pending_kind_id=_ptr(buffers.pending_kind_id, ctypes.c_int64),
+            num_present_options=_ptr(buffers.num_present_options, ctypes.c_int64),
+            option_kind_ids=_ptr(buffers.option_kind_ids, ctypes.c_int64),
+            option_scalars=_ptr(buffers.option_scalars, ctypes.c_float),
+            option_mask=_ptr(buffers.option_mask, ctypes.c_float),
+            option_ref_slot_idx=_ptr(buffers.option_ref_slot_idx, ctypes.c_int64),
+            option_ref_card_row=_ptr(buffers.option_ref_card_row, ctypes.c_int64),
+            target_mask=_ptr(buffers.target_mask, ctypes.c_float),
+            target_type_ids=_ptr(buffers.target_type_ids, ctypes.c_int64),
+            target_scalars=_ptr(buffers.target_scalars, ctypes.c_float),
+            target_overflow=_ptr(buffers.target_overflow, ctypes.c_float),
+            target_ref_slot_idx=_ptr(buffers.target_ref_slot_idx, ctypes.c_int64),
+            target_ref_is_player=_ptr(buffers.target_ref_is_player_u8, ctypes.c_uint8),
+            target_ref_is_self=_ptr(buffers.target_ref_is_self_u8, ctypes.c_uint8),
+            may_mask=_ptr(buffers.may_mask_u8, ctypes.c_uint8),
+            decision_start=_ptr(buffers.decision_start, ctypes.c_int64),
+            decision_count=_ptr(buffers.decision_count, ctypes.c_int64),
+            decision_option_idx=_ptr(buffers.decision_option_idx, ctypes.c_int64),
+            decision_target_idx=_ptr(buffers.decision_target_idx, ctypes.c_int64),
+            decision_mask=_ptr(buffers.decision_mask_u8, ctypes.c_uint8),
+            uses_none_head=_ptr(buffers.uses_none_head_u8, ctypes.c_uint8),
+        )
 
     @staticmethod
     def _slice_batch_buffers(buffers: _BufferSet, batch_size: int) -> dict[str, Tensor]:
@@ -666,15 +728,14 @@ class NativeBatchEncoder:
         batch_size = len(games)
         scratch = self._scratch
         assert scratch.handles_t is not None and scratch.perspectives_t is not None
+        # Fill scratch via numpy view rather than torch.tensor(list, ...) +
+        # .copy_(); the latter is the dominant python self-time on this path.
+        handles_np = scratch.handles_np
+        for i, g in enumerate(games):
+            handles_np[i] = getattr(g, "_id", None) or g.handle
+        scratch.perspectives_np[:batch_size] = perspective_player_indices
         handles_t = scratch.handles_t[:batch_size]
         perspectives_t = scratch.perspectives_t[:batch_size]
-        handles_t.copy_(
-            torch.tensor(
-                [int(getattr(game, "handle", getattr(game, "_id"))) for game in games],
-                dtype=torch.int64,
-            )
-        )
-        perspectives_t.copy_(torch.tensor(perspective_player_indices, dtype=torch.int64))
         req = ffi.new(
             "MageBatchRequest *",
             {
@@ -745,51 +806,15 @@ class NativeBatchEncoder:
         )
         ctypes_lib = self._ctypes_lib
         if ctypes_lib is not None:
-            # Build ctypes mirrors of the same buffers and call via the
-            # GIL-releasing ctypes binding.
-            req_c = _MageBatchRequest(
-                n=len(games),
-                handles=_ptr(handles_t, ctypes.c_int64),
-                perspective_player_idx=_ptr(perspectives_t, ctypes.c_int64),
-            )
-            cfg_c = _MageEncodeConfig(
-                max_options=self.max_options,
-                max_targets_per_option=self.max_targets_per_option,
-                max_cached_choices=self.max_cached_choices,
-                zone_slot_count=cast(int, self.zone_slot_count),
-                game_info_dim=cast(int, self.game_info_dim),
-                option_scalar_dim=cast(int, self.option_scalar_dim),
-                target_scalar_dim=cast(int, self.target_scalar_dim),
-                decision_capacity=decision_capacity,
-            )
-            out_c = _MageEncodeOutputs(
-                trace_kind_id=_ptr(buffers.trace_kind_id, ctypes.c_int64),
-                slot_card_rows=_ptr(buffers.slot_card_rows, ctypes.c_int64),
-                slot_occupied=_ptr(buffers.slot_occupied, ctypes.c_float),
-                slot_tapped=_ptr(buffers.slot_tapped, ctypes.c_float),
-                game_info=_ptr(buffers.game_info, ctypes.c_float),
-                pending_kind_id=_ptr(buffers.pending_kind_id, ctypes.c_int64),
-                num_present_options=_ptr(buffers.num_present_options, ctypes.c_int64),
-                option_kind_ids=_ptr(buffers.option_kind_ids, ctypes.c_int64),
-                option_scalars=_ptr(buffers.option_scalars, ctypes.c_float),
-                option_mask=_ptr(buffers.option_mask, ctypes.c_float),
-                option_ref_slot_idx=_ptr(buffers.option_ref_slot_idx, ctypes.c_int64),
-                option_ref_card_row=_ptr(buffers.option_ref_card_row, ctypes.c_int64),
-                target_mask=_ptr(buffers.target_mask, ctypes.c_float),
-                target_type_ids=_ptr(buffers.target_type_ids, ctypes.c_int64),
-                target_scalars=_ptr(buffers.target_scalars, ctypes.c_float),
-                target_overflow=_ptr(buffers.target_overflow, ctypes.c_float),
-                target_ref_slot_idx=_ptr(buffers.target_ref_slot_idx, ctypes.c_int64),
-                target_ref_is_player=_ptr(buffers.target_ref_is_player_u8, ctypes.c_uint8),
-                target_ref_is_self=_ptr(buffers.target_ref_is_self_u8, ctypes.c_uint8),
-                may_mask=_ptr(buffers.may_mask_u8, ctypes.c_uint8),
-                decision_start=_ptr(buffers.decision_start, ctypes.c_int64),
-                decision_count=_ptr(buffers.decision_count, ctypes.c_int64),
-                decision_option_idx=_ptr(buffers.decision_option_idx, ctypes.c_int64),
-                decision_target_idx=_ptr(buffers.decision_target_idx, ctypes.c_int64),
-                decision_mask=_ptr(buffers.decision_mask_u8, ctypes.c_uint8),
-                uses_none_head=_ptr(buffers.uses_none_head_u8, ctypes.c_uint8),
-            )
+            # Reuse the cached ctypes structs (pointers into scratch are
+            # stable across calls until scratch is reallocated). Per-call
+            # work is just updating n / decision_capacity.
+            req_c = scratch.req_c
+            cfg_c = scratch.cfg_c
+            out_c = scratch.out_c
+            assert req_c is not None and cfg_c is not None and out_c is not None
+            req_c.n = batch_size
+            cfg_c.decision_capacity = decision_capacity
             result_c = ctypes_lib.MageEncodeBatch(
                 ctypes.byref(req_c), ctypes.byref(cfg_c), ctypes.byref(out_c)
             )

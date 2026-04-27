@@ -142,6 +142,12 @@ class NativeRolloutDriver:
     # dataclass is not actually frozen but the assignment-by-init pattern is
     # only used for `lib` and `ffi`.
     _step_ctypes_lib: ctypes.CDLL | None = None
+    _step_handles_np: Any = None
+    _step_starts_np: Any = None
+    _step_counts_np: Any = None
+    _step_may_np: Any = None
+    _step_selected_np: Any = None
+    _step_request_c: Any = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "_poll_capacity", 0)
@@ -158,6 +164,12 @@ class NativeRolloutDriver:
         object.__setattr__(self, "_step_selected", torch.empty((0,), dtype=torch.int64))
         object.__setattr__(self, "_step_may", torch.empty((0,), dtype=torch.int64))
         object.__setattr__(self, "_step_ctypes_lib", None)
+        object.__setattr__(self, "_step_handles_np", self._step_handles.numpy())
+        object.__setattr__(self, "_step_starts_np", self._step_starts.numpy())
+        object.__setattr__(self, "_step_counts_np", self._step_counts.numpy())
+        object.__setattr__(self, "_step_may_np", self._step_may.numpy())
+        object.__setattr__(self, "_step_selected_np", self._step_selected.numpy())
+        object.__setattr__(self, "_step_request_c", None)
 
     @classmethod
     def for_mage(cls, mage: Any) -> NativeRolloutDriver:
@@ -221,6 +233,46 @@ class NativeRolloutDriver:
         self._raise_for_result(result, "MageBatchPoll")
         return ready, game_over, pending_player_idx, winner_player_idx
 
+    def _ensure_step_capacity(self, n: int, selected_n: int) -> None:
+        # Allocate scratch + rebuild cached ctypes/cffi request structs only
+        # when capacity grows. Pointers into scratch are stable while the
+        # underlying tensors don't get reallocated, so subsequent calls can
+        # reuse the cached request objects and just bump the scalar fields.
+        grew = False
+        if n > self._step_capacity:
+            self._step_capacity = max(n, self._step_capacity * 2 or 64)
+            self._step_handles = torch.empty((self._step_capacity,), dtype=torch.int64)
+            self._step_starts = torch.empty((self._step_capacity,), dtype=torch.int64)
+            self._step_counts = torch.empty((self._step_capacity,), dtype=torch.int64)
+            self._step_may = torch.empty((self._step_capacity,), dtype=torch.int64)
+            object.__setattr__(self, "_step_handles_np", self._step_handles.numpy())
+            object.__setattr__(self, "_step_starts_np", self._step_starts.numpy())
+            object.__setattr__(self, "_step_counts_np", self._step_counts.numpy())
+            object.__setattr__(self, "_step_may_np", self._step_may.numpy())
+            grew = True
+        if selected_n > self._step_selected_capacity:
+            self._step_selected_capacity = max(selected_n, self._step_selected_capacity * 2 or 256)
+            self._step_selected = torch.empty((self._step_selected_capacity,), dtype=torch.int64)
+            object.__setattr__(self, "_step_selected_np", self._step_selected.numpy())
+            grew = True
+        if grew and self._step_ctypes_lib is not None:
+            object.__setattr__(
+                self,
+                "_step_request_c",
+                _MageStepChoiceRequestC(
+                    n=0,
+                    max_options=0,
+                    max_targets_per_option=0,
+                    handles=ctypes.cast(self._step_handles.data_ptr(), POINTER(c_int64)),
+                    decision_start=ctypes.cast(self._step_starts.data_ptr(), POINTER(c_int64)),
+                    decision_count=ctypes.cast(self._step_counts.data_ptr(), POINTER(c_int64)),
+                    selected_choice_cols=ctypes.cast(
+                        self._step_selected.data_ptr(), POINTER(c_int64)
+                    ),
+                    may_selected=ctypes.cast(self._step_may.data_ptr(), POINTER(c_int64)),
+                ),
+            )
+
     def step_by_choice(
         self,
         games: list[Any],
@@ -234,43 +286,30 @@ class NativeRolloutDriver:
     ) -> None:
         n = len(games)
         selected_n = len(selected_choice_cols)
-        if n > self._step_capacity:
-            self._step_capacity = n
-            self._step_handles = torch.empty((n,), dtype=torch.int64)
-            self._step_starts = torch.empty((n,), dtype=torch.int64)
-            self._step_counts = torch.empty((n,), dtype=torch.int64)
-            self._step_may = torch.empty((n,), dtype=torch.int64)
-        if selected_n > self._step_selected_capacity:
-            self._step_selected_capacity = selected_n
-            self._step_selected = torch.empty((selected_n,), dtype=torch.int64)
-        handles = self._step_handles[:n]
-        starts = self._step_starts[:n]
-        counts = self._step_counts[:n]
-        may = self._step_may[:n]
-        selected = self._step_selected[:selected_n]
-        handles.copy_(torch.tensor([int(game.handle) for game in games], dtype=torch.int64))
-        starts.copy_(torch.tensor(decision_starts, dtype=torch.int64))
-        counts.copy_(torch.tensor(decision_counts, dtype=torch.int64))
-        may.copy_(torch.tensor(may_selected, dtype=torch.int64))
+        self._ensure_step_capacity(n, selected_n)
+
+        # Fill scratch in place via numpy views — avoids 5x torch.tensor(...)
+        # allocations and the extra .copy_ per call. handles uses Game._id
+        # directly to skip the property lookup overhead.
+        handles_np = self._step_handles_np
+        for i, g in enumerate(games):
+            handles_np[i] = g._id
+        self._step_starts_np[:n] = decision_starts
+        self._step_counts_np[:n] = decision_counts
+        self._step_may_np[:n] = may_selected
         if selected_n:
-            selected.copy_(torch.tensor(selected_choice_cols, dtype=torch.int64))
+            self._step_selected_np[:selected_n] = selected_choice_cols
 
         ctypes_lib = self._step_ctypes_lib
         if ctypes_lib is not None:
             # ctypes path: releases the GIL across the C call so that worker
             # threads in ShardedNativeRolloutDriver can run the engine in
             # parallel. cffi (ABI mode) holds the GIL, which serialises them.
-            req_c = _MageStepChoiceRequestC(
-                n=n,
-                max_options=max_options,
-                max_targets_per_option=max_targets_per_option,
-                handles=ctypes.cast(handles.data_ptr(), POINTER(c_int64)),
-                decision_start=ctypes.cast(starts.data_ptr(), POINTER(c_int64)),
-                decision_count=ctypes.cast(counts.data_ptr(), POINTER(c_int64)),
-                selected_choice_cols=ctypes.cast(selected.data_ptr(), POINTER(c_int64)),
-                may_selected=ctypes.cast(may.data_ptr(), POINTER(c_int64)),
-            )
-            result_c = ctypes_lib.MageBatchStepByChoice(byref(req_c))
+            req = self._step_request_c
+            req.n = n
+            req.max_options = max_options
+            req.max_targets_per_option = max_targets_per_option
+            result_c = ctypes_lib.MageBatchStepByChoice(byref(req))
             if result_c.error_code != 0:
                 msg = "MageBatchStepByChoice failed"
                 if result_c.error_message:
@@ -280,6 +319,12 @@ class NativeRolloutDriver:
                         ctypes_lib.MageFreeString(result_c.error_message)
                 raise NativeRolloutUnavailable(msg)
             return
+
+        handles = self._step_handles[:n]
+        starts = self._step_starts[:n]
+        counts = self._step_counts[:n]
+        may = self._step_may[:n]
+        selected = self._step_selected[:selected_n]
 
         req = self.ffi.new(
             "MageStepChoiceRequest *",
