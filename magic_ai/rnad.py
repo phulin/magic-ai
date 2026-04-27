@@ -358,13 +358,22 @@ def two_player_vtrace(
 
     # Own-turn linear recurrence:
     #   v_hat_own[k] = A[k] + B[k] * v_hat_own[k+1],  v_hat_own[K] = 0
+    #
+    # Run the K-step recurrence on host (K is small, ~50 typical) to avoid
+    # K GPU kernel launches per call. v-trace inputs are detached at every
+    # call site (values come from the frozen target net, logp from behavior
+    # / target policies after .detach()) so the output is a pure target with
+    # no gradient flowing through this branch.
     A = pre_c - c * v_next_own_vec
     B = c
-    v_hat_own = torch.zeros(K, dtype=dtype, device=device)
-    next_val = values_own.new_zeros(())
+    A_h = A.detach().cpu().tolist()
+    B_h = B.detach().cpu().tolist()
+    v_h = [0.0] * K
+    next_val = 0.0
     for k in range(K - 1, -1, -1):
-        next_val = A[k] + B[k] * next_val
-        v_hat_own[k] = next_val
+        next_val = A_h[k] + B_h[k] * next_val
+        v_h[k] = next_val
+    v_hat_own = torch.tensor(v_h, dtype=dtype, device=device)
 
     # Scatter own-turn results back; opp-turn steps inherit v_hat from the
     # next own-turn (or zero if none follows).
