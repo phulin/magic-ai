@@ -22,7 +22,23 @@ from torch import Tensor
 
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
-from magic_ai.text_encoder.policy import TextPolicy
+from magic_ai.text_encoder.policy import EncodedSnapshots, TextPolicy
+
+
+def _cast_encoded(encoded: EncodedSnapshots, dtype: torch.dtype) -> EncodedSnapshots:
+    """Cast the float vectors of ``encoded`` to ``dtype`` (boolean masks
+    are left untouched). Used to bring autocast'd encoder outputs back to
+    the LSTM/head parameter dtype."""
+
+    return EncodedSnapshots(
+        card_vectors=encoded.card_vectors.to(dtype),
+        card_mask=encoded.card_mask,
+        option_vectors=encoded.option_vectors.to(dtype),
+        option_mask=encoded.option_mask,
+        target_vectors=encoded.target_vectors.to(dtype),
+        target_mask=encoded.target_mask,
+        state_vector=encoded.state_vector.to(dtype),
+    )
 
 
 @dataclass
@@ -91,7 +107,23 @@ class RecurrentTextPolicy(nn.Module):
         *,
         state_hidden_override: Tensor | None = None,
     ) -> tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]]:
-        encoded = self.text_policy.encode_only(batch)
+        # bf16 autocast on CUDA scoped to the encoder: cuts attention memory
+        # ~2x and lets SDPA dispatch to the mem-efficient kernel (it skips
+        # the math-backend full [B, H, T, T] score tensor when inputs are
+        # bf16/fp16). bf16 has fp32's exponent range so no grad scaler is
+        # needed. We narrow the cm to the encoder block because the LSTM
+        # below holds fp32 state buffers and mixing dtypes through it is a
+        # pile of compatibility issues for marginal additional savings.
+        device_type = batch.token_ids.device.type
+        autocast_enabled = device_type == "cuda"
+        with torch.autocast(
+            device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+        ):
+            encoded = self.text_policy.encode_only(batch)
+        # Cast encoder outputs back to the LSTM's parameter dtype so the
+        # downstream LSTM + heads run in fp32.
+        target_dtype = self.in_proj.weight.dtype
+        encoded = _cast_encoded(encoded, target_dtype)
 
         b = encoded.state_vector.shape[0]
         device = encoded.state_vector.device
