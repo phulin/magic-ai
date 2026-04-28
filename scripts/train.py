@@ -121,6 +121,7 @@ class TrainingResumeState:
     last_saved_games: int = 0
     total_rollout_steps: int = 0
     total_generated_rollout_steps: int = 0
+    total_wandb_logs: int = 0
 
 
 @dataclass
@@ -470,6 +471,7 @@ def _resume_state_from_checkpoint(checkpoint: dict[str, Any] | None) -> Training
         last_saved_games=int(training_state.get("last_saved_games", 0)),
         total_rollout_steps=int(training_state.get("total_rollout_steps", 0)),
         total_generated_rollout_steps=int(training_state.get("total_generated_rollout_steps", 0)),
+        total_wandb_logs=int(training_state.get("total_wandb_logs", 0)),
     )
 
 
@@ -493,6 +495,7 @@ def _restore_rnad_state(
     payload = _training_state_dict(checkpoint).get("rnad_state")
     if not isinstance(payload, dict):
         return
+    total_wandb_logs = int(_training_state_dict(checkpoint).get("total_wandb_logs", 0))
     target_sd = payload.get("target")
     if isinstance(target_sd, dict):
         state.target.load_state_dict(target_sd)
@@ -509,6 +512,7 @@ def _restore_rnad_state(
     if saved_dir is not None and (saved_dir / f"reg_m{outer:03d}.pt").exists():
         if saved_dir != state.reg_snapshot_dir:
             print(
+                f"step={total_wandb_logs} "
                 f"[rnad] resuming from saved reg_snapshot_dir {saved_dir!s} "
                 f"(configured was {state.reg_snapshot_dir!s})",
                 flush=True,
@@ -521,6 +525,7 @@ def _restore_rnad_state(
         resume_from_snapshot_dir(state, outer_iteration=outer, gradient_step=grad_step)
     except (FileNotFoundError, KeyError) as err:
         print(
+            f"step={total_wandb_logs} "
             f"[rnad] failed to restore reg snapshots from "
             f"{state.reg_snapshot_dir!s}: {err}; continuing with in-memory regs",
             flush=True,
@@ -651,7 +656,7 @@ def main() -> None:
         run_artifact_dir=run_artifact_dir,
         rnad_state=final_rnad_state,
     )
-    print(f"saved checkpoint -> {args.output}")
+    print(f"step={final_resume_state.total_wandb_logs} saved checkpoint -> {args.output}")
     wandb.finish()
     if batch_pool is not None:
         batch_pool.shutdown(wait=True)
@@ -980,6 +985,7 @@ def validate_args(args: argparse.Namespace) -> None:
         track = args.rnad_delta_m * args.rnad_target_ema
         if track < 0.5:
             print(
+                "step=0",
                 f"warning: --rnad-delta-m ({args.rnad_delta_m}) * "
                 f"--rnad-target-ema ({args.rnad_target_ema}) = {track:.3f} "
                 "< 0.5: target network will not meaningfully track online "
@@ -1074,6 +1080,7 @@ def log_retrospective_table(
     horizon_step_count: int,
     ratings: list[dict[str, float | int | None]],
     table_factory: Callable[..., Any] | None = None,
+    log_fn: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     """Log the current snapshot TrueSkill curve as a wandb table."""
 
@@ -1102,13 +1109,15 @@ def log_retrospective_table(
     ]
     make_table = wandb.Table if table_factory is None else table_factory
     table = make_table(columns=columns, data=data)
-    run.log(
-        {
-            "retrospective/current_curve": table,
-            "retrospective/horizon_pct": horizon_pct,
-            "retrospective/horizon_step_count": horizon_step_count,
-        }
-    )
+    payload = {
+        "retrospective/current_curve": table,
+        "retrospective/horizon_pct": horizon_pct,
+        "retrospective/horizon_step_count": horizon_step_count,
+    }
+    if log_fn is None:
+        run.log(payload)
+    else:
+        log_fn(payload)
 
 
 def rollout_value_metrics(
@@ -1183,6 +1192,10 @@ def train_native_batched_envs(
     last_saved_games = restored_state.last_saved_games
     total_rollout_steps = restored_state.total_rollout_steps
     total_generated_rollout_steps = restored_state.total_generated_rollout_steps
+    total_wandb_logs = restored_state.total_wandb_logs
+    run_step = getattr(wandb.run, "step", None) if wandb.run is not None else None
+    if isinstance(run_step, int):
+        total_wandb_logs = max(total_wandb_logs, run_step)
     next_episode_idx = completed_games
     live_games: list[LiveGame] = []
     free_slots = list(range(args.num_envs - 1, -1, -1))
@@ -1225,11 +1238,25 @@ def train_native_batched_envs(
             live_games.append(start_game(free_slots.pop(), next_episode_idx))
             next_episode_idx += 1
 
+    def cli_step_prefix() -> str:
+        return f"step={total_wandb_logs}"
+
+    def tracked_wandb_log(payload: dict[str, Any]) -> None:
+        nonlocal total_wandb_logs
+        if wandb.run is None:
+            return
+        wandb.log(payload)
+        total_wandb_logs += 1
+
     def disable_transcript(env: LiveGame, reason: str) -> None:
         nonlocal transcript_warning_emitted
         env.transcript_enabled = False
         if not transcript_warning_emitted:
-            print(f"warning: disabling sample transcript capture: {reason}", flush=True)
+            print(
+                cli_step_prefix(),
+                f"warning: disabling sample transcript capture: {reason}",
+                flush=True,
+            )
             transcript_warning_emitted = True
 
     def finish_games(finished: list[tuple[LiveGame, int]]) -> None:
@@ -1452,6 +1479,7 @@ def train_native_batched_envs(
                 snapshot_armed = args.cuda_memory_snapshot is not None and torch.cuda.is_available()
                 if snapshot_armed:
                     print(
+                        cli_step_prefix(),
                         f"[mem] before run_rnad_update[{total_rollout_steps}]: "
                         f"{torch.cuda.memory_allocated() / 1e9:.2f} GB live, "
                         f"{torch.cuda.memory_reserved() / 1e9:.2f} GB reserved",
@@ -1472,12 +1500,14 @@ def train_native_batched_envs(
                         try:
                             torch.cuda.memory._dump_snapshot(str(path))
                             print(
+                                cli_step_prefix(),
                                 f"[mem] OOM in run_rnad_update; allocator history dumped "
                                 f"to {path}. Load at https://pytorch.org/memory_viz",
                                 flush=True,
                             )
                         except Exception as dump_exc:
                             print(
+                                cli_step_prefix(),
                                 f"[mem] _dump_snapshot failed: "
                                 f"{type(dump_exc).__name__}: {dump_exc}",
                                 flush=True,
@@ -1504,6 +1534,7 @@ def train_native_batched_envs(
             elapsed = now - last_step_time
             last_step_time = now
             fields = [
+                cli_step_prefix(),
                 f"update[{args.trainer}]",
                 f"games={completed_games}",
                 f"steps={rollout_step_count}",
@@ -1551,6 +1582,8 @@ def train_native_batched_envs(
                 total_generated_rollout_steps=total_generated_rollout_steps,
                 win_stats=win_stats,
                 value_metrics=value_metrics,
+                log_fn=tracked_wandb_log,
+                run_active=True,
             )
             policy.reset_rollout_buffer()
             pending_steps.clear()
@@ -1578,6 +1611,7 @@ def train_native_batched_envs(
                     last_saved_games=completed_games,
                     total_rollout_steps=total_rollout_steps,
                     total_generated_rollout_steps=total_generated_rollout_steps,
+                    total_wandb_logs=total_wandb_logs,
                 ),
                 rnad_state=rnad_state,
             )
@@ -1601,6 +1635,8 @@ def train_native_batched_envs(
                     mage=mage,
                     deck_pool=deck_pool,
                     rng=eval_rng,
+                    step_prefix=cli_step_prefix(),
+                    log_fn=tracked_wandb_log,
                 )
 
         if opponent_pool is not None and retrospective_schedule is not None:
@@ -1614,6 +1650,7 @@ def train_native_batched_envs(
                             opponent_pool,
                             total_episodes=args.episodes,
                         ),
+                        log_fn=tracked_wandb_log,
                     )
 
         _t = time.perf_counter()
@@ -1645,6 +1682,7 @@ def train_native_batched_envs(
                 spr_coef=args.spr_coef if args.spr else 0.0,
             )
         print(
+            cli_step_prefix(),
             f"final_update[{args.trainer}]",
             f"games={completed_games}",
             f"steps={rollout_step_count}",
@@ -1663,6 +1701,8 @@ def train_native_batched_envs(
             total_generated_rollout_steps=total_generated_rollout_steps,
             win_stats=win_stats,
             value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
+            log_fn=tracked_wandb_log,
+            run_active=True,
         )
         policy.reset_rollout_buffer()
         pending_episodes.clear()
@@ -1673,6 +1713,7 @@ def train_native_batched_envs(
             last_saved_games=last_saved_games,
             total_rollout_steps=total_rollout_steps,
             total_generated_rollout_steps=total_generated_rollout_steps,
+            total_wandb_logs=total_wandb_logs,
         ),
         rnad_state,
     )
@@ -1690,12 +1731,15 @@ def take_snapshot_and_eval(
     mage: Any,
     deck_pool: list[dict[str, Any]],
     rng: random.Random,
+    step_prefix: str,
+    log_fn: Callable[[dict[str, Any]], None],
 ) -> None:
     tag = snapshot_tag(threshold, args.episodes)
     snapshot_path = save_snapshot(policy, args.opponent_pool_dir, tag)
     current_entry = opponent_pool.add_snapshot(snapshot_path, tag)
     current_entry.cached_policy = opponent_policy_state_dict(policy)
     print(
+        step_prefix,
         f"pool: snapshot {tag} -> {snapshot_path} (pool size={len(opponent_pool.entries)})",
         flush=True,
     )
@@ -1712,13 +1756,12 @@ def take_snapshot_and_eval(
     historical_opponents = opponent_pool.entries[:-1]
 
     if eval_games_per_snapshot == 0 or not historical_opponents:
-        if wandb.run is not None:
-            wandb.log(
-                {
-                    **opponent_pool.current_rating_metrics(),
-                    "eval/snapshot_games": float(threshold),
-                }
-            )
+        log_fn(
+            {
+                **opponent_pool.current_rating_metrics(),
+                "eval/snapshot_games": float(threshold),
+            }
+        )
         return
 
     game_opponents = distribute_games_by_recency(
@@ -1770,20 +1813,21 @@ def take_snapshot_and_eval(
             opponent.rating.sigma,
         )
         print(
+            step_prefix,
             f"eval: snapshot_tag={tag} opponent={opponent.tag} "
             f"games={games} main_win={main_win:.2f} "
             f"rating=mu={opponent_mu:.2f},sigma={opponent_sigma:.2f}",
             flush=True,
         )
 
-    if wandb.run is not None:
-        payload = {
+    log_fn(
+        {
             **metrics,
             **opponent_pool.current_rating_metrics(),
             "eval/snapshot_games": float(threshold),
             "eval/new_snapshot_tag": tag,
         }
-        wandb.log(payload)
+    )
 
 
 def load_deck_pool(deck_json: Path | None, deck_dir: Path | None) -> list[dict[str, Any]]:
@@ -1925,6 +1969,7 @@ def save_checkpoint(
         "total_generated_rollout_steps": (
             resume_state.total_generated_rollout_steps if resume_state is not None else 0
         ),
+        "total_wandb_logs": resume_state.total_wandb_logs if resume_state is not None else 0,
         "snapshot_schedule_next_idx": snapshot_schedule.next_idx if snapshot_schedule else 0,
         "retrospective_schedule_next_idx": (
             retrospective_schedule.next_idx if retrospective_schedule else 0

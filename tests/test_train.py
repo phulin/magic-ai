@@ -411,6 +411,7 @@ class TrainPPOTests(unittest.TestCase):
                     last_saved_games=6,
                     total_rollout_steps=11,
                     total_generated_rollout_steps=13,
+                    total_wandb_logs=17,
                 ),
                 wandb_run_id="run-123",
             )
@@ -427,6 +428,7 @@ class TrainPPOTests(unittest.TestCase):
             str(opponent_pool_dir.parent),
         )
         self.assertEqual(checkpoint["training_state"]["completed_games"], 7)
+        self.assertEqual(checkpoint["training_state"]["total_wandb_logs"], 17)
         self.assertEqual(checkpoint["training_state"]["snapshot_schedule_next_idx"], 1)
         self.assertEqual(checkpoint["training_state"]["retrospective_schedule_next_idx"], 1)
         self.assertEqual(
