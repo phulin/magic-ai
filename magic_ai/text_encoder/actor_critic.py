@@ -241,10 +241,48 @@ class TextActorCritic(nn.Module):
                 uses_none_flags = layout.uses_none_head.to(torch.bool).tolist()
                 num_groups = int(layout.decision_option_idx.shape[0])
                 selected_col_tensors: list[Tensor] = []
+                # Pre-compute model-visibility masks so we can drop layout cols
+                # that reference options/targets which the assembler truncated
+                # past ``max_tokens`` (their option_mask/target_mask is False
+                # and the corresponding logits are -inf — sampling would land
+                # on an all-``-inf`` softmax and produce NaN).
+                opt_visibility = output.option_mask[step_idx]  # [max_opts]
+                tgt_visibility = output.target_mask[step_idx]  # [max_opts, max_targets]
+                num_opts_view = int(opt_visibility.shape[0])
+                num_tgts_view = int(tgt_visibility.shape[1])
                 for group_idx in range(num_groups):
                     mask = mask_dev[group_idx]
+                    option_idx_g = option_idx_dev[group_idx]
+                    target_idx_g = target_idx_dev[group_idx]
+                    # AND in model-visibility so layout cols pointing at
+                    # truncated slots are dropped before the softmax.
+                    if num_opts_view > 0:
+                        opt_clamped_g = option_idx_g.clamp(min=0)
+                        opt_visible = opt_visibility[opt_clamped_g]
+                        opt_visible = opt_visible & (option_idx_g >= 0)
+                    else:
+                        opt_visible = torch.zeros_like(option_idx_g, dtype=torch.bool)
+                    if num_opts_view > 0 and num_tgts_view > 0:
+                        tgt_clamped_g = target_idx_g.clamp(min=0)
+                        tgt_visible = tgt_visibility[opt_clamped_g, tgt_clamped_g]
+                    else:
+                        tgt_visible = torch.zeros_like(target_idx_g, dtype=torch.bool)
+                    target_required = target_idx_g >= 0
+                    visible = opt_visible & (~target_required | tgt_visible)
+                    if uses_none_flags[group_idx]:
+                        # The ``none`` slot lives at col 0 and isn't a real
+                        # option/target — keep it visible so the head can fire.
+                        col0 = torch.zeros_like(visible)
+                        col0[0] = True
+                        visible = visible | col0
+                    mask = mask & visible
                     if not bool(mask.any()):
-                        raise ValueError("decision group must include at least one valid choice")
+                        raise ValueError(
+                            "decision group has no model-visible choice "
+                            "(all layout cols reference options/targets that "
+                            "were truncated by assemble_batch); raise "
+                            "--text-max-tokens to fit the assembled state"
+                        )
                     logits = self._direct_live_decision_logits(
                         output,
                         none_logits,
@@ -639,10 +677,21 @@ class TextActorCritic(nn.Module):
         # ``.item()`` syncs it carried. ``option_idx`` / ``target_idx`` may
         # contain -1 sentinels for masked columns; clamp before indexing and
         # use ``torch.where`` to fill those slots with -inf afterwards.
+        # Guard against zero-sized option/target dims (a step with no live
+        # options or no live targets) — gather would still raise even though
+        # the values get masked away by ``torch.where``.
+        num_options = int(output.policy_logits.shape[1])
+        num_targets = int(output.target_logits.shape[2])
         opt_clamped = option_idx.clamp(min=0)
         tgt_clamped = target_idx.clamp(min=0)
-        option_vals = output.policy_logits[step_idx, opt_clamped]
-        target_vals = output.target_logits[step_idx, opt_clamped, tgt_clamped]
+        if num_options > 0:
+            option_vals = output.policy_logits[step_idx, opt_clamped]
+        else:
+            option_vals = output.values.new_full(option_idx.shape, float("-inf"))
+        if num_options > 0 and num_targets > 0:
+            target_vals = output.target_logits[step_idx, opt_clamped, tgt_clamped]
+        else:
+            target_vals = option_vals
         logits = torch.where(target_idx >= 0, target_vals, option_vals)
         neg_inf = output.values.new_tensor(float("-inf"))
         logits = torch.where(option_idx >= 0, logits, neg_inf)

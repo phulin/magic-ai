@@ -14,6 +14,7 @@ numeric/string tables for every scalar.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -56,6 +57,8 @@ from magic_ai.text_encoder.render_plan import (
     ZONE_STACK,
 )
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
+
+logger = logging.getLogger(__name__)
 
 CARD_CLOSER_TEXT = " </card>"
 
@@ -613,18 +616,49 @@ def assemble_batch(
     if actual_max > max_tokens:
         if on_overflow == "raise":
             raise ValueError(f"assembled token length {actual_max} exceeds max_tokens={max_tokens}")
-        # Truncate.
+        # Truncate but preserve the option/target index space. Setting
+        # truncated positions to -1 (instead of dropping the entries) keeps
+        # the K↔K invariant the upstream layout relies on: a layout col that
+        # references "the K'th option" still finds slot K — option_mask just
+        # ends up False there, so the model can't score it but the indexing
+        # contract holds. card_ref_positions is keyed by K so it can stay a
+        # filtered dict.
+        truncated_options = 0
+        truncated_targets = 0
+        truncated_examples = 0
         for ex in assembled:
             if len(ex.token_ids) > max_tokens:
                 ex.token_ids = ex.token_ids[:max_tokens]
                 ex.card_ref_positions = {
                     k: p for k, p in ex.card_ref_positions.items() if p < max_tokens
                 }
-                ex.option_positions = [p for p in ex.option_positions if p < max_tokens]
-                ex.target_positions = [
-                    [p for p in tp if p < max_tokens] for tp in ex.target_positions
-                ]
+                new_options: list[int] = []
+                new_targets: list[list[int]] = []
+                ex_truncated_opts = 0
+                ex_truncated_tgts = 0
+                for opt_pos, tp in zip(ex.option_positions, ex.target_positions, strict=True):
+                    if opt_pos < max_tokens:
+                        new_options.append(opt_pos)
+                    else:
+                        new_options.append(-1)
+                        ex_truncated_opts += 1
+                    new_targets.append([tpos if tpos < max_tokens else -1 for tpos in tp])
+                    ex_truncated_tgts += sum(1 for tpos in tp if tpos >= max_tokens)
+                ex.option_positions = new_options
+                ex.target_positions = new_targets
+                truncated_options += ex_truncated_opts
+                truncated_targets += ex_truncated_tgts
+                truncated_examples += 1
         seq_lengths = [len(ex.token_ids) for ex in assembled]
+        logger.warning(
+            "assemble_batch: truncated %d/%d example(s) to max_tokens=%d "
+            "(masked %d option(s) and %d target(s) past the budget)",
+            truncated_examples,
+            len(assembled),
+            max_tokens,
+            truncated_options,
+            truncated_targets,
+        )
 
     batch_size = len(assembled)
     width = max(seq_lengths)
@@ -651,11 +685,13 @@ def assemble_batch(
             if 0 <= k < MAX_CARD_REFS:
                 card_ref_positions[b, k] = int(pos)
         for o, pos in enumerate(ex.option_positions):
-            option_positions[b, o] = int(pos)
-            option_mask[b, o] = True
+            if pos >= 0:
+                option_positions[b, o] = int(pos)
+                option_mask[b, o] = True
             for t, tpos in enumerate(ex.target_positions[o]):
-                target_positions[b, o, t] = int(tpos)
-                target_mask[b, o, t] = True
+                if tpos >= 0:
+                    target_positions[b, o, t] = int(tpos)
+                    target_mask[b, o, t] = True
 
     return TextEncodedBatch(
         token_ids=token_ids,
