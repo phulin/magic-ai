@@ -175,6 +175,57 @@ class TextActorCriticTests(unittest.TestCase):
         torch.testing.assert_close(per_choice.step_for_decision_group, torch.tensor([0]))
         self.assertFalse(bool(per_choice.may_is_active[0]))
 
+    def test_recompute_lstm_states_and_outputs_for_rnad(self) -> None:
+        torch.manual_seed(0)
+        model = _model()
+        replay = TextReplayBuffer(
+            capacity=4,
+            max_tokens=4,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            recurrent_layers=1,
+            recurrent_hidden_dim=8,
+        )
+        model.rollout_buffer = replay
+        rows = []
+        for batch_index in (0, 1):
+            rows.append(
+                replay.append(
+                    encoded=_batch(batch_size=2),
+                    batch_index=batch_index,
+                    trace_kind_id=0,
+                    decision_option_idx=torch.tensor([[0, 1]]),
+                    decision_target_idx=torch.tensor([[-1, -1]]),
+                    decision_mask=torch.tensor([[True, False]]),
+                    uses_none_head=torch.tensor([False]),
+                    selected_indices=torch.tensor([0]),
+                    may_selected=0.0,
+                    old_log_prob=-0.5,
+                    value=0.1,
+                    perspective_player_idx=0,
+                    lstm_h_in=torch.zeros(1, 8),
+                    lstm_c_in=torch.zeros(1, 8),
+                )
+            )
+
+        states = model.recompute_lstm_states_for_episodes([rows])
+        outputs = model.recompute_lstm_outputs_for_episodes([rows])
+        log_probs, entropies, values, _per_choice = model.evaluate_replay_batch_per_choice(
+            rows,
+            lstm_state_override=states[0],
+        )
+
+        self.assertEqual(len(states), 1)
+        self.assertEqual(tuple(states[0][0].shape), (1, 2, 8))
+        self.assertEqual(tuple(states[0][1].shape), (1, 2, 8))
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(tuple(outputs[0].shape), (2, 8))
+        self.assertTrue(torch.isfinite(log_probs).all())
+        self.assertTrue(torch.isfinite(entropies).all())
+        self.assertTrue(torch.isfinite(values).all())
+
     def test_rejects_mismatched_env_and_player_lists(self) -> None:
         model = _model()
         model.init_lstm_env_states(1)

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import Tensor, nn
@@ -193,6 +194,40 @@ class TextActorCritic(nn.Module):
         )
         return log_probs, entropies, output.values, per_choice
 
+    def recompute_lstm_states_for_episode(
+        self,
+        replay_rows: list[int],
+    ) -> tuple[Tensor, Tensor]:
+        result = self.recompute_lstm_states_for_episodes([replay_rows])
+        return result[0]
+
+    def recompute_lstm_states_for_episodes(
+        self,
+        episodes: list[list[int]],
+        *,
+        strategy: str = "legacy",
+    ) -> list[tuple[Tensor, Tensor]]:
+        del strategy
+        if not episodes:
+            raise ValueError("episodes must be non-empty")
+        if any(len(ep) == 0 for ep in episodes):
+            raise ValueError("each episode must contain at least one row")
+        return [self._recompute_lstm_states_for_rows(ep) for ep in episodes]
+
+    def recompute_lstm_outputs_for_episodes(
+        self,
+        episodes: list[list[int]],
+        *,
+        chunk_size: int = 200,
+        compiled_lstm: Callable[..., Any] | None = None,
+    ) -> list[Tensor]:
+        del chunk_size, compiled_lstm
+        if not episodes:
+            raise ValueError("episodes must be non-empty")
+        if any(len(ep) == 0 for ep in episodes):
+            raise ValueError("each episode must contain at least one row")
+        return [self._recompute_lstm_outputs_for_rows(ep) for ep in episodes]
+
     def scatter_lstm_env_states(
         self,
         env_indices: list[int],
@@ -209,6 +244,38 @@ class TextActorCritic(nn.Module):
             )
         self.live_lstm_h[:, slots] = h_out.detach()
         self.live_lstm_c[:, slots] = c_out.detach()
+
+    def _recompute_lstm_states_for_rows(self, replay_rows: list[int]) -> tuple[Tensor, Tensor]:
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+        batch = self.rollout_buffer.gather(replay_rows)
+        encoded = self.policy.text_policy.encode_only(batch.encoded)
+        projected = self.policy.in_proj(encoded.state_vector)
+        h = torch.zeros(self.lstm_layers, 1, self.lstm_hidden, device=projected.device)
+        c = torch.zeros_like(h)
+        h_list: list[Tensor] = []
+        c_list: list[Tensor] = []
+        for t in range(projected.shape[0]):
+            h_list.append(h)
+            c_list.append(c)
+            _out, (h_t, c_t) = self.policy.lstm(
+                projected[t : t + 1].unsqueeze(0),
+                (h.contiguous(), c.contiguous()),
+            )
+            h = h_t
+            c = c_t
+        return torch.cat(h_list, dim=1).contiguous(), torch.cat(c_list, dim=1).contiguous()
+
+    def _recompute_lstm_outputs_for_rows(self, replay_rows: list[int]) -> Tensor:
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+        batch = self.rollout_buffer.gather(replay_rows)
+        encoded = self.policy.text_policy.encode_only(batch.encoded)
+        projected = self.policy.in_proj(encoded.state_vector).unsqueeze(0)
+        h = torch.zeros(self.lstm_layers, 1, self.lstm_hidden, device=projected.device)
+        c = torch.zeros_like(h)
+        output, _state = self.policy.lstm(projected, (h, c))
+        return output.squeeze(0).contiguous()
 
     def _evaluate_decision_groups(
         self,
