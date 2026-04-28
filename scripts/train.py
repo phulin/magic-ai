@@ -516,6 +516,29 @@ def validate_checkpoint_encoder(
             f"checkpoint encoder '{checkpoint_encoder}' is incompatible with "
             f"--encoder {args.encoder}"
         )
+    if checkpoint_encoder != "text":
+        return
+    metadata = _checkpoint_metadata(checkpoint)
+    text_config = metadata.get("text_config")
+    if not isinstance(text_config, dict):
+        raise ValueError("text checkpoint metadata is missing text_config")
+    for key in (
+        "text_max_tokens",
+        "text_d_model",
+        "text_layers",
+        "text_heads",
+        "text_d_ff",
+        "hidden_layers",
+        "max_options",
+        "max_targets_per_option",
+    ):
+        saved = text_config.get(key)
+        requested = getattr(args, key, None)
+        if saved != requested:
+            raise ValueError(
+                f"text checkpoint {key}={saved!r} is incompatible with "
+                f"--{key.replace('_', '-')} {requested!r}"
+            )
 
 
 def _default_run_artifact_dir(output_path: Path, run_id: str | None) -> Path:
@@ -1084,8 +1107,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--text-d-ff must be at least 1")
     if getattr(args, "render_plan_capacity", 1) < 1:
         raise ValueError("--render-plan-capacity must be at least 1")
-    if getattr(args, "encoder", "slots") == "text" and args.trainer != "ppo":
-        raise ValueError("--encoder text currently supports --trainer ppo only")
+    if getattr(args, "encoder", "slots") == "text":
+        if args.trainer != "ppo":
+            raise ValueError("--encoder text currently supports --trainer ppo only")
+        args.spr = False
     if args.torch_compile and not args.no_validate:
         raise ValueError("--torch-compile requires --no-validate")
     if args.deck_json is not None and args.deck_dir is not None:

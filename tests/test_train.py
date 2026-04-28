@@ -68,6 +68,40 @@ class TrainPPOTests(unittest.TestCase):
         ):
             validate_checkpoint_encoder(args, checkpoint)
 
+    def test_validate_checkpoint_encoder_rejects_text_config_mismatch(self) -> None:
+        args = Namespace(
+            encoder="text",
+            text_max_tokens=128,
+            text_d_model=32,
+            text_layers=1,
+            text_heads=4,
+            text_d_ff=64,
+            hidden_layers=1,
+            max_options=4,
+            max_targets_per_option=2,
+        )
+        checkpoint = {
+            "metadata": {
+                "encoder": "text",
+                "text_config": {
+                    "text_max_tokens": 128,
+                    "text_d_model": 16,
+                    "text_layers": 1,
+                    "text_heads": 4,
+                    "text_d_ff": 64,
+                    "hidden_layers": 1,
+                    "max_options": 4,
+                    "max_targets_per_option": 2,
+                },
+            },
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "text checkpoint text_d_model=16 is incompatible with --text-d-model 32",
+        ):
+            validate_checkpoint_encoder(args, checkpoint)
+
     def test_decode_action_choice_color_falls_back_when_transcript_options_are_short(self) -> None:
         policy = PPOPolicy.__new__(PPOPolicy)
 
@@ -857,9 +891,11 @@ class TrainPPOTests(unittest.TestCase):
             eval_num_envs=None,
             encoder="text",
             trainer="ppo",
+            spr=True,
         )
 
         validate_args(args)
+        self.assertFalse(args.spr)
         args.trainer = "rnad"
         with self.assertRaisesRegex(ValueError, "supports --trainer ppo only"):
             validate_args(args)
