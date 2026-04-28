@@ -9,13 +9,24 @@ position-anchored gather pools, and (b) policy / target / value head logits.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
 from magic_ai.text_encoder.batch import TextEncodedBatch
+
+# flex_attention only generates the fused FA-style kernel under torch.compile;
+# called eagerly it materializes the full [B, H, T, T] score tensor and emits
+# a UserWarning to that effect. Compile once at module load with dynamic=True
+# so a changing T across batches doesn't trigger recompiles per shape. Same
+# for create_block_mask — its compiled form runs as a single fused kernel
+# instead of a Python-level scan over (b, q_block, kv_block).
+_flex_attention = torch.compile(flex_attention, dynamic=True)
+_create_block_mask = torch.compile(create_block_mask, dynamic=True)
 
 
 @dataclass
@@ -54,6 +65,21 @@ def _build_rope_cache(
     return cos, sin
 
 
+def _key_pad_mask_mod(key_pad: Tensor):
+    """Build a flex_attention mask_mod for a per-batch key-padding mask.
+
+    ``key_pad`` is shape ``[B, T]`` and is True at masked-out (padded) key
+    positions. Returns a closure that captures it; flex_attention compiles
+    the closure into the FA-style kernel.
+    """
+
+    def mask_mod(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
+        del h, q_idx
+        return ~key_pad[b, kv_idx]
+
+    return mask_mod
+
+
 def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     # x: [B, H, T, D]; cos/sin: [T, D/2]
     d = x.shape[-1]
@@ -77,7 +103,14 @@ class MultiHeadSelfAttention(nn.Module):
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.dropout = cfg.dropout
 
-    def forward(self, x: Tensor, attn_bias: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        block_mask: BlockMask,
+        attn_bias: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+    ) -> Tensor:
         b, t, _ = x.shape
         qkv = self.qkv(x).view(b, t, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)  # each [B, T, H, D]
@@ -86,9 +119,19 @@ class MultiHeadSelfAttention(nn.Module):
         v = v.transpose(1, 2)
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_bias, dropout_p=self.dropout if self.training else 0.0
-        )
+        # flex_attention compiles the key-padding ``block_mask`` into a flash-
+        # attention-style kernel — O(B·H·T·d) memory instead of the O(B·H·T²)
+        # score matrix the SDPA math fallback was materializing. flex_attention
+        # has no CPU backward kernel as of torch 2.11, so we keep the old
+        # additive-mask SDPA path for CPU (used by the test suite). dropout is
+        # config-defaulted to 0 and unused, so no score_mod plumbing here.
+        if x.device.type == "cuda":
+            result = _flex_attention(q, k, v, block_mask=block_mask)
+            out = result if isinstance(result, Tensor) else result[0]
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_bias, dropout_p=self.dropout if self.training else 0.0
+            )
         out = out.transpose(1, 2).contiguous().view(b, t, self.n_heads * self.head_dim)
         return self.proj(out)
 
@@ -113,8 +156,15 @@ class EncoderBlock(nn.Module):
         self.norm2 = RMSNorm(cfg.d_model)
         self.ffn = GeGLUFFN(cfg)
 
-    def forward(self, x: Tensor, attn_bias: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-        x = x + self.attn(self.norm1(x), attn_bias, cos, sin)
+    def forward(
+        self,
+        x: Tensor,
+        block_mask: BlockMask,
+        attn_bias: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+    ) -> Tensor:
+        x = x + self.attn(self.norm1(x), block_mask, attn_bias, cos, sin)
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -148,21 +198,35 @@ class TextStateEncoder(nn.Module):
         attention_mask = batch.attention_mask
         b, t = token_ids.shape
         x = self.tok_emb(token_ids)
-        # Additive attention bias: 0 at real positions, -inf at pads on the key axis.
-        # Shape [B, 1, 1, T] broadcasts over heads and queries.
         key_pad = attention_mask == 0
-        # Guard rows whose entire key axis is masked: softmax over [-inf, ...]
-        # is NaN, which then poisons the whole batch. Such rows produce
-        # meaningless hidden states either way; we just need them to stay
-        # finite so downstream code doesn't crash.
+        # Guard rows whose entire key axis is masked: softmax over an empty
+        # set is NaN, which would poison the whole batch. Such rows produce
+        # meaningless hidden states either way; un-mask them here so
+        # attention reduces to a finite (if useless) average. Downstream
+        # code only consumes hidden states at valid positions anyway.
         all_masked = key_pad.all(dim=-1, keepdim=True)
         key_pad = key_pad & ~all_masked
-        attn_bias = torch.zeros(b, 1, 1, t, device=x.device, dtype=x.dtype)
-        attn_bias = attn_bias.masked_fill(key_pad[:, None, None, :], float("-inf"))
+        # Two mask formulations — flex_attention's BlockMask for CUDA (FA
+        # kernel) and the additive-bias SDPA fallback for CPU. Building both
+        # is cheap; only the one for the active device is consumed.
+        if x.device.type == "cuda":
+            block_mask = _create_block_mask(
+                _key_pad_mask_mod(key_pad),
+                B=b,
+                H=None,
+                Q_LEN=t,
+                KV_LEN=t,
+                device=x.device,
+            )
+            attn_bias = x.new_zeros(())
+        else:
+            block_mask = cast(BlockMask, None)
+            attn_bias = torch.zeros(b, 1, 1, t, device=x.device, dtype=x.dtype)
+            attn_bias = attn_bias.masked_fill(key_pad[:, None, None, :], float("-inf"))
         head_dim = self.cfg.d_model // self.cfg.n_heads
         cos, sin = _build_rope_cache(t, head_dim, x.device, x.dtype)
         for block in self.blocks:
-            x = block(x, attn_bias, cos, sin)
+            x = block(x, block_mask, attn_bias, cos, sin)
         x = self.final_norm(x)
         return x
 
