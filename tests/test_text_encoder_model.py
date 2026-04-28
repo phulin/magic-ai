@@ -1,0 +1,130 @@
+"""Forward / pooling / heads smoke test for the text-encoder model."""
+
+from __future__ import annotations
+
+import torch
+from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.model import (
+    PolicyHead,
+    TargetHead,
+    TextEncoderConfig,
+    TextStateEncoder,
+    ValueHead,
+    gather_card_vectors,
+    gather_option_vectors,
+    gather_state_vector,
+    gather_target_vectors,
+)
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
+
+
+def _make_batch(
+    b: int = 2,
+    t: int = 64,
+    max_opts: int = 4,
+    max_targets: int = 3,
+    vocab_size: int = 1000,
+) -> TextEncodedBatch:
+    torch.manual_seed(0)
+    token_ids = torch.randint(low=1, high=vocab_size, size=(b, t), dtype=torch.int64)
+    # Right-pad varying amounts.
+    seq_lens = torch.tensor([t, t - 8], dtype=torch.int64)
+    attention_mask = torch.zeros(b, t, dtype=torch.int64)
+    for i, n in enumerate(seq_lens.tolist()):
+        attention_mask[i, :n] = 1
+        token_ids[i, n:] = 0  # pad_id
+
+    # Card-ref positions: a few real anchors per row, rest -1.
+    card_ref_positions = torch.full((b, MAX_CARD_REFS), -1, dtype=torch.int64)
+    card_ref_positions[0, :3] = torch.tensor([2, 10, 20])
+    card_ref_positions[1, :2] = torch.tensor([4, 15])
+
+    # Options: 3 valid in row 0, 2 valid in row 1.
+    option_positions = torch.full((b, max_opts), -1, dtype=torch.int64)
+    option_positions[0, :3] = torch.tensor([30, 35, 40])
+    option_positions[1, :2] = torch.tensor([25, 45])
+    option_mask = option_positions >= 0
+
+    # Targets per option.
+    target_positions = torch.full((b, max_opts, max_targets), -1, dtype=torch.int64)
+    target_positions[0, 0, :2] = torch.tensor([31, 32])
+    target_positions[0, 1, :1] = torch.tensor([36])
+    target_positions[1, 0, :3] = torch.tensor([26, 27, 28])
+    target_mask = target_positions >= 0
+
+    return TextEncodedBatch(
+        token_ids=token_ids,
+        attention_mask=attention_mask,
+        card_ref_positions=card_ref_positions,
+        option_positions=option_positions,
+        option_mask=option_mask,
+        target_positions=target_positions,
+        target_mask=target_mask,
+        seq_lengths=seq_lens,
+    )
+
+
+def test_text_encoder_forward_pooling_heads_backward() -> None:
+    vocab_size = 1000
+    cfg = TextEncoderConfig(vocab_size=vocab_size)
+    encoder = TextStateEncoder(cfg)
+    batch = _make_batch(vocab_size=vocab_size)
+
+    hidden = encoder(batch)
+    assert hidden.shape == (2, 64, cfg.d_model)
+    assert torch.isfinite(hidden).all()
+
+    # Card vectors.
+    card_vecs, card_mask = gather_card_vectors(hidden, batch)
+    assert card_vecs.shape == (2, MAX_CARD_REFS, cfg.d_model)
+    assert card_mask.shape == (2, MAX_CARD_REFS)
+    assert (card_vecs[~card_mask] == 0).all()
+    assert card_mask[0, :3].all() and not card_mask[0, 3:].any()
+
+    # Options.
+    opt_vecs, opt_mask = gather_option_vectors(hidden, batch)
+    assert opt_vecs.shape == (2, 4, cfg.d_model)
+    assert opt_mask.shape == (2, 4)
+    assert (opt_vecs[~opt_mask] == 0).all()
+
+    # Targets.
+    tgt_vecs, tgt_mask = gather_target_vectors(hidden, batch)
+    assert tgt_vecs.shape == (2, 4, 3, cfg.d_model)
+    assert tgt_mask.shape == (2, 4, 3)
+    assert (tgt_vecs[~tgt_mask] == 0).all()
+
+    # State.
+    state_vec = gather_state_vector(hidden, batch)
+    assert state_vec.shape == (2, cfg.d_model)
+    assert torch.allclose(state_vec, hidden[:, 0, :])
+
+    # Heads.
+    policy = PolicyHead(cfg.d_model)
+    target = TargetHead(cfg.d_model)
+    value = ValueHead(cfg.d_model)
+
+    policy_logits = policy(opt_vecs, state_vec, opt_mask)
+    assert policy_logits.shape == (2, 4)
+    assert (policy_logits[~opt_mask] == float("-inf")).all()
+    assert torch.isfinite(policy_logits[opt_mask]).all()
+
+    target_logits = target(tgt_vecs, opt_vecs, state_vec, tgt_mask)
+    assert target_logits.shape == (2, 4, 3)
+    assert (target_logits[~tgt_mask] == float("-inf")).all()
+    assert torch.isfinite(target_logits[tgt_mask]).all()
+
+    values = value(state_vec)
+    assert values.shape == (2,)
+    assert torch.isfinite(values).all()
+
+    # Backward smoke.
+    valid_policy = policy_logits[opt_mask]
+    loss = values.sum() + valid_policy.sum() + target_logits[tgt_mask].sum()
+    loss.backward()
+
+    grad_norms = [
+        p.grad.detach().abs().sum().item()
+        for p in list(encoder.parameters()) + list(policy.parameters()) + list(value.parameters())
+        if p.grad is not None
+    ]
+    assert any(g > 0 for g in grad_norms)
