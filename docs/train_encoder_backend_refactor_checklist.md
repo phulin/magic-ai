@@ -164,21 +164,22 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 
 ## Phase 8: Validation
 
-- [ ] Verify existing slot tests pass unchanged.
+- [x] Verify existing slot tests pass unchanged.
+  - Focused slot replay/native tests pass; full suite smoke remains separate.
 - [ ] Add `--encoder slots` train smoke test.
 - [ ] Add `--encoder text` single-game rollout smoke test.
-- [ ] Add text PPO replay test:
-  - [ ] sample action
-  - [ ] store replay row
-  - [ ] reevaluate log-prob from replay
-  - [ ] confirm finite loss/backward
-- [ ] Add text RNaD replay test after per-choice replay is implemented.
+- [x] Add text PPO replay test:
+  - [x] sample action
+  - [x] store replay row
+  - [x] reevaluate log-prob from replay
+  - [x] confirm finite loss/backward
+- [x] Add text RNaD replay test after per-choice replay is implemented.
 - [ ] Run:
-  - [ ] `uv run ruff format`
-  - [ ] `uv run ruff check --fix`
-  - [ ] `uv run ty check`
-  - [ ] focused pytest for slot replay
-  - [ ] focused pytest for text replay
+  - [x] `uv run ruff format`
+  - [x] `uv run ruff check --fix`
+  - [x] `uv run ty check`
+  - [x] focused pytest for slot replay
+  - [x] focused pytest for text replay
 
 ## Non-Goals For The First Pass
 
