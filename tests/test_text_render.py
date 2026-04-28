@@ -27,6 +27,7 @@ from magic_ai.text_encoder.render import (
     OracleEntry,
     SnapshotRenderer,
     load_oracle_text,
+    render_card_body,
     render_snapshot,
 )
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, card_ref_token
@@ -355,22 +356,158 @@ def test_planeswalker_loyalty(oracle: dict[str, OracleEntry]) -> None:
     assert "[+3]" in rendered.text or "<counter>" in rendered.text
 
 
-@pytest.mark.xfail(reason="Split-card faces not surfaced in snapshot; §9 hard case.")
+def _split_oracle() -> OracleEntry:
+    """Synthetic split card (Fire // Ice). The oracle JSON pipeline currently
+    flattens ``card_faces`` away so we hand-build the Scryfall shape here."""
+
+    return cast(
+        OracleEntry,
+        {
+            "name": "Fire // Ice",
+            "type_line": "Instant // Instant",
+            "layout": "split",
+            "card_faces": [
+                {
+                    "name": "Fire",
+                    "type_line": "Instant",
+                    "mana_cost": "{1}{R}",
+                    "oracle_text": (
+                        "Fire deals 2 damage divided as you choose among one or two targets."
+                    ),
+                    "power_toughness": None,
+                },
+                {
+                    "name": "Ice",
+                    "type_line": "Instant",
+                    "mana_cost": "{1}{U}",
+                    "oracle_text": "Tap target permanent. Draw a card.",
+                    "power_toughness": None,
+                },
+            ],
+        },
+    )
+
+
+def _mdfc_oracle() -> OracleEntry:
+    """Synthetic MDFC (Valki, God of Lies // Tibalt, Cosmic Impostor)."""
+
+    return cast(
+        OracleEntry,
+        {
+            "name": "Valki, God of Lies // Tibalt, Cosmic Impostor",
+            "type_line": "Legendary Creature — God // Legendary Planeswalker — Tibalt",
+            "layout": "modal_dfc",
+            "card_faces": [
+                {
+                    "name": "Valki, God of Lies",
+                    "type_line": "Legendary Creature — God",
+                    "mana_cost": "{1}{B}",
+                    "oracle_text": (
+                        "When Valki enters the battlefield, each opponent reveals their hand."
+                    ),
+                    "power_toughness": "2/1",
+                },
+                {
+                    "name": "Tibalt, Cosmic Impostor",
+                    "type_line": "Legendary Planeswalker — Tibalt",
+                    "mana_cost": "{7}{B}{R}",
+                    "oracle_text": "Exile the top three cards of each player's library.",
+                    "power_toughness": None,
+                },
+            ],
+        },
+    )
+
+
+def _adventure_oracle() -> OracleEntry:
+    """Synthetic adventure card (Brazen Borrower // Petty Theft).
+
+    Per Scryfall, ``card_faces[0]`` is the creature half (the "main" face)
+    and ``card_faces[1]`` is the adventure half — the renderer emits them
+    in that order.
+    """
+
+    return cast(
+        OracleEntry,
+        {
+            "name": "Brazen Borrower // Petty Theft",
+            "type_line": "Creature — Faerie Rogue // Instant — Adventure",
+            "layout": "adventure",
+            "card_faces": [
+                {
+                    "name": "Brazen Borrower",
+                    "type_line": "Creature — Faerie Rogue",
+                    "mana_cost": "{1}{U}{U}",
+                    "oracle_text": "Flash. Flying.",
+                    "power_toughness": "3/1",
+                },
+                {
+                    "name": "Petty Theft",
+                    "type_line": "Instant — Adventure",
+                    "mana_cost": "{1}{U}",
+                    "oracle_text": (
+                        "Return target nonland permanent an opponent controls to its owner's hand."
+                    ),
+                    "power_toughness": None,
+                },
+            ],
+        },
+    )
+
+
 def test_split_card() -> None:
-    # TODO: split cards (e.g., Fire // Ice) render only one face.
-    raise AssertionError("split card faces not yet rendered")
+    """Both halves of a split card appear in the rendered body."""
+
+    oracle = {"Fire // Ice": _split_oracle()}
+    body = render_card_body("Fire // Ice", oracle["Fire // Ice"])
+    assert body.startswith("<card> Fire // Ice")
+    assert body.endswith(" </card>")
+    # Both face names must appear.
+    assert "Fire" in body
+    assert "Ice" in body
+    # Both oracle texts must appear.
+    assert "deals 2 damage" in body
+    assert "Tap target permanent" in body
+    # Both mana costs must appear.
+    assert "{1}{R}" in body
+    assert "{1}{U}" in body
+    # The face delimiter is present.
+    assert " // " in body
 
 
-@pytest.mark.xfail(reason="MDFC back face not rendered; §9 hard case.")
 def test_mdfc() -> None:
-    # TODO: MDFC (modal double-faced cards) need both faces in the <card> block.
-    raise AssertionError("MDFC back face not yet rendered")
+    """Both faces of an MDFC are rendered front-face-then-back-face."""
+
+    oracle = {"Valki, God of Lies // Tibalt, Cosmic Impostor": _mdfc_oracle()}
+    body = render_card_body(
+        "Valki, God of Lies // Tibalt, Cosmic Impostor",
+        oracle["Valki, God of Lies // Tibalt, Cosmic Impostor"],
+    )
+    # Both face names must appear.
+    assert "Valki, God of Lies" in body
+    assert "Tibalt, Cosmic Impostor" in body
+    # Front face (creature) ordering: Valki appears before Tibalt.
+    assert body.index("Valki") < body.index("Tibalt, Cosmic Impostor")
+    # Both oracle texts must appear.
+    assert "each opponent reveals their hand" in body
+    assert "top three cards" in body
 
 
-@pytest.mark.xfail(reason="Adventure half not rendered; §9 hard case.")
 def test_adventure() -> None:
-    # TODO: adventure half (e.g., Brazen Borrower // Petty Theft) not surfaced.
-    raise AssertionError("adventure half not yet rendered")
+    """Adventure cards render the creature half first, adventure half second."""
+
+    oracle = {"Brazen Borrower // Petty Theft": _adventure_oracle()}
+    body = render_card_body(
+        "Brazen Borrower // Petty Theft", oracle["Brazen Borrower // Petty Theft"]
+    )
+    assert "Brazen Borrower" in body
+    assert "Petty Theft" in body
+    # Creature half precedes the adventure half.
+    assert body.index("Brazen Borrower") < body.index("Petty Theft")
+    # Creature P/T from the front face appears.
+    assert "3/1" in body
+    # Adventure-half oracle text appears.
+    assert "Return target nonland permanent" in body
 
 
 @pytest.mark.xfail(reason="Saga chapter counters not rendered; §9 hard case.")

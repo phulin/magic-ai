@@ -35,8 +35,33 @@ from magic_ai.text_encoder.tokenizer import (
 DEFAULT_ORACLE_PATH = Path(__file__).resolve().parents[2] / "data" / "card_oracle_embeddings.json"
 
 
+class OracleFace(TypedDict, total=False):
+    """One face of a multi-face card (split, MDFC, transform, adventure, flip).
+
+    Mirrors the per-face shape Scryfall returns under ``card_faces``: each face
+    has its own ``name``, ``type_line``, ``mana_cost``, ``oracle_text``, and
+    optional ``power``/``toughness``. We pre-flatten ``power``/``toughness``
+    into ``power_toughness`` for renderer convenience, matching the top-level
+    convention in :func:`load_oracle_text`.
+    """
+
+    name: str
+    type_line: str
+    mana_cost: str
+    oracle_text: str
+    power_toughness: str | None
+
+
 class OracleEntry(TypedDict, total=False):
-    """Subset of fields used by the renderer from ``card_oracle_embeddings.json``."""
+    """Subset of fields used by the renderer from ``card_oracle_embeddings.json``.
+
+    For single-face cards the top-level ``type_line`` / ``mana_cost`` /
+    ``oracle_text`` / ``power_toughness`` carry everything. For multi-face
+    cards (split, MDFC, transform, adventure, flip) each face is also exposed
+    via ``card_faces``; when present the renderer prefers the per-face fields
+    over the top-level ones. The ``layout`` field is preserved when known so
+    callers can dispatch on it.
+    """
 
     name: str
     type_line: str
@@ -44,6 +69,8 @@ class OracleEntry(TypedDict, total=False):
     oracle_text: str
     power_toughness: str | None
     colors: list[str]
+    layout: str
+    card_faces: list[OracleFace]
 
 
 @dataclass(frozen=True)
@@ -113,6 +140,34 @@ def load_oracle_text(path: str | Path = DEFAULT_ORACLE_PATH) -> dict[str, Oracle
             "power_toughness": record.get("power_toughness"),
             "colors": list(record.get("colors") or []),
         }
+        # Preserve multi-face metadata when present. The current
+        # ``card_oracle_embeddings.json`` flattens these fields out (see
+        # ``scripts/build_card_embeddings.py``), but the renderer accepts the
+        # raw Scryfall shape so test fixtures can opt in without touching the
+        # build pipeline.
+        layout = record.get("layout")
+        if layout:
+            entry["layout"] = layout
+        faces_raw = record.get("card_faces") or []
+        if faces_raw:
+            faces: list[OracleFace] = []
+            for face in faces_raw:
+                face_pt = face.get("power_toughness")
+                if face_pt is None:
+                    fp = face.get("power")
+                    ft = face.get("toughness")
+                    if fp is not None and ft is not None:
+                        face_pt = f"{fp}/{ft}"
+                faces.append(
+                    {
+                        "name": face.get("name", "") or "",
+                        "type_line": face.get("type_line", "") or "",
+                        "mana_cost": face.get("mana_cost", "") or "",
+                        "oracle_text": face.get("oracle_text", "") or "",
+                        "power_toughness": face_pt,
+                    }
+                )
+            entry["card_faces"] = faces
         out[name] = entry
     return out
 
@@ -122,31 +177,125 @@ def load_oracle_text(path: str | Path = DEFAULT_ORACLE_PATH) -> dict[str, Oracle
 # ---------------------------------------------------------------------------
 
 
-def render_card_body(name: str, oracle: OracleEntry | None) -> str:
-    """Render the static ``<card> Name <sep> Type <sep> P/T <sep> oracle </card>``
-    fragment for a single card.
+def _render_face_fields(parts: list[str], face: OracleFace | OracleEntry) -> None:
+    """Append ``<sep>``-joined per-face fields to ``parts``.
 
-    Status flags, zone wrappers, and ``<card-ref:K>`` are *not* included — those
-    are state-dependent and inserted by the snapshot renderer / hot-path
-    assembler. This is the unit cached at startup by
+    Shared by single-face and multi-face rendering: emits Type / mana cost /
+    P/T / oracle text in that order, skipping whichever fields are empty.
+    """
+
+    type_line = face.get("type_line", "") or ""
+    mana_cost = face.get("mana_cost", "") or ""
+    pt = face.get("power_toughness")
+    text = render_oracle_text(face.get("oracle_text", "") or "")
+    if type_line:
+        parts.append(f" <sep> {type_line}")
+    if mana_cost:
+        parts.append(f" <sep> {mana_cost}")
+    if pt:
+        parts.append(f" <sep> {pt}")
+    if text:
+        parts.append(f" <sep> {text}")
+
+
+# Layouts whose ``card_faces`` represent two halves the model should see
+# together inside one ``<card>`` block. ``flip`` (Kamigawa-block flip cards)
+# is included for completeness even though the engine doesn't surface them
+# today.
+_MULTI_FACE_LAYOUTS: frozenset[str] = frozenset(
+    {"split", "modal_dfc", "transform", "adventure", "flip"}
+)
+
+
+def _is_multi_face(oracle: OracleEntry) -> bool:
+    """Return True if ``oracle`` describes a multi-face card.
+
+    Multi-face is detected via the presence of ``card_faces`` (most robust:
+    the raw Scryfall payload always carries this for multi-face cards) or
+    via a ``layout`` value in :data:`_MULTI_FACE_LAYOUTS`. The two are
+    redundant by construction, but we accept either so fixtures can be terse.
+    """
+
+    faces = oracle.get("card_faces") or []
+    if faces:
+        return True
+    layout = oracle.get("layout")
+    if layout and layout in _MULTI_FACE_LAYOUTS:
+        return True
+    return False
+
+
+def _ordered_faces(name: str, oracle: OracleEntry) -> list[OracleFace]:
+    """Return the faces in render order.
+
+    - ``adventure``: creature half first, adventure half second. Scryfall's
+      ``card_faces`` ordering is creature-then-adventure; the printed name on
+      the top-level card is the creature side, so we emit faces in their
+      Scryfall order which already matches.
+    - ``split`` / ``modal_dfc`` / ``transform`` / ``flip``: emit in the
+      Scryfall-provided order (left-to-right for split, front-to-back for
+      MDFC/transform, original-to-flipped for flip).
+
+    If ``card_faces`` is absent but ``layout`` flags multi-face, fall back to
+    a single synthetic face from the top-level fields so the renderer still
+    produces the standard structure.
+    """
+
+    faces: list[OracleFace] = list(oracle.get("card_faces") or [])
+    if faces:
+        return faces
+    # Fallback: layout claimed multi-face but no faces array; treat the
+    # top-level fields as the single face we know about.
+    fallback: OracleFace = {
+        "name": name,
+        "type_line": oracle.get("type_line", "") or "",
+        "mana_cost": oracle.get("mana_cost", "") or "",
+        "oracle_text": oracle.get("oracle_text", "") or "",
+        "power_toughness": oracle.get("power_toughness"),
+    }
+    return [fallback]
+
+
+def render_card_body(name: str, oracle: OracleEntry | None) -> str:
+    """Render the static ``<card> ...fields... </card>`` fragment for one card.
+
+    For single-face cards the layout is::
+
+        <card> Name <sep> Type <sep> mana <sep> P/T <sep> oracle </card>
+
+    For multi-face cards (split / MDFC / transform / adventure / flip) every
+    face's fields are emitted inside the same ``<card>`` block, separated by
+    `` <sep> // <sep> ``::
+
+        <card> Name <sep> Type <sep> mana <sep> P/T <sep> oracle
+               <sep> // <sep>
+               OtherName <sep> Type <sep> mana <sep> P/T <sep> oracle </card>
+
+    The cached body is the same regardless of which face is "active"
+    in-game — the model has both faces' rules text always; per-game state
+    (which face is currently up) is a separate status concern.
+
+    Status flags, zone wrappers, and ``<card-ref:K>`` are *not* included —
+    those are state-dependent and inserted by the snapshot renderer /
+    hot-path assembler. This is the unit cached at startup by
     :mod:`magic_ai.text_encoder.card_cache` and reused by
     :class:`SnapshotRenderer` so the cache and slow-path agree byte-for-byte.
     """
 
     parts: list[str] = ["<card> ", name]
-    if oracle is not None:
-        type_line = oracle.get("type_line", "") or ""
-        mana_cost = oracle.get("mana_cost", "") or ""
-        pt = oracle.get("power_toughness")
-        text = render_oracle_text(oracle.get("oracle_text", "") or "")
-        if type_line:
-            parts.append(f" <sep> {type_line}")
-        if mana_cost:
-            parts.append(f" <sep> {mana_cost}")
-        if pt:
-            parts.append(f" <sep> {pt}")
-        if text:
-            parts.append(f" <sep> {text}")
+    if oracle is not None and _is_multi_face(oracle):
+        faces = _ordered_faces(name, oracle)
+        # Emit the first face's fields after the (already-written) top-level
+        # ``Name``. Subsequent faces get their own name re-emitted after the
+        # `` // `` separator.
+        if faces:
+            _render_face_fields(parts, faces[0])
+            for face in faces[1:]:
+                parts.append(" <sep> // <sep> ")
+                parts.append(face.get("name", "") or "")
+                _render_face_fields(parts, face)
+    elif oracle is not None:
+        _render_face_fields(parts, oracle)
     parts.append(" </card>")
     return "".join(parts)
 

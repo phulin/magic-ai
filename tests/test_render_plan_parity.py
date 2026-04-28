@@ -54,9 +54,56 @@ def tokenizer() -> PreTrainedTokenizerFast:
     return load_tokenizer()
 
 
+_MULTI_FACE_NAME = "Brazen Borrower // Petty Theft"
+
+
+def _multi_face_oracle_entry() -> OracleEntry:
+    """Synthetic adventure-card oracle entry.
+
+    The production ``card_oracle_embeddings.json`` flattens ``card_faces``
+    away (see ``scripts/build_card_embeddings.py``), so we construct the
+    Scryfall-shaped entry inline. Adventure was chosen because it covers
+    the renderer's "creature-half-first" ordering rule.
+    """
+
+    return cast(
+        OracleEntry,
+        {
+            "name": _MULTI_FACE_NAME,
+            "type_line": "Creature — Faerie Rogue // Instant — Adventure",
+            "layout": "adventure",
+            "card_faces": cast(
+                list,
+                [
+                    {
+                        "name": "Brazen Borrower",
+                        "type_line": "Creature — Faerie Rogue",
+                        "mana_cost": "{1}{U}{U}",
+                        "oracle_text": "Flash. Flying.",
+                        "power_toughness": "3/1",
+                    },
+                    {
+                        "name": "Petty Theft",
+                        "type_line": "Instant — Adventure",
+                        "mana_cost": "{1}{U}",
+                        "oracle_text": (
+                            "Return target nonland permanent an opponent controls"
+                            " to its owner's hand."
+                        ),
+                        "power_toughness": None,
+                    },
+                ],
+            ),
+        },
+    )
+
+
 @pytest.fixture(scope="module")
 def oracle() -> dict[str, OracleEntry]:
-    return load_oracle_text(Path(DEFAULT_ORACLE_PATH))
+    base = load_oracle_text(Path(DEFAULT_ORACLE_PATH))
+    # Inject one synthetic multi-face entry so the parity fixtures can use it.
+    base[_MULTI_FACE_NAME] = _multi_face_oracle_entry()
+    return base
 
 
 @pytest.fixture(scope="module")
@@ -349,6 +396,31 @@ def _snap_multi_options() -> GameStateSnapshot:
     return snap
 
 
+def _snap_multi_face_card() -> GameStateSnapshot:
+    """Snapshot containing a multi-face (adventure) card on the battlefield.
+
+    Exercises the multi-face branch of ``render_card_body`` end-to-end: the
+    slow path renders both faces inline; the fast path memcpys the cached
+    body. Byte-equal parity here proves the cache keys multi-face cards
+    correctly and that no face-specific rendering is happening during
+    snapshot assembly.
+    """
+
+    bf = [_card("c1", _MULTI_FACE_NAME, tapped=False)]
+    return cast(
+        GameStateSnapshot,
+        {
+            "turn": 4,
+            "active_player": "p1",
+            "step": "Precombat Main",
+            "players": [
+                _player("p1", "Self", battlefield=bf),
+                _player("p2", "Opp"),
+            ],
+        },
+    )
+
+
 FIXTURE_BUILDERS: list[tuple[str, Callable[..., GameStateSnapshot]]] = [
     ("lone_creature", _snap_lone_creature),
     ("basic", _snap_basic),
@@ -361,6 +433,7 @@ FIXTURE_BUILDERS: list[tuple[str, Callable[..., GameStateSnapshot]]] = [
     ("with_graveyard", _snap_with_graveyard),
     ("multi_options", _snap_multi_options),
     ("busy_midgame", _snap_busy_midgame),
+    ("multi_face_card", _snap_multi_face_card),
 ]
 
 

@@ -209,3 +209,67 @@ def test_cached_tokens_match_snapshot_render(
     cached_ids = small_cache.body_tokens(TEST_NAMES.index(name) + 1).tolist()
     direct_ids = tokenizer.encode(body_text, add_special_tokens=False)
     assert cached_ids == direct_ids
+
+
+def _multi_face_oracle() -> OracleEntry:
+    """Hand-built MDFC oracle entry — the production JSON flattens
+    ``card_faces`` away, so multi-face fixtures are synthesized for tests."""
+
+    return cast(
+        OracleEntry,
+        {
+            "name": "Valki, God of Lies // Tibalt, Cosmic Impostor",
+            "type_line": "Legendary Creature — God // Legendary Planeswalker — Tibalt",
+            "layout": "modal_dfc",
+            "card_faces": cast(
+                list,
+                [
+                    {
+                        "name": "Valki, God of Lies",
+                        "type_line": "Legendary Creature — God",
+                        "mana_cost": "{1}{B}",
+                        "oracle_text": "When Valki enters, each opponent reveals their hand.",
+                        "power_toughness": "2/1",
+                    },
+                    {
+                        "name": "Tibalt, Cosmic Impostor",
+                        "type_line": "Legendary Planeswalker — Tibalt",
+                        "mana_cost": "{7}{B}{R}",
+                        "oracle_text": "Exile the top three cards of each player's library.",
+                        "power_toughness": None,
+                    },
+                ],
+            ),
+        },
+    )
+
+
+def test_cached_tokens_match_snapshot_render_multi_face(
+    oracle: dict[str, OracleEntry],
+    tokenizer,
+) -> None:
+    """Cache parity must hold for multi-face cards too.
+
+    The MDFC fixture exercises the ``card_faces`` branch of
+    ``render_card_body``: the cached body must contain both face names and
+    the cached token slice must match a fresh BPE of the body produced by
+    ``render_card_body`` and round-trip through ``render_snapshot``.
+    """
+
+    from magic_ai.text_encoder.render import render_card_body
+
+    name = "Valki, God of Lies // Tibalt, Cosmic Impostor"
+    multi_oracle: dict[str, OracleEntry] = {**oracle, name: _multi_face_oracle()}
+    cache = build_card_cache([name], multi_oracle, tokenizer)
+
+    body_text = render_card_body(name, multi_oracle[name])
+    assert "Valki, God of Lies" in body_text
+    assert "Tibalt, Cosmic Impostor" in body_text
+
+    rendered = render_snapshot(_single_card_snapshot(name), [], oracle=multi_oracle)
+    assert body_text in rendered.text
+
+    # Row 1 == only real card in this single-name cache.
+    cached_ids = cache.body_tokens(1).tolist()
+    direct_ids = tokenizer.encode(body_text, add_special_tokens=False)
+    assert cached_ids == direct_ids
