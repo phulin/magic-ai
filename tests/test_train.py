@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -531,6 +532,45 @@ class TrainPPOTests(unittest.TestCase):
             checkpoint["training_state"]["opponent_pool"]["entries"][0]["tag"],
             "g000100_p010.0",
         )
+
+    def test_save_checkpoint_serializes_text_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            checkpoint_path = root / "text.pt"
+            cache_path = root / "card_tokens.pt"
+            cache_path.write_bytes(b"card-cache")
+            policy = torch.nn.Linear(2, 1)
+            optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+            args = Namespace(
+                output=checkpoint_path,
+                opponent_pool_dir=root / "opponent_pool",
+                encoder="text",
+                card_token_cache=cache_path,
+                text_max_tokens=128,
+                text_d_model=16,
+                text_layers=1,
+                text_heads=2,
+                text_d_ff=64,
+                hidden_layers=1,
+                max_options=4,
+                max_targets_per_option=2,
+            )
+
+            save_checkpoint(checkpoint_path, policy, optimizer, args)
+            checkpoint = load_training_checkpoint(checkpoint_path)
+
+        self.assertIsNotNone(checkpoint)
+        assert checkpoint is not None
+        metadata = checkpoint["metadata"]
+        self.assertEqual(metadata["encoder"], "text")
+        self.assertEqual(metadata["text_config"]["text_max_tokens"], 128)
+        self.assertEqual(metadata["text_config"]["max_targets_per_option"], 2)
+        self.assertEqual(metadata["card_token_cache"]["path"], str(cache_path))
+        self.assertEqual(
+            metadata["card_token_cache"]["sha256"],
+            hashlib.sha256(b"card-cache").hexdigest(),
+        )
+        self.assertIn("modernbert_revision", metadata["tokenizer"])
 
     def test_restore_opponent_pool_loads_checkpoint_state_and_new_snapshots(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

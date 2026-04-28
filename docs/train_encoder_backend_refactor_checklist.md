@@ -157,9 +157,9 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - Text PPO now has a separate correctness loop; R-NaD remains slot-only in `train.py`.
 - [ ] Save checkpoint metadata including:
   - [x] encoder kind
-  - [ ] text config when `encoder=text`
-  - [ ] tokenizer path/hash if available
-  - [ ] card-token cache hash
+  - [x] text config when `encoder=text`
+  - [x] tokenizer path/hash if available
+  - [x] card-token cache hash
 - [x] Reject incompatible checkpoint/CLI combinations clearly.
 
 ## Phase 8: Validation

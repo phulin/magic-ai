@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import importlib
 import itertools
 import json
@@ -80,7 +81,12 @@ from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig  # noqa: E
 from magic_ai.text_encoder.render import OracleEntry, load_oracle_text  # noqa: E402
 from magic_ai.text_encoder.render_plan import emit_render_plan  # noqa: E402
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer  # noqa: E402
-from magic_ai.text_encoder.tokenizer import load_tokenizer  # noqa: E402
+from magic_ai.text_encoder.tokenizer import (  # noqa: E402
+    MODERNBERT_REPO,
+    MODERNBERT_REVISION,
+    TOKENIZER_DIR,
+    load_tokenizer,
+)
 
 DEFAULT_DECK = {
     "name": "bolt-mountain",
@@ -2336,20 +2342,60 @@ def save_checkpoint(
             "target": rnad_state.target.state_dict(),
             "reg_snapshot_dir": str(rnad_state.reg_snapshot_dir),
         }
+    metadata = {
+        "encoder": getattr(args, "encoder", "slots"),
+        "wandb_run_id": effective_wandb_run_id,
+        "run_artifact_dir": str(effective_run_artifact_dir),
+    }
+    if getattr(args, "encoder", "slots") == "text":
+        cache_path = Path(getattr(args, "card_token_cache", ""))
+        metadata["text_config"] = {
+            "text_max_tokens": getattr(args, "text_max_tokens", None),
+            "text_d_model": getattr(args, "text_d_model", None),
+            "text_layers": getattr(args, "text_layers", None),
+            "text_heads": getattr(args, "text_heads", None),
+            "text_d_ff": getattr(args, "text_d_ff", None),
+            "hidden_layers": getattr(args, "hidden_layers", None),
+            "max_options": getattr(args, "max_options", None),
+            "max_targets_per_option": getattr(args, "max_targets_per_option", None),
+        }
+        metadata["tokenizer"] = {
+            "path": str(TOKENIZER_DIR),
+            "modernbert_repo": MODERNBERT_REPO,
+            "modernbert_revision": MODERNBERT_REVISION,
+            "sha256": _hash_path_if_exists(TOKENIZER_DIR),
+        }
+        metadata["card_token_cache"] = {
+            "path": str(cache_path),
+            "sha256": _hash_path_if_exists(cache_path),
+        }
     torch.save(
         {
             "policy": policy.state_dict(),
             "optimizer": optimizer.state_dict(),
             "args": serialized_args,
             "training_state": training_state,
-            "metadata": {
-                "encoder": getattr(args, "encoder", "slots"),
-                "wandb_run_id": effective_wandb_run_id,
-                "run_artifact_dir": str(effective_run_artifact_dir),
-            },
+            "metadata": metadata,
         },
         path,
     )
+
+
+def _hash_path_if_exists(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    digest = hashlib.sha256()
+    if path.is_file():
+        digest.update(path.read_bytes())
+        return digest.hexdigest()
+    if not path.is_dir():
+        return None
+    for child in sorted(p for p in path.rglob("*") if p.is_file()):
+        digest.update(str(child.relative_to(path)).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(child.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def print_sample_game(
