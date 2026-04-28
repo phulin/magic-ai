@@ -143,7 +143,7 @@ LOYALTY_TOKENS: tuple[str, ...] = _loyalty_tokens()
 # Intra-snapshot card references.
 # ---------------------------------------------------------------------------
 
-MAX_CARD_REFS = 64
+MAX_CARD_REFS = 256
 
 
 def card_ref_token(k: int) -> str:

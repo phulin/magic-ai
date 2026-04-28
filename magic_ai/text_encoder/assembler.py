@@ -287,14 +287,19 @@ def _assemble_one(
     def emit_text(text: str) -> None:
         out.extend(_fragment(toks, text))
 
-    def emit_card_ref(uuid_idx: int) -> None:
-        if uuid_idx < 0:
-            return
+    def emit_card_ref(uuid_idx: int) -> bool:
+        # Returns True iff a ``<card-ref:K>`` token was emitted. Caller may
+        # fall back to a row-name on False. ``uuid_idx >= MAX_CARD_REFS``
+        # happens in cluttered states where Go assigned a per-snapshot ref
+        # past the tokenizer's 64-slot cap; treat it like a missing ref.
+        if uuid_idx < 0 or uuid_idx >= len(toks.card_ref_ids):
+            return False
         ref_id = toks.card_ref_ids[uuid_idx]
         pos = len(out)
         out.append(ref_id)
         if uuid_idx not in card_ref_positions:
             card_ref_positions[uuid_idx] = pos
+        return True
 
     def close_scalar_owner() -> None:
         nonlocal scalar_owner_open
@@ -335,7 +340,7 @@ def _assemble_one(
                     cur_target_bucket.append(pos)
                 else:
                     # card-ref ids: record first-occurrence position per K.
-                    # Linear lookup is fine — MAX_CARD_REFS = 64 and most
+                    # Linear lookup is fine — MAX_CARD_REFS is small and most
                     # literal slices contain 0–1 card-refs.
                     for k, ref_id in enumerate(toks.card_ref_ids):
                         if tid == ref_id and k not in card_ref_positions:
@@ -442,9 +447,9 @@ def _assemble_one(
                 emit_text(f" {verb}")
                 if verb not in ("pass", "choice", "unknown"):
                     emit_text(" ")
-                    if source_uuid_idx >= 0:
-                        emit_card_ref(source_uuid_idx)
-                    elif source_row >= 0 and source_row < len(cache.row_to_name):
+                    if not emit_card_ref(source_uuid_idx) and (
+                        0 <= source_row < len(cache.row_to_name)
+                    ):
                         emit_text(cache.row_to_name[source_row])
                 if ability_idx >= 0 and kind_id == 3:
                     emit_text(f" ability {ability_idx}")
@@ -459,12 +464,11 @@ def _assemble_one(
                 if cur_target_bucket is not None:
                     cur_target_bucket.append(pos)
                 emit_text(" ")
-                if target_uuid_idx >= 0:
-                    emit_card_ref(target_uuid_idx)
-                elif target_row >= 0 and target_row < len(cache.row_to_name):
-                    emit_text(cache.row_to_name[target_row])
-                else:
-                    emit_text("target")
+                if not emit_card_ref(target_uuid_idx):
+                    if 0 <= target_row < len(cache.row_to_name):
+                        emit_text(cache.row_to_name[target_row])
+                    else:
+                        emit_text("target")
                 emit_text(" ")
                 out.append(toks.target_close_id)
                 i += 1 + arity
