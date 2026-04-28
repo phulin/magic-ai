@@ -30,7 +30,72 @@ DEFAULT_DECK_DIR = Path("decks")
 DEFAULT_CARD_CACHE = Path("data/cards.json")
 SCRYFALL_REQUESTS_PER_SECOND = 1.0
 SCRYFALL_REQUEST_INTERVAL = 1.0 / SCRYFALL_REQUESTS_PER_SECOND
-EMBEDDING_TEXT_FORMATS = ("json", "tagged", "plain")
+EMBEDDING_TEXT_FORMATS = (
+    "json",
+    "tagged",
+    "plain",
+    "json-keywords",
+    "json-emphasized",
+    "labeled-prose",
+    "json-emphasized-keywords",
+    "json-scoped",
+)
+
+# Canonical reminder text for evergreen keyword abilities. Used by the
+# "json-keywords" embedding text format to inject definitions even after
+# Scryfall's parenthetical reminders are stripped.
+KEYWORD_REMINDERS: dict[str, str] = {
+    "flying": ("Flying: this creature can't be blocked except by creatures with flying or reach."),
+    "first strike": (
+        "First strike: this creature deals combat damage before creatures without first strike."
+    ),
+    "double strike": (
+        "Double strike: this creature deals both first-strike and regular combat damage."
+    ),
+    "lifelink": (
+        "Lifelink: damage dealt by this creature also causes its controller to gain that much life."
+    ),
+    "deathtouch": (
+        "Deathtouch: any amount of damage this deals to a creature is enough to destroy it."
+    ),
+    "trample": (
+        "Trample: this creature can deal excess combat damage to the defending player"
+        " or planeswalker."
+    ),
+    "vigilance": "Vigilance: attacking doesn't cause this creature to tap.",
+    "haste": (
+        "Haste: this creature can attack and use tap abilities the turn it comes"
+        " under your control."
+    ),
+    "reach": "Reach: this creature can block creatures with flying.",
+    "menace": "Menace: this creature can't be blocked except by two or more creatures.",
+    "hexproof": (
+        "Hexproof: this creature can't be the target of spells or abilities your opponents control."
+    ),
+    "shroud": "Shroud: this creature can't be the target of spells or abilities.",
+    "indestructible": (
+        "Indestructible: damage and effects that say 'destroy' don't destroy this;"
+        " lethal damage is required."
+    ),
+    "flash": "Flash: you may cast this any time you could cast an instant.",
+    "defender": "Defender: this creature can't attack.",
+    "fear": (
+        "Fear: this creature can't be blocked except by artifact creatures and black creatures."
+    ),
+    "intimidate": (
+        "Intimidate: this creature can't be blocked except by artifact creatures"
+        " and creatures that share a color with it."
+    ),
+    "infect": (
+        "Infect: damage to creatures is dealt as -1/-1 counters;"
+        " damage to players is dealt as poison counters."
+    ),
+    "skulk": "Skulk: this creature can't be blocked by creatures with greater power.",
+    "protection": (
+        "Protection from a quality: this can't be damaged, enchanted, equipped,"
+        " blocked, or targeted by anything with that quality."
+    ),
+}
 
 # Edit this list for the project-local baseline cards that should always be
 # included unless --no-fixed-list is passed.
@@ -481,6 +546,47 @@ def build_embedding_text(
             wrap_in_tag=text_format == "tagged",
             include_cardname_line=text_format == "plain",
         )
+    if text_format == "json-keywords":
+        embedding_oracle_text = expand_keyword_reminders(embedding_oracle_text)
+        return json.dumps(
+            {
+                "object": "Magic: the Gathering card",
+                "type_line": embedding_type_line,
+                "mana_cost": mana_cost,
+                "oracle_text": embedding_oracle_text,
+                "power_toughness": power_toughness,
+            },
+            ensure_ascii=False,
+            sort_keys=False,
+        )
+    if text_format == "json-emphasized":
+        return build_json_emphasized_embedding_text(
+            type_line=embedding_type_line,
+            mana_cost=mana_cost,
+            oracle_text=embedding_oracle_text,
+            power_toughness=power_toughness,
+        )
+    if text_format == "json-emphasized-keywords":
+        return build_json_emphasized_embedding_text(
+            type_line=embedding_type_line,
+            mana_cost=mana_cost,
+            oracle_text=expand_keyword_reminders(embedding_oracle_text),
+            power_toughness=power_toughness,
+        )
+    if text_format == "json-scoped":
+        return build_json_scoped_embedding_text(
+            type_line=embedding_type_line,
+            mana_cost=mana_cost,
+            oracle_text=expand_keyword_reminders(embedding_oracle_text),
+            power_toughness=power_toughness,
+        )
+    if text_format == "labeled-prose":
+        return build_labeled_prose_embedding_text(
+            type_line=embedding_type_line,
+            mana_cost=mana_cost,
+            oracle_text=embedding_oracle_text,
+            power_toughness=power_toughness,
+        )
     if text_format != "json":
         raise ValueError(f"unknown embedding text format: {text_format}")
     return json.dumps(
@@ -494,6 +600,186 @@ def build_embedding_text(
         ensure_ascii=False,
         sort_keys=False,
     )
+
+
+def split_power_toughness(value: str | None) -> tuple[str | None, str | None]:
+    """Return (power, toughness) for a simple 'P/T' string. For multi-face cards
+    ('Face: P/T; Face: P/T') or unparseable input, returns (None, None) so callers
+    can fall back to the raw string."""
+    if not value:
+        return None, None
+    if ";" in value or ":" in value:
+        return None, None
+    parts = value.split("/")
+    if len(parts) != 2:
+        return None, None
+    power, toughness = parts[0].strip(), parts[1].strip()
+    if not power or not toughness:
+        return None, None
+    return power, toughness
+
+
+def build_json_emphasized_embedding_text(
+    *,
+    type_line: str,
+    mana_cost: str,
+    oracle_text: str,
+    power_toughness: str | None,
+) -> str:
+    """JSON variant that splits power/toughness into separate fields and adds a
+    redundant natural-language summary so P/T carries more weight in the embedding."""
+    power, toughness = split_power_toughness(power_toughness)
+    payload: dict[str, Any] = {
+        "object": "Magic: the Gathering card",
+        "type_line": type_line,
+        "mana_cost": mana_cost,
+        "oracle_text": oracle_text,
+    }
+    if power is not None and toughness is not None:
+        payload["power"] = power
+        payload["toughness"] = toughness
+        payload["combat_stats_summary"] = (
+            f"This creature has power {power} and toughness {toughness}."
+        )
+    elif power_toughness is not None:
+        payload["power_toughness"] = power_toughness
+    return json.dumps(payload, ensure_ascii=False, sort_keys=False)
+
+
+def detect_effect_tags(oracle_text: str) -> list[str]:
+    """Heuristically classify the card's gross effect scope and effect type from
+    its oracle text. Returns a list of canonical tag strings; the list is empty
+    if no rule matches. Tags are coarse on purpose: the goal is to separate
+    'destroy all creatures' from 'destroy target creature' so the embedding
+    doesn't collapse those clusters."""
+    if not oracle_text:
+        return []
+    text = oracle_text.lower()
+    tags: list[str] = []
+
+    # --- Effect scope -------------------------------------------------------
+    if re.search(r"\bdestroy all\b", text) or re.search(r"\bexile all\b", text):
+        tags.append("scope:mass-permanent")
+    elif re.search(r"\ball creatures\b.{0,60}-[\dx]+/-[\dx]+", text) or re.search(
+        r"\bcreatures get -[\dx]+/-[\dx]+", text
+    ):
+        tags.append("scope:mass-creature-pump-down")
+    elif re.search(r"\bdestroy target (?:\w+ )*creature\b", text) or re.search(
+        r"\bexile target (?:\w+ )*creature\b", text
+    ):
+        tags.append("scope:single-target-creature")
+    elif re.search(r"\bdestroy target\b", text) or re.search(r"\bexile target\b", text):
+        tags.append("scope:single-target-permanent")
+    elif re.search(r"\bcounter target spell\b", text):
+        tags.append("scope:single-target-spell")
+    elif re.search(r"\btarget creature\b", text):
+        tags.append("scope:single-target-creature")
+    elif re.search(r"\btarget player\b", text):
+        tags.append("scope:single-target-player")
+
+    # --- Effect type --------------------------------------------------------
+    if re.search(r"\bdestroy\b", text):
+        tags.append("effect:destroy")
+    if re.search(r"\bexile\b", text):
+        tags.append("effect:exile")
+    if re.search(r"\bcounter target spell\b", text):
+        tags.append("effect:counter-spell")
+    if re.search(r"\bdraws? \w+ cards?\b", text) or re.search(r"\bdraw a card\b", text):
+        tags.append("effect:card-draw")
+    if re.search(r"\bdeals? \d+ damage\b", text) or re.search(r"\bdeals \w+ damage\b", text):
+        tags.append("effect:deal-damage")
+    if re.search(r"\bsearch your library\b", text) and re.search(r"\bland\b", text):
+        tags.append("effect:fetch-land")
+    if re.search(r"\bgets? \+\d+/\+\d+", text):
+        tags.append("effect:creature-pump-up")
+    if (
+        re.search(r"\{t\}\s*:\s*add\b", text)
+        or re.search(r"\badd \{[wubrgc1-9x]\}", text)
+        or re.search(r"\badd one mana\b", text)
+    ):
+        tags.append("effect:produce-mana")
+    if re.search(r"\bgains? \d+ life\b", text) or re.search(r"\bgain \w+ life\b", text):
+        tags.append("effect:gain-life")
+    if re.search(r"\breturn target\b.{0,40}\bto its owner's hand\b", text):
+        tags.append("effect:bounce")
+    if re.search(r"\bregenerate\b", text):
+        tags.append("effect:regenerate")
+
+    return tags
+
+
+def build_json_scoped_embedding_text(
+    *,
+    type_line: str,
+    mana_cost: str,
+    oracle_text: str,
+    power_toughness: str | None,
+) -> str:
+    """Like json-emphasized-keywords but prepends a structured `effect_tags`
+    field detected from the oracle text. The intent is to separate cards that
+    differ on scope ('destroy all' vs 'destroy target') even when they share
+    most surface vocabulary."""
+    power, toughness = split_power_toughness(power_toughness)
+    payload: dict[str, Any] = {
+        "object": "Magic: the Gathering card",
+        "effect_tags": detect_effect_tags(oracle_text),
+        "type_line": type_line,
+        "mana_cost": mana_cost,
+        "oracle_text": oracle_text,
+    }
+    if power is not None and toughness is not None:
+        payload["power"] = power
+        payload["toughness"] = toughness
+        payload["combat_stats_summary"] = (
+            f"This creature has power {power} and toughness {toughness}."
+        )
+    elif power_toughness is not None:
+        payload["power_toughness"] = power_toughness
+    return json.dumps(payload, ensure_ascii=False, sort_keys=False)
+
+
+def build_labeled_prose_embedding_text(
+    *,
+    type_line: str,
+    mana_cost: str,
+    oracle_text: str,
+    power_toughness: str | None,
+) -> str:
+    """Field-labeled prose: one labeled line per attribute. P/T gets prominent
+    natural-language treatment when present."""
+    lines: list[str] = []
+    if mana_cost:
+        lines.append(f"Mana cost: {mana_cost}.")
+    if type_line:
+        lines.append(f"Card type: {type_line}.")
+    power, toughness = split_power_toughness(power_toughness)
+    if power is not None and toughness is not None:
+        lines.append(f"Power: {power}.")
+        lines.append(f"Toughness: {toughness}.")
+    elif power_toughness is not None:
+        lines.append(f"Power and toughness: {power_toughness}.")
+    if oracle_text:
+        lines.append(f"Rules text:\n{oracle_text}")
+    return "\n".join(lines)
+
+
+def expand_keyword_reminders(oracle_text: str) -> str:
+    """Append canonical reminder text for any evergreen keyword found in the
+    oracle text. Detection is whole-word case-insensitive."""
+    if not oracle_text:
+        return oracle_text
+    lower = oracle_text.lower()
+    found: list[str] = []
+    seen: set[str] = set()
+    for keyword, definition in KEYWORD_REMINDERS.items():
+        if keyword in seen:
+            continue
+        if re.search(rf"(?<![a-z]){re.escape(keyword)}(?![a-z])", lower):
+            found.append(definition)
+            seen.add(keyword)
+    if not found:
+        return oracle_text
+    return oracle_text + "\n\nKeyword definitions:\n" + "\n".join(found)
 
 
 def format_type_line_for_embedding(type_line: str) -> str:

@@ -1,0 +1,56 @@
+{
+  "format": "json",
+  "model": "Qwen/Qwen3-Embedding-0.6B",
+  "dimensions": 1024,
+  "card_count": 28,
+  "permutation_invariance": {
+    "TL (2 perms)": {
+      "mean_cos": 0.9828,
+      "min_cos": 0.9828
+    },
+    "FL (2 perms)": {
+      "mean_cos": 0.9837,
+      "min_cos": 0.9837
+    },
+    "YT (2 perms)": {
+      "mean_cos": 0.9916,
+      "min_cos": 0.9916
+    },
+    "DT (2 perms)": {
+      "mean_cos": 0.9863,
+      "min_cos": 0.9863
+    },
+    "VH (2 perms)": {
+      "mean_cos": 0.9866,
+      "min_cos": 0.9866
+    },
+    "YTL (6 perms)": {
+      "mean_cos": 0.9834,
+      "min_cos": 0.9678
+    },
+    "Triggered abilities order": {
+      "mean_cos": 0.9844,
+      "min_cos": 0.9844
+    }
+  },
+  "type_reorder": {
+    "goblin_soldier_vs_soldier_goblin": 0.9913
+  },
+  "differentiation": {
+    "Trample vs Lifelink": 0.6366,
+    "Trample vs First strike": 0.7327,
+    "Flying vs Trample": 0.7356,
+    "{T,L} vs {F,L}": 0.8432,
+    "vanilla vs Trample": 0.7658,
+    "vanilla vs Flying": 0.8736
+  },
+  "keyword_analogies": {
+    "(TL−T) vs (FL−F)  [+Lifelink]": 0.886,
+    "(L−vanilla) vs (TL−T) [+Lifelink]": 0.7659,
+    "(T−vanilla) vs (TL−L)  [+Trample]": 0.7662,
+    "(YT−Y) vs (T−vanilla)  [+Trample]": 0.8214,
+    "(Y−vanilla) vs (YT−T)  [+Flying]": 0.6263,
+    "(T−vanilla) vs (L−vanilla)  [orthogonal]": 0.2246,
+    "(F−vanilla) vs (Y−vanilla)  [orthogonal]": 0.2609
+  }
+}

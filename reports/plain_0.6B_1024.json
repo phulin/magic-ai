@@ -1,0 +1,543 @@
+{
+  "embeddings_path": "data/embed_plain.json",
+  "labels_path": "data/embedding_eval_pairs.json",
+  "card_count": 150,
+  "dimensions": 1024,
+  "synonyms": {
+    "n": 7,
+    "missing": [],
+    "mean_cos": 0.9378695232527596,
+    "mrr": 0.7925170068027211,
+    "recall@1": 0.7142857142857143,
+    "recall@5": 0.8571428571428571,
+    "rows": [
+      {
+        "a": "Wrath of God",
+        "b": "Damnation",
+        "cos": 0.9938,
+        "rank_a_to_b": 1,
+        "rank_b_to_a": 1
+      },
+      {
+        "a": "Harmonize",
+        "b": "Concentrate",
+        "cos": 0.9963,
+        "rank_a_to_b": 1,
+        "rank_b_to_a": 1
+      },
+      {
+        "a": "Lightning Bolt",
+        "b": "Chain Lightning",
+        "cos": 0.6727,
+        "rank_a_to_b": 36,
+        "rank_b_to_a": 21
+      },
+      {
+        "a": "Counterspell",
+        "b": "Mana Drain",
+        "cos": 0.9426,
+        "rank_a_to_b": 4,
+        "rank_b_to_a": 1
+      },
+      {
+        "a": "Llanowar Elves",
+        "b": "Elvish Mystic",
+        "cos": 0.9998,
+        "rank_a_to_b": 1,
+        "rank_b_to_a": 2
+      },
+      {
+        "a": "Doom Blade",
+        "b": "Go for the Throat",
+        "cos": 0.9796,
+        "rank_a_to_b": 2,
+        "rank_b_to_a": 2
+      },
+      {
+        "a": "Naturalize",
+        "b": "Disenchant",
+        "cos": 0.9804,
+        "rank_a_to_b": 1,
+        "rank_b_to_a": 1
+      }
+    ]
+  },
+  "near_neighbors": {
+    "n": 5,
+    "missing": [],
+    "mean_cos": 0.9552107572555542,
+    "mrr": 0.6666666666666667,
+    "recall@1": 0.4,
+    "recall@5": 1.0,
+    "rows": [
+      {
+        "a": "Lightning Bolt",
+        "b": "Shock",
+        "cos": 0.9874,
+        "rank_a_to_b": 1,
+        "rank_b_to_a": 1
+      },
+      {
+        "a": "Wrath of God",
+        "b": "Day of Judgment",
+        "cos": 0.9529,
+        "rank_a_to_b": 2,
+        "rank_b_to_a": 2
+      },
+      {
+        "a": "Giant Growth",
+        "b": "Titanic Growth",
+        "cos": 0.9418,
+        "rank_a_to_b": 1,
+        "rank_b_to_a": 1
+      },
+      {
+        "a": "Harmonize",
+        "b": "Divination",
+        "cos": 0.9394,
+        "rank_a_to_b": 3,
+        "rank_b_to_a": 2
+      },
+      {
+        "a": "Counterspell",
+        "b": "Mana Leak",
+        "cos": 0.9546,
+        "rank_a_to_b": 3,
+        "rank_b_to_a": 5
+      }
+    ]
+  },
+  "anti_pairs": {
+    "violations": 1,
+    "rows": [
+      {
+        "a": "Lightning Bolt",
+        "b": "Black Lotus",
+        "cos": 0.5972,
+        "max_cos": 0.85
+      },
+      {
+        "a": "Llanowar Elves",
+        "b": "Serra Angel",
+        "cos": 0.6388,
+        "max_cos": 0.8
+      },
+      {
+        "a": "Counterspell",
+        "b": "Cancel",
+        "cos": 0.9852,
+        "decoy": "Mana Leak",
+        "cos_a_to_decoy": 0.9546,
+        "violation": "decoy_not_closer"
+      }
+    ]
+  },
+  "clusters": {
+    "intra_per_cluster": {
+      "board_wipes": 0.8368,
+      "hard_counters": 0.8837,
+      "soft_counters": 0.9654,
+      "one_mana_dorks": 0.8488,
+      "draw_three_sorcery": 0.8996,
+      "one_mana_burn": 0.7471,
+      "unconditional_removal": 0.8108,
+      "ramp_spells": 0.8937,
+      "etb_drawers": 0.7468,
+      "one_drop_fliers": 0.6178
+    },
+    "inter_per_pair": {
+      "board_wipes": {
+        "hard_counters": 0.6686,
+        "soft_counters": 0.675,
+        "one_mana_dorks": 0.5472,
+        "draw_three_sorcery": 0.7156,
+        "one_mana_burn": 0.6662,
+        "unconditional_removal": 0.6588,
+        "ramp_spells": 0.6755,
+        "etb_drawers": 0.5579,
+        "one_drop_fliers": 0.5257
+      },
+      "hard_counters": {
+        "board_wipes": 0.6686,
+        "soft_counters": 0.9111,
+        "one_mana_dorks": 0.5312,
+        "draw_three_sorcery": 0.7233,
+        "one_mana_burn": 0.6786,
+        "unconditional_removal": 0.7645,
+        "ramp_spells": 0.6074,
+        "etb_drawers": 0.5675,
+        "one_drop_fliers": 0.5238
+      },
+      "soft_counters": {
+        "board_wipes": 0.675,
+        "hard_counters": 0.9111,
+        "one_mana_dorks": 0.5303,
+        "draw_three_sorcery": 0.71,
+        "one_mana_burn": 0.6923,
+        "unconditional_removal": 0.7608,
+        "ramp_spells": 0.5881,
+        "etb_drawers": 0.5493,
+        "one_drop_fliers": 0.5264
+      },
+      "one_mana_dorks": {
+        "board_wipes": 0.5472,
+        "hard_counters": 0.5312,
+        "soft_counters": 0.5303,
+        "draw_three_sorcery": 0.5567,
+        "one_mana_burn": 0.508,
+        "unconditional_removal": 0.5444,
+        "ramp_spells": 0.5292,
+        "etb_drawers": 0.6855,
+        "one_drop_fliers": 0.6554
+      },
+      "draw_three_sorcery": {
+        "board_wipes": 0.7156,
+        "hard_counters": 0.7233,
+        "soft_counters": 0.71,
+        "one_mana_dorks": 0.5567,
+        "one_mana_burn": 0.6917,
+        "unconditional_removal": 0.6785,
+        "ramp_spells": 0.7142,
+        "etb_drawers": 0.5999,
+        "one_drop_fliers": 0.5018
+      },
+      "one_mana_burn": {
+        "board_wipes": 0.6662,
+        "hard_counters": 0.6786,
+        "soft_counters": 0.6923,
+        "one_mana_dorks": 0.508,
+        "draw_three_sorcery": 0.6917,
+        "unconditional_removal": 0.6702,
+        "ramp_spells": 0.5969,
+        "etb_drawers": 0.5179,
+        "one_drop_fliers": 0.467
+      },
+      "unconditional_removal": {
+        "board_wipes": 0.6588,
+        "hard_counters": 0.7645,
+        "soft_counters": 0.7608,
+        "one_mana_dorks": 0.5444,
+        "draw_three_sorcery": 0.6785,
+        "one_mana_burn": 0.6702,
+        "ramp_spells": 0.598,
+        "etb_drawers": 0.5874,
+        "one_drop_fliers": 0.5129
+      },
+      "ramp_spells": {
+        "board_wipes": 0.6755,
+        "hard_counters": 0.6074,
+        "soft_counters": 0.5881,
+        "one_mana_dorks": 0.5292,
+        "draw_three_sorcery": 0.7142,
+        "one_mana_burn": 0.5969,
+        "unconditional_removal": 0.598,
+        "etb_drawers": 0.5841,
+        "one_drop_fliers": 0.4923
+      },
+      "etb_drawers": {
+        "board_wipes": 0.5579,
+        "hard_counters": 0.5675,
+        "soft_counters": 0.5493,
+        "one_mana_dorks": 0.6855,
+        "draw_three_sorcery": 0.5999,
+        "one_mana_burn": 0.5179,
+        "unconditional_removal": 0.5874,
+        "ramp_spells": 0.5841,
+        "one_drop_fliers": 0.6529
+      },
+      "one_drop_fliers": {
+        "board_wipes": 0.5257,
+        "hard_counters": 0.5238,
+        "soft_counters": 0.5264,
+        "one_mana_dorks": 0.6554,
+        "draw_three_sorcery": 0.5018,
+        "one_mana_burn": 0.467,
+        "unconditional_removal": 0.5129,
+        "ramp_spells": 0.4923,
+        "etb_drawers": 0.6529
+      }
+    },
+    "intra_mean": 0.8250479221343994,
+    "inter_mean": 0.6155573533640968,
+    "gap": 0.2094905687703026,
+    "precision@5": 0.4454545454545455,
+    "worst_cluster": "one_drop_fliers",
+    "missing": {}
+  },
+  "held_out": {
+    "synonym_recall@3": 0.8,
+    "rows": [
+      {
+        "query": "Damnation",
+        "top3": [
+          "Wrath of God",
+          "Day of Judgment",
+          "Supreme Verdict"
+        ],
+        "synonyms": [
+          "Wrath of God"
+        ],
+        "synonym_in_top3": true
+      },
+      {
+        "query": "Concentrate",
+        "top3": [
+          "Harmonize",
+          "Tidings",
+          "Divination"
+        ],
+        "synonyms": [
+          "Harmonize"
+        ],
+        "synonym_in_top3": true
+      },
+      {
+        "query": "Chain Lightning",
+        "top3": [
+          "Lava Spike",
+          "Fireball",
+          "Detonate"
+        ],
+        "synonyms": [
+          "Lightning Bolt"
+        ],
+        "synonym_in_top3": false
+      },
+      {
+        "query": "Elvish Mystic",
+        "top3": [
+          "Fyndhorn Elves",
+          "Llanowar Elves",
+          "Noble Hierarch"
+        ],
+        "synonyms": [
+          "Llanowar Elves"
+        ],
+        "synonym_in_top3": true
+      },
+      {
+        "query": "Go for the Throat",
+        "top3": [
+          "Murder",
+          "Doom Blade",
+          "Disenchant"
+        ],
+        "synonyms": [
+          "Doom Blade"
+        ],
+        "synonym_in_top3": true
+      },
+      {
+        "query": "Day of Judgment",
+        "top3": [
+          "Damnation",
+          "Wrath of God",
+          "Supreme Verdict"
+        ],
+        "synonyms": []
+      }
+    ]
+  },
+  "qualitative": [
+    {
+      "query": "Lightning Bolt",
+      "neighbors": [
+        [
+          "Shock",
+          0.9874
+        ],
+        [
+          "Psionic Blast",
+          0.9226
+        ],
+        [
+          "Inferno",
+          0.8977
+        ],
+        [
+          "Murder",
+          0.8625
+        ],
+        [
+          "Go for the Throat",
+          0.8552
+        ]
+      ]
+    },
+    {
+      "query": "Counterspell",
+      "neighbors": [
+        [
+          "Cancel",
+          0.9852
+        ],
+        [
+          "Force Spike",
+          0.9599
+        ],
+        [
+          "Mana Leak",
+          0.9546
+        ],
+        [
+          "Mana Drain",
+          0.9426
+        ],
+        [
+          "Spell Pierce",
+          0.9407
+        ]
+      ]
+    },
+    {
+      "query": "Wrath of God",
+      "neighbors": [
+        [
+          "Damnation",
+          0.9938
+        ],
+        [
+          "Day of Judgment",
+          0.9529
+        ],
+        [
+          "Supreme Verdict",
+          0.8871
+        ],
+        [
+          "Languish",
+          0.8242
+        ],
+        [
+          "Disintegrate",
+          0.8199
+        ]
+      ]
+    },
+    {
+      "query": "Llanowar Elves",
+      "neighbors": [
+        [
+          "Elvish Mystic",
+          0.9998
+        ],
+        [
+          "Fyndhorn Elves",
+          0.9998
+        ],
+        [
+          "Noble Hierarch",
+          0.905
+        ],
+        [
+          "Elvish Visionary",
+          0.7444
+        ],
+        [
+          "Grizzly Bears",
+          0.7384
+        ]
+      ]
+    },
+    {
+      "query": "Harmonize",
+      "neighbors": [
+        [
+          "Concentrate",
+          0.9963
+        ],
+        [
+          "Tidings",
+          0.9444
+        ],
+        [
+          "Divination",
+          0.9394
+        ],
+        [
+          "Braingeyser",
+          0.8656
+        ],
+        [
+          "Jace's Ingenuity",
+          0.8464
+        ]
+      ]
+    },
+    {
+      "query": "Doom Blade",
+      "neighbors": [
+        [
+          "Murder",
+          0.982
+        ],
+        [
+          "Go for the Throat",
+          0.9796
+        ],
+        [
+          "Disenchant",
+          0.9368
+        ],
+        [
+          "Naturalize",
+          0.9362
+        ],
+        [
+          "Unsummon",
+          0.8669
+        ]
+      ]
+    },
+    {
+      "query": "Giant Growth",
+      "neighbors": [
+        [
+          "Titanic Growth",
+          0.9418
+        ],
+        [
+          "Ancestral Recall",
+          0.8409
+        ],
+        [
+          "Cancel",
+          0.8404
+        ],
+        [
+          "Lightning Bolt",
+          0.8339
+        ],
+        [
+          "Murder",
+          0.8254
+        ]
+      ]
+    },
+    {
+      "query": "Birds of Paradise",
+      "neighbors": [
+        [
+          "Zephyr Falcon",
+          0.8134
+        ],
+        [
+          "Cloudfin Raptor",
+          0.7837
+        ],
+        [
+          "Dancing Scimitar",
+          0.7508
+        ],
+        [
+          "Shivan Dragon",
+          0.7467
+        ],
+        [
+          "Mulldrifter",
+          0.722
+        ]
+      ]
+    }
+  ]
+}
