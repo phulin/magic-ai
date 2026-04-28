@@ -122,6 +122,35 @@ def load_oracle_text(path: str | Path = DEFAULT_ORACLE_PATH) -> dict[str, Oracle
 # ---------------------------------------------------------------------------
 
 
+def render_card_body(name: str, oracle: OracleEntry | None) -> str:
+    """Render the static ``<card> Name <sep> Type <sep> P/T <sep> oracle </card>``
+    fragment for a single card.
+
+    Status flags, zone wrappers, and ``<card-ref:K>`` are *not* included — those
+    are state-dependent and inserted by the snapshot renderer / hot-path
+    assembler. This is the unit cached at startup by
+    :mod:`magic_ai.text_encoder.card_cache` and reused by
+    :class:`SnapshotRenderer` so the cache and slow-path agree byte-for-byte.
+    """
+
+    parts: list[str] = ["<card> ", name]
+    if oracle is not None:
+        type_line = oracle.get("type_line", "") or ""
+        mana_cost = oracle.get("mana_cost", "") or ""
+        pt = oracle.get("power_toughness")
+        text = render_oracle_text(oracle.get("oracle_text", "") or "")
+        if type_line:
+            parts.append(f" <sep> {type_line}")
+        if mana_cost:
+            parts.append(f" <sep> {mana_cost}")
+        if pt:
+            parts.append(f" <sep> {pt}")
+        if text:
+            parts.append(f" <sep> {text}")
+    parts.append(" </card>")
+    return "".join(parts)
+
+
 def render_oracle_text(text: str) -> str:
     """Render Scryfall oracle text verbatim.
 
@@ -384,29 +413,21 @@ class SnapshotRenderer:
                     char_end=char_end,
                 )
             )
-        buf.append("<card> ")
-        buf.append(name)
-        oracle = self._oracle.get(name)
-        if oracle is not None:
-            type_line = oracle.get("type_line", "") or ""
-            mana_cost = oracle.get("mana_cost", "") or ""
-            pt = oracle.get("power_toughness")
-            text = render_oracle_text(oracle.get("oracle_text", "") or "")
-            if type_line:
-                buf.append(f" <sep> {type_line}")
-            if mana_cost:
-                buf.append(f" <sep> {mana_cost}")
-            if pt:
-                buf.append(f" <sep> {pt}")
-            if text:
-                buf.append(f" <sep> {text}")
+        # Reuse the same `<card> ... </card>` fragment that the offline cache
+        # builds, then splice state-dependent status flags in front of the
+        # closing tag so the cache and slow-path agree byte-for-byte on the
+        # static portion.
+        body = render_card_body(name, self._oracle.get(name))
+        closing = " </card>"
+        assert body.endswith(closing)
+        buf.append(body[: -len(closing)])
         # Status flags — only what the snapshot actually carries.
         tapped = card.get("Tapped")
         if tapped is True:
             buf.append(" <sep> <tapped>")
         elif tapped is False:
             buf.append(" <sep> <untapped>")
-        buf.append(" </card>")
+        buf.append(closing)
 
     def _render_stack_object(
         self,
