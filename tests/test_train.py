@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from typing import cast
 
 import torch
 from magic_ai.game_state import GameStateEncoder
@@ -12,6 +13,7 @@ from magic_ai.model import PPOPolicy
 from magic_ai.opponent_pool import OpponentPool, SnapshotSchedule
 from magic_ai.ppo import PPOStats, RolloutStep, gae_returns
 from scripts.train import (
+    RetrospectiveLogSchedule,
     TrainingResumeState,
     _current_transcript_snapshot,
     _restore_opponent_pool,
@@ -21,6 +23,8 @@ from scripts.train import (
     load_training_checkpoint,
     log_args_to_wandb_summary,
     log_ppo_stats,
+    log_retrospective_table,
+    retrospective_rating_rows,
     sample_decks,
     save_checkpoint,
     validate_args,
@@ -216,6 +220,70 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(payloads[0]["games"], 8)
         self.assertEqual(payloads[0]["return_mean"], 0.5)
 
+    def test_retrospective_log_schedule_fires_every_five_percent(self) -> None:
+        schedule = RetrospectiveLogSchedule.build(episodes := 100)
+        self.assertEqual(schedule.total_episodes, episodes)
+
+        self.assertEqual(schedule.fire(4), [])
+        self.assertEqual(schedule.fire(5), [(5, 5)])
+        self.assertEqual(schedule.fire(16), [(10, 10), (15, 15)])
+
+    def test_log_retrospective_table_includes_all_snapshot_ratings(self) -> None:
+        pool = OpponentPool()
+        first = pool.add_snapshot(Path("snapshot_g000005_p005.0.pt"), "g000005_p005.0")
+        second = pool.add_snapshot(Path("snapshot_g000010_p010.0.pt"), "g000010_p010.0")
+        pool.record_match(second, first, rated_won=True)
+
+        rows = retrospective_rating_rows(pool, total_episodes=100)
+
+        class StubRun:
+            def __init__(self) -> None:
+                self.payloads: list[dict[str, object]] = []
+
+            def log(self, payload: dict[str, object]) -> None:
+                self.payloads.append(payload)
+
+        class StubTable:
+            def __init__(self, *, columns: list[str], data: list[list[object]]) -> None:
+                self.columns = columns
+                self.data = data
+
+        run = StubRun()
+
+        log_retrospective_table(
+            run,
+            horizon_pct=10,
+            horizon_step_count=10,
+            ratings=rows,
+            table_factory=StubTable,
+        )
+
+        self.assertEqual(len(run.payloads), 1)
+        payload = run.payloads[0]
+        self.assertEqual(payload["retrospective/horizon_pct"], 10)
+        self.assertEqual(payload["retrospective/horizon_step_count"], 10)
+        table = payload["retrospective/current_curve"]
+        self.assertIsInstance(table, StubTable)
+        table = cast(StubTable, table)
+        self.assertEqual(
+            table.columns,
+            [
+                "horizon_pct",
+                "horizon_step_count",
+                "snapshot_pct",
+                "snapshot_step_count",
+                "mu",
+                "sigma",
+                "conservative",
+                "n_games",
+            ],
+        )
+        self.assertEqual(len(table.data), 2)
+        self.assertEqual(table.data[0][0], 10)
+        self.assertEqual(table.data[0][2], 5.0)
+        self.assertEqual(table.data[0][3], 5)
+        self.assertEqual(table.data[0][7], 1)
+
     def test_build_slot_backend_constructs_current_slot_components(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             embeddings_path = Path(tmpdir) / "embeddings.json"
@@ -284,6 +352,12 @@ class TrainPPOTests(unittest.TestCase):
                 snapshot_schedule=SnapshotSchedule(
                     total_episodes=10, thresholds=[1, 2], next_idx=1
                 ),
+                retrospective_schedule=RetrospectiveLogSchedule(
+                    total_episodes=10,
+                    thresholds=[1, 2],
+                    horizon_pcts=[5, 10],
+                    next_idx=1,
+                ),
                 resume_state=TrainingResumeState(
                     completed_games=7,
                     last_saved_games=6,
@@ -306,6 +380,7 @@ class TrainPPOTests(unittest.TestCase):
         )
         self.assertEqual(checkpoint["training_state"]["completed_games"], 7)
         self.assertEqual(checkpoint["training_state"]["snapshot_schedule_next_idx"], 1)
+        self.assertEqual(checkpoint["training_state"]["retrospective_schedule_next_idx"], 1)
         self.assertEqual(
             checkpoint["training_state"]["opponent_pool"]["entries"][0]["tag"],
             "g000100_p010.0",
@@ -328,6 +403,7 @@ class TrainPPOTests(unittest.TestCase):
                                 "tag": "g000100_p010.0",
                                 "mu": 31.0,
                                 "sigma": 5.0,
+                                "n_games": 9,
                             }
                         ],
                     }
@@ -340,6 +416,7 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(pool.entries[0].tag, "g000100_p010.0")
         self.assertEqual(pool.entries[1].tag, "g000200_p020.0")
         self.assertEqual(pool.entries[0].rating.mu, 31.0)
+        self.assertEqual(pool.entries[0].n_games, 9)
         # New snapshot seeds from the previous entry's mean, but not confidence.
         self.assertAlmostEqual(pool.entries[1].rating.mu, 31.0)
         self.assertAlmostEqual(pool.entries[1].rating.sigma, 25.0 / 3.0)

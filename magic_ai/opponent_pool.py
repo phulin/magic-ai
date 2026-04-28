@@ -21,6 +21,7 @@ class OpponentEntry:
     path: Path
     tag: str
     rating: trueskill.Rating
+    n_games: int = 0
     cached_policy: dict[str, torch.Tensor] | None = None
 
 
@@ -78,6 +79,8 @@ class OpponentPool:
             new_o, new_r = env.rate_1vs1(opponent.rating, rated.rating)
         rated.rating = new_r
         opponent.rating = new_o
+        rated.n_games += 1
+        opponent.n_games += 1
 
     def current_rating_metrics(self) -> dict[str, float]:
         if not self.entries:
@@ -100,6 +103,7 @@ class OpponentPool:
                     "tag": entry.tag,
                     "mu": float(entry.rating.mu),
                     "sigma": float(entry.rating.sigma),
+                    "n_games": int(entry.n_games),
                 }
                 for entry in self.entries
             ],
@@ -121,6 +125,7 @@ class OpponentPool:
                         mu=float(item.get("mu", 25.0)),
                         sigma=float(item.get("sigma", 25.0 / 3.0)),
                     ),
+                    n_games=int(item.get("n_games", 0)),
                 )
                 pool.entries.append(entry)
         return pool

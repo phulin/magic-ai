@@ -113,6 +113,50 @@ class TrainingResumeState:
 
 
 @dataclass
+class RetrospectiveLogSchedule:
+    """Fires wandb retrospective-rating logs at fixed run-percent horizons."""
+
+    total_episodes: int
+    thresholds: list[int]
+    horizon_pcts: list[int]
+    next_idx: int = 0
+
+    @classmethod
+    def build(cls, total_episodes: int, *, pct_step: int = 5) -> RetrospectiveLogSchedule:
+        if total_episodes < 1:
+            raise ValueError("total_episodes must be at least 1")
+        if pct_step < 1:
+            raise ValueError("pct_step must be at least 1")
+
+        thresholds: list[int] = []
+        horizon_pcts: list[int] = []
+        for pct in range(pct_step, 101, pct_step):
+            threshold = max(1, int(round(total_episodes * pct / 100.0)))
+            if thresholds and threshold <= thresholds[-1]:
+                threshold = thresholds[-1] + 1
+            if threshold > total_episodes:
+                break
+            thresholds.append(threshold)
+            horizon_pcts.append(pct)
+        return cls(
+            total_episodes=total_episodes,
+            thresholds=thresholds,
+            horizon_pcts=horizon_pcts,
+        )
+
+    def fire(self, completed_games: int) -> list[tuple[int, int]]:
+        """Return ``(horizon_pct, threshold_games)`` crossed since the last call."""
+        fired: list[tuple[int, int]] = []
+        while (
+            self.next_idx < len(self.thresholds)
+            and completed_games >= self.thresholds[self.next_idx]
+        ):
+            fired.append((self.horizon_pcts[self.next_idx], self.thresholds[self.next_idx]))
+            self.next_idx += 1
+        return fired
+
+
+@dataclass
 class WinFractionStats:
     p1_wins: int = 0
     p2_wins: int = 0
@@ -490,14 +534,20 @@ def main() -> None:
 
     opponent_pool: OpponentPool | None = None
     snapshot_schedule: SnapshotSchedule | None = None
+    retrospective_schedule: RetrospectiveLogSchedule | None = None
     opponent_policy: PPOPolicy | None = None
     if not args.disable_opponent_pool:
         opponent_pool = _restore_opponent_pool(checkpoint_cpu, args.opponent_pool_dir)
         snapshot_schedule = SnapshotSchedule.build(args.episodes)
+        retrospective_schedule = RetrospectiveLogSchedule.build(args.episodes)
         training_state = _training_state_dict(checkpoint_cpu)
         snapshot_schedule.next_idx = min(
             int(training_state.get("snapshot_schedule_next_idx", 0)),
             len(snapshot_schedule.thresholds),
+        )
+        retrospective_schedule.next_idx = min(
+            int(training_state.get("retrospective_schedule_next_idx", 0)),
+            len(retrospective_schedule.thresholds),
         )
         opponent_policy = build_opponent_policy(policy, device)
 
@@ -512,6 +562,7 @@ def main() -> None:
         staging_buffer,
         opponent_pool=opponent_pool,
         snapshot_schedule=snapshot_schedule,
+        retrospective_schedule=retrospective_schedule,
         opponent_policy=opponent_policy,
         resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
         resume_checkpoint=checkpoint_cpu,
@@ -524,6 +575,7 @@ def main() -> None:
         args,
         opponent_pool=opponent_pool,
         snapshot_schedule=snapshot_schedule,
+        retrospective_schedule=retrospective_schedule,
         resume_state=final_resume_state,
         wandb_run_id=active_wandb_run_id,
         run_artifact_dir=run_artifact_dir,
@@ -877,6 +929,89 @@ def log_ppo_stats(
     logger(payload)
 
 
+def _snapshot_games_from_tag(tag: str) -> int | None:
+    match = re.match(r"g(\d+)_p", tag)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _snapshot_pct_from_tag(tag: str, total_episodes: int) -> float | None:
+    match = re.search(r"_p(\d+(?:\.\d+)?)$", tag)
+    if match is not None:
+        return float(match.group(1))
+    snapshot_games = _snapshot_games_from_tag(tag)
+    if snapshot_games is None:
+        return None
+    return 100.0 * snapshot_games / max(1, total_episodes)
+
+
+def retrospective_rating_rows(
+    opponent_pool: OpponentPool,
+    *,
+    total_episodes: int,
+) -> list[dict[str, float | int | None]]:
+    rows: list[dict[str, float | int | None]] = []
+    for entry in opponent_pool.entries:
+        mu = float(entry.rating.mu)
+        sigma = float(entry.rating.sigma)
+        rows.append(
+            {
+                "snapshot_pct": _snapshot_pct_from_tag(entry.tag, total_episodes),
+                "snapshot_step_count": _snapshot_games_from_tag(entry.tag),
+                "mu": mu,
+                "sigma": sigma,
+                "conservative": mu - 3.0 * sigma,
+                "n_games": int(entry.n_games),
+            }
+        )
+    return rows
+
+
+def log_retrospective_table(
+    run: Any,
+    *,
+    horizon_pct: int,
+    horizon_step_count: int,
+    ratings: list[dict[str, float | int | None]],
+    table_factory: Callable[..., Any] | None = None,
+) -> None:
+    """Log the current snapshot TrueSkill curve as a wandb table."""
+
+    columns = [
+        "horizon_pct",
+        "horizon_step_count",
+        "snapshot_pct",
+        "snapshot_step_count",
+        "mu",
+        "sigma",
+        "conservative",
+        "n_games",
+    ]
+    data = [
+        [
+            horizon_pct,
+            horizon_step_count,
+            rating["snapshot_pct"],
+            rating["snapshot_step_count"],
+            rating["mu"],
+            rating["sigma"],
+            rating["conservative"],
+            rating.get("n_games"),
+        ]
+        for rating in ratings
+    ]
+    make_table = wandb.Table if table_factory is None else table_factory
+    table = make_table(columns=columns, data=data)
+    run.log(
+        {
+            "retrospective/current_curve": table,
+            "retrospective/horizon_pct": horizon_pct,
+            "retrospective/horizon_step_count": horizon_step_count,
+        }
+    )
+
+
 def rollout_value_metrics(
     steps: list[RolloutStep],
     returns: torch.Tensor,
@@ -907,6 +1042,7 @@ def train_native_batched_envs(
     *,
     opponent_pool: OpponentPool | None = None,
     snapshot_schedule: SnapshotSchedule | None = None,
+    retrospective_schedule: RetrospectiveLogSchedule | None = None,
     opponent_policy: PPOPolicy | None = None,
     resume_state: TrainingResumeState | None = None,
     resume_checkpoint: dict[str, Any] | None = None,
@@ -1337,6 +1473,7 @@ def train_native_batched_envs(
                 args,
                 opponent_pool=opponent_pool,
                 snapshot_schedule=snapshot_schedule,
+                retrospective_schedule=retrospective_schedule,
                 resume_state=TrainingResumeState(
                     completed_games=completed_games,
                     last_saved_games=completed_games,
@@ -1366,6 +1503,19 @@ def train_native_batched_envs(
                     deck_pool=deck_pool,
                     rng=eval_rng,
                 )
+
+        if opponent_pool is not None and retrospective_schedule is not None:
+            for horizon_pct, horizon_step_count in retrospective_schedule.fire(completed_games):
+                if wandb.run is not None:
+                    log_retrospective_table(
+                        wandb.run,
+                        horizon_pct=horizon_pct,
+                        horizon_step_count=horizon_step_count,
+                        ratings=retrospective_rating_rows(
+                            opponent_pool,
+                            total_episodes=args.episodes,
+                        ),
+                    )
 
         _t = time.perf_counter()
         maybe_start_games()
@@ -1657,6 +1807,7 @@ def save_checkpoint(
     *,
     opponent_pool: OpponentPool | None = None,
     snapshot_schedule: SnapshotSchedule | None = None,
+    retrospective_schedule: RetrospectiveLogSchedule | None = None,
     resume_state: TrainingResumeState | None = None,
     wandb_run_id: str | None = None,
     run_artifact_dir: Path | None = None,
@@ -1676,6 +1827,9 @@ def save_checkpoint(
             resume_state.total_generated_rollout_steps if resume_state is not None else 0
         ),
         "snapshot_schedule_next_idx": snapshot_schedule.next_idx if snapshot_schedule else 0,
+        "retrospective_schedule_next_idx": (
+            retrospective_schedule.next_idx if retrospective_schedule else 0
+        ),
         "opponent_pool": opponent_pool.state_dict() if opponent_pool is not None else None,
     }
     if rnad_state is not None:
