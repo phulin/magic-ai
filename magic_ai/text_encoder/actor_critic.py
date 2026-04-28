@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch import Tensor, nn
+from torch.distributions import Bernoulli
 
+from magic_ai.model import TRACE_KIND_TO_ID
+from magic_ai.replay_decisions import ReplayPerChoice
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
     RecurrentTextPolicyConfig,
     RecurrentTextPolicyOutput,
 )
+from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 
 
 @dataclass(frozen=True)
@@ -35,10 +40,14 @@ class TextActorCritic(nn.Module):
         self.policy = RecurrentTextPolicy(cfg)
         self.lstm_layers = cfg.lstm_layers
         self.lstm_hidden = cfg.lstm_hidden
+        self.none_head = nn.Linear(self.lstm_hidden, 1)
+        self.may_head = nn.Linear(self.lstm_hidden, 1)
         self.register_buffer("live_lstm_h", torch.zeros(self.lstm_layers, 0, self.lstm_hidden))
         self.register_buffer("live_lstm_c", torch.zeros(self.lstm_layers, 0, self.lstm_hidden))
         self._num_envs = 0
         self._players_per_env = 2
+        self.spr_enabled = False
+        self.rollout_buffer: TextReplayBuffer | None = None
 
     @property
     def device(self) -> torch.device:
@@ -86,6 +95,104 @@ class TextActorCritic(nn.Module):
         self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
         return TextActorCriticStep(output=output, h_out=h_out, c_out=c_out)
 
+    def evaluate_replay_batch(
+        self,
+        replay_rows: list[int],
+        *,
+        return_extras: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor, None]:
+        if return_extras:
+            raise ValueError("TextActorCritic does not implement SPR replay extras")
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+        batch = self.rollout_buffer.gather(replay_rows)
+        if batch.lstm_h_in is None or batch.lstm_c_in is None:
+            output, _state = self.policy(batch.encoded)
+        else:
+            h_in = batch.lstm_h_in.permute(1, 0, 2).contiguous()
+            c_in = batch.lstm_c_in.permute(1, 0, 2).contiguous()
+            output, _state = self.policy(batch.encoded, h_in=h_in, c_in=c_in)
+
+        n = int(batch.trace_kind_id.shape[0])
+        log_probs = output.values.new_zeros(n)
+        entropies = output.values.new_zeros(n)
+
+        may_mask = batch.trace_kind_id == TRACE_KIND_TO_ID["may"]
+        if may_mask.any():
+            may_logits = self.may_head(output.state_hidden).squeeze(-1)
+            may_dist = Bernoulli(logits=may_logits[may_mask])
+            may_selected = batch.may_selected[may_mask].to(dtype=output.values.dtype)
+            log_probs[may_mask] = may_dist.log_prob(may_selected)
+            entropies[may_mask] = may_dist.entropy()
+
+        decision_log_probs, decision_entropies = cast(
+            tuple[Tensor, Tensor],
+            self._evaluate_decision_groups(output, batch),
+        )
+        log_probs = log_probs + decision_log_probs
+        entropies = entropies + decision_entropies
+        return log_probs, entropies, output.values, None
+
+    def evaluate_replay_batch_per_choice(
+        self,
+        replay_rows: list[int],
+        *,
+        lstm_state_override: tuple[Tensor, Tensor] | None = None,
+        hidden_override: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice]:
+        if hidden_override is not None:
+            raise ValueError("TextActorCritic does not support hidden_override")
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+        batch = self.rollout_buffer.gather(replay_rows)
+        if lstm_state_override is not None:
+            output, _state = self.policy(
+                batch.encoded,
+                h_in=lstm_state_override[0],
+                c_in=lstm_state_override[1],
+            )
+        elif batch.lstm_h_in is None or batch.lstm_c_in is None:
+            output, _state = self.policy(batch.encoded)
+        else:
+            h_in = batch.lstm_h_in.permute(1, 0, 2).contiguous()
+            c_in = batch.lstm_c_in.permute(1, 0, 2).contiguous()
+            output, _state = self.policy(batch.encoded, h_in=h_in, c_in=c_in)
+
+        n = int(batch.trace_kind_id.shape[0])
+        log_probs = output.values.new_zeros(n)
+        entropies = output.values.new_zeros(n)
+        may_mask = batch.trace_kind_id == TRACE_KIND_TO_ID["may"]
+        may_logits_per_step = self.may_head(output.state_hidden).squeeze(-1)
+        may_selected_per_step = batch.may_selected.to(dtype=output.values.dtype)
+        if may_mask.any():
+            may_dist = Bernoulli(logits=may_logits_per_step[may_mask])
+            log_probs[may_mask] = may_dist.log_prob(may_selected_per_step[may_mask])
+            entropies[may_mask] = may_dist.entropy()
+
+        decision_log_probs, decision_entropies, per_choice = cast(
+            tuple[Tensor, Tensor, ReplayPerChoice],
+            self._evaluate_decision_groups(
+                output,
+                batch,
+                return_per_choice=True,
+            ),
+        )
+        log_probs = log_probs + decision_log_probs
+        entropies = entropies + decision_entropies
+        per_choice = ReplayPerChoice(
+            flat_logits=per_choice.flat_logits,
+            flat_log_probs=per_choice.flat_log_probs,
+            group_idx=per_choice.group_idx,
+            choice_cols=per_choice.choice_cols,
+            is_sampled_flat=per_choice.is_sampled_flat,
+            may_is_active=may_mask,
+            may_logits_per_step=may_logits_per_step,
+            may_selected_per_step=may_selected_per_step,
+            decision_group_id_flat=per_choice.decision_group_id_flat,
+            step_for_decision_group=per_choice.step_for_decision_group,
+        )
+        return log_probs, entropies, output.values, per_choice
+
     def scatter_lstm_env_states(
         self,
         env_indices: list[int],
@@ -102,6 +209,126 @@ class TextActorCritic(nn.Module):
             )
         self.live_lstm_h[:, slots] = h_out.detach()
         self.live_lstm_c[:, slots] = c_out.detach()
+
+    def _evaluate_decision_groups(
+        self,
+        output: RecurrentTextPolicyOutput,
+        batch: TextReplayBatch,
+        *,
+        return_per_choice: bool = False,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, ReplayPerChoice]:
+        decision_count = batch.decision_count
+        n = int(decision_count.shape[0])
+        log_probs = output.values.new_zeros(n)
+        entropies = output.values.new_zeros(n)
+        none_logits = self.none_head(output.state_hidden).squeeze(-1)
+        flat_logits_parts: list[Tensor] = []
+        flat_log_prob_parts: list[Tensor] = []
+        group_idx_parts: list[Tensor] = []
+        choice_col_parts: list[Tensor] = []
+        is_sampled_parts: list[Tensor] = []
+        decision_group_id_parts: list[Tensor] = []
+        step_for_decision_groups: list[int] = []
+        decision_group_id = 0
+        for step_idx in range(n):
+            group_count = int(decision_count[step_idx].item())
+            for group_idx in range(group_count):
+                mask = batch.decision_mask[step_idx, group_idx]
+                if not bool(mask.any()):
+                    raise ValueError("decision group must include at least one valid choice")
+                logits = self._direct_decision_logits(
+                    output,
+                    none_logits,
+                    step_idx=step_idx,
+                    group_idx=group_idx,
+                    batch=batch,
+                )
+                valid_logits = logits[mask]
+                valid_cols = mask.nonzero(as_tuple=False).squeeze(-1)
+                selected = int(batch.selected_indices[step_idx, group_idx].item())
+                selected_pos = (valid_cols == selected).nonzero(as_tuple=False)
+                if selected_pos.numel() == 0:
+                    raise ValueError("selected decision column is not valid for replay group")
+                group_log_probs = torch.log_softmax(valid_logits, dim=0)
+                probs = group_log_probs.exp()
+                log_probs[step_idx] = (
+                    log_probs[step_idx] + group_log_probs[int(selected_pos[0, 0].item())]
+                )
+                entropies[step_idx] = entropies[step_idx] - (probs * group_log_probs).sum()
+                if return_per_choice:
+                    flat_logits_parts.append(valid_logits)
+                    flat_log_prob_parts.append(group_log_probs)
+                    group_idx_parts.append(torch.full_like(valid_cols, step_idx))
+                    choice_col_parts.append(valid_cols)
+                    is_sampled_parts.append(valid_cols == selected)
+                    decision_group_id_parts.append(torch.full_like(valid_cols, decision_group_id))
+                    step_for_decision_groups.append(step_idx)
+                decision_group_id += 1
+        if not return_per_choice:
+            return log_probs, entropies
+        if flat_logits_parts:
+            flat_logits = torch.cat(flat_logits_parts, dim=0)
+            flat_log_probs = torch.cat(flat_log_prob_parts, dim=0)
+            group_idx_out = torch.cat(group_idx_parts, dim=0)
+            choice_cols = torch.cat(choice_col_parts, dim=0)
+            is_sampled_flat = torch.cat(is_sampled_parts, dim=0)
+            decision_group_id_flat = torch.cat(decision_group_id_parts, dim=0)
+            step_for_decision_group = torch.tensor(
+                step_for_decision_groups,
+                dtype=torch.long,
+                device=output.values.device,
+            )
+        else:
+            flat_logits = output.values.new_zeros(0)
+            flat_log_probs = output.values.new_zeros(0)
+            group_idx_out = torch.zeros(0, dtype=torch.long, device=output.values.device)
+            choice_cols = torch.zeros(0, dtype=torch.long, device=output.values.device)
+            is_sampled_flat = torch.zeros(0, dtype=torch.bool, device=output.values.device)
+            decision_group_id_flat = torch.zeros(0, dtype=torch.long, device=output.values.device)
+            step_for_decision_group = torch.zeros(0, dtype=torch.long, device=output.values.device)
+        return (
+            log_probs,
+            entropies,
+            ReplayPerChoice(
+                flat_logits=flat_logits,
+                flat_log_probs=flat_log_probs,
+                group_idx=group_idx_out,
+                choice_cols=choice_cols,
+                is_sampled_flat=is_sampled_flat,
+                may_is_active=torch.zeros(n, dtype=torch.bool, device=output.values.device),
+                may_logits_per_step=output.values.new_zeros(n),
+                may_selected_per_step=output.values.new_zeros(n),
+                decision_group_id_flat=decision_group_id_flat,
+                step_for_decision_group=step_for_decision_group,
+            ),
+        )
+
+    def _direct_decision_logits(
+        self,
+        output: RecurrentTextPolicyOutput,
+        none_logits: Tensor,
+        *,
+        step_idx: int,
+        group_idx: int,
+        batch: TextReplayBatch,
+    ) -> Tensor:
+        option_idx = batch.decision_option_idx[step_idx, group_idx]
+        target_idx = batch.decision_target_idx[step_idx, group_idx]
+        uses_none = bool(batch.uses_none_head[step_idx, group_idx].item())
+        logits = output.values.new_full(option_idx.shape, -torch.inf)
+        for col in range(int(option_idx.shape[0])):
+            if uses_none and col == 0:
+                logits[col] = none_logits[step_idx]
+                continue
+            opt = int(option_idx[col].item())
+            tgt = int(target_idx[col].item())
+            if opt < 0:
+                continue
+            if tgt >= 0:
+                logits[col] = output.target_logits[step_idx, opt, tgt]
+            else:
+                logits[col] = output.policy_logits[step_idx, opt]
+        return logits
 
     def _state_slots(
         self,

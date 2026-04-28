@@ -109,8 +109,10 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - [ ] Python render-plan emission as fallback
   - [ ] `assemble_batch(...)`
   - [ ] shared decision replay logic
-- [ ] Implement `evaluate_replay_batch(...)` for PPO.
-- [ ] Implement `evaluate_replay_batch_per_choice(...)` for RNaD.
+- [x] Implement `evaluate_replay_batch(...)` for PPO.
+  - `TextActorCritic.evaluate_replay_batch(...)` now replays `TextReplayBuffer` rows through `RecurrentTextPolicy`, scores direct option/target logits plus none/may heads, and supports PPO loss/backward.
+- [x] Implement `evaluate_replay_batch_per_choice(...)` for RNaD.
+  - Text replay now returns the same `ReplayPerChoice` shape used by R-NaD's slot path; recurrent recompute is still pending.
 - [ ] Implement recurrent recompute methods needed by RNaD.
 - [ ] Initially disable SPR for text unless/until a text-specific SPR target path is implemented.
 

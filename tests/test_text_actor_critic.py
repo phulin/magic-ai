@@ -5,6 +5,7 @@ from magic_ai.text_encoder.actor_critic import TextActorCritic
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig
+from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 
@@ -85,6 +86,94 @@ class TextActorCriticTests(unittest.TestCase):
         self.assertFalse(torch.equal(model.live_lstm_h[:, 3], torch.zeros(1, 8)))
         self.assertTrue(torch.equal(model.live_lstm_h[:, 1], torch.zeros(1, 8)))
         self.assertTrue(torch.equal(model.live_lstm_h[:, 2], torch.zeros(1, 8)))
+
+    def test_evaluate_replay_batch_produces_finite_ppo_tensors(self) -> None:
+        torch.manual_seed(0)
+        model = _model()
+        replay = TextReplayBuffer(
+            capacity=4,
+            max_tokens=4,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            recurrent_layers=1,
+            recurrent_hidden_dim=8,
+        )
+        model.rollout_buffer = replay
+        row = replay.append(
+            encoded=_batch(batch_size=1),
+            batch_index=0,
+            trace_kind_id=0,
+            decision_option_idx=torch.tensor([[0, 1]]),
+            decision_target_idx=torch.tensor([[-1, -1]]),
+            decision_mask=torch.tensor([[True, True]]),
+            uses_none_head=torch.tensor([False]),
+            selected_indices=torch.tensor([0]),
+            may_selected=0.0,
+            old_log_prob=-0.5,
+            value=0.1,
+            perspective_player_idx=0,
+            lstm_h_in=torch.zeros(1, 8),
+            lstm_c_in=torch.zeros(1, 8),
+        )
+
+        log_probs, entropies, values, extras = model.evaluate_replay_batch([row])
+        loss = -(log_probs + 0.01 * entropies).mean() + values.square().mean()
+        loss.backward()
+
+        self.assertIsNone(extras)
+        self.assertEqual(tuple(log_probs.shape), (1,))
+        self.assertEqual(tuple(entropies.shape), (1,))
+        self.assertEqual(tuple(values.shape), (1,))
+        self.assertTrue(torch.isfinite(log_probs).all())
+        self.assertTrue(torch.isfinite(entropies).all())
+        self.assertTrue(torch.isfinite(values).all())
+
+    def test_evaluate_replay_batch_per_choice_returns_rnad_shape(self) -> None:
+        torch.manual_seed(0)
+        model = _model()
+        replay = TextReplayBuffer(
+            capacity=4,
+            max_tokens=4,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            recurrent_layers=1,
+            recurrent_hidden_dim=8,
+        )
+        model.rollout_buffer = replay
+        row = replay.append(
+            encoded=_batch(batch_size=1),
+            batch_index=0,
+            trace_kind_id=0,
+            decision_option_idx=torch.tensor([[0, 1]]),
+            decision_target_idx=torch.tensor([[-1, -1]]),
+            decision_mask=torch.tensor([[True, True]]),
+            uses_none_head=torch.tensor([False]),
+            selected_indices=torch.tensor([1]),
+            may_selected=0.0,
+            old_log_prob=-0.5,
+            value=0.1,
+            perspective_player_idx=0,
+            lstm_h_in=torch.zeros(1, 8),
+            lstm_c_in=torch.zeros(1, 8),
+        )
+
+        log_probs, entropies, values, per_choice = model.evaluate_replay_batch_per_choice([row])
+
+        self.assertEqual(tuple(log_probs.shape), (1,))
+        self.assertEqual(tuple(entropies.shape), (1,))
+        self.assertEqual(tuple(values.shape), (1,))
+        self.assertEqual(tuple(per_choice.flat_logits.shape), (2,))
+        self.assertEqual(tuple(per_choice.flat_log_probs.shape), (2,))
+        torch.testing.assert_close(per_choice.group_idx, torch.tensor([0, 0]))
+        torch.testing.assert_close(per_choice.choice_cols, torch.tensor([0, 1]))
+        torch.testing.assert_close(per_choice.is_sampled_flat, torch.tensor([False, True]))
+        torch.testing.assert_close(per_choice.decision_group_id_flat, torch.tensor([0, 0]))
+        torch.testing.assert_close(per_choice.step_for_decision_group, torch.tensor([0]))
+        self.assertFalse(bool(per_choice.may_is_active[0]))
 
     def test_rejects_mismatched_env_and_player_lists(self) -> None:
         model = _model()
