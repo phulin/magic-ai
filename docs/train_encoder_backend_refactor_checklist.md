@@ -36,21 +36,22 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 
 - [x] Extract the decision-group distribution code out of `PPOPolicy` into a backend-neutral helper module.
   - Added `magic_ai/replay_decisions.py`; `PPOPolicy` now delegates decision logits, flat distribution, and validation helpers to it.
-- [ ] Preserve support for:
+- [x] Preserve support for:
   - [x] priority choices
   - [x] targets
   - [x] attackers/blockers multi-decision groups
   - [x] blocker/pass "none" choice
-  - [ ] may Bernoulli head
-    - May remains in `PPOPolicy.evaluate_replay_batch*`; only decision-group scoring was extracted in this pass.
-- [ ] Define a common forward-output shape for replay scoring:
-  - [ ] `values`
-  - [ ] `option_vectors`
-  - [ ] `target_vectors`
-  - [ ] `query` or direct option/target logits
-  - [ ] `none_logits`
-  - [ ] `may_logits`
-  - [ ] recurrent hidden vector for auxiliary losses
+  - [x] may Bernoulli head
+    - May replay scoring now lives in `magic_ai/replay_decisions.py` and is shared by slot and text replay evaluation.
+- [x] Define a common forward-output shape for replay scoring:
+  - [x] `values`
+  - [x] `option_vectors`
+  - [x] `target_vectors`
+  - [x] `query` or direct option/target logits
+  - [x] `none_logits`
+  - [x] `may_logits`
+  - [x] recurrent hidden vector for auxiliary losses
+  - Added `ReplayScoringForward`; slot `_ForwardBatch` now uses it and text replay builds the same shape around `RecurrentTextPolicyOutput`. Shared helpers cover slot query-vector scoring and text direct option/target-logit scoring.
 - [x] Keep slot behavior byte-for-byte or test-equivalent after extraction.
 - [x] Add tests that compare old slot replay log-probs against the extracted helper.
   - Added `tests/test_replay_decisions.py` for manual logits/entropy expectations and the `PPOPolicy` adapter path.
@@ -67,12 +68,12 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - `main()` now builds a `SlotTrainingBackend` and passes its existing policy, native encoder, and staging buffer into the unchanged loop.
 - [x] Keep checkpoint save/load metadata compatible with existing slot checkpoints.
   - Checkpoints now save `metadata.encoder`; legacy checkpoints without it are treated as `slots`.
-- [ ] Verify `--encoder slots` produces the same smoke behavior as before.
+- [x] Verify `--encoder slots` produces the same smoke behavior as before.
 
 ## Phase 4: Text Replay Buffer
 
 - [x] Add `TextReplayBuffer` for text-encoded replay rows.
-- [ ] Store per step:
+- [x] Store per step:
   - [x] `token_ids`
   - [x] `attention_mask`
   - [x] `card_ref_positions`
@@ -99,7 +100,7 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 ## Phase 5: Text Actor-Critic Training Surface
 
 - [x] Add `TextActorCritic` wrapper around `RecurrentTextPolicy`.
-- [ ] Implement live env recurrent state management:
+- [x] Implement live env recurrent state management:
   - [x] initialize per-env player states
   - [x] reset states for completed games
   - [x] gather/scatter state for active env batches
@@ -122,12 +123,12 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 ## Phase 6: Text Backend Collector
 
 - [x] Add `TextTrainingBackend`.
-- [ ] Load text artifacts:
+- [x] Load text artifacts:
   - [x] tokenizer
   - [x] oracle text
   - [x] `data/text_encoder_card_tokens.pt`
 - [x] Build in-memory card-token cache when the `.pt` cache is missing.
-- [ ] Add CLI args:
+- [x] Add CLI args:
   - [x] `--card-token-cache`
   - [x] `--text-max-tokens`
   - [x] `--text-d-model`
@@ -145,7 +146,7 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 
 - [x] Split current setup into `build_slot_backend(...)`.
 - [x] Add `build_text_backend(...)`.
-- [ ] Branch once after argument validation:
+- [x] Branch once after argument validation:
   - [x] `args.encoder == "slots"`
   - [x] `args.encoder == "text"`
 - [ ] Keep the main training loop backend-oriented:
@@ -155,7 +156,7 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - [x] save checkpoint
   - [x] log metrics
   - Text PPO now has a separate correctness loop; R-NaD remains slot-only in `train.py`.
-- [ ] Save checkpoint metadata including:
+- [x] Save checkpoint metadata including:
   - [x] encoder kind
   - [x] text config when `encoder=text`
   - [x] tokenizer path/hash if available
@@ -166,15 +167,15 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 
 - [x] Verify existing slot tests pass unchanged.
   - Focused slot replay/native tests pass; full suite smoke remains separate.
-- [ ] Add `--encoder slots` train smoke test.
-- [ ] Add `--encoder text` single-game rollout smoke test.
+- [x] Add `--encoder slots` train smoke test.
+- [x] Add `--encoder text` single-game rollout smoke test.
 - [x] Add text PPO replay test:
   - [x] sample action
   - [x] store replay row
   - [x] reevaluate log-prob from replay
   - [x] confirm finite loss/backward
 - [x] Add text RNaD replay test after per-choice replay is implemented.
-- [ ] Run:
+- [x] Run:
   - [x] `uv run ruff format`
   - [x] `uv run ruff check --fix`
   - [x] `uv run ty check`

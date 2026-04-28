@@ -49,9 +49,11 @@ from magic_ai.lstm_recompute import (
 from magic_ai.native_encoder import NativeEncodedBatch
 from magic_ai.replay_decisions import (
     ReplayPerChoice,
+    ReplayScoringForward,
     decision_logits_reference,
-    flat_decision_distribution,
+    flat_decision_distribution_from_forward,
     flat_decision_distribution_impl,
+    score_may_decisions_from_forward,
     validate_decision_indices,
     validate_flat_scored_indices,
 )
@@ -642,7 +644,7 @@ class PPOPolicy(nn.Module):
                     uses_none=uses_none,
                     option_vectors=forward.option_vectors,
                     target_vectors=forward.target_vectors,
-                    query=forward.query,
+                    query=cast(Tensor, forward.query),
                     none_logits=forward.none_logits,
                 )
             )
@@ -810,7 +812,7 @@ class PPOPolicy(nn.Module):
                     uses_none=uses_none,
                     option_vectors=forward.option_vectors,
                     target_vectors=forward.target_vectors,
-                    query=forward.query,
+                    query=cast(Tensor, forward.query),
                     none_logits=forward.none_logits,
                 )
             )
@@ -1081,14 +1083,15 @@ class PPOPolicy(nn.Module):
 
         trace_kind_ids = rb.trace_kind_id[step_indices]
         may_mask = trace_kind_ids == TRACE_KIND_TO_ID["may"]
-        if may_mask.any():
-            may_pos_t = may_mask.nonzero(as_tuple=False).squeeze(-1)
-            may_buf_t = step_indices[may_pos_t]
-            may_logits = forward.may_logits[may_pos_t]
-            may_selected_t = rb.may_selected[may_buf_t].to(dtype=forward.values.dtype)
-            may_dist = Bernoulli(logits=may_logits)
-            log_probs[may_pos_t] = may_dist.log_prob(may_selected_t)
-            entropies[may_pos_t] = may_dist.entropy()
+        may_log_probs, may_entropies, _may_logits_per_step, _may_selected_per_step = (
+            score_may_decisions_from_forward(
+                forward,
+                may_selected=rb.may_selected[step_indices],
+                may_mask=may_mask,
+            )
+        )
+        log_probs = log_probs + may_log_probs
+        entropies = entropies + may_entropies
 
         decision_starts = rb.decision_start[step_indices]
         decision_counts = rb.decision_count[step_indices]
@@ -1123,7 +1126,7 @@ class PPOPolicy(nn.Module):
                     uses_none=uses_none,
                     option_vectors=forward.option_vectors,
                     target_vectors=forward.target_vectors,
-                    query=forward.query,
+                    query=cast(Tensor, forward.query),
                     none_logits=forward.none_logits,
                 )
             )
@@ -1327,23 +1330,15 @@ class PPOPolicy(nn.Module):
 
         trace_kind_ids = rb.trace_kind_id[step_indices]
         may_mask = trace_kind_ids == TRACE_KIND_TO_ID["may"]
-        may_logits_per_step = forward.values.new_zeros(n)
-        may_selected_per_step = forward.values.new_zeros(n)
-        # Always run the may-head path; downstream uses are gated by may_mask
-        # via scatters, so an empty may_pos_t is a no-op. This avoids a sync
-        # on `may_mask.any()` per call.
-        may_pos_t = may_mask.nonzero(as_tuple=False).squeeze(-1)
-        may_buf_t = step_indices[may_pos_t]
-        may_logits = forward.may_logits[may_pos_t]
-        may_selected_t = rb.may_selected[may_buf_t].to(dtype=forward.values.dtype)
-        may_dist = Bernoulli(logits=may_logits)
-        log_probs[may_pos_t] = may_dist.log_prob(may_selected_t)
-        entropies[may_pos_t] = may_dist.entropy()
-        # Preserve differentiability on may_logits_per_step so downstream
-        # losses applied to it (e.g. beta-gated NeuRD) receive gradient.
-        may_logits_per_step = may_logits_per_step.clone()
-        may_logits_per_step[may_pos_t] = may_logits
-        may_selected_per_step[may_pos_t] = may_selected_t
+        may_log_probs, may_entropies, may_logits_per_step, may_selected_per_step = (
+            score_may_decisions_from_forward(
+                forward,
+                may_selected=rb.may_selected[step_indices],
+                may_mask=may_mask,
+            )
+        )
+        log_probs = log_probs + may_log_probs
+        entropies = entropies + may_entropies
 
         decision_starts = rb.decision_start[step_indices]
         decision_counts = rb.decision_count[step_indices]
@@ -1383,7 +1378,7 @@ class PPOPolicy(nn.Module):
                     uses_none=uses_none,
                     option_vectors=forward.option_vectors,
                     target_vectors=forward.target_vectors,
-                    query=forward.query,
+                    query=cast(Tensor, forward.query),
                     none_logits=forward.none_logits,
                 )
             )
@@ -2153,16 +2148,21 @@ class PPOPolicy(nn.Module):
         """Return flat valid-choice logits plus grouped log-probs/entropies."""
 
         self._maybe_init_compiled_functions()
-        return flat_decision_distribution(
+        return flat_decision_distribution_from_forward(
+            ReplayScoringForward(
+                values=query.new_zeros(query.shape[0]),
+                option_vectors=option_vectors,
+                target_vectors=target_vectors,
+                none_logits=none_logits,
+                may_logits=none_logits.new_zeros(none_logits.shape),
+                hidden=query,
+                query=query,
+            ),
             step_positions=step_positions,
             option_idx=option_idx,
             target_idx=target_idx,
             masks=masks,
             uses_none=uses_none,
-            option_vectors=option_vectors,
-            target_vectors=target_vectors,
-            query=query,
-            none_logits=none_logits,
             validate=self.validate,
             compiled_fn=self._compiled_flat_decision_distribution_impl,
         )
@@ -2552,15 +2552,8 @@ class _ForwardInputs:
     target_ref_is_self: Tensor
 
 
-@dataclass(frozen=True)
-class _ForwardBatch:
-    query: Tensor
-    values: Tensor
-    none_logits: Tensor
-    may_logits: Tensor
-    option_vectors: Tensor
-    target_vectors: Tensor
-    hidden: Tensor
+class _ForwardBatch(ReplayScoringForward):
+    pass
 
 
 @dataclass(frozen=True)

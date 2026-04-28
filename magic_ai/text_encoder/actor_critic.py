@@ -25,7 +25,12 @@ from magic_ai.actions import (
 )
 from magic_ai.game_state import PendingState
 from magic_ai.model import TRACE_KIND_TO_ID, ActionTrace, PolicyStep, TraceKind
-from magic_ai.replay_decisions import ReplayPerChoice
+from magic_ai.replay_decisions import (
+    ReplayPerChoice,
+    ReplayScoringForward,
+    direct_decision_logits_from_forward,
+    score_may_decisions_from_forward,
+)
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
@@ -253,13 +258,17 @@ class TextActorCritic(nn.Module):
         log_probs = output.values.new_zeros(n)
         entropies = output.values.new_zeros(n)
 
+        forward = self._replay_scoring_forward(output)
         may_mask = batch.trace_kind_id == TRACE_KIND_TO_ID["may"]
-        if may_mask.any():
-            may_logits = self.may_head(output.state_hidden).squeeze(-1)
-            may_dist = Bernoulli(logits=may_logits[may_mask])
-            may_selected = batch.may_selected[may_mask].to(dtype=output.values.dtype)
-            log_probs[may_mask] = may_dist.log_prob(may_selected)
-            entropies[may_mask] = may_dist.entropy()
+        may_log_probs, may_entropies, _may_logits_per_step, _may_selected_per_step = (
+            score_may_decisions_from_forward(
+                forward,
+                may_selected=batch.may_selected,
+                may_mask=may_mask,
+            )
+        )
+        log_probs = log_probs + may_log_probs
+        entropies = entropies + may_entropies
 
         decision_log_probs, decision_entropies = cast(
             tuple[Tensor, Tensor],
@@ -309,13 +318,17 @@ class TextActorCritic(nn.Module):
         n = int(batch.trace_kind_id.shape[0])
         log_probs = output.values.new_zeros(n)
         entropies = output.values.new_zeros(n)
+        forward = self._replay_scoring_forward(output)
         may_mask = batch.trace_kind_id == TRACE_KIND_TO_ID["may"]
-        may_logits_per_step = self.may_head(output.state_hidden).squeeze(-1)
-        may_selected_per_step = batch.may_selected.to(dtype=output.values.dtype)
-        if may_mask.any():
-            may_dist = Bernoulli(logits=may_logits_per_step[may_mask])
-            log_probs[may_mask] = may_dist.log_prob(may_selected_per_step[may_mask])
-            entropies[may_mask] = may_dist.entropy()
+        may_log_probs, may_entropies, may_logits_per_step, may_selected_per_step = (
+            score_may_decisions_from_forward(
+                forward,
+                may_selected=batch.may_selected,
+                may_mask=may_mask,
+            )
+        )
+        log_probs = log_probs + may_log_probs
+        entropies = entropies + may_entropies
 
         decision_log_probs, decision_entropies, per_choice = cast(
             tuple[Tensor, Tensor, ReplayPerChoice],
@@ -435,7 +448,7 @@ class TextActorCritic(nn.Module):
         n = int(decision_count.shape[0])
         log_probs = output.values.new_zeros(n)
         entropies = output.values.new_zeros(n)
-        none_logits = self.none_head(output.state_hidden).squeeze(-1)
+        forward = self._replay_scoring_forward(output)
         flat_logits_parts: list[Tensor] = []
         flat_log_prob_parts: list[Tensor] = []
         group_idx_parts: list[Tensor] = []
@@ -451,8 +464,7 @@ class TextActorCritic(nn.Module):
                 if not bool(mask.any()):
                     raise ValueError("decision group must include at least one valid choice")
                 logits = self._direct_decision_logits(
-                    output,
-                    none_logits,
+                    forward,
                     step_idx=step_idx,
                     group_idx=group_idx,
                     batch=batch,
@@ -517,32 +529,35 @@ class TextActorCritic(nn.Module):
             ),
         )
 
+    def _replay_scoring_forward(self, output: RecurrentTextPolicyOutput) -> ReplayScoringForward:
+        return ReplayScoringForward(
+            values=output.values,
+            option_vectors=output.option_vectors,
+            target_vectors=output.target_vectors,
+            none_logits=self.none_head(output.state_hidden).squeeze(-1),
+            may_logits=self.may_head(output.state_hidden).squeeze(-1),
+            hidden=output.state_hidden,
+            option_logits=output.policy_logits,
+            target_logits=output.target_logits,
+        )
+
     def _direct_decision_logits(
         self,
-        output: RecurrentTextPolicyOutput,
-        none_logits: Tensor,
+        forward: ReplayScoringForward,
         *,
         step_idx: int,
         group_idx: int,
         batch: TextReplayBatch,
     ) -> Tensor:
-        option_idx = batch.decision_option_idx[step_idx, group_idx]
-        target_idx = batch.decision_target_idx[step_idx, group_idx]
-        uses_none = bool(batch.uses_none_head[step_idx, group_idx].item())
-        logits = output.values.new_full(option_idx.shape, -torch.inf)
-        for col in range(int(option_idx.shape[0])):
-            if uses_none and col == 0:
-                logits[col] = none_logits[step_idx]
-                continue
-            opt = int(option_idx[col].item())
-            tgt = int(target_idx[col].item())
-            if opt < 0:
-                continue
-            if tgt >= 0:
-                logits[col] = output.target_logits[step_idx, opt, tgt]
-            else:
-                logits[col] = output.policy_logits[step_idx, opt]
-        return logits
+        device = forward.values.device
+        return direct_decision_logits_from_forward(
+            forward,
+            step_positions=torch.tensor([step_idx], dtype=torch.long, device=device),
+            option_idx=batch.decision_option_idx[step_idx, group_idx].unsqueeze(0),
+            target_idx=batch.decision_target_idx[step_idx, group_idx].unsqueeze(0),
+            masks=batch.decision_mask[step_idx, group_idx].unsqueeze(0),
+            uses_none=batch.uses_none_head[step_idx, group_idx].unsqueeze(0),
+        )[0]
 
     def _direct_live_decision_logits(
         self,

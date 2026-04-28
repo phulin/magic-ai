@@ -6,18 +6,20 @@ import tempfile
 import unittest
 from argparse import Namespace
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import patch
 
+import scripts.train as train_mod
 import torch
 from magic_ai.game_state import GameStateEncoder, GameStateSnapshot, PendingState
-from magic_ai.model import PPOPolicy
+from magic_ai.model import ActionTrace, PolicyStep, PPOPolicy
 from magic_ai.opponent_pool import OpponentPool, SnapshotSchedule
 from magic_ai.ppo import PPOStats, RolloutStep, gae_returns
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from scripts.train import (
     RetrospectiveLogSchedule,
+    SlotTrainingBackend,
     TrainingResumeState,
     _current_transcript_snapshot,
     _restore_opponent_pool,
@@ -29,10 +31,12 @@ from scripts.train import (
     log_args_to_wandb_summary,
     log_ppo_stats,
     log_retrospective_table,
+    main,
     retrospective_rating_rows,
     sample_decks,
     sample_text_policy_batch,
     save_checkpoint,
+    train_text_envs,
     validate_args,
     validate_checkpoint_encoder,
     validate_deck_embeddings,
@@ -326,6 +330,63 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(backend.staging_buffer.max_steps_per_trajectory, 4)
         self.assertEqual(backend.policy.live_lstm_h.shape[1], 2)
 
+    def test_main_slots_branch_uses_native_training_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            args = Namespace(
+                encoder="slots",
+                learning_rate=1e-3,
+                trainer="ppo",
+                deck_json=None,
+                deck_dir=None,
+                embeddings=root / "embeddings.json",
+                torch_threads=None,
+                checkpoint=None,
+                no_wandb=True,
+                wandb_project="magic-ai",
+                wandb_run_name=None,
+                output=root / "ppo.pt",
+                disable_opponent_pool=True,
+                device="cpu",
+            )
+            policy = torch.nn.Linear(2, 1)
+            backend = SlotTrainingBackend(
+                policy=cast(PPOPolicy, policy),
+                native_encoder=cast(Any, object()),
+                staging_buffer=cast(Any, object()),
+                batch_pool=None,
+                batch_workers=1,
+            )
+
+            with (
+                patch("scripts.train.parse_args", return_value=args),
+                patch("scripts.train.validate_args"),
+                patch("scripts.train.load_deck_pool", return_value=[{"cards": []}]),
+                patch("scripts.train.validate_deck_embeddings"),
+                patch("scripts.train.load_training_checkpoint", return_value=None),
+                patch("scripts.train.build_slot_backend", return_value=backend) as build_slot,
+                patch("scripts.train.importlib.import_module", return_value=object()),
+                patch.object(
+                    train_mod.ShardedNativeRolloutDriver,
+                    "for_mage",
+                    return_value=object(),
+                ),
+                patch.object(train_mod, "train_text_envs") as train_text,
+                patch.object(
+                    train_mod,
+                    "train_native_batched_envs",
+                    return_value=(TrainingResumeState(completed_games=1), None),
+                ) as train_native,
+                patch.object(train_mod, "save_checkpoint") as save,
+                patch.object(train_mod.wandb, "finish"),
+            ):
+                main()
+
+        build_slot.assert_called_once()
+        train_text.assert_not_called()
+        train_native.assert_called_once()
+        save.assert_called_once()
+
     def test_build_text_backend_constructs_artifacts_and_replay_buffer(self) -> None:
         from magic_ai.text_encoder.card_cache import CardTokenCache
         from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
@@ -464,6 +525,135 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(backend.replay_buffer.size, 1)
         emit.assert_called_once()
         assemble.assert_called_once()
+
+    def test_train_text_envs_single_game_rollout_smoke(self) -> None:
+        class FakeReplayBuffer:
+            def __init__(self) -> None:
+                self.reset_calls = 0
+
+            def reset(self) -> None:
+                self.reset_calls += 1
+
+        class FakePolicy(torch.nn.Module):
+            spr_enabled = False
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor([0.0]))
+                self.init_count = 0
+                self.reset_indices: list[list[int]] = []
+
+            def init_lstm_env_states(self, num_envs: int) -> None:
+                self.init_count += num_envs
+
+            def reset_lstm_env_states(self, env_indices: list[int]) -> None:
+                self.reset_indices.append(list(env_indices))
+
+        class FakeGame:
+            def __init__(self) -> None:
+                self.is_over = False
+                self.winner = ""
+                self.state = {
+                    "players": [{"ID": "A", "Name": "A"}, {"ID": "B", "Name": "B"}],
+                    "active_player": "A",
+                    "turn": 1,
+                    "step": "Precombat Main",
+                }
+                self.pending = {
+                    "kind": "priority",
+                    "player_idx": 0,
+                    "options": [{"kind": "pass"}],
+                }
+                self.actions: list[dict[str, object]] = []
+                self.closed = False
+
+            def refresh_state(self) -> dict[str, object]:
+                return cast(dict[str, object], self.state)
+
+            def legal(self) -> dict[str, object]:
+                return cast(dict[str, object], self.pending)
+
+            def step(self, action: dict[str, object]) -> None:
+                self.actions.append(action)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeMage:
+            def __init__(self) -> None:
+                self.game = FakeGame()
+
+            def new_game(self, *_args: object, **_kwargs: object) -> FakeGame:
+                return self.game
+
+        args = Namespace(
+            episodes=1,
+            max_steps_per_game=1,
+            seed=3,
+            name_a="A",
+            name_b="B",
+            no_shuffle=True,
+            hand_size=7,
+            deterministic_rollout=True,
+            rollout_steps=1,
+            ppo_epochs=1,
+            minibatch_size=1,
+            clip_epsilon=0.2,
+            value_coef=0.5,
+            entropy_coef=0.01,
+            max_grad_norm=0.5,
+            spr=False,
+            spr_coef=0.0,
+            gamma=1.0,
+            gae_lambda=1.0,
+            draw_penalty=1.0,
+            save_every=0,
+            output=Path("unused.pt"),
+        )
+        policy = FakePolicy()
+        backend = Namespace(policy=policy, replay_buffer=FakeReplayBuffer())
+        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+        policy_step = PolicyStep(
+            action={"kind": "pass"},
+            trace=ActionTrace("priority", indices=(0,)),
+            log_prob=torch.tensor(-0.5),
+            value=torch.tensor(0.1),
+            entropy=torch.tensor(0.0),
+            replay_idx=0,
+            selected_choice_cols=(0,),
+        )
+
+        with (
+            patch("scripts.train.sample_text_policy_batch", return_value=[policy_step]) as sample,
+            patch(
+                "scripts.train.ppo_update",
+                return_value=PPOStats(
+                    loss=1.0,
+                    policy_loss=0.5,
+                    value_loss=0.25,
+                    entropy=0.0,
+                    approx_kl=0.0,
+                    clip_fraction=0.0,
+                ),
+            ) as update,
+        ):
+            resume, rnad_state = train_text_envs(
+                args,
+                FakeMage(),
+                [{"cards": []}],
+                cast(Any, backend),
+                optimizer,
+            )
+
+        self.assertIsNone(rnad_state)
+        self.assertEqual(resume.completed_games, 1)
+        self.assertEqual(resume.total_generated_rollout_steps, 1)
+        self.assertEqual(resume.total_rollout_steps, 1)
+        self.assertGreaterEqual(backend.replay_buffer.reset_calls, 2)
+        self.assertEqual(policy.init_count, 1)
+        self.assertEqual(policy.reset_indices, [[0]])
+        sample.assert_called_once()
+        update.assert_called_once()
 
     def test_save_checkpoint_serializes_resume_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

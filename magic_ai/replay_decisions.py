@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor
+from torch.distributions import Bernoulli
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,74 @@ class ReplayPerChoice:
     may_selected_per_step: Tensor
     decision_group_id_flat: Tensor
     step_for_decision_group: Tensor
+
+
+@dataclass(frozen=True)
+class ReplayScoringForward:
+    """Backend-neutral tensors needed to score replay rows.
+
+    Slot replay uses ``query`` with option/target vectors. Text replay can
+    instead expose direct ``option_logits`` / ``target_logits`` while still
+    sharing values, none/may logits, and recurrent hidden state.
+    """
+
+    values: Tensor
+    option_vectors: Tensor
+    target_vectors: Tensor
+    none_logits: Tensor
+    may_logits: Tensor
+    hidden: Tensor
+    query: Tensor | None = None
+    option_logits: Tensor | None = None
+    target_logits: Tensor | None = None
+
+
+def score_may_decisions(
+    *,
+    may_logits: Tensor,
+    may_selected: Tensor,
+    may_mask: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Score per-step Bernoulli may decisions from replay rows.
+
+    Returns ``(log_probs, entropies, may_logits_per_step, may_selected_per_step)``
+    with zeros for non-may steps. Active logits keep gradient so downstream
+    per-choice losses can operate on ``may_logits_per_step``.
+    """
+
+    selected = may_selected.to(dtype=may_logits.dtype, device=may_logits.device)
+    log_probs = may_logits.new_zeros(may_mask.shape[0])
+    entropies = may_logits.new_zeros(may_mask.shape[0])
+    may_logits_per_step = may_logits.new_zeros(may_mask.shape[0])
+    may_selected_per_step = may_logits.new_zeros(may_mask.shape[0])
+
+    may_pos = may_mask.nonzero(as_tuple=False).squeeze(-1)
+    active_logits = may_logits[may_pos]
+    active_selected = selected[may_pos]
+    dist = Bernoulli(logits=active_logits)
+    log_probs[may_pos] = dist.log_prob(active_selected)
+    entropies[may_pos] = dist.entropy()
+
+    # Assignment into a cloned tensor preserves gradient from active logits.
+    may_logits_per_step = may_logits_per_step.clone()
+    may_logits_per_step[may_pos] = active_logits
+    may_selected_per_step[may_pos] = active_selected
+    return log_probs, entropies, may_logits_per_step, may_selected_per_step
+
+
+def score_may_decisions_from_forward(
+    forward: ReplayScoringForward,
+    *,
+    may_selected: Tensor,
+    may_mask: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Score may decisions using the common replay-forward shape."""
+
+    return score_may_decisions(
+        may_logits=forward.may_logits,
+        may_selected=may_selected,
+        may_mask=may_mask,
+    )
 
 
 def decision_logits_reference(
@@ -97,6 +166,98 @@ def decision_logits_reference(
     return logits.masked_fill(~masks, -torch.inf)
 
 
+def decision_logits_from_forward(
+    forward: ReplayScoringForward,
+    *,
+    step_positions: Tensor,
+    option_idx: Tensor,
+    target_idx: Tensor,
+    masks: Tensor,
+    uses_none: Tensor,
+    validate: bool = False,
+) -> Tensor:
+    """Compute decision logits using the common replay-forward shape."""
+
+    if forward.query is None:
+        raise ValueError("ReplayScoringForward.query is required for vector replay scoring")
+    return decision_logits_reference(
+        step_positions=step_positions,
+        option_idx=option_idx,
+        target_idx=target_idx,
+        masks=masks,
+        uses_none=uses_none,
+        option_vectors=forward.option_vectors,
+        target_vectors=forward.target_vectors,
+        query=forward.query,
+        none_logits=forward.none_logits,
+        validate=validate,
+    )
+
+
+def direct_decision_logits_from_forward(
+    forward: ReplayScoringForward,
+    *,
+    step_positions: Tensor,
+    option_idx: Tensor,
+    target_idx: Tensor,
+    masks: Tensor,
+    uses_none: Tensor,
+    validate: bool = False,
+) -> Tensor:
+    """Compute replay logits from direct option/target heads.
+
+    This is the text-backend counterpart to ``decision_logits_from_forward``:
+    choices with ``target_idx >= 0`` use target logits, other option choices
+    use option logits, and none choices use ``none_logits``.
+    """
+
+    if forward.option_logits is None or forward.target_logits is None:
+        raise ValueError(
+            "ReplayScoringForward.option_logits and target_logits are required "
+            "for direct replay scoring"
+        )
+
+    if validate:
+        validate_decision_indices(
+            step_positions=step_positions,
+            option_idx=option_idx,
+            target_idx=target_idx,
+            masks=masks,
+            uses_none=uses_none,
+            max_steps=forward.option_logits.shape[0],
+            max_options=forward.option_logits.shape[1],
+            max_targets=forward.target_logits.shape[2],
+        )
+
+    option_logits = forward.option_logits
+    target_logits = forward.target_logits
+    option_idx_clamped = option_idx.clamp(0, option_logits.shape[1] - 1)
+    target_idx_clamped = target_idx.clamp(0, target_logits.shape[2] - 1)
+
+    option_for_groups = option_logits[step_positions]
+    option_choice_logits = torch.gather(option_for_groups, 1, option_idx_clamped)
+
+    target_for_groups = target_logits[step_positions]
+    option_targets = torch.gather(
+        target_for_groups,
+        dim=1,
+        index=option_idx_clamped.unsqueeze(-1).expand(-1, -1, target_logits.shape[2]),
+    )
+    target_choice_logits = torch.gather(
+        option_targets,
+        dim=2,
+        index=target_idx_clamped.unsqueeze(-1),
+    ).squeeze(-1)
+
+    has_target = target_idx >= 0
+    has_option = option_idx >= 0
+    logits = torch.where(has_target, target_choice_logits, option_choice_logits)
+    logits = torch.where(has_option, logits, torch.full_like(logits, -torch.inf))
+    if uses_none.any():
+        logits[uses_none, 0] = forward.none_logits[step_positions[uses_none]]
+    return logits.masked_fill(~masks, -torch.inf)
+
+
 def flat_decision_distribution_impl(
     step_positions: Tensor,
     option_idx: Tensor,
@@ -158,6 +319,36 @@ def flat_decision_distribution_impl(
     group_entropies.scatter_add_(0, group_idx, -(probs * flat_log_probs))
 
     return group_idx, choice_cols, flat_logits, flat_log_probs, group_entropies
+
+
+def flat_decision_distribution_from_forward(
+    forward: ReplayScoringForward,
+    *,
+    step_positions: Tensor,
+    option_idx: Tensor,
+    target_idx: Tensor,
+    masks: Tensor,
+    uses_none: Tensor,
+    validate: bool = False,
+    compiled_fn: Callable[..., tuple[Tensor, Tensor, Tensor, Tensor, Tensor]] | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Return flat valid-choice logits using the common replay-forward shape."""
+
+    if forward.query is None:
+        raise ValueError("ReplayScoringForward.query is required for vector replay scoring")
+    return flat_decision_distribution(
+        step_positions=step_positions,
+        option_idx=option_idx,
+        target_idx=target_idx,
+        masks=masks,
+        uses_none=uses_none,
+        option_vectors=forward.option_vectors,
+        target_vectors=forward.target_vectors,
+        query=forward.query,
+        none_logits=forward.none_logits,
+        validate=validate,
+        compiled_fn=compiled_fn,
+    )
 
 
 def flat_decision_distribution(
