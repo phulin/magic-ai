@@ -103,6 +103,8 @@ Rules:
 
 **Duplicate-card optimization**: render long oracle text once per *unique* card; subsequent copies emit only `<card-ref:K><card> Name <sep> ...stats... </card>` and rely on attention to match by name. Quantify the savings in stage 2 of §7 before relying on it.
 
+**Note on the renderer's role**: this Python renderer is the offline cache builder + debug fallback, not the per-step hot path. Per-step prompt assembly happens via the cached-card-tokens + render-plan path in §13 — Python `render.py` is too slow to run on every rollout step.
+
 ## 4. Model architecture
 
 `magic_ai/text_encoder/model.py`:
@@ -129,7 +131,7 @@ Rules:
 
 1. **New batch type**: `TextEncodedBatch` in `magic_ai/text_encoder/batch.py` carrying `token_ids [B, T]`, `attention_mask [B, T]`, `card_ref_positions [B, max_cards]`, `option_positions [B, max_opts]`, `target_positions [B, max_opts, max_targets]`, plus existing reward / legal-mask / step bookkeeping.
 
-2. **Python tokenize-on-CPU path in the rollout worker.** Slow (~few ms/step) but unblocks training and lets us validate before any native port. Native port is a follow-up, not v1.
+2. **Hot-path prompt assembly via cached card tokens + Go-side render plan.** See §13. Per-step BPE is avoided entirely: oracle text is tokenized once at startup, indexed by Go's existing card-row IDs, and the rollout worker memcpys cached token slices into a preallocated `[batch, max_tokens]` buffer driven by a structured render-plan stream the engine emits alongside the existing slot output.
 
 3. **Model integration** (`magic_ai/model.py`):
    - Behind config flag `policy.encoder = "text" | "slot"`. Keep the slot encoder available for A/B comparison.
@@ -182,7 +184,7 @@ Ablation at stage 3 of §7: same supervised warm-start run, scratch vs finetune-
 
 - **Sequence length blow-up** on cluttered boards. Mitigations: per-zone token budget (e.g. opponent graveyard truncated to last 6 cards + `…+N more`), duplicate-card body suppression (§3). Renderer reports length stats during stage 2 of §7 — set the cap from data, not guess.
 - **Replay storage cost**. 2048 tokens × int16 × ~1M steps ≈ 4 GB RAM. Acceptable; fall back to re-rendering if it bites.
-- **Native encoder divergence**: until the Rust/C native path also emits text, sample collection is Python-bound and rollouts will be slower. Pragmatic v1: "Python rollouts only for the text path; slot-encoder native rollouts kept for benchmarking."
+- **Native encoder divergence**: superseded by §13. The native encoder is *extended* to emit a render-plan stream alongside the existing slot output, not replaced; the Python rollout fallback from earlier drafts is no longer load-bearing.
 - **Card-ref binding**: the model has to learn that `<card-ref:0>` mentioned in `<actions>` refers to the `<card>` block tagged `<card-ref:0>` earlier. RoPE + bidirectional attention should handle this; sanity-check with an attention-map probe on a small example before stage 5.
 - **Hard cases for the renderer**: X-spells, modal choices, split cards, MDFCs, adventure cards, sagas, planeswalkers (loyalty + abilities), tokens with no oracle ID. Enumerate in the renderer test suite before declaring v1 done; each has historically broken state encoders.
 - **Tokenizer drift**: ModernBERT BPE is case-sensitive. Card names like "Llanowar Elves" tokenize differently from "llanowar elves". Renderer must use canonical Scryfall casing. Pin the upstream tokenizer revision so a HF update can't shift base-vocab ids out from under a checkpoint.
@@ -212,3 +214,62 @@ The renderer in §3 produces a single-snapshot prompt — the model sees the cur
 3. **In-prompt history window (defer).** Render the last K full snapshots back-to-back with `<step-N>` delimiters and drop the LSTM. Most natural fit for a transformer, but at ~1.5k tokens per snapshot K=2 already pushes the cap. Mitigation would be diff-only rendering for past steps. Pursue only if (1) and (2) both plateau.
 
 **Plan:** ship (1) for the slot↔text A/B in §7 — isolates "did the encoder get better?" from "did adding history help?". Once parity is shown, A/B (2) vs (1); the delta there is the expected free win the slot encoder cannot match. (3) is on hold pending those results.
+
+## 13. Hot-path prompt assembly (cached card tokens + render plan)
+
+The Python renderer in §3 is too slow to run on every rollout step (string formatting + BPE + Python overhead, all per env per step). Production prompts are assembled by **cached-card-token memcpy** driven by a structured **render plan** the engine emits alongside the existing slot output. Oracle text is BPE'd once at startup; the hot path is pure int copies.
+
+### Identity and cache key
+
+The Go engine already maps every registered card name to a deterministic 1-indexed row ID via `mage.RegisteredCardNames()` + `cardRowForName()` (`../mage-go/cmd/pylib/encoder.go`); row 0 is the unknown sentinel. This is the slot encoder's existing card-table key — we reuse it. UUIDs (per-game card identities, also already produced) drive the per-snapshot `<card-ref:K>` assignment.
+
+### Startup (Python, once)
+
+1. Call `MageRegisteredCards()` to enumerate the engine's card set.
+2. For each card name, render the **card body fragment only** (`Name <sep> Type <sep> P/T <sep> oracle text`) via `magic_ai/text_encoder/render.py` and tokenize via the §2 tokenizer. Status flags, zone delimiters, and `<card-ref:K>` are *not* in the cached body — those are state-dependent and are inserted by the assembler.
+3. Pack into a flat `int32` buffer + a `(row_id) → (offset, length)` index. Persist to `data/text_encoder_card_tokens.npz`. Order of magnitude: ~600 cards × ~80 tokens × 4 bytes ≈ 200 KB.
+4. Audit at build time: every registered name must have oracle text from `data/card_oracle_embeddings.json` or `pkg/catalog`. Fail loud at startup, not at first inference.
+5. Tie cache validity to a hash of `MageRegisteredCards()` output so cache rebuilds when the engine card set changes.
+
+### Per-step (Go side, hot path)
+
+Extend `MageEncodeOutputs` with a `render_plan` stream — a flat int32 sequence of `(opcode, payload)` events behind a new `cfg.emit_render_plan` flag. Existing slot output is untouched so the slot encoder keeps working.
+
+Opcodes:
+- `OPEN_ZONE(zone_id, owner_id)`, `CLOSE_ZONE`
+- `PLACE_CARD(slot_idx, card_row_id, status_bits, uuid_idx)` — `status_bits` is a bitfield over (tapped, sick, attacking, blocking, monstrous, flipped, facedown); `uuid_idx` is the position of this card's UUID in the snapshot's UUID table (used for `<card-ref:K>` assignment in deterministic traversal order)
+- `OPEN_ACTIONS`, `CLOSE_ACTIONS`
+- `OPTION(kind_id, source_card_row, source_uuid_idx, mana_cost_id, ability_idx)`
+- `TARGET(target_card_row, target_uuid_idx, target_kind)`
+- `COUNTER(kind, count)`, `ATTACHED_TO(target_uuid_idx)` — emitted inside `PLACE_CARD` blocks when present
+
+Most of the data already flows through `collectSlotCards` / `fillStateEncoding` / `fillActionEncoding`; the change is **output format, not data extraction**. Engine work needed: extend `stateCard` (currently only `tapped`) with the missing status fields and plumb them from `pkg/mage` snapshotters.
+
+### Per-step (Python side, hot path)
+
+A small assembler (numpy or Cython) walks the render-plan stream and writes into a preallocated `[batch, max_tokens]` int32 buffer:
+
+- For each opcode, write the corresponding delimiter / structural tokens (constant ids).
+- For `PLACE_CARD`: write `<card-ref:K>` (where K is the cumulative `uuid_idx`), then memcpy the card body slice from the cache into the cursor, then write status-bit tokens (`<tapped>` etc.) decoded from `status_bits`.
+- For `OPTION` / `TARGET`: write structural tokens + the appropriate `<card-ref:K>` indices recovered from the UUID table.
+- Track anchor positions (`card_ref_positions`, `option_positions`, `target_positions`) into the `TextEncodedBatch` position arrays as the cursor advances — every `<card-ref>` / `<option>` / `<target>` write is a one-line record.
+
+No tokenizer call, no string formatting on the per-step path. Microseconds per env per step in numpy; trivially batchable to GPU later if needed.
+
+### Two stages
+
+- **Stage A — Python assembler, Go ABI extended.** Assembler lives in `magic_ai/text_encoder/assembler.py`. Engine work is the new `render_plan` output stream + the missing status fields on `stateCard`. The Python `render.py` is preserved as the offline cache builder and as the slow-path reference used in the parity test (Stage A output must equal `tokenize_snapshot(render_snapshot(...))` for every snapshot in a held-out fixture).
+- **Stage B — Go-side assembler, only on profile evidence.** Move the memcpy loop into Go; Python startup writes the card-token table into a Go-visible buffer via a new `MageSetCardTokens` FFI call. Eliminates Python-side per-step work entirely. Don't pre-build this — the Stage A numpy assembler is almost certainly fast enough.
+
+### PR slicing
+
+13-A. Python startup: build & validate the card-token cache from `MageRegisteredCards()` + oracle JSON. Persist to `data/text_encoder_card_tokens.npz`. **No engine changes** — uses what the Go side already exposes. Lands today.
+13-B. Engine/ABI: extend `stateCard` with the missing status fields, surface them through `MageEncodeOutputs.render_plan` behind `cfg.emit_render_plan`. Cross-repo change to `mage-go`; needs Go-side review.
+13-C. Python assembler: walks the render plan + cache → `TextEncodedBatch`. Standalone, with a parity test against `render_snapshot` + `tokenize_snapshot`.
+13-D. Wire the assembler into `RolloutBuffer` / `PPOPolicy` behind `encoder="text"`.
+
+### Open questions
+
+- **Status flag coverage on the Go side.** `stateCard` carries only `tapped` today. `<sick>`, `<attacking>`, `<blocking>`, counter values, and attachment refs need plumbing from `pkg/mage`. Enumerate before locking the FFI shape.
+- **Custom cards lacking Scryfall oracle text.** `cards/custom/*.go` exists in the engine; either enrich `pkg/catalog` with hand-written oracle text and pull from there at startup, or fail loud at cache build. Catalog route generalizes better.
+- **Action template caching** (`OPTION` token sequences keyed by (kind, source-card)) is *not* done in v1 — actions are short and few per step, Python-side action assembly won't dominate.
