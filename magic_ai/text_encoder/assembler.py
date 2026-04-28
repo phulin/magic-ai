@@ -112,6 +112,9 @@ class AssemblerTokens:
     untapped_id: int
     card_ref_ids: list[int]  # length MAX_CARD_REFS
     card_closer_ids: list[int]  # tokens of " </card>"
+    # ref_id -> K reverse map for the literal-tokens walker, which would
+    # otherwise scan card_ref_ids per token.
+    card_ref_id_to_k: dict[int, int] = field(default_factory=dict)
     _status_tapped: list[int] = field(default_factory=list)
     _status_untapped: list[int] = field(default_factory=list)
     # Memoized per-fragment token-id lists. Populated at init for all known
@@ -152,6 +155,7 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
         card_ref_ids=[_single_id(tokenizer, f"<card-ref:{k}>") for k in range(MAX_CARD_REFS)],
         card_closer_ids=list(tokenizer.encode(CARD_CLOSER_TEXT, add_special_tokens=False)),
     )
+    toks.card_ref_id_to_k = {ref_id: k for k, ref_id in enumerate(toks.card_ref_ids)}
     toks._tokenizer = tokenizer
     frags = toks.fragment_ids
     # Static structural fragments.
@@ -255,6 +259,7 @@ def _assemble_one(
     # on each tensor element. ``plan`` is a small CPU int32 tensor.
     plan_list: list[int] = plan.tolist() if isinstance(plan, torch.Tensor) else list(plan)
     plan_len = len(plan_list)
+    ref_id_to_k = toks.card_ref_id_to_k
     out: list[int] = []
     card_ref_positions: dict[int, int] = {}
     option_positions: list[int] = []
@@ -343,12 +348,12 @@ def _assemble_one(
                     cur_target_bucket.append(pos)
                 else:
                     # card-ref ids: record first-occurrence position per K.
-                    # Linear lookup is fine — MAX_CARD_REFS is small and most
-                    # literal slices contain 0–1 card-refs.
-                    for k, ref_id in enumerate(toks.card_ref_ids):
-                        if tid == ref_id and k not in card_ref_positions:
-                            card_ref_positions[k] = pos
-                            break
+                    # O(1) reverse-map lookup; the linear scan over
+                    # MAX_CARD_REFS=256 here used to dominate literal-heavy
+                    # plans.
+                    k = ref_id_to_k.get(tid)
+                    if k is not None and k not in card_ref_positions:
+                        card_ref_positions[k] = pos
             i = slice_end
             continue
 
