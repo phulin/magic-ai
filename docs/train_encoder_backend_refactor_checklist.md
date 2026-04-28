@@ -106,11 +106,11 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - [x] gather/scatter state for active env batches
     - Added `magic_ai/text_encoder/actor_critic.py`; sampling/replay evaluation are still pending.
 - [x] Implement `sample_text_batch(...)` using:
-  - [ ] native render-plan emission when enabled
+  - [x] native render-plan emission when enabled
   - [x] Python render-plan emission as fallback
   - [x] `assemble_batch(...)`
   - [x] shared decision replay logic
-  - `TextActorCritic.sample_text_batch(...)` now consumes assembled text batches, samples decision groups/may decisions, updates live LSTM state, appends `TextReplayBuffer` rows, and returns `PolicyStep` entries with `replay_idx`. `scripts.train.sample_text_policy_batch(...)` owns Python render-plan emission and `assemble_batch(...)`; native render-plan emission is still pending.
+  - `TextActorCritic.sample_text_batch(...)` now consumes assembled text batches, samples decision groups/may decisions, updates live LSTM state, appends `TextReplayBuffer` rows, and returns `PolicyStep` entries with `replay_idx`. `scripts.train.sample_text_policy_batch(...)` owns Python render-plan emission and `assemble_batch(...)`; `train_text_native_batched_envs(...)` owns native render-plan emission for the batched text rollout path.
 - [x] Implement `evaluate_replay_batch(...)` for PPO.
   - `TextActorCritic.evaluate_replay_batch(...)` now replays `TextReplayBuffer` rows through `RecurrentTextPolicy`, scores direct option/target logits plus none/may heads, and supports PPO loss/backward.
 - [x] Implement `evaluate_replay_batch_per_choice(...)` for RNaD.
@@ -149,13 +149,13 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 - [x] Branch once after argument validation:
   - [x] `args.encoder == "slots"`
   - [x] `args.encoder == "text"`
-- [ ] Keep the main training loop backend-oriented:
+- [x] Keep the main training loop backend-oriented:
   - [x] collect rollout
   - [x] compute returns or RNaD episode batch
   - [x] run selected trainer update
   - [x] save checkpoint
   - [x] log metrics
-  - Text PPO now has a separate correctness loop; R-NaD remains slot-only in `train.py`.
+  - `main()` now dispatches through `train_selected_backend(...)` and uses one final checkpoint-save path. Text PPO still uses the separate Python correctness collector internally; R-NaD remains slot-only in `train.py`.
 - [x] Save checkpoint metadata including:
   - [x] encoder kind
   - [x] text config when `encoder=text`
@@ -188,4 +188,4 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 - [ ] Do not force `PPOPolicy` to internally switch between slot and text encoders.
 - [ ] Do not enable text SPR until the text replay surface is stable.
 - [ ] Do not delete the current slot path.
-- [ ] Do not require native render-plan emission for the first text training smoke; Python render-plan emission is acceptable for correctness.
+- [x] Do not require native render-plan emission for the first text training smoke; Python render-plan emission is acceptable for correctness.

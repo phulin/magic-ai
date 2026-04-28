@@ -163,6 +163,66 @@ class ShardedNativeBatchEncoder:
             )
         return cls(encoders, pool=pool if workers > 1 else None)
 
+    @classmethod
+    def for_text(
+        cls,
+        *,
+        max_options: int,
+        max_targets_per_option: int,
+        max_cached_choices: int,
+        zone_slot_count: int,
+        game_info_dim: int,
+        option_scalar_dim: int,
+        target_scalar_dim: int,
+        card_name_to_row: dict[str, int],
+        emit_render_plan: bool,
+        render_plan_capacity: int,
+        validate: bool,
+        workers: int,
+        pool: ThreadPoolExecutor | None,
+    ) -> ShardedNativeBatchEncoder:
+        if workers < 1:
+            raise ValueError("workers must be >= 1")
+        try:
+            mage = importlib.import_module("mage")
+            mage_any = cast(Any, mage)
+            if mage_any._lib is None or mage_any._ffi is None:
+                mage_any.load()
+            lib = mage_any._lib
+            ffi = mage_any._ffi
+        except Exception:
+            return cls(
+                [
+                    NativeBatchEncoder(
+                        max_options=max_options,
+                        max_targets_per_option=max_targets_per_option,
+                        max_cached_choices=max_cached_choices,
+                    )
+                ],
+                pool=None,
+            )
+
+        encoders: list[NativeBatchEncoder] = []
+        for i in range(workers):
+            encoders.append(
+                NativeBatchEncoder(
+                    max_options=max_options,
+                    max_targets_per_option=max_targets_per_option,
+                    max_cached_choices=max_cached_choices,
+                    zone_slot_count=zone_slot_count,
+                    game_info_dim=game_info_dim,
+                    option_scalar_dim=option_scalar_dim,
+                    target_scalar_dim=target_scalar_dim,
+                    lib=lib,
+                    ffi=ffi,
+                    card_name_to_row=card_name_to_row if i == 0 else None,
+                    validate=validate,
+                    emit_render_plan=emit_render_plan,
+                    render_plan_capacity=render_plan_capacity,
+                )
+            )
+        return cls(encoders, pool=pool if workers > 1 else None)
+
     def encode_handles(
         self,
         games: list[Any],

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
 import torch
 from dotenv import load_dotenv
 
@@ -28,16 +29,22 @@ import wandb  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from magic_ai.actions import ActionRequest  # noqa: E402
+from magic_ai.actions import (  # noqa: E402
+    OPTION_SCALAR_DIM,
+    TARGET_SCALAR_DIM,
+    ActionRequest,
+)
 from magic_ai.buffer import NativeTrajectoryBuffer  # noqa: E402
 from magic_ai.game_state import (  # noqa: E402
+    GAME_INFO_DIM,
+    ZONE_SLOT_COUNT,
     GameStateEncoder,
     GameStateSnapshot,
     PendingOptionState,
     PendingState,
 )
 from magic_ai.model import PPOPolicy  # noqa: E402
-from magic_ai.native_encoder import NativeBatchEncoder  # noqa: E402,F401
+from magic_ai.native_encoder import NativeBatchEncoder, NativeEncodingError  # noqa: E402,F401
 from magic_ai.native_rollout import (  # noqa: E402
     NativeRolloutDriver,  # noqa: F401
     NativeRolloutUnavailable,
@@ -67,6 +74,7 @@ from magic_ai.sharded_native import (  # noqa: E402
 )
 from magic_ai.text_encoder.actor_critic import (  # noqa: E402
     TextActorCritic,  # noqa: E402
+    TextDecisionLayout,
     build_text_decision_layout,
     infer_text_trace_kind,
 )
@@ -232,6 +240,18 @@ class TextTrainingBackend:
     cache: CardTokenCache
     oracle: dict[str, OracleEntry]
     tokenizer: Any
+    native_encoder: ShardedNativeBatchEncoder | None = None
+    batch_pool: ThreadPoolExecutor | None = None
+    batch_workers: int = 1
+
+
+@dataclass
+class TrainingRunResult:
+    resume_state: TrainingResumeState
+    rnad_state: RNaDTrainerState | None
+    opponent_pool: OpponentPool | None = None
+    snapshot_schedule: SnapshotSchedule | None = None
+    retrospective_schedule: RetrospectiveLogSchedule | None = None
 
 
 def build_slot_backend(args: argparse.Namespace, device: torch.device) -> SlotTrainingBackend:
@@ -261,7 +281,7 @@ def build_slot_backend(args: argparse.Namespace, device: torch.device) -> SlotTr
         # CUDA copy tensors that PyTorch may hold in its caching allocator.
         _ = torch.empty((1, 1), device=device) @ torch.empty((1, 1), device=device)
 
-    batch_workers = max(1, args.batch_workers)
+    batch_workers = max(1, getattr(args, "batch_workers", 1))
     batch_pool = (
         ThreadPoolExecutor(max_workers=batch_workers, thread_name_prefix="mage-batch")
         if batch_workers > 1
@@ -341,12 +361,38 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         device=device,
     )
     policy.rollout_buffer = replay_buffer
+    batch_workers = max(1, getattr(args, "batch_workers", 1))
+    batch_pool = (
+        ThreadPoolExecutor(max_workers=batch_workers, thread_name_prefix="mage-text-batch")
+        if batch_workers > 1
+        else None
+    )
+    native_encoder = None
+    if getattr(args, "native_render_plan", False):
+        native_encoder = ShardedNativeBatchEncoder.for_text(
+            max_options=args.max_options,
+            max_targets_per_option=args.max_targets_per_option,
+            max_cached_choices=replay_buffer.max_cached_choices,
+            zone_slot_count=ZONE_SLOT_COUNT,
+            game_info_dim=GAME_INFO_DIM,
+            option_scalar_dim=OPTION_SCALAR_DIM,
+            target_scalar_dim=TARGET_SCALAR_DIM,
+            card_name_to_row=_build_text_card_name_to_row(cache),
+            emit_render_plan=True,
+            render_plan_capacity=args.render_plan_capacity,
+            validate=not getattr(args, "no_validate", False),
+            workers=batch_workers,
+            pool=batch_pool,
+        )
     return TextTrainingBackend(
         policy=policy,
         replay_buffer=replay_buffer,
         cache=cache,
         oracle=oracle,
         tokenizer=tokenizer,
+        native_encoder=native_encoder,
+        batch_pool=batch_pool,
+        batch_workers=batch_workers,
     )
 
 
@@ -419,16 +465,21 @@ def sample_text_policy_batch(
 
 
 def _build_text_card_row_lookup(cache: CardTokenCache) -> Callable[[str], int]:
-    name_to_row: dict[str, int] = {}
-    for idx, name in enumerate(cache.row_to_name):
-        if idx == 0 or not name:
-            continue
-        name_to_row.setdefault(name, idx)
+    name_to_row = _build_text_card_name_to_row(cache)
 
     def lookup(name: str) -> int:
         return name_to_row.get(name, 0)
 
     return lookup
+
+
+def _build_text_card_name_to_row(cache: CardTokenCache) -> dict[str, int]:
+    name_to_row: dict[str, int] = {}
+    for idx, name in enumerate(cache.row_to_name):
+        if idx == 0 or not name:
+            continue
+        name_to_row.setdefault(name, idx)
+    return name_to_row
 
 
 def _current_transcript_snapshot(game: Any) -> tuple[GameStateSnapshot, PendingState]:
@@ -653,6 +704,107 @@ def _restore_rnad_state(
     state.is_finetuning = finetuning
 
 
+def train_selected_backend(
+    args: argparse.Namespace,
+    mage: Any,
+    deck_pool: list[dict[str, Any]],
+    optimizer: torch.optim.Optimizer,
+    *,
+    device: torch.device,
+    checkpoint_cpu: dict[str, Any] | None,
+    slot_backend: SlotTrainingBackend | None = None,
+    text_backend: TextTrainingBackend | None = None,
+    batch_pool: ThreadPoolExecutor | None = None,
+) -> TrainingRunResult:
+    """Dispatch the selected encoder backend and return checkpoint state."""
+
+    if getattr(args, "encoder", "slots") == "text":
+        if text_backend is None:
+            raise ValueError("text_backend is required when --encoder text")
+        if getattr(args, "native_render_plan", False):
+            if text_backend.native_encoder is None:
+                raise ValueError("text backend is missing native render-plan encoder")
+            try:
+                native_rollout = ShardedNativeRolloutDriver.for_mage(
+                    mage, workers=text_backend.batch_workers, pool=batch_pool
+                )
+            except NativeRolloutUnavailable as exc:
+                raise SystemExit(f"native rollout is unavailable: {exc}") from exc
+            resume_state, rnad_state = train_text_native_batched_envs(
+                args,
+                mage,
+                deck_pool,
+                text_backend,
+                optimizer,
+                native_rollout,
+                text_backend.native_encoder,
+                resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
+            )
+        else:
+            resume_state, rnad_state = train_text_envs(
+                args,
+                mage,
+                deck_pool,
+                text_backend,
+                optimizer,
+                resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
+            )
+        return TrainingRunResult(resume_state=resume_state, rnad_state=rnad_state)
+
+    if slot_backend is None:
+        raise ValueError("slot_backend is required when --encoder slots")
+    slot_policy = slot_backend.policy
+    try:
+        native_rollout = ShardedNativeRolloutDriver.for_mage(
+            mage, workers=slot_backend.batch_workers, pool=batch_pool
+        )
+    except NativeRolloutUnavailable as exc:
+        raise SystemExit(f"native rollout is unavailable: {exc}") from exc
+
+    opponent_pool: OpponentPool | None = None
+    snapshot_schedule: SnapshotSchedule | None = None
+    retrospective_schedule: RetrospectiveLogSchedule | None = None
+    opponent_policy: PPOPolicy | None = None
+    if not args.disable_opponent_pool:
+        opponent_pool = _restore_opponent_pool(checkpoint_cpu, args.opponent_pool_dir)
+        snapshot_schedule = SnapshotSchedule.build(args.episodes)
+        retrospective_schedule = RetrospectiveLogSchedule.build(args.episodes)
+        training_state = _training_state_dict(checkpoint_cpu)
+        snapshot_schedule.next_idx = min(
+            int(training_state.get("snapshot_schedule_next_idx", 0)),
+            len(snapshot_schedule.thresholds),
+        )
+        retrospective_schedule.next_idx = min(
+            int(training_state.get("retrospective_schedule_next_idx", 0)),
+            len(retrospective_schedule.thresholds),
+        )
+        opponent_policy = build_opponent_policy(slot_policy, device)
+
+    resume_state, rnad_state = train_native_batched_envs(
+        args,
+        mage,
+        deck_pool,
+        slot_policy,
+        slot_backend.native_encoder,
+        optimizer,
+        native_rollout,
+        slot_backend.staging_buffer,
+        opponent_pool=opponent_pool,
+        snapshot_schedule=snapshot_schedule,
+        retrospective_schedule=retrospective_schedule,
+        opponent_policy=opponent_policy,
+        resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
+        resume_checkpoint=checkpoint_cpu,
+    )
+    return TrainingRunResult(
+        resume_state=resume_state,
+        rnad_state=rnad_state,
+        opponent_pool=opponent_pool,
+        snapshot_schedule=snapshot_schedule,
+        retrospective_schedule=retrospective_schedule,
+    )
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -695,17 +847,15 @@ def main() -> None:
     encoder_kind = getattr(args, "encoder", "slots")
     batch_pool: ThreadPoolExecutor | None = None
     slot_backend: SlotTrainingBackend | None = None
+    text_backend: TextTrainingBackend | None = None
     if encoder_kind == "slots":
         slot_backend = build_slot_backend(args, device)
         policy = slot_backend.policy
-        native_encoder = slot_backend.native_encoder
-        staging_buffer = slot_backend.staging_buffer
         batch_pool = slot_backend.batch_pool
     else:
         text_backend = build_text_backend(args, device)
         policy = text_backend.policy
-        native_encoder = None
-        staging_buffer = None
+        batch_pool = getattr(text_backend, "batch_pool", None)
     # Paper §199: R-NaD uses Adam with b1=0.0 (no momentum). This is
     # load-bearing for stability: nonzero b1 lets policy updates accumulate
     # directional drift across batches, which combined with NeuRD's raw-logit
@@ -727,93 +877,32 @@ def main() -> None:
             optimizer.load_state_dict(checkpoint["optimizer"])
 
     mage = importlib.import_module("mage")
-    if encoder_kind == "text":
-        final_resume_state, final_rnad_state = train_text_envs(
-            args,
-            mage,
-            deck_pool,
-            text_backend,
-            optimizer,
-            resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
-        )
-        save_checkpoint(
-            args.output,
-            policy,
-            optimizer,
-            args,
-            opponent_pool=None,
-            snapshot_schedule=None,
-            retrospective_schedule=None,
-            resume_state=final_resume_state,
-            wandb_run_id=active_wandb_run_id,
-            run_artifact_dir=run_artifact_dir,
-            rnad_state=final_rnad_state,
-        )
-        print(f"step={final_resume_state.total_wandb_logs} saved checkpoint -> {args.output}")
-        wandb.finish()
-        return
-
-    assert native_encoder is not None
-    assert staging_buffer is not None
-    assert slot_backend is not None
-    slot_policy = cast(PPOPolicy, policy)
-    try:
-        native_rollout = ShardedNativeRolloutDriver.for_mage(
-            mage, workers=slot_backend.batch_workers, pool=batch_pool
-        )
-    except NativeRolloutUnavailable as exc:
-        raise SystemExit(f"native rollout is unavailable: {exc}") from exc
-
-    opponent_pool: OpponentPool | None = None
-    snapshot_schedule: SnapshotSchedule | None = None
-    retrospective_schedule: RetrospectiveLogSchedule | None = None
-    opponent_policy: PPOPolicy | None = None
-    if not args.disable_opponent_pool:
-        opponent_pool = _restore_opponent_pool(checkpoint_cpu, args.opponent_pool_dir)
-        snapshot_schedule = SnapshotSchedule.build(args.episodes)
-        retrospective_schedule = RetrospectiveLogSchedule.build(args.episodes)
-        training_state = _training_state_dict(checkpoint_cpu)
-        snapshot_schedule.next_idx = min(
-            int(training_state.get("snapshot_schedule_next_idx", 0)),
-            len(snapshot_schedule.thresholds),
-        )
-        retrospective_schedule.next_idx = min(
-            int(training_state.get("retrospective_schedule_next_idx", 0)),
-            len(retrospective_schedule.thresholds),
-        )
-        opponent_policy = build_opponent_policy(slot_policy, device)
-
-    final_resume_state, final_rnad_state = train_native_batched_envs(
+    result = train_selected_backend(
         args,
         mage,
         deck_pool,
-        slot_policy,
-        native_encoder,
         optimizer,
-        native_rollout,
-        staging_buffer,
-        opponent_pool=opponent_pool,
-        snapshot_schedule=snapshot_schedule,
-        retrospective_schedule=retrospective_schedule,
-        opponent_policy=opponent_policy,
-        resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
-        resume_checkpoint=checkpoint_cpu,
+        device=device,
+        checkpoint_cpu=checkpoint_cpu,
+        slot_backend=slot_backend,
+        text_backend=text_backend,
+        batch_pool=batch_pool,
     )
 
     save_checkpoint(
         args.output,
-        slot_policy,
+        policy,
         optimizer,
         args,
-        opponent_pool=opponent_pool,
-        snapshot_schedule=snapshot_schedule,
-        retrospective_schedule=retrospective_schedule,
-        resume_state=final_resume_state,
+        opponent_pool=result.opponent_pool,
+        snapshot_schedule=result.snapshot_schedule,
+        retrospective_schedule=result.retrospective_schedule,
+        resume_state=result.resume_state,
         wandb_run_id=active_wandb_run_id,
         run_artifact_dir=run_artifact_dir,
-        rnad_state=final_rnad_state,
+        rnad_state=result.rnad_state,
     )
-    print(f"step={final_resume_state.total_wandb_logs} saved checkpoint -> {args.output}")
+    print(f"step={result.resume_state.total_wandb_logs} saved checkpoint -> {args.output}")
     wandb.finish()
     if batch_pool is not None:
         batch_pool.shutdown(wait=True)
@@ -2076,6 +2165,301 @@ def train_text_envs(
                 ),
             )
             last_saved_games = completed_games
+
+    run_update(final=True)
+    return (
+        TrainingResumeState(
+            completed_games=completed_games,
+            last_saved_games=last_saved_games,
+            total_rollout_steps=total_rollout_steps,
+            total_generated_rollout_steps=total_generated_rollout_steps,
+            total_wandb_logs=total_wandb_logs,
+        ),
+        None,
+    )
+
+
+def sample_native_text_policy_batch(
+    args: argparse.Namespace,
+    backend: TextTrainingBackend,
+    native_batch: Any,
+    *,
+    env_indices: list[int],
+    perspective_player_indices: list[int],
+    deterministic: bool = False,
+) -> list[Any]:
+    if native_batch.render_plan is None or native_batch.render_plan_lengths is None:
+        raise NativeEncodingError("native encoder did not return render plans")
+    if native_batch.render_plan_overflow is not None and bool(
+        native_batch.render_plan_overflow.any()
+    ):
+        overflow_idx = int(native_batch.render_plan_overflow.nonzero(as_tuple=False)[0, 0].item())
+        raise NativeEncodingError(f"native render plan overflowed for batch row {overflow_idx}")
+
+    plans: list[np.ndarray] = []
+    lengths = native_batch.render_plan_lengths.detach().cpu().tolist()
+    render_plan_cpu = native_batch.render_plan.detach().cpu()
+    for row_idx, length in enumerate(lengths):
+        plans.append(render_plan_cpu[row_idx, : int(length)].numpy().astype(np.int32, copy=True))
+
+    encoded = assemble_batch(
+        plans,
+        backend.cache,
+        backend.tokenizer,
+        max_tokens=args.text_max_tokens,
+        on_overflow="truncate",
+    )
+
+    layouts: list[Any] = []
+    starts = native_batch.decision_start.detach().cpu().tolist()
+    counts = native_batch.decision_count.detach().cpu().tolist()
+    for row_idx, trace_kind_raw in enumerate(native_batch.trace_kinds):
+        trace_kind = cast(Any, trace_kind_raw)
+        start = int(starts[row_idx])
+        count = int(counts[row_idx])
+        end = start + count
+        pending = cast(PendingState, {"kind": trace_kind, "options": []})
+        layouts.append(
+            TextDecisionLayout(
+                trace_kind=trace_kind,
+                decision_option_idx=native_batch.decision_option_idx[start:end].detach().cpu(),
+                decision_target_idx=native_batch.decision_target_idx[start:end].detach().cpu(),
+                decision_mask=native_batch.decision_mask[start:end].detach().cpu().bool(),
+                uses_none_head=native_batch.uses_none_head[start:end].detach().cpu().bool(),
+                pending=pending,
+            )
+        )
+
+    return backend.policy.sample_text_batch(
+        encoded,
+        env_indices=env_indices,
+        perspective_player_indices=perspective_player_indices,
+        layouts=layouts,
+        deterministic=deterministic,
+    )
+
+
+def train_text_native_batched_envs(
+    args: argparse.Namespace,
+    mage: Any,
+    deck_pool: list[dict[str, Any]],
+    backend: TextTrainingBackend,
+    optimizer: torch.optim.Optimizer,
+    native_rollout: ShardedNativeRolloutDriver,
+    native_encoder: ShardedNativeBatchEncoder,
+    *,
+    resume_state: TrainingResumeState | None = None,
+) -> tuple[TrainingResumeState, None]:
+    if not native_encoder.is_available:
+        raise SystemExit("native text rollout requires MageEncodeBatch")
+
+    restored_state = resume_state or TrainingResumeState()
+    completed_games = restored_state.completed_games
+    last_saved_games = restored_state.last_saved_games
+    total_rollout_steps = restored_state.total_rollout_steps
+    total_generated_rollout_steps = restored_state.total_generated_rollout_steps
+    total_wandb_logs = restored_state.total_wandb_logs
+    run_step = getattr(wandb.run, "step", None) if wandb.run is not None else None
+    if isinstance(run_step, int):
+        total_wandb_logs = max(total_wandb_logs, run_step)
+
+    pending_steps: list[RolloutStep] = []
+    pending_returns: list[torch.Tensor] = []
+    win_stats = WinFractionStats()
+    backend.replay_buffer.reset()
+    backend.policy.init_lstm_env_states(args.num_envs)
+    next_episode_idx = completed_games
+    live_games: list[LiveGame] = []
+    free_slots = list(range(args.num_envs - 1, -1, -1))
+    last_step_time = time.monotonic()
+
+    def cli_step_prefix() -> str:
+        return f"step={total_wandb_logs}"
+
+    def tracked_wandb_log(payload: dict[str, Any]) -> None:
+        nonlocal total_wandb_logs
+        if wandb.run is None:
+            return
+        wandb.log(payload)
+        total_wandb_logs += 1
+
+    def start_game(slot_idx: int, episode_idx: int) -> LiveGame:
+        backend.policy.reset_lstm_env_states([slot_idx])
+        seed = args.seed + episode_idx
+        deck_a, deck_b = sample_decks(deck_pool, seed)
+        return LiveGame(
+            game=mage.new_game(
+                deck_a,
+                deck_b,
+                name_a=args.name_a,
+                name_b=args.name_b,
+                seed=seed,
+                shuffle=not args.no_shuffle,
+                hand_size=args.hand_size,
+            ),
+            slot_idx=slot_idx,
+            episode_idx=episode_idx,
+            episode_steps=[],
+            transcript=[],
+        )
+
+    def maybe_start_games() -> None:
+        nonlocal next_episode_idx
+        if len(pending_steps) >= args.rollout_steps:
+            return
+        while free_slots and next_episode_idx < args.episodes:
+            live_games.append(start_game(free_slots.pop(), next_episode_idx))
+            next_episode_idx += 1
+
+    def finish_games(finished: list[tuple[LiveGame, int]]) -> None:
+        nonlocal completed_games, total_generated_rollout_steps
+        for env, winner_idx in finished:
+            try:
+                env.game.close()
+            except Exception:
+                pass
+            if env.episode_steps:
+                pending_steps.extend(env.episode_steps)
+                pending_returns.append(
+                    gae_returns(
+                        env.episode_steps,
+                        winner_idx=winner_idx,
+                        gamma=args.gamma,
+                        gae_lambda=args.gae_lambda,
+                        draw_penalty=args.draw_penalty,
+                    )
+                )
+                total_generated_rollout_steps += len(env.episode_steps)
+            free_slots.append(env.slot_idx)
+            if winner_idx == 0:
+                win_stats.p1_wins += 1
+            elif winner_idx == 1:
+                win_stats.p2_wins += 1
+            else:
+                win_stats.draws += 1
+            completed_games += 1
+
+    def run_update(*, final: bool = False) -> None:
+        nonlocal total_rollout_steps, last_step_time
+        if not pending_steps:
+            return
+        rollout_returns = torch.cat(pending_returns)
+        rollout_step_count = len(pending_steps)
+        stats = ppo_update(
+            backend.policy,
+            optimizer,
+            pending_steps,
+            rollout_returns,
+            epochs=args.ppo_epochs,
+            minibatch_size=args.minibatch_size,
+            clip_epsilon=args.clip_epsilon,
+            value_coef=args.value_coef,
+            entropy_coef=args.entropy_coef,
+            max_grad_norm=args.max_grad_norm,
+            spr_coef=0.0,
+        )
+        now = time.monotonic()
+        elapsed = now - last_step_time
+        last_step_time = now
+        print(
+            cli_step_prefix(),
+            "final_update[ppo,text,native]" if final else "update[ppo,text,native]",
+            f"games={completed_games}",
+            f"steps={rollout_step_count}",
+            f"dt={elapsed:.1f}s",
+            f"loss={stats.loss:.4f}",
+            f"policy={stats.policy_loss:.4f}",
+            f"value={stats.value_loss:.4f}",
+            f"entropy={stats.entropy:.4f}",
+            f"kl={stats.approx_kl:.4f}",
+            f"clip={stats.clip_fraction:.3f}",
+            flush=True,
+        )
+        total_rollout_steps += rollout_step_count
+        log_ppo_stats(
+            stats,
+            games=completed_games,
+            steps=rollout_step_count,
+            total_rollout_steps=total_rollout_steps,
+            total_generated_rollout_steps=total_generated_rollout_steps,
+            win_stats=win_stats,
+            value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
+            log_fn=tracked_wandb_log,
+            run_active=True,
+        )
+        backend.replay_buffer.reset()
+        pending_steps.clear()
+        pending_returns.clear()
+        win_stats.reset()
+
+    maybe_start_games()
+    while live_games:
+        ready_t, over_t, player_t, winner_t = native_rollout.poll([env.game for env in live_games])
+        ready_l = ready_t.tolist()
+        over_l = over_t.tolist()
+        player_l = player_t.tolist()
+        winner_l = winner_t.tolist()
+        ready_envs: list[LiveGame] = []
+        ready_players: list[int] = []
+        still_live: list[LiveGame] = []
+        finished_games: list[tuple[LiveGame, int]] = []
+        for idx, env in enumerate(live_games):
+            is_over = bool(over_l[idx])
+            if is_over or env.action_count >= args.max_steps_per_game:
+                finished_games.append((env, int(winner_l[idx]) if is_over else -1))
+                continue
+            still_live.append(env)
+            if ready_l[idx]:
+                ready_envs.append(env)
+                ready_players.append(int(player_l[idx]))
+        live_games = still_live
+        finish_games(finished_games)
+
+        if ready_envs:
+            ready_env_indices = [env.slot_idx for env in ready_envs]
+            ready_games = [env.game for env in ready_envs]
+            native_batch = native_encoder.encode_handles(
+                ready_games,
+                perspective_player_indices=ready_players,
+            )
+            with torch.no_grad():
+                policy_steps = sample_native_text_policy_batch(
+                    args,
+                    backend,
+                    native_batch,
+                    env_indices=ready_env_indices,
+                    perspective_player_indices=ready_players,
+                    deterministic=args.deterministic_rollout,
+                )
+            counts = [len(s.selected_choice_cols) for s in policy_steps]
+            starts: list[int] = list(itertools.accumulate(counts, initial=0))[:-1]
+            selected_cols: list[int] = [c for s in policy_steps for c in s.selected_choice_cols]
+            may_selected = [s.may_selected for s in policy_steps]
+            for env, player_idx, policy_step in zip(
+                ready_envs, ready_players, policy_steps, strict=True
+            ):
+                env.action_count += 1
+                env.episode_steps.append(
+                    RolloutStep(
+                        perspective_player_idx=int(player_idx),
+                        old_log_prob=float(policy_step.log_prob.detach().cpu()),
+                        value=float(policy_step.value.detach().cpu()),
+                        replay_idx=policy_step.replay_idx,
+                    )
+                )
+            native_rollout.step_by_choice(
+                ready_games,
+                decision_starts=starts,
+                decision_counts=counts,
+                selected_choice_cols=selected_cols,
+                may_selected=may_selected,
+                max_options=args.max_options,
+                max_targets_per_option=args.max_targets_per_option,
+            )
+
+        if len(pending_steps) >= args.rollout_steps and not live_games:
+            run_update()
+        maybe_start_games()
 
     run_update(final=True)
     return (

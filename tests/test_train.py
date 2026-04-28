@@ -36,6 +36,7 @@ from scripts.train import (
     sample_decks,
     sample_text_policy_batch,
     save_checkpoint,
+    train_selected_backend,
     train_text_envs,
     validate_args,
     validate_checkpoint_encoder,
@@ -421,6 +422,52 @@ class TrainPPOTests(unittest.TestCase):
         train_native.assert_called_once()
         save.assert_called_once()
 
+    def test_main_text_branch_uses_common_save_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            args = Namespace(
+                encoder="text",
+                learning_rate=1e-3,
+                trainer="ppo",
+                deck_json=None,
+                deck_dir=None,
+                embeddings=root / "embeddings.json",
+                torch_threads=None,
+                checkpoint=None,
+                no_wandb=True,
+                wandb_project="magic-ai",
+                wandb_run_name=None,
+                output=root / "text.pt",
+                device="cpu",
+            )
+            policy = torch.nn.Linear(2, 1)
+            backend = Namespace(policy=policy)
+
+            with (
+                patch("scripts.train.parse_args", return_value=args),
+                patch("scripts.train.validate_args"),
+                patch("scripts.train.load_deck_pool", return_value=[{"cards": []}]),
+                patch("scripts.train.validate_deck_embeddings"),
+                patch("scripts.train.load_training_checkpoint", return_value=None),
+                patch("scripts.train.build_text_backend", return_value=backend) as build_text,
+                patch("scripts.train.importlib.import_module", return_value=object()),
+                patch.object(
+                    train_mod,
+                    "train_text_envs",
+                    return_value=(TrainingResumeState(completed_games=1), None),
+                ) as train_text,
+                patch.object(train_mod, "train_native_batched_envs") as train_native,
+                patch.object(train_mod, "save_checkpoint") as save,
+                patch.object(train_mod.wandb, "finish") as finish,
+            ):
+                main()
+
+        build_text.assert_called_once()
+        train_text.assert_called_once()
+        train_native.assert_not_called()
+        save.assert_called_once()
+        finish.assert_called_once()
+
     def test_build_text_backend_constructs_artifacts_and_replay_buffer(self) -> None:
         from magic_ai.text_encoder.card_cache import CardTokenCache
         from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
@@ -688,6 +735,43 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(policy.reset_indices, [[0]])
         sample.assert_called_once()
         update.assert_called_once()
+
+    def test_train_selected_backend_native_text_dispatches_to_native_loop(self) -> None:
+        args = Namespace(
+            encoder="text",
+            native_render_plan=True,
+        )
+        backend = Namespace(native_encoder=object(), batch_workers=1)
+        optimizer = torch.optim.Adam(torch.nn.Linear(1, 1).parameters(), lr=1e-3)
+        expected_state = TrainingResumeState(completed_games=1)
+
+        with (
+            patch.object(
+                train_mod.ShardedNativeRolloutDriver,
+                "for_mage",
+                return_value=object(),
+            ) as rollout,
+            patch.object(
+                train_mod,
+                "train_text_native_batched_envs",
+                return_value=(expected_state, None),
+            ) as train_native_text,
+            patch.object(train_mod, "train_text_envs") as train_text,
+        ):
+            result = train_selected_backend(
+                args,
+                object(),
+                [{"cards": []}],
+                optimizer,
+                device=torch.device("cpu"),
+                checkpoint_cpu=None,
+                text_backend=cast(Any, backend),
+            )
+
+        self.assertEqual(result.resume_state, expected_state)
+        rollout.assert_called_once()
+        train_native_text.assert_called_once()
+        train_text.assert_not_called()
 
     def test_save_checkpoint_serializes_resume_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
