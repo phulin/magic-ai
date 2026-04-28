@@ -112,6 +112,19 @@ class AssemblerTokens:
     card_closer_ids: list[int]  # tokens of " </card>"
     _status_tapped: list[int] = field(default_factory=list)
     _status_untapped: list[int] = field(default_factory=list)
+    # Memoized per-fragment token-id lists. Populated at init for all known
+    # static fragments and small bounded vocabularies; dynamic-but-low-arity
+    # strings (turn=N, life=N, ability N) fill in lazily on first encounter.
+    fragment_ids: dict[str, list[int]] = field(default_factory=dict)
+    # Cached mana glyph per color id (e.g. "{W}" -> [tok_ids...]).
+    mana_glyph_ids: list[list[int]] = field(default_factory=list)
+    _tokenizer: PreTrainedTokenizerFast | None = None
+    # Per-(cache id) memo of card-body Python lists with the trailing
+    # ``" </card>"`` already stripped. Built once per CardTokenCache instance
+    # the first time the assembler sees it, then reused across all subsequent
+    # snapshots — replaces the per-card .tolist()/tail-compare/.tolist() in
+    # the OP_PLACE_CARD hot path.
+    _body_lists_cache: dict[int, list[list[int]]] = field(default_factory=dict)
 
 
 def _single_id(tokenizer: PreTrainedTokenizerFast, token: str) -> int:
@@ -121,9 +134,13 @@ def _single_id(tokenizer: PreTrainedTokenizerFast, token: str) -> int:
     return int(tid)
 
 
+def _encode(tokenizer: PreTrainedTokenizerFast, text: str) -> list[int]:
+    return [int(t) for t in tokenizer.encode(text, add_special_tokens=False)]
+
+
 def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerTokens:
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-    return AssemblerTokens(
+    toks = AssemblerTokens(
         pad_id=int(pad),
         option_id=_single_id(tokenizer, "<option>"),
         target_open_id=_single_id(tokenizer, "<target>"),
@@ -133,6 +150,83 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
         card_ref_ids=[_single_id(tokenizer, f"<card-ref:{k}>") for k in range(MAX_CARD_REFS)],
         card_closer_ids=list(tokenizer.encode(CARD_CLOSER_TEXT, add_special_tokens=False)),
     )
+    toks._tokenizer = tokenizer
+    frags = toks.fragment_ids
+    # Static structural fragments.
+    for s in (
+        "<bos><state>",
+        "</state><eos>",
+        " </self>",
+        " </opp>",
+        " </option>",
+        "<actions>",
+        "</actions>",
+        " <target>",
+        " ",
+        "target",
+        "<self> mana=",
+        "<opp> mana=",
+    ):
+        frags[s] = _encode(tokenizer, s)
+    # Step-name fragments: " turn=" handled lazily; step strings as a unit
+    # within the f" turn={turn} step={step} " template are dynamic on `turn`,
+    # so we cache the f" step={step} " portion and emit `turn=N` lazily.
+    for step in _STEP_NAMES:
+        frags[f" step={step} "] = _encode(tokenizer, f" step={step} ")
+    # Owner+zone open/close tags (2 × 7 combos).
+    for tag in _ZONE_TAGS.values():
+        for owner_tag in ("self", "opp"):
+            open_s = f"<{owner_tag}><{tag}>"
+            close_s = f"</{tag}></{owner_tag}>"
+            frags[open_s] = _encode(tokenizer, open_s)
+            frags[close_s] = _encode(tokenizer, close_s)
+    # Action verbs (with leading space, as emitted).
+    for verb in _ACTION_KINDS.values():
+        frags[f" {verb}"] = _encode(tokenizer, f" {verb}")
+    # Mana glyph per color id.
+    toks.mana_glyph_ids = [_encode(tokenizer, f"{{{sym}}}") for sym in _MANA_SYMBOLS]
+    return toks
+
+
+def _body_lists(toks: AssemblerTokens, cache: CardTokenCache) -> list[list[int]]:
+    """Return per-row tail-stripped token-id lists for ``cache``.
+
+    Built once per cache and memoized on ``toks`` keyed by ``id(cache)``. The
+    trailing ``" </card>"`` token sequence is removed up front so the assembler
+    never re-checks it inside the per-card hot path.
+    """
+    key = id(cache)
+    cached = toks._body_lists_cache.get(key)
+    if cached is not None:
+        return cached
+    tail = toks.card_closer_ids
+    tail_len = len(tail)
+    offsets = cache.offsets
+    buf = cache.token_buffer
+    rows: list[list[int]] = []
+    num_rows = len(cache.row_to_name)
+    for row in range(num_rows):
+        start = int(offsets[row])
+        end = int(offsets[row + 1])
+        body = buf[start:end].tolist()
+        if tail_len and len(body) >= tail_len and body[-tail_len:] == tail:
+            del body[-tail_len:]
+        rows.append(body)
+    toks._body_lists_cache[key] = rows
+    return rows
+
+
+def _fragment(toks: AssemblerTokens, text: str) -> list[int]:
+    """Return the cached token-id list for ``text``, encoding lazily on miss."""
+    cached = toks.fragment_ids.get(text)
+    if cached is not None:
+        return cached
+    tok = toks._tokenizer
+    if tok is None:
+        raise RuntimeError("AssemblerTokens has no tokenizer attached")
+    encoded = _encode(tok, text)
+    toks.fragment_ids[text] = encoded
+    return encoded
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +246,7 @@ def _assemble_one(
     plan: np.ndarray,
     cache: CardTokenCache,
     toks: AssemblerTokens,
-    tokenizer: PreTrainedTokenizerFast,
+    body_lists: list[list[int]],
 ) -> _AssembledExample:
     out: list[int] = []
     card_ref_positions: dict[int, int] = {}
@@ -162,6 +256,9 @@ def _assemble_one(
     cur_target_bucket: list[int] | None = None
     scalar_owner_open: int | None = None
     option_open = False
+    # (zone_id, owner) pushed on OPEN_ZONE / popped on CLOSE_ZONE so we can
+    # recover the matching open in O(1) instead of rescanning the plan.
+    zone_stack: list[tuple[int, int]] = []
     # Detect literal-tokens mode by walking the opcode stream — naive
     # ``np.any(plan == OP_LITERAL_TOKENS)`` scans payload ints too and
     # spuriously flips when any payload happens to equal the opcode id
@@ -185,7 +282,7 @@ def _assemble_one(
         _scan_i += 1 + _scan_arity
 
     def emit_text(text: str) -> None:
-        out.extend(int(t) for t in tokenizer.encode(text, add_special_tokens=False))
+        out.extend(_fragment(toks, text))
 
     def emit_card_ref(uuid_idx: int) -> None:
         if uuid_idx < 0:
@@ -286,9 +383,10 @@ def _assemble_one(
                 if scalar_owner_open is None:
                     emit_text("<self> mana=" if owner == 0 else "<opp> mana=")
                     scalar_owner_open = owner
-                symbol = _MANA_SYMBOLS[color_id] if 0 <= color_id < len(_MANA_SYMBOLS) else ""
-                if symbol and amount > 0:
-                    emit_text(f"{{{symbol}}}" * amount)
+                if 0 <= color_id < len(toks.mana_glyph_ids) and amount > 0:
+                    glyph_ids = toks.mana_glyph_ids[color_id]
+                    for _ in range(amount):
+                        out.extend(glyph_ids)
                 i += 1 + arity
                 continue
 
@@ -296,6 +394,7 @@ def _assemble_one(
                 close_option()
                 zone = int(plan[i + 1])
                 owner = int(plan[i + 2])
+                zone_stack.append((zone, owner))
                 tag = _ZONE_TAGS.get(zone, "zone")
                 owner_tag = "self" if owner == 0 else "opp"
                 emit_text(f"<{owner_tag}><{tag}>")
@@ -304,21 +403,8 @@ def _assemble_one(
 
             if op == OP_CLOSE_ZONE:
                 close_option()
-                # Recover the matching open-zone payload by scanning backward
-                # over the already validated fixed-arity stream.
-                zone = None
-                owner = None
-                cursor = 0
-                while cursor < i:
-                    prev = int(plan[cursor])
-                    prev_arity = OPCODE_ARITY[prev]
-                    if prev == OP_OPEN_ZONE:
-                        zone = int(plan[cursor + 1])
-                        owner = int(plan[cursor + 2])
-                    elif prev == OP_CLOSE_ZONE:
-                        zone = owner = None
-                    cursor += 2 + int(plan[cursor + 1]) if prev_arity == -1 else 1 + prev_arity
-                if zone is not None and owner is not None:
+                if zone_stack:
+                    zone, owner = zone_stack.pop()
                     tag = _ZONE_TAGS.get(zone, "zone")
                     owner_tag = "self" if owner == 0 else "opp"
                     emit_text(f"</{tag}></{owner_tag}>")
@@ -388,15 +474,11 @@ def _assemble_one(
             uuid_idx = int(plan[i + 4])
             # Emit <card-ref:K> if attached.
             emit_card_ref(uuid_idx)
-            # Memcpy the card body, dropping its trailing ` </card>` tail
-            # — the END_CARD opcode (or the status decoder) will replace it.
-            body = cache.token_buffer[int(cache.offsets[row]) : int(cache.offsets[row + 1])]
-            tail = toks.card_closer_ids
-            if len(tail) and len(body) >= len(tail) and body[-len(tail) :].tolist() == tail:
-                trimmed = body[: -len(tail)]
-            else:
-                trimmed = body
-            out.extend(int(t) for t in trimmed.tolist())
+            # Memcpy the card body — the trailing ``" </card>"`` was already
+            # stripped when ``body_lists`` was built. The END_CARD opcode (or
+            # the status decoder) will replace it.
+            if 0 <= row < len(body_lists):
+                out.extend(body_lists[row])
             # Status flags — replicate the renderer's behavior:
             # "<sep> <tapped>" or "<sep> <untapped>" appended before " </card>".
             # The cache's body already had " </card>" stripped above, so we
@@ -522,8 +604,9 @@ def assemble_batch(
 
     toks = assembler_tokens or build_assembler_tokens(tokenizer)
     _attach_status_prefixes(toks, tokenizer)
+    body_lists = _body_lists(toks, cache)
 
-    assembled: list[_AssembledExample] = [_assemble_one(p, cache, toks, tokenizer) for p in plans]
+    assembled: list[_AssembledExample] = [_assemble_one(p, cache, toks, body_lists) for p in plans]
 
     seq_lengths = [len(ex.token_ids) for ex in assembled]
     actual_max = max(seq_lengths)

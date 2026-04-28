@@ -230,31 +230,43 @@ class TextActorCritic(nn.Module):
             else:
                 log_prob = output.values.new_zeros(())
                 entropy = output.values.new_zeros(())
-                for group_idx in range(int(layout.decision_option_idx.shape[0])):
-                    mask = layout.decision_mask[group_idx].to(device=self.device, dtype=torch.bool)
+                # Hoist H2D copies of the layout tensors out of the per-group
+                # loop — they're tiny but the per-iteration ``.to(device)``
+                # was issuing a fresh copy each call.
+                option_idx_dev = layout.decision_option_idx.to(self.device)
+                target_idx_dev = layout.decision_target_idx.to(self.device)
+                mask_dev = layout.decision_mask.to(device=self.device, dtype=torch.bool)
+                # Single H2D + one ``.tolist()`` for the per-group ``uses_none``
+                # flags so we don't synchronize once per iteration.
+                uses_none_flags = layout.uses_none_head.to(torch.bool).tolist()
+                num_groups = int(layout.decision_option_idx.shape[0])
+                selected_col_tensors: list[Tensor] = []
+                for group_idx in range(num_groups):
+                    mask = mask_dev[group_idx]
                     if not bool(mask.any()):
                         raise ValueError("decision group must include at least one valid choice")
                     logits = self._direct_live_decision_logits(
                         output,
                         none_logits,
                         step_idx=step_idx,
-                        option_idx=layout.decision_option_idx[group_idx].to(self.device),
-                        target_idx=layout.decision_target_idx[group_idx].to(self.device),
-                        uses_none=bool(layout.uses_none_head[group_idx].item()),
+                        option_idx=option_idx_dev[group_idx],
+                        target_idx=target_idx_dev[group_idx],
+                        uses_none=uses_none_flags[group_idx],
                     )
                     valid_cols = mask.nonzero(as_tuple=False).squeeze(-1)
                     valid_logits = logits[valid_cols]
                     dist = Categorical(logits=valid_logits)
-                    selected_pos = (
-                        int(torch.argmax(valid_logits).item())
-                        if deterministic
-                        else int(dist.sample().item())
-                    )
-                    selected_col = int(valid_cols[selected_pos].item())
-                    selected_cols.append(selected_col)
-                    selected_t = torch.tensor(selected_pos, dtype=torch.long, device=self.device)
+                    if deterministic:
+                        selected_t = torch.argmax(valid_logits)
+                    else:
+                        selected_t = dist.sample()
                     log_prob = log_prob + dist.log_prob(selected_t)
                     entropy = entropy + dist.entropy()
+                    selected_col_tensors.append(valid_cols[selected_t])
+                # One synchronous read for all groups, instead of two .item()
+                # calls per group.
+                if selected_col_tensors:
+                    selected_cols = torch.stack(selected_col_tensors).tolist()
                 trace, action = _decode_text_action(trace_kind, layout.pending, selected_cols)
 
             replay_idx = self.rollout_buffer.append(
@@ -623,19 +635,20 @@ class TextActorCritic(nn.Module):
         target_idx: Tensor,
         uses_none: bool,
     ) -> Tensor:
-        logits = output.values.new_full(option_idx.shape, -torch.inf)
-        for col in range(int(option_idx.shape[0])):
-            if uses_none and col == 0:
-                logits[col] = none_logits[step_idx]
-                continue
-            opt = int(option_idx[col].item())
-            tgt = int(target_idx[col].item())
-            if opt < 0:
-                continue
-            if tgt >= 0:
-                logits[col] = output.target_logits[step_idx, opt, tgt]
-            else:
-                logits[col] = output.policy_logits[step_idx, opt]
+        # Vectorized gather: avoid the per-column Python loop and the two
+        # ``.item()`` syncs it carried. ``option_idx`` / ``target_idx`` may
+        # contain -1 sentinels for masked columns; clamp before indexing and
+        # use ``torch.where`` to fill those slots with -inf afterwards.
+        opt_clamped = option_idx.clamp(min=0)
+        tgt_clamped = target_idx.clamp(min=0)
+        option_vals = output.policy_logits[step_idx, opt_clamped]
+        target_vals = output.target_logits[step_idx, opt_clamped, tgt_clamped]
+        logits = torch.where(target_idx >= 0, target_vals, option_vals)
+        neg_inf = output.values.new_tensor(float("-inf"))
+        logits = torch.where(option_idx >= 0, logits, neg_inf)
+        if uses_none:
+            logits = logits.clone()
+            logits[0] = none_logits[step_idx]
         return logits
 
     def _state_slots(
