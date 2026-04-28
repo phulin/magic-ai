@@ -21,10 +21,10 @@ from magic_ai.text_encoder.batch import TextEncodedBatch
 
 # flex_attention only generates the fused FA-style kernel under torch.compile;
 # called eagerly it materializes the full [B, H, T, T] score tensor and emits
-# a UserWarning to that effect. Compile once at module load with dynamic=True
-# so a changing T across batches doesn't trigger recompiles per shape. Same
-# for create_block_mask — its compiled form runs as a single fused kernel
-# instead of a Python-level scan over (b, q_block, kv_block).
+# a UserWarning. Compiling the *whole* encoder trunk turned out to have a
+# bigger per-call dispatch cost than compiling these ops individually
+# (332ms/call vs 281ms/call in profiling), so we keep the per-op compile and
+# accept the multiple dispatch boundaries.
 _flex_attention = torch.compile(flex_attention, dynamic=True)
 _create_block_mask = torch.compile(create_block_mask, dynamic=True)
 

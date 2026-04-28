@@ -207,82 +207,77 @@ class TextActorCritic(nn.Module):
 
         none_logits = self.none_head(output.state_hidden).squeeze(-1)
         may_logits = self.may_head(output.state_hidden).squeeze(-1)
-        results: list[PolicyStep] = []
+        # Phase 1: queue all GPU work without ever forcing a sync. We collect
+        # selected-col 0-D tensors, per-step log_prob/entropy/value tensors,
+        # and Python metadata. Old code synced once per step (selected cols
+        # via .tolist(), log_prob via .cpu(), value via .cpu(), plus a per-
+        # group mask.any().item()); for n=32 envs × ~3 groups that was ~120
+        # syncs/call dominating the loop. We defer everything to one batched
+        # sync at the end.
+        per_step_log_prob: list[Tensor] = []
+        per_step_entropy: list[Tensor] = []
+        per_step_value: list[Tensor] = []
+        per_step_may_sample: list[Tensor | None] = []
+        per_step_trace_kind: list[TraceKind] = []
+        per_step_layout: list[TextDecisionLayout] = []
+        per_step_selected_tensors: list[list[Tensor]] = []
         for step_idx, layout in enumerate(layouts):
             trace_kind = layout.trace_kind
             value = output.values[step_idx]
-            may_selected = 0
-            selected_cols: list[int] = []
+            may_sample_t: Tensor | None = None
+            selected_tensors: list[Tensor] = []
 
             if trace_kind == "may":
                 may_logit = may_logits[step_idx]
                 may_dist = Bernoulli(logits=may_logit)
-                may_sample = (
+                may_sample_t = (
                     (may_logit >= 0).to(dtype=output.values.dtype)
                     if deterministic
                     else may_dist.sample()
                 )
-                log_prob = may_dist.log_prob(may_sample)
+                log_prob = may_dist.log_prob(may_sample_t)
                 entropy = may_dist.entropy()
-                may_selected = int(float(may_sample.item()) >= 0.5)
-                action = action_from_choice_accepted(bool(may_selected))
-                trace = ActionTrace("may", binary=(float(may_selected),))
             else:
                 log_prob = output.values.new_zeros(())
                 entropy = output.values.new_zeros(())
-                # Hoist H2D copies of the layout tensors out of the per-group
-                # loop — they're tiny but the per-iteration ``.to(device)``
-                # was issuing a fresh copy each call.
                 option_idx_dev = layout.decision_option_idx.to(self.device)
                 target_idx_dev = layout.decision_target_idx.to(self.device)
                 mask_dev = layout.decision_mask.to(device=self.device, dtype=torch.bool)
-                # Single H2D + one ``.tolist()`` for the per-group ``uses_none``
-                # flags so we don't synchronize once per iteration.
                 uses_none_flags = layout.uses_none_head.to(torch.bool).tolist()
                 num_groups = int(layout.decision_option_idx.shape[0])
-                selected_col_tensors: list[Tensor] = []
-                # Pre-compute model-visibility masks so we can drop layout cols
-                # that reference options/targets which the assembler truncated
-                # past ``max_tokens`` (their option_mask/target_mask is False
-                # and the corresponding logits are -inf — sampling would land
-                # on an all-``-inf`` softmax and produce NaN).
-                opt_visibility = output.option_mask[step_idx]  # [max_opts]
-                tgt_visibility = output.target_mask[step_idx]  # [max_opts, max_targets]
+                # Vectorize visibility across ALL groups for this step instead
+                # of computing per-group inside the loop.
+                opt_visibility = output.option_mask[step_idx]
+                tgt_visibility = output.target_mask[step_idx]
                 num_opts_view = int(opt_visibility.shape[0])
                 num_tgts_view = int(tgt_visibility.shape[1])
+                opt_clamped_all = option_idx_dev.clamp(min=0)
+                tgt_clamped_all = target_idx_dev.clamp(min=0)
+                if num_opts_view > 0:
+                    opt_visible_all = opt_visibility[opt_clamped_all] & (option_idx_dev >= 0)
+                else:
+                    opt_visible_all = torch.zeros_like(option_idx_dev, dtype=torch.bool)
+                if num_opts_view > 0 and num_tgts_view > 0:
+                    tgt_visible_all = tgt_visibility[opt_clamped_all, tgt_clamped_all]
+                else:
+                    tgt_visible_all = torch.zeros_like(target_idx_dev, dtype=torch.bool)
+                target_required_all = target_idx_dev >= 0
+                visible_all = opt_visible_all & (~target_required_all | tgt_visible_all)
+                if any(uses_none_flags):
+                    col0 = torch.zeros_like(visible_all)
+                    for gi, uses in enumerate(uses_none_flags):
+                        if uses:
+                            col0[gi, 0] = True
+                    visible_all = visible_all | col0
+                mask_all = mask_dev & visible_all  # [G, C]
+
                 for group_idx in range(num_groups):
-                    mask = mask_dev[group_idx]
-                    option_idx_g = option_idx_dev[group_idx]
-                    target_idx_g = target_idx_dev[group_idx]
-                    # AND in model-visibility so layout cols pointing at
-                    # truncated slots are dropped before the softmax.
-                    if num_opts_view > 0:
-                        opt_clamped_g = option_idx_g.clamp(min=0)
-                        opt_visible = opt_visibility[opt_clamped_g]
-                        opt_visible = opt_visible & (option_idx_g >= 0)
-                    else:
-                        opt_visible = torch.zeros_like(option_idx_g, dtype=torch.bool)
-                    if num_opts_view > 0 and num_tgts_view > 0:
-                        tgt_clamped_g = target_idx_g.clamp(min=0)
-                        tgt_visible = tgt_visibility[opt_clamped_g, tgt_clamped_g]
-                    else:
-                        tgt_visible = torch.zeros_like(target_idx_g, dtype=torch.bool)
-                    target_required = target_idx_g >= 0
-                    visible = opt_visible & (~target_required | tgt_visible)
-                    if uses_none_flags[group_idx]:
-                        # The ``none`` slot lives at col 0 and isn't a real
-                        # option/target — keep it visible so the head can fire.
-                        col0 = torch.zeros_like(visible)
-                        col0[0] = True
-                        visible = visible | col0
-                    mask = mask & visible
-                    if not bool(mask.any()):
-                        raise ValueError(
-                            "decision group has no model-visible choice "
-                            "(all layout cols reference options/targets that "
-                            "were truncated by assemble_batch); raise "
-                            "--text-max-tokens to fit the assembled state"
-                        )
+                    mask = mask_all[group_idx]
+                    # Skip the per-group ``bool(mask.any())`` sync. If a layout
+                    # group's mask is empty after visibility-trim, the
+                    # downstream Categorical raises with a clear NaN error,
+                    # which is enough to surface the bug without burning a
+                    # sync per group on the happy path.
                     logits = self._direct_live_decision_logits(
                         output,
                         none_logits,
@@ -300,11 +295,64 @@ class TextActorCritic(nn.Module):
                         selected_t = dist.sample()
                     log_prob = log_prob + dist.log_prob(selected_t)
                     entropy = entropy + dist.entropy()
-                    selected_col_tensors.append(valid_cols[selected_t])
-                # One synchronous read for all groups, instead of two .item()
-                # calls per group.
-                if selected_col_tensors:
-                    selected_cols = torch.stack(selected_col_tensors).tolist()
+                    selected_tensors.append(valid_cols[selected_t])
+
+            per_step_log_prob.append(log_prob)
+            per_step_entropy.append(entropy)
+            per_step_value.append(value)
+            per_step_may_sample.append(may_sample_t)
+            per_step_trace_kind.append(trace_kind)
+            per_step_layout.append(layout)
+            per_step_selected_tensors.append(selected_tensors)
+
+        # Phase 2: one batched GPU→CPU sync to materialize everything.
+        flat_selected: list[Tensor] = [t for sublist in per_step_selected_tensors for t in sublist]
+        if flat_selected:
+            selected_flat_cpu = torch.stack(flat_selected).detach().cpu().tolist()
+        else:
+            selected_flat_cpu = []
+        log_prob_cpu = torch.stack(per_step_log_prob).detach().cpu().tolist()
+        value_cpu = torch.stack(per_step_value).detach().cpu().tolist()
+        may_sample_cpu: list[float | None] = []
+        if any(t is not None for t in per_step_may_sample):
+            stacked_may = (
+                torch.stack(
+                    [
+                        t if t is not None else output.values.new_zeros(())
+                        for t in per_step_may_sample
+                    ]
+                )
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            for raw, original in zip(stacked_may, per_step_may_sample, strict=True):
+                may_sample_cpu.append(raw if original is not None else None)
+        else:
+            may_sample_cpu = [None] * len(per_step_may_sample)
+
+        # Phase 3: build PolicyStep results in Python from the materialized
+        # values. This is pure CPU/Python work after this point.
+        results: list[PolicyStep] = []
+        cursor = 0
+        for step_idx in range(len(layouts)):
+            trace_kind = per_step_trace_kind[step_idx]
+            layout = per_step_layout[step_idx]
+            log_prob = per_step_log_prob[step_idx]
+            entropy = per_step_entropy[step_idx]
+            value = per_step_value[step_idx]
+            num_selected = len(per_step_selected_tensors[step_idx])
+            selected_cols = selected_flat_cpu[cursor : cursor + num_selected]
+            cursor += num_selected
+
+            may_selected = 0
+            if trace_kind == "may":
+                may_val = may_sample_cpu[step_idx]
+                assert may_val is not None
+                may_selected = int(may_val >= 0.5)
+                action = action_from_choice_accepted(bool(may_selected))
+                trace = ActionTrace("may", binary=(float(may_selected),))
+            else:
                 trace, action = _decode_text_action(trace_kind, layout.pending, selected_cols)
 
             replay_idx = self.rollout_buffer.append(
@@ -317,8 +365,8 @@ class TextActorCritic(nn.Module):
                 uses_none_head=layout.uses_none_head,
                 selected_indices=torch.tensor(selected_cols, dtype=torch.long),
                 may_selected=float(may_selected),
-                old_log_prob=float(log_prob.detach().cpu()),
-                value=float(value.detach().cpu()),
+                old_log_prob=float(log_prob_cpu[step_idx]),
+                value=float(value_cpu[step_idx]),
                 perspective_player_idx=int(perspective_player_indices[step_idx]),
                 lstm_h_in=h_in[:, step_idx].detach(),
                 lstm_c_in=c_in[:, step_idx].detach(),
