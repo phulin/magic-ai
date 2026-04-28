@@ -158,6 +158,22 @@ def _alpha_for_step(step_in_m: int, delta_m: int) -> float:
     return min(1.0, 2.0 * step_in_m / float(delta_m))
 
 
+def _delta_m_for_outer_iteration(outer_iteration: int, delta_m: int) -> int:
+    """Gradient-step interval before the next outer update.
+
+    The initial ``reg_m000`` snapshot is persisted at construction time. For
+    early training stability, take the next two fixed-point snapshots halfway
+    through the normal interval, then return to the configured cadence:
+    ``0, Δ/2, Δ, 2Δ, ...``.
+    """
+
+    if delta_m <= 1:
+        return 1
+    if outer_iteration < 2:
+        return max(1, delta_m // 2)
+    return delta_m
+
+
 def _advance_outer_iteration(state: RNaDTrainerState) -> None:
     """Perform one fixed-point step: ``reg_prev <- reg_cur``, ``reg_cur <- target``.
 
@@ -272,7 +288,11 @@ def run_rnad_update(
     if not episodes:
         raise ValueError("run_rnad_update requires at least one episode")
 
-    alpha = _alpha_for_step(state.gradient_step, state.config.delta_m)
+    current_delta_m = _delta_m_for_outer_iteration(
+        state.outer_iteration,
+        state.config.delta_m,
+    )
+    alpha = _alpha_for_step(state.gradient_step, current_delta_m)
 
     per_episode_replay_rows: list[list[int]] = []
     per_episode_perspective: list[list[int]] = []
@@ -419,7 +439,7 @@ def run_rnad_update(
     polyak_update_(state.target, cast(nn.Module, policy), gamma=state.config.target_ema_gamma)
 
     state.gradient_step += 1
-    if state.gradient_step >= state.config.delta_m:
+    if state.gradient_step >= current_delta_m:
         _advance_outer_iteration(state)
 
     q_clip_fraction = (

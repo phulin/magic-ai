@@ -14,6 +14,7 @@ from magic_ai.rnad_trainer import (
     _advance_outer_iteration,
     _alpha_for_step,
     _clone_policy_sharing_buffer,
+    _delta_m_for_outer_iteration,
     build_trainer_state,
     resume_from_snapshot_dir,
 )
@@ -39,6 +40,10 @@ class AlphaScheduleTests(unittest.TestCase):
 
     def test_zero_delta_returns_one(self) -> None:
         self.assertAlmostEqual(_alpha_for_step(0, 0), 1.0)
+
+    def test_first_two_outer_intervals_are_half_delta_m(self) -> None:
+        intervals = [_delta_m_for_outer_iteration(outer_iteration=m, delta_m=500) for m in range(5)]
+        self.assertEqual(intervals, [250, 250, 500, 500, 500])
 
 
 class ClonePolicyTests(unittest.TestCase):
