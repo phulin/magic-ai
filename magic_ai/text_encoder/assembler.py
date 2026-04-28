@@ -372,7 +372,7 @@ def _assemble_one(
             # — the END_CARD opcode (or the status decoder) will replace it.
             body = cache.token_buffer[int(cache.offsets[row]) : int(cache.offsets[row + 1])]
             tail = toks.card_closer_ids
-            if len(tail) and len(body) >= len(tail) and list(body[-len(tail) :]) == tail:
+            if len(tail) and len(body) >= len(tail) and body[-len(tail) :].tolist() == tail:
                 trimmed = body[: -len(tail)]
             else:
                 trimmed = body

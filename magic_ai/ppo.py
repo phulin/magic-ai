@@ -11,7 +11,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from magic_ai.model import PPOPolicy
+from magic_ai.training_interfaces import PPOReplayPolicy
 
 
 @dataclass(frozen=True)
@@ -35,7 +35,7 @@ class PPOStats:
 
 
 def ppo_update(
-    policy: PPOPolicy,
+    policy: PPOReplayPolicy,
     optimizer: torch.optim.Optimizer,
     steps: Sequence[RolloutStep],
     returns: Tensor,

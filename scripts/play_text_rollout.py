@@ -38,7 +38,7 @@ from magic_ai.text_encoder.render import load_oracle_text  # noqa: E402
 from magic_ai.text_encoder.rollout import TextRolloutWorker  # noqa: E402
 from magic_ai.text_encoder.tokenizer import load_tokenizer  # noqa: E402
 
-DEFAULT_CACHE = REPO_ROOT / "data" / "text_encoder_card_tokens.npz"
+DEFAULT_CACHE = REPO_ROOT / "data" / "text_encoder_card_tokens.pt"
 DEFAULT_DECK = REPO_ROOT / "decks" / "bears.json"
 
 

@@ -26,7 +26,7 @@ import dataclasses
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import torch
 from torch import Tensor, nn
@@ -961,19 +961,6 @@ class RNaDStats:
     regularization landscape rather than the win/loss landscape."""
 
 
-class _ReplayEvaluator(Protocol):
-    """Structural type for the policy callable into :func:`rnad_update_trajectory`.
-
-    See :meth:`magic_ai.model.PPOPolicy.evaluate_replay_batch`.
-    """
-
-    def evaluate_replay_batch(
-        self, replay_rows: list[int]
-    ) -> tuple[Tensor, Tensor, Tensor, Any]: ...
-
-    def parameters(self) -> Any: ...  # for optimizer introspection + device
-
-
 @dataclass(frozen=True)
 class _TrajLossPieces:
     """Raw loss tensors + counts + scalar stats for one trajectory.
@@ -1080,10 +1067,10 @@ def _gather_sampled_scalar(pc: Any, may_logp: Tensor) -> Tensor:
 
 def rnad_trajectory_loss(
     *,
-    online: _ReplayEvaluator,
-    target: _ReplayEvaluator,
-    reg_cur: _ReplayEvaluator,
-    reg_prev: _ReplayEvaluator,
+    online: Any,
+    target: Any,
+    reg_cur: Any,
+    reg_prev: Any,
     replay_rows: list[int],
     perspective_player_idx: Sequence[int],
     winner_idx: int,
@@ -1950,10 +1937,10 @@ def _maybe_recompute_lstm_h_out_episodes(
 
 def rnad_batched_trajectory_loss(
     *,
-    online: _ReplayEvaluator,
-    target: _ReplayEvaluator,
-    reg_cur: _ReplayEvaluator,
-    reg_prev: _ReplayEvaluator,
+    online: Any,
+    target: Any,
+    reg_cur: Any,
+    reg_prev: Any,
     episodes_replay_rows: Sequence[Sequence[int]],
     episodes_perspective: Sequence[Sequence[int]],
     episodes_winner_idx: Sequence[int],
@@ -2065,10 +2052,10 @@ def rnad_batched_trajectory_loss(
 
 def rnad_update_trajectory(
     *,
-    online: _ReplayEvaluator,
-    target: _ReplayEvaluator,
-    reg_cur: _ReplayEvaluator,
-    reg_prev: _ReplayEvaluator,
+    online: Any,
+    target: Any,
+    reg_cur: Any,
+    reg_prev: Any,
     optimizer: torch.optim.Optimizer,
     replay_rows: list[int],
     perspective_player_idx: Sequence[int],

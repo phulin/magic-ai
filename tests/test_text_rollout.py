@@ -15,7 +15,7 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DECK = REPO_ROOT / "decks" / "bears.json"
-DEFAULT_CACHE = REPO_ROOT / "data" / "text_encoder_card_tokens.npz"
+DEFAULT_CACHE = REPO_ROOT / "data" / "text_encoder_card_tokens.pt"
 
 
 def _have_mage() -> bool:

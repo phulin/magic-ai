@@ -33,6 +33,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import torch
 from torch import nn
@@ -48,6 +49,7 @@ from magic_ai.rnad import (
     rnad_batched_trajectory_loss,
     save_reg_snapshot,
 )
+from magic_ai.training_interfaces import RNaDTrainablePolicy
 
 
 @dataclass
@@ -245,7 +247,7 @@ def _count_active_steps(
 
 
 def run_rnad_update(
-    policy: PPOPolicy,
+    policy: RNaDTrainablePolicy,
     optimizer: torch.optim.Optimizer,
     state: RNaDTrainerState,
     episodes: Sequence[EpisodeBatch],
@@ -414,7 +416,7 @@ def run_rnad_update(
     trainable = [p for p in policy.parameters() if p.requires_grad]
     grad_norm = float(nn.utils.clip_grad_norm_(trainable, max_norm=state.config.grad_clip))
     optimizer.step()
-    polyak_update_(state.target, policy, gamma=state.config.target_ema_gamma)
+    polyak_update_(state.target, cast(nn.Module, policy), gamma=state.config.target_ema_gamma)
 
     state.gradient_step += 1
     if state.gradient_step >= state.config.delta_m:

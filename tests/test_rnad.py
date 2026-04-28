@@ -512,8 +512,10 @@ class _StubPolicy(nn.Module):
         replay_rows: list[int],
         *,
         lstm_state_override: tuple[torch.Tensor, torch.Tensor] | None = None,
+        hidden_override: torch.Tensor | None = None,
     ):  # type: ignore[no-untyped-def]
         del lstm_state_override
+        del hidden_override
         from magic_ai.model import ReplayPerChoice
 
         idx = torch.tensor(replay_rows, dtype=torch.long)

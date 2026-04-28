@@ -26,7 +26,7 @@ that reuses the data extracted by `collectSlotCards` / `fillStateEncoding` /
 **Out of scope (lands in PR 13-C, Python side):**
 - The numpy / Cython assembler that walks the plan into a `[batch, max_tokens]`
   buffer.
-- The card-token cache (`data/text_encoder_card_tokens.npz`) — already covered
+- The card-token cache (`data/text_encoder_card_tokens.pt`) — already covered
   by PR 13-A.
 - Any change to the existing slot-encoder outputs.
 - A Go-side assembler (Stage B in §13) — deferred until profile evidence.

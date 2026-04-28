@@ -1,4 +1,4 @@
-"""Build the pre-tokenized card-body cache (``data/text_encoder_card_tokens.npz``).
+"""Build the pre-tokenized card-body cache (``data/text_encoder_card_tokens.pt``).
 
 PR 13-A from ``docs/text_encoder_plan.md``. Run once at startup (or whenever
 the engine card set changes); the hot-path assembler memcpys slices from this
@@ -48,8 +48,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output",
         type=Path,
-        default=REPO_ROOT / "data" / "text_encoder_card_tokens.npz",
-        help="Where to write the npz cache.",
+        default=REPO_ROOT / "data" / "text_encoder_card_tokens.pt",
+        help="Where to write the PyTorch cache.",
     )
     p.add_argument(
         "--names-from",
@@ -92,7 +92,7 @@ def main() -> int:
 
     print(f"Wrote {args.output} ({file_size:,} bytes).")
     print(f"  cards (rows excl. unknown): {stats['count']}")
-    print(f"  total tokens cached:        {int(cache.token_buffer.size):,}")
+    print(f"  total tokens cached:        {int(cache.token_buffer.numel()):,}")
     print(
         "  body length: mean={mean:.1f}  p50={p50}  p90={p90}  max={max}".format(
             mean=float(stats["mean"]),

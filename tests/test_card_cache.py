@@ -9,8 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import cast
 
-import numpy as np
 import pytest
+import torch
 from magic_ai.game_state import GameCardState, GameStateSnapshot, PlayerState
 from magic_ai.text_encoder.card_cache import (
     UNKNOWN_NAME,
@@ -66,19 +66,19 @@ def test_cache_shape_and_unknown_row(small_cache: CardTokenCache) -> None:
     assert int(small_cache.offsets[0]) == 0
     assert int(small_cache.offsets[1]) == 0
     assert small_cache.offsets.shape == (len(TEST_NAMES) + 2,)
-    assert small_cache.token_buffer.dtype == np.int32
-    assert small_cache.offsets.dtype == np.int64
+    assert small_cache.token_buffer.dtype == torch.int32
+    assert small_cache.offsets.dtype == torch.int64
     # Each real card body must be non-empty.
     for k in range(2, len(TEST_NAMES) + 2):
         assert int(small_cache.offsets[k]) > int(small_cache.offsets[k - 1])
 
 
 def test_save_and_load_roundtrip(small_cache: CardTokenCache, tmp_path: Path) -> None:
-    out = tmp_path / "cache.npz"
+    out = tmp_path / "cache.pt"
     save_card_cache(small_cache, out)
     loaded = load_card_cache(out)
-    assert np.array_equal(loaded.token_buffer, small_cache.token_buffer)
-    assert np.array_equal(loaded.offsets, small_cache.offsets)
+    assert torch.equal(loaded.token_buffer, small_cache.token_buffer)
+    assert torch.equal(loaded.offsets, small_cache.offsets)
     assert loaded.row_to_name == small_cache.row_to_name
     assert loaded.engine_card_set_hash == small_cache.engine_card_set_hash
 

@@ -3,7 +3,7 @@
 PR 13-A from ``docs/text_encoder_plan.md``. At startup we render the
 ``<card> Name <sep> Type <sep> P/T <sep> oracle </card>`` fragment for every
 card the Go engine knows about, BPE-tokenize it once, and pack the results
-into a flat ``int32`` buffer keyed by the engine's 1-indexed card-row IDs.
+into a flat ``torch.int32`` buffer keyed by the engine's 1-indexed card-row IDs.
 The hot-path assembler (PR 13-C) memcpys slices out of this cache; per-step
 BPE is avoided entirely.
 """
@@ -21,7 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
-import numpy as np
+import torch
+from torch import Tensor
 from transformers import PreTrainedTokenizerFast
 
 from magic_ai.text_encoder.render import OracleEntry, render_card_body
@@ -52,8 +53,8 @@ class CardTokenCache:
     card-row IDs.
     """
 
-    token_buffer: np.ndarray  # shape [total_tokens] dtype int32
-    offsets: np.ndarray  # shape [num_card_rows + 1] dtype int64
+    token_buffer: Tensor  # shape [total_tokens] dtype torch.int32
+    offsets: Tensor  # shape [num_card_rows + 1] dtype torch.int64
     row_to_name: list[str]  # length num_card_rows + 1; index 0 = UNKNOWN_NAME
     engine_card_set_hash: str
 
@@ -61,7 +62,7 @@ class CardTokenCache:
     def num_rows(self) -> int:
         return len(self.row_to_name)
 
-    def body_tokens(self, row: int) -> np.ndarray:
+    def body_tokens(self, row: int) -> Tensor:
         return self.token_buffer[int(self.offsets[row]) : int(self.offsets[row + 1])]
 
 
@@ -111,7 +112,7 @@ def build_card_cache(
 
     # Row 0 = unknown sentinel: empty body.
     row_to_name: list[str] = [UNKNOWN_NAME]
-    pieces: list[np.ndarray] = []
+    pieces: list[Tensor] = []
     offsets: list[int] = [0, 0]  # offsets[0] = offsets[1] = 0
     cursor = 0
     for name in names:
@@ -126,18 +127,16 @@ def build_card_cache(
             body_text = render_card_body(name, entry)
         if body_text:
             ids = tokenizer.encode(body_text, add_special_tokens=False)
-            arr = np.asarray(ids, dtype=np.int32)
+            arr = torch.tensor(ids, dtype=torch.int32)
         else:
-            arr = np.empty((0,), dtype=np.int32)
+            arr = torch.empty((0,), dtype=torch.int32)
         pieces.append(arr)
         cursor += int(arr.shape[0])
         offsets.append(cursor)
         row_to_name.append(name)
 
-    token_buffer = (np.concatenate(pieces) if pieces else np.empty((0,), dtype=np.int32)).astype(
-        np.int32, copy=False
-    )
-    offsets_arr = np.asarray(offsets, dtype=np.int64)
+    token_buffer = torch.cat(pieces) if pieces else torch.empty((0,), dtype=torch.int32)
+    offsets_arr = torch.tensor(offsets, dtype=torch.int64)
     return CardTokenCache(
         token_buffer=token_buffer,
         offsets=offsets_arr,
@@ -151,42 +150,40 @@ def build_card_cache(
 # ---------------------------------------------------------------------------
 
 
-_SIDECAR_KEY = "metadata_json"
-
-
 def save_card_cache(cache: CardTokenCache, path: Path | str) -> None:
-    """Write the cache to ``path`` as an ``np.savez`` archive (no pickle)."""
+    """Write the cache to ``path`` as a PyTorch checkpoint."""
 
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    metadata = json.dumps(
+    torch.save(
         {
+            "token_buffer": cache.token_buffer.detach().cpu().to(dtype=torch.int32),
+            "offsets": cache.offsets.detach().cpu().to(dtype=torch.int64),
             "row_to_name": cache.row_to_name,
             "engine_card_set_hash": cache.engine_card_set_hash,
-        }
-    )
-    # Persist metadata as bytes via a 1-D uint8 array to avoid pickle.
-    metadata_arr = np.frombuffer(metadata.encode("utf-8"), dtype=np.uint8)
-    np.savez(
+        },
         p,
-        token_buffer=cache.token_buffer,
-        offsets=cache.offsets,
-        metadata_json=metadata_arr,
     )
 
 
 def load_card_cache(path: Path | str) -> CardTokenCache:
     p = Path(path)
-    with np.load(p, allow_pickle=False) as archive:
-        token_buffer = np.asarray(archive["token_buffer"], dtype=np.int32)
-        offsets = np.asarray(archive["offsets"], dtype=np.int64)
-        metadata_bytes = bytes(archive[_SIDECAR_KEY].tobytes())
-    metadata = json.loads(metadata_bytes.decode("utf-8"))
+    payload = torch.load(p, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"card cache {p} did not contain a dict payload")
+    token_buffer = payload.get("token_buffer")
+    offsets = payload.get("offsets")
+    row_to_name = payload.get("row_to_name")
+    engine_card_set_hash = payload.get("engine_card_set_hash")
+    if not isinstance(token_buffer, Tensor) or not isinstance(offsets, Tensor):
+        raise RuntimeError(f"card cache {p} is missing tensor buffers")
+    if not isinstance(row_to_name, list) or not isinstance(engine_card_set_hash, str):
+        raise RuntimeError(f"card cache {p} is missing metadata")
     return CardTokenCache(
-        token_buffer=token_buffer,
-        offsets=offsets,
-        row_to_name=list(metadata["row_to_name"]),
-        engine_card_set_hash=str(metadata["engine_card_set_hash"]),
+        token_buffer=token_buffer.to(dtype=torch.int32).contiguous(),
+        offsets=offsets.to(dtype=torch.int64).contiguous(),
+        row_to_name=[str(name) for name in row_to_name],
+        engine_card_set_hash=engine_card_set_hash,
     )
 
 
@@ -255,11 +252,12 @@ def cache_length_stats(cache: CardTokenCache) -> dict[str, float | int]:
 
     if cache.num_rows <= 1:
         return {"count": 0, "mean": 0.0, "p50": 0, "p90": 0, "max": 0}
-    lens = np.diff(cache.offsets[1:])  # one entry per real card row
+    lens = cache.offsets[2:] - cache.offsets[1:-1]  # one entry per real card row
+    lens_f = lens.to(dtype=torch.float32)
     return {
-        "count": int(lens.size),
-        "mean": float(lens.mean()),
-        "p50": int(np.percentile(lens, 50)),
-        "p90": int(np.percentile(lens, 90)),
+        "count": int(lens.numel()),
+        "mean": float(lens_f.mean()),
+        "p50": int(torch.quantile(lens_f, 0.5)),
+        "p90": int(torch.quantile(lens_f, 0.9)),
         "max": int(lens.max()),
     }

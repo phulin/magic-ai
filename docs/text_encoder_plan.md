@@ -227,7 +227,7 @@ The Go engine already maps every registered card name to a deterministic 1-index
 
 1. Call `MageRegisteredCards()` to enumerate the engine's card set.
 2. For each card name, render the **card body fragment only** (`Name <sep> Type <sep> P/T <sep> oracle text`) via `magic_ai/text_encoder/render.py` and tokenize via the §2 tokenizer. Status flags, zone delimiters, and `<card-ref:K>` are *not* in the cached body — those are state-dependent and are inserted by the assembler.
-3. Pack into a flat `int32` buffer + a `(row_id) → (offset, length)` index. Persist to `data/text_encoder_card_tokens.npz`. Order of magnitude: ~600 cards × ~80 tokens × 4 bytes ≈ 200 KB.
+3. Pack into a flat `torch.int32` buffer + a `(row_id) → (offset, length)` index. Persist to `data/text_encoder_card_tokens.pt`. Order of magnitude: ~600 cards × ~80 tokens × 4 bytes ≈ 200 KB.
 4. Audit at build time: every registered name must have oracle text from `data/card_oracle_embeddings.json` or `pkg/catalog`. Fail loud at startup, not at first inference.
 5. Tie cache validity to a hash of `MageRegisteredCards()` output so cache rebuilds when the engine card set changes.
 
@@ -263,7 +263,7 @@ No tokenizer call, no string formatting on the per-step path. Microseconds per e
 
 ### PR slicing
 
-13-A. Python startup: build & validate the card-token cache from `MageRegisteredCards()` + oracle JSON. Persist to `data/text_encoder_card_tokens.npz`. **No engine changes** — uses what the Go side already exposes. Lands today.
+13-A. Python startup: build & validate the card-token cache from `MageRegisteredCards()` + oracle JSON. Persist to `data/text_encoder_card_tokens.pt`. **No engine changes** — uses what the Go side already exposes. Lands today.
 13-B. Engine/ABI: extend `stateCard` with the missing status fields, surface them through `MageEncodeOutputs.render_plan` behind `cfg.emit_render_plan`. Cross-repo change to `mage-go`; needs Go-side review.
 13-C. Python assembler: walks the render plan + cache → `TextEncodedBatch`. Standalone, with a parity test against `render_snapshot` + `tokenize_snapshot`.
 13-D. Wire the assembler into `RolloutBuffer` / `PPOPolicy` behind `encoder="text"`.
