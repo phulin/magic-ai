@@ -2175,34 +2175,43 @@ class PPOPolicy(nn.Module):
         group_idx = valid[:, 0]
         choice_cols = valid[:, 1]
         flat_step_positions = step_positions[group_idx]
-        flat_logits = torch.empty(valid.shape[0], dtype=query.dtype, device=device)
 
         # Force bool dtype: callers may pass uses_none as uint8 (the encoder
         # stores it as u8); torch.compile's fake-tensor pass rejects uint8
         # mask indexing even though eager accepts it with a deprecation
         # warning.
         is_none = uses_none[group_idx].bool() & (choice_cols == 0)
-        flat_logits[is_none] = none_logits[flat_step_positions[is_none]]
-
         is_scored = ~is_none
-        scored_groups = group_idx[is_scored]
-        scored_steps = flat_step_positions[is_scored]
-        scored_cols = choice_cols[is_scored]
+        scored_pos = is_scored.nonzero(as_tuple=False).squeeze(-1)
+        scored_groups = group_idx[scored_pos]
+        scored_steps = flat_step_positions[scored_pos]
+        scored_cols = choice_cols[scored_pos]
 
         scored_option_idx = option_idx[scored_groups, scored_cols]
         scored_target_idx = target_idx[scored_groups, scored_cols]
 
         scored_option_vectors = option_vectors[scored_steps, scored_option_idx]
-        scored_target_vectors = torch.zeros_like(scored_option_vectors)
+        # Build the per-scored-entry target vector functionally: writing into a
+        # zeros tensor with index_put (out-of-place) avoids the in-place
+        # index_put_ that anomaly mode flags.
         has_target = scored_target_idx >= 0
-        scored_target_vectors[has_target] = target_vectors[
-            scored_steps[has_target],
-            scored_option_idx[has_target],
-            scored_target_idx[has_target],
+        hat_pos = has_target.nonzero(as_tuple=False).squeeze(-1)
+        target_present = target_vectors[
+            scored_steps[hat_pos],
+            scored_option_idx[hat_pos],
+            scored_target_idx[hat_pos],
         ]
+        scored_target_vectors = torch.zeros_like(scored_option_vectors).index_put(
+            (hat_pos,), target_present
+        )
 
         decision_vectors = scored_option_vectors + scored_target_vectors
-        flat_logits[is_scored] = (decision_vectors * query[scored_steps]).sum(dim=-1)
+        scored_values = (decision_vectors * query[scored_steps]).sum(dim=-1)
+        # Combine the two branches without in-place writes: start from the
+        # full-size none branch (correct on is_none entries) and scatter the
+        # scored values over the is_scored positions.
+        none_full = none_logits[flat_step_positions]
+        flat_logits = none_full.scatter(0, scored_pos, scored_values)
 
         group_count = step_positions.shape[0]
         group_max = torch.full((group_count,), -torch.inf, dtype=query.dtype, device=device)

@@ -95,6 +95,59 @@ def _wrap_phase(obj: Any, attr: str, name: str) -> None:
     setattr(obj, attr, wrapper)
 
 
+N_PROFILE = 2
+WARMUP = 1
+WITH_STACK = False
+CPROFILE_ITER = 0  # cProfile only this iteration index (0 = disabled)
+LINE_PROFILE = True  # use line_profiler for per-line wall in train_native_batched_envs
+
+_line_profiler: Any = None
+if LINE_PROFILE:
+    import line_profiler  # noqa: E402
+
+    _line_profiler = line_profiler.LineProfiler()
+
+
+def _line_profile_method(cls: type, attr: str) -> None:
+    """Wrap cls.attr with line_profiler. Must run before any other wrappers."""
+    if _line_profiler is None:
+        return
+    fn = getattr(cls, attr)
+    _line_profiler.add_function(fn)
+    setattr(cls, attr, _line_profiler(fn))
+
+
+# Register step_by_choice with line_profiler BEFORE _wrap_phase wraps it,
+# so the line profiler sees the actual method body, not the timing wrapper.
+_line_profile_method(ShardedNativeRolloutDriver, "step_by_choice")
+if _line_profiler is not None:
+    for _attr in (
+        "sample_native_batch",
+        "_forward_native_batch",
+        "_flat_decision_distribution",
+        "_sample_flat_decisions",
+        "_trace_action_without_pending",
+        "evaluate_replay_batch_per_choice",
+        "evaluate_replay_batch",
+    ):
+        if hasattr(PPOPolicy, _attr):
+            _line_profile_method(PPOPolicy, _attr)
+
+# Line-profile the rnad update internals — the rnad path spends ~85% of update
+# wall inside rnad_batched_trajectory_loss and we want a per-line view.
+import magic_ai.rnad as _rnad_mod  # noqa: E402
+
+for _fn_name in ("rnad_batched_trajectory_loss", "_trajectory_loss_from_forwards"):
+    _fn = getattr(_rnad_mod, _fn_name, None)
+    if _fn is not None:
+        _line_profiler.add_function(_fn)
+        setattr(_rnad_mod, _fn_name, _line_profiler(_fn))
+# rnad_trainer.run_rnad_update calls rnad_batched_trajectory_loss via its own
+# import; rebind there too so the wrapper is what gets called.
+for _fn_name in ("rnad_batched_trajectory_loss",):
+    if hasattr(rt, _fn_name):
+        setattr(rt, _fn_name, getattr(_rnad_mod, _fn_name))
+
 _wrap_phase(ShardedNativeRolloutDriver, "poll", "poll")
 _wrap_phase(ShardedNativeRolloutDriver, "step_by_choice", "step")
 _wrap_phase(ShardedNativeBatchEncoder, "encode_handles", "encode")
@@ -122,12 +175,6 @@ def _gae_wrapper(*args: Any, **kwargs: Any) -> Any:
 setattr(_ppo_mod, "gae_returns", _gae_wrapper)
 # --------------------------------------------------------------------------
 
-N_PROFILE = 2
-WARMUP = 1
-WITH_STACK = False
-CPROFILE_ITER = 0  # cProfile only this iteration index (0 = disabled)
-LINE_PROFILE = False  # use line_profiler for per-line wall in train_native_batched_envs
-
 _train_spec = importlib.util.spec_from_file_location("train_mod", _ROOT / "scripts" / "train.py")
 assert _train_spec is not None and _train_spec.loader is not None
 train_mod = importlib.util.module_from_spec(_train_spec)
@@ -140,28 +187,17 @@ setattr(train_mod, "gae_returns", _gae_wrapper)
 # Bind the inline subphase recorder on train.py.
 setattr(train_mod, "_subphase_record", _add_phase)
 
-_line_profiler: Any = None
-if LINE_PROFILE:
-    import line_profiler  # noqa: E402
-
-    _line_profiler = line_profiler.LineProfiler()
-    # Register sample_native_batch and a few of its inner methods so the
-    # whole sampling path shows up in the line profile.
-    for _attr in (
-        "sample_native_batch",
-        "_forward_native_batch",
-        "_flat_decision_distribution",
-        "_sample_flat_decisions",
-        "_trace_action_without_pending",
-    ):
-        if hasattr(PPOPolicy, _attr):
-            _orig = getattr(PPOPolicy, _attr)
-            _line_profiler.add_function(_orig)
-            setattr(PPOPolicy, _attr, _line_profiler(_orig))
-
+if _line_profiler is not None:
     _train_fn = cast(Any, train_mod).train_native_batched_envs
     _line_profiler.add_function(_train_fn)
     setattr(train_mod, "train_native_batched_envs", _line_profiler(_train_fn))
+    # Line-profile run_rnad_update. main() rebinds rt.run_rnad_update to its
+    # torch-profile wrapper, but reads the current value as `orig` first, so
+    # the line-profiled function ends up inside that wrapper.
+    _rnad_update_fn = rt.run_rnad_update
+    _line_profiler.add_function(_rnad_update_fn)
+    rt.run_rnad_update = cast(Any, _line_profiler(_rnad_update_fn))
+    setattr(train_mod, "run_rnad_update", rt.run_rnad_update)
 
 
 @dataclass

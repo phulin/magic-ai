@@ -205,6 +205,57 @@ class TwoPlayerVTraceTests(unittest.TestCase):
                 perspective_is_player_i=torch.zeros(0, dtype=torch.bool),
             )
 
+    def test_batched_matches_per_episode(self) -> None:
+        from magic_ai.rnad import _two_player_vtrace_batched
+
+        torch.manual_seed(7)
+        eps = []
+        for t_len in (5, 9, 1, 12):
+            rewards = torch.zeros(t_len)
+            rewards[-1] = 1.0 if torch.rand(()) > 0.5 else -1.0
+            values = torch.linspace(0.1, 0.5, t_len)
+            logp_theta = -torch.rand(t_len)
+            logp_mu = -torch.rand(t_len)
+            is_own = torch.tensor([t % 2 == 0 for t in range(t_len)])
+            eps.append((rewards, values, logp_theta, logp_mu, is_own))
+
+        per_ep = [
+            two_player_vtrace(
+                rewards=r,
+                values=v,
+                logp_theta=lt,
+                logp_mu=lm,
+                perspective_is_player_i=io,
+            )
+            for r, v, lt, lm, io in eps
+        ]
+
+        flat_rewards = torch.cat([e[0] for e in eps])
+        flat_values = torch.cat([e[1] for e in eps])
+        flat_lt = torch.cat([e[2] for e in eps])
+        flat_lm = torch.cat([e[3] for e in eps])
+        flat_io = torch.cat([e[4] for e in eps])
+        offsets = torch.tensor(
+            [0, *torch.cumsum(torch.tensor([e[0].numel() for e in eps]), 0).tolist()],
+            dtype=torch.long,
+        )
+        out = _two_player_vtrace_batched(
+            rewards=flat_rewards,
+            values=flat_values,
+            logp_theta=flat_lt,
+            logp_mu=flat_lm,
+            perspective_is_player_i=flat_io,
+            ep_offsets=offsets,
+        )
+        expected_v_hat = torch.cat([p.v_hat for p in per_ep])
+        expected_q_hat = torch.cat([p.q_hat for p in per_ep])
+        expected_r_next = torch.cat([p.r_hat_next for p in per_ep])
+        expected_v_next = torch.cat([p.v_hat_next for p in per_ep])
+        self.assertTrue(torch.allclose(out.v_hat, expected_v_hat, atol=1e-6))
+        self.assertTrue(torch.allclose(out.q_hat, expected_q_hat, atol=1e-6))
+        self.assertTrue(torch.allclose(out.r_hat_next, expected_r_next, atol=1e-6))
+        self.assertTrue(torch.allclose(out.v_hat_next, expected_v_next, atol=1e-6))
+
 
 class NeuRDLossTests(unittest.TestCase):
     def test_gradient_matches_expected_in_range(self) -> None:
