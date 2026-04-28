@@ -16,6 +16,7 @@ from scripts.train import (
     _current_transcript_snapshot,
     _restore_opponent_pool,
     build_slot_backend,
+    checkpoint_encoder_kind,
     load_deck_dir,
     load_training_checkpoint,
     log_args_to_wandb_summary,
@@ -23,6 +24,7 @@ from scripts.train import (
     sample_decks,
     save_checkpoint,
     validate_args,
+    validate_checkpoint_encoder,
     validate_deck_embeddings,
 )
 
@@ -38,6 +40,19 @@ class TrainPPOTests(unittest.TestCase):
         self.assertIsNotNone(checkpoint)
         assert checkpoint is not None
         self.assertEqual(checkpoint["args"]["output"], Path("checkpoints/ppo.pt"))
+
+    def test_legacy_checkpoint_defaults_to_slots_encoder(self) -> None:
+        self.assertEqual(checkpoint_encoder_kind({"metadata": {}}), "slots")
+
+    def test_validate_checkpoint_encoder_rejects_mismatch(self) -> None:
+        args = Namespace(encoder="text")
+        checkpoint = {"metadata": {"encoder": "slots"}}
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "checkpoint encoder 'slots' is incompatible with --encoder text",
+        ):
+            validate_checkpoint_encoder(args, checkpoint)
 
     def test_decode_action_choice_color_falls_back_when_transcript_options_are_short(self) -> None:
         policy = PPOPolicy.__new__(PPOPolicy)
@@ -251,7 +266,11 @@ class TrainPPOTests(unittest.TestCase):
                 rollout_capacity=16,
             )
             optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
-            args = Namespace(output=checkpoint_path, opponent_pool_dir=opponent_pool_dir)
+            args = Namespace(
+                output=checkpoint_path,
+                opponent_pool_dir=opponent_pool_dir,
+                encoder="slots",
+            )
             pool = OpponentPool()
             snapshot_path = opponent_pool_dir / "snapshot_g000100_p010.0.pt"
             pool.add_snapshot(snapshot_path, "g000100_p010.0")
@@ -280,6 +299,7 @@ class TrainPPOTests(unittest.TestCase):
         assert checkpoint is not None
         self.assertEqual(checkpoint["args"]["output"], str(checkpoint_path))
         self.assertEqual(checkpoint["metadata"]["wandb_run_id"], "run-123")
+        self.assertEqual(checkpoint["metadata"]["encoder"], "slots")
         self.assertEqual(
             checkpoint["metadata"]["run_artifact_dir"],
             str(opponent_pool_dir.parent),

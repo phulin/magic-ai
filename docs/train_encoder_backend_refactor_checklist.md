@@ -4,9 +4,9 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 
 ## Target Shape
 
-- [ ] Add `--encoder {slots,text}` to `scripts/train.py`.
-- [ ] Keep `slots` as the default path and preserve current behavior.
-- [ ] Treat the current `PPOPolicy` + `RolloutBuffer` + native encoder path as the slot backend.
+- [x] Add `--encoder {slots,text}` to `scripts/train.py`.
+- [x] Keep `slots` as the default path and preserve current behavior.
+- [x] Treat the current `PPOPolicy` + `RolloutBuffer` + native encoder path as the slot backend.
 - [ ] Add a separate text backend built from `RecurrentTextPolicy`, `CardTokenCache`, render-plan assembly, and a text replay buffer.
 - [ ] Refactor PPO/RNaD trainer code to depend on a replay-policy interface instead of concrete `PPOPolicy`.
 
@@ -65,42 +65,45 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - [x] `NativeTrajectoryBuffer(...)`
 - [x] Keep current rollout collection logic working through the slot backend.
   - `main()` now builds a `SlotTrainingBackend` and passes its existing policy, native encoder, and staging buffer into the unchanged loop.
-- [ ] Keep checkpoint save/load metadata compatible with existing slot checkpoints.
+- [x] Keep checkpoint save/load metadata compatible with existing slot checkpoints.
+  - Checkpoints now save `metadata.encoder`; legacy checkpoints without it are treated as `slots`.
 - [ ] Verify `--encoder slots` produces the same smoke behavior as before.
 
 ## Phase 4: Text Replay Buffer
 
-- [ ] Add `TextReplayBuffer` for text-encoded replay rows.
+- [x] Add `TextReplayBuffer` for text-encoded replay rows.
 - [ ] Store per step:
-  - [ ] `token_ids`
-  - [ ] `attention_mask`
-  - [ ] `card_ref_positions`
-  - [ ] `option_positions`
-  - [ ] `option_mask`
-  - [ ] `target_positions`
-  - [ ] `target_mask`
-  - [ ] `seq_lengths`
-  - [ ] `trace_kind_id`
-  - [ ] decision layout tensors
-  - [ ] selected decision columns
-  - [ ] `may_selected`
-  - [ ] old log-prob
-  - [ ] value
-  - [ ] perspective player index
-  - [ ] recurrent `h_in` / `c_in`
-- [ ] Decide padding strategy for replay rows:
-  - [ ] fixed `text_max_tokens` buffer for speed, or
+  - [x] `token_ids`
+  - [x] `attention_mask`
+  - [x] `card_ref_positions`
+  - [x] `option_positions`
+  - [x] `option_mask`
+  - [x] `target_positions`
+  - [x] `target_mask`
+  - [x] `seq_lengths`
+  - [x] `trace_kind_id`
+  - [x] decision layout tensors
+  - [x] selected decision columns
+  - [x] `may_selected`
+  - [x] old log-prob
+  - [x] value
+  - [x] perspective player index
+  - [x] recurrent `h_in` / `c_in`
+- [x] Decide padding strategy for replay rows:
+  - [x] fixed `text_max_tokens` buffer for speed, or
   - [ ] compact variable-length storage with minibatch collation.
-- [ ] Add replay-row append/release/reset methods matching the slot buffer lifecycle.
-- [ ] Add focused buffer tests for append, replay gather, and episode grouping.
+- [x] Add replay-row append/release/reset methods matching the slot buffer lifecycle.
+- [x] Add focused buffer tests for append, replay gather, and episode grouping.
+  - Added `magic_ai/text_encoder/replay_buffer.py` and `tests/test_text_replay_buffer.py`.
 
 ## Phase 5: Text Actor-Critic Training Surface
 
-- [ ] Add `TextActorCritic` wrapper around `RecurrentTextPolicy`.
+- [x] Add `TextActorCritic` wrapper around `RecurrentTextPolicy`.
 - [ ] Implement live env recurrent state management:
-  - [ ] initialize per-env player states
-  - [ ] reset states for completed games
-  - [ ] gather/scatter state for active env batches
+  - [x] initialize per-env player states
+  - [x] reset states for completed games
+  - [x] gather/scatter state for active env batches
+    - Added `magic_ai/text_encoder/actor_critic.py`; sampling/replay evaluation are still pending.
 - [ ] Implement `sample_text_batch(...)` using:
   - [ ] native render-plan emission when enabled
   - [ ] Python render-plan emission as fallback
@@ -134,10 +137,10 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 
 ## Phase 7: `train.py` Integration
 
-- [ ] Split current setup into `build_slot_backend(...)`.
+- [x] Split current setup into `build_slot_backend(...)`.
 - [ ] Add `build_text_backend(...)`.
 - [ ] Branch once after argument validation:
-  - [ ] `args.encoder == "slots"`
+  - [x] `args.encoder == "slots"`
   - [ ] `args.encoder == "text"`
 - [ ] Keep the main training loop backend-oriented:
   - [ ] collect rollout
@@ -146,11 +149,11 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - [ ] save checkpoint
   - [ ] log metrics
 - [ ] Save checkpoint metadata including:
-  - [ ] encoder kind
+  - [x] encoder kind
   - [ ] text config when `encoder=text`
   - [ ] tokenizer path/hash if available
   - [ ] card-token cache hash
-- [ ] Reject incompatible checkpoint/CLI combinations clearly.
+- [x] Reject incompatible checkpoint/CLI combinations clearly.
 
 ## Phase 8: Validation
 

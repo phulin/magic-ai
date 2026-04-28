@@ -284,6 +284,30 @@ def _checkpoint_wandb_run_id(checkpoint: dict[str, Any] | None) -> str | None:
     return str(run_id) if isinstance(run_id, str) and run_id else None
 
 
+def checkpoint_encoder_kind(checkpoint: dict[str, Any] | None) -> str:
+    """Return serialized encoder kind, defaulting legacy checkpoints to slots."""
+
+    encoder = _checkpoint_metadata(checkpoint).get("encoder")
+    if encoder is None:
+        return "slots"
+    if isinstance(encoder, str) and encoder:
+        return encoder
+    raise ValueError("checkpoint metadata field 'encoder' must be a non-empty string")
+
+
+def validate_checkpoint_encoder(
+    args: argparse.Namespace, checkpoint: dict[str, Any] | None
+) -> None:
+    if checkpoint is None:
+        return
+    checkpoint_encoder = checkpoint_encoder_kind(checkpoint)
+    if checkpoint_encoder != args.encoder:
+        raise ValueError(
+            f"checkpoint encoder '{checkpoint_encoder}' is incompatible with "
+            f"--encoder {args.encoder}"
+        )
+
+
 def _default_run_artifact_dir(output_path: Path, run_id: str | None) -> Path:
     label = run_id or output_path.stem
     return output_path.parent / "runs" / label
@@ -403,6 +427,7 @@ def main() -> None:
         torch.set_num_threads(args.torch_threads)
 
     checkpoint_cpu = load_training_checkpoint(args.checkpoint, map_location="cpu")
+    validate_checkpoint_encoder(args, checkpoint_cpu)
     checkpoint_wandb_run_id = _checkpoint_wandb_run_id(checkpoint_cpu)
 
     if not args.no_wandb:
@@ -512,6 +537,12 @@ def main() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run PPO self-play training with mage-go.")
+    parser.add_argument(
+        "--encoder",
+        choices=("slots", "text"),
+        default="slots",
+        help="state encoder backend to train; slots preserves the existing native slot path",
+    )
     parser.add_argument("--embeddings", type=Path, default=Path("data/embeddings.json"))
     parser.add_argument("--output", type=Path, default=Path("checkpoints/ppo.pt"))
     parser.add_argument("--checkpoint", type=Path, default=None)
@@ -763,6 +794,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--gae-lambda must be in [0, 1]")
     if args.hidden_layers < 1:
         raise ValueError("--hidden-layers must be at least 1")
+    if getattr(args, "encoder", "slots") == "text":
+        raise ValueError("--encoder text is not wired into train.py yet")
     if args.torch_compile and not args.no_validate:
         raise ValueError("--torch-compile requires --no-validate")
     if args.deck_json is not None and args.deck_dir is not None:
@@ -1663,6 +1696,7 @@ def save_checkpoint(
             "args": serialized_args,
             "training_state": training_state,
             "metadata": {
+                "encoder": getattr(args, "encoder", "slots"),
                 "wandb_run_id": effective_wandb_run_id,
                 "run_artifact_dir": str(effective_run_artifact_dir),
             },
