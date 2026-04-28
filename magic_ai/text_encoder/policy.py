@@ -42,6 +42,25 @@ from magic_ai.text_encoder.render import OracleEntry, render_snapshot
 
 
 @dataclass
+class EncodedSnapshots:
+    """Pooled encoder outputs for a :class:`TextEncodedBatch`.
+
+    Produced by :meth:`TextPolicy.encode_only` so that callers (notably the
+    recurrent wrapper in ``magic_ai.text_encoder.recurrent``) can reuse the
+    encoder + pools and drive the heads with a different state vector (e.g. an
+    LSTM hidden state) without re-running the trunk.
+    """
+
+    card_vectors: Tensor
+    card_mask: Tensor
+    option_vectors: Tensor
+    option_mask: Tensor
+    target_vectors: Tensor
+    target_mask: Tensor
+    state_vector: Tensor
+
+
+@dataclass
 class TextPolicyOutput:
     """Bundle of tensors produced by :meth:`TextPolicy.forward`.
 
@@ -83,22 +102,20 @@ class TextPolicy(nn.Module):
         self.target_head = TargetHead(cfg.d_model)
         self.value_head = ValueHead(cfg.d_model)
 
-    def forward(self, batch: TextEncodedBatch) -> TextPolicyOutput:
-        hidden = self.encoder(batch)
+    def encode_only(self, batch: TextEncodedBatch) -> EncodedSnapshots:
+        """Run the encoder + pool ops; return raw vectors without head logits.
 
+        Used by :class:`TextPolicy.forward` and by the recurrent wrapper so the
+        latter can substitute an LSTM hidden state for ``state_vector`` before
+        running the heads.
+        """
+
+        hidden = self.encoder(batch)
         card_vecs, card_mask = gather_card_vectors(hidden, batch)
         option_vecs, option_mask = gather_option_vectors(hidden, batch)
         target_vecs, target_mask = gather_target_vectors(hidden, batch)
         state_vec = gather_state_vector(hidden, batch)
-
-        policy_logits = self.policy_head(option_vecs, state_vec, option_mask)
-        target_logits = self.target_head(target_vecs, option_vecs, state_vec, target_mask)
-        values = self.value_head(state_vec)
-
-        return TextPolicyOutput(
-            policy_logits=policy_logits,
-            target_logits=target_logits,
-            values=values,
+        return EncodedSnapshots(
             card_vectors=card_vecs,
             card_mask=card_mask,
             option_vectors=option_vecs,
@@ -106,6 +123,39 @@ class TextPolicy(nn.Module):
             target_vectors=target_vecs,
             target_mask=target_mask,
             state_vector=state_vec,
+        )
+
+    def run_heads(
+        self, encoded: EncodedSnapshots, state_vec: Tensor | None = None
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Run the three heads against ``encoded`` using ``state_vec``.
+
+        If ``state_vec`` is ``None``, ``encoded.state_vector`` is used.
+        Returns ``(policy_logits, target_logits, values)``.
+        """
+
+        sv = encoded.state_vector if state_vec is None else state_vec
+        policy_logits = self.policy_head(encoded.option_vectors, sv, encoded.option_mask)
+        target_logits = self.target_head(
+            encoded.target_vectors, encoded.option_vectors, sv, encoded.target_mask
+        )
+        values = self.value_head(sv)
+        return policy_logits, target_logits, values
+
+    def forward(self, batch: TextEncodedBatch) -> TextPolicyOutput:
+        encoded = self.encode_only(batch)
+        policy_logits, target_logits, values = self.run_heads(encoded)
+        return TextPolicyOutput(
+            policy_logits=policy_logits,
+            target_logits=target_logits,
+            values=values,
+            card_vectors=encoded.card_vectors,
+            card_mask=encoded.card_mask,
+            option_vectors=encoded.option_vectors,
+            option_mask=encoded.option_mask,
+            target_vectors=encoded.target_vectors,
+            target_mask=encoded.target_mask,
+            state_vector=encoded.state_vector,
         )
 
     @staticmethod
@@ -185,6 +235,7 @@ def parameter_count(module: nn.Module) -> int:
 
 
 __all__ = [
+    "EncodedSnapshots",
     "TextPolicy",
     "TextPolicyOutput",
     "build_text_policy",
