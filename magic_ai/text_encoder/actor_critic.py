@@ -8,9 +8,23 @@ from typing import Any, cast
 
 import torch
 from torch import Tensor, nn
-from torch.distributions import Bernoulli
+from torch.distributions import Bernoulli, Categorical
 
-from magic_ai.model import TRACE_KIND_TO_ID
+from magic_ai.actions import (
+    COLORS,
+    ActionRequest,
+    action_from_attackers,
+    action_from_blockers,
+    action_from_choice_accepted,
+    action_from_choice_color,
+    action_from_choice_ids,
+    action_from_choice_index,
+    action_from_priority_candidate,
+    build_priority_candidates,
+    selected_option_id,
+)
+from magic_ai.game_state import PendingState
+from magic_ai.model import TRACE_KIND_TO_ID, ActionTrace, PolicyStep, TraceKind
 from magic_ai.replay_decisions import ReplayPerChoice
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.recurrent import (
@@ -26,6 +40,16 @@ class TextActorCriticStep:
     output: RecurrentTextPolicyOutput
     h_out: Tensor
     c_out: Tensor
+
+
+@dataclass(frozen=True)
+class TextDecisionLayout:
+    trace_kind: TraceKind
+    decision_option_idx: Tensor
+    decision_target_idx: Tensor
+    decision_mask: Tensor
+    uses_none_head: Tensor
+    pending: PendingState
 
 
 class TextActorCritic(nn.Module):
@@ -95,6 +119,117 @@ class TextActorCritic(nn.Module):
         output, (h_out, c_out) = self.policy(batch, h_in=h_in, c_in=c_in)
         self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
         return TextActorCriticStep(output=output, h_out=h_out, c_out=c_out)
+
+    def sample_text_batch(
+        self,
+        batch: TextEncodedBatch,
+        *,
+        env_indices: list[int],
+        perspective_player_indices: list[int],
+        layouts: list[TextDecisionLayout],
+        deterministic: bool = False,
+    ) -> list[PolicyStep]:
+        """Sample a live text-encoded batch and append replay rows.
+
+        The caller owns render-plan emission and assembly. This method owns
+        recurrent state, decision-group sampling, and replay-buffer writes so
+        PPO/R-NaD can re-score the exact sampled text rows later.
+        """
+
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+        n = int(batch.token_ids.shape[0])
+        if n == 0:
+            return []
+        if len(env_indices) != n or len(perspective_player_indices) != n or len(layouts) != n:
+            raise ValueError("batch, env_indices, perspective_player_indices, and layouts differ")
+
+        moved = _move_text_batch(batch, self.device)
+        h_in, c_in = self.lstm_env_state_inputs(env_indices, perspective_player_indices)
+        output, (h_out, c_out) = self.policy(moved, h_in=h_in, c_in=c_in)
+        self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
+
+        none_logits = self.none_head(output.state_hidden).squeeze(-1)
+        may_logits = self.may_head(output.state_hidden).squeeze(-1)
+        results: list[PolicyStep] = []
+        for step_idx, layout in enumerate(layouts):
+            trace_kind = layout.trace_kind
+            value = output.values[step_idx]
+            may_selected = 0
+            selected_cols: list[int] = []
+
+            if trace_kind == "may":
+                may_logit = may_logits[step_idx]
+                may_dist = Bernoulli(logits=may_logit)
+                may_sample = (
+                    (may_logit >= 0).to(dtype=output.values.dtype)
+                    if deterministic
+                    else may_dist.sample()
+                )
+                log_prob = may_dist.log_prob(may_sample)
+                entropy = may_dist.entropy()
+                may_selected = int(float(may_sample.item()) >= 0.5)
+                action = action_from_choice_accepted(bool(may_selected))
+                trace = ActionTrace("may", binary=(float(may_selected),))
+            else:
+                log_prob = output.values.new_zeros(())
+                entropy = output.values.new_zeros(())
+                for group_idx in range(int(layout.decision_option_idx.shape[0])):
+                    mask = layout.decision_mask[group_idx].to(device=self.device, dtype=torch.bool)
+                    if not bool(mask.any()):
+                        raise ValueError("decision group must include at least one valid choice")
+                    logits = self._direct_live_decision_logits(
+                        output,
+                        none_logits,
+                        step_idx=step_idx,
+                        option_idx=layout.decision_option_idx[group_idx].to(self.device),
+                        target_idx=layout.decision_target_idx[group_idx].to(self.device),
+                        uses_none=bool(layout.uses_none_head[group_idx].item()),
+                    )
+                    valid_cols = mask.nonzero(as_tuple=False).squeeze(-1)
+                    valid_logits = logits[valid_cols]
+                    dist = Categorical(logits=valid_logits)
+                    selected_pos = (
+                        int(torch.argmax(valid_logits).item())
+                        if deterministic
+                        else int(dist.sample().item())
+                    )
+                    selected_col = int(valid_cols[selected_pos].item())
+                    selected_cols.append(selected_col)
+                    selected_t = torch.tensor(selected_pos, dtype=torch.long, device=self.device)
+                    log_prob = log_prob + dist.log_prob(selected_t)
+                    entropy = entropy + dist.entropy()
+                trace, action = _decode_text_action(trace_kind, layout.pending, selected_cols)
+
+            replay_idx = self.rollout_buffer.append(
+                encoded=moved,
+                batch_index=step_idx,
+                trace_kind_id=TRACE_KIND_TO_ID[trace_kind],
+                decision_option_idx=layout.decision_option_idx,
+                decision_target_idx=layout.decision_target_idx,
+                decision_mask=layout.decision_mask,
+                uses_none_head=layout.uses_none_head,
+                selected_indices=torch.tensor(selected_cols, dtype=torch.long),
+                may_selected=float(may_selected),
+                old_log_prob=float(log_prob.detach().cpu()),
+                value=float(value.detach().cpu()),
+                perspective_player_idx=int(perspective_player_indices[step_idx]),
+                lstm_h_in=h_in[:, step_idx].detach(),
+                lstm_c_in=c_in[:, step_idx].detach(),
+            )
+            results.append(
+                PolicyStep(
+                    action=action,
+                    trace=trace,
+                    log_prob=log_prob,
+                    value=value,
+                    entropy=entropy,
+                    replay_idx=replay_idx,
+                    selected_choice_cols=tuple(selected_cols),
+                    may_selected=may_selected,
+                )
+            )
+        return results
 
     def evaluate_replay_batch(
         self,
@@ -397,6 +532,31 @@ class TextActorCritic(nn.Module):
                 logits[col] = output.policy_logits[step_idx, opt]
         return logits
 
+    def _direct_live_decision_logits(
+        self,
+        output: RecurrentTextPolicyOutput,
+        none_logits: Tensor,
+        *,
+        step_idx: int,
+        option_idx: Tensor,
+        target_idx: Tensor,
+        uses_none: bool,
+    ) -> Tensor:
+        logits = output.values.new_full(option_idx.shape, -torch.inf)
+        for col in range(int(option_idx.shape[0])):
+            if uses_none and col == 0:
+                logits[col] = none_logits[step_idx]
+                continue
+            opt = int(option_idx[col].item())
+            tgt = int(target_idx[col].item())
+            if opt < 0:
+                continue
+            if tgt >= 0:
+                logits[col] = output.target_logits[step_idx, opt, tgt]
+            else:
+                logits[col] = output.policy_logits[step_idx, opt]
+        return logits
+
     def _state_slots(
         self,
         env_indices: list[int],
@@ -427,4 +587,231 @@ class TextActorCritic(nn.Module):
             raise IndexError("env index out of range")
 
 
-__all__ = ["TextActorCritic", "TextActorCriticStep"]
+def build_text_decision_layout(
+    trace_kind: TraceKind,
+    pending: PendingState,
+    *,
+    max_options: int,
+    max_targets_per_option: int,
+    max_cached_choices: int,
+) -> TextDecisionLayout:
+    if trace_kind == "may":
+        return _layout(trace_kind, pending, [], [], [], [], max_cached_choices)
+
+    if trace_kind == "priority":
+        candidates = build_priority_candidates(
+            pending,
+            max_targets_per_option=max_targets_per_option,
+        )[:max_cached_choices]
+        if not candidates:
+            return _layout(trace_kind, pending, [], [], [], [], max_cached_choices)
+        option_row = [-1] * max_cached_choices
+        target_row = [-1] * max_cached_choices
+        mask_row = [False] * max_cached_choices
+        for col, cand in enumerate(candidates):
+            option_row[col] = cand.option_index
+            if cand.target_index is not None:
+                target_row[col] = cand.target_index
+            mask_row[col] = True
+        return _layout(
+            trace_kind,
+            pending,
+            [option_row],
+            [target_row],
+            [mask_row],
+            [False],
+            max_cached_choices,
+        )
+
+    options = pending.get("options", [])[:max_options]
+    if not options:
+        return _layout(trace_kind, pending, [], [], [], [], max_cached_choices)
+
+    if trace_kind == "attackers":
+        option_rows = []
+        target_rows = []
+        mask_rows = []
+        for i, _option in enumerate(options):
+            option_row = [-1] * max_cached_choices
+            target_row = [-1] * max_cached_choices
+            mask_row = [False] * max_cached_choices
+            if max_cached_choices > 0:
+                mask_row[0] = True
+            if max_cached_choices > 1:
+                option_row[1] = i
+                mask_row[1] = True
+            option_rows.append(option_row)
+            target_rows.append(target_row)
+            mask_rows.append(mask_row)
+        return _layout(
+            trace_kind,
+            pending,
+            option_rows,
+            target_rows,
+            mask_rows,
+            [True] * len(option_rows),
+            max_cached_choices,
+        )
+
+    if trace_kind == "blockers":
+        option_rows = []
+        target_rows = []
+        mask_rows = []
+        for i, option in enumerate(options):
+            option_row = [-1] * max_cached_choices
+            target_row = [-1] * max_cached_choices
+            mask_row = [False] * max_cached_choices
+            if max_cached_choices > 0:
+                mask_row[0] = True
+            target_count = min(
+                len(option.get("valid_targets", [])),
+                max_targets_per_option,
+                max_cached_choices - 1,
+            )
+            for target_idx in range(target_count):
+                col = target_idx + 1
+                option_row[col] = i
+                target_row[col] = target_idx
+                mask_row[col] = True
+            option_rows.append(option_row)
+            target_rows.append(target_row)
+            mask_rows.append(mask_row)
+        return _layout(
+            trace_kind,
+            pending,
+            option_rows,
+            target_rows,
+            mask_rows,
+            [True] * len(option_rows),
+            max_cached_choices,
+        )
+
+    option_row = [-1] * max_cached_choices
+    target_row = [-1] * max_cached_choices
+    mask_row = [False] * max_cached_choices
+    for i in range(min(len(options), max_cached_choices)):
+        option_row[i] = i
+        mask_row[i] = True
+    return _layout(
+        trace_kind,
+        pending,
+        [option_row],
+        [target_row],
+        [mask_row],
+        [False],
+        max_cached_choices,
+    )
+
+
+def infer_text_trace_kind(pending: PendingState) -> TraceKind:
+    kind = pending.get("kind", "") or ""
+    if kind in ("priority", "attackers", "blockers", "may"):
+        return cast(TraceKind, kind)
+    if kind == "mana_color":
+        return "choice_color"
+    if kind in ("cards_from_hand", "card_from_library"):
+        return "choice_ids"
+    return "choice_index"
+
+
+def _layout(
+    trace_kind: TraceKind,
+    pending: PendingState,
+    option_rows: list[list[int]],
+    target_rows: list[list[int]],
+    mask_rows: list[list[bool]],
+    uses_none: list[bool],
+    max_cached_choices: int,
+) -> TextDecisionLayout:
+    group_count = len(option_rows)
+    if group_count == 0:
+        shape = (0, max_cached_choices)
+        decision_option_idx = torch.empty(shape, dtype=torch.long)
+        decision_target_idx = torch.empty(shape, dtype=torch.long)
+        decision_mask = torch.empty(shape, dtype=torch.bool)
+        uses_none_head = torch.empty((0,), dtype=torch.bool)
+    else:
+        decision_option_idx = torch.tensor(option_rows, dtype=torch.long)
+        decision_target_idx = torch.tensor(target_rows, dtype=torch.long)
+        decision_mask = torch.tensor(mask_rows, dtype=torch.bool)
+        uses_none_head = torch.tensor(uses_none, dtype=torch.bool)
+    return TextDecisionLayout(
+        trace_kind=trace_kind,
+        decision_option_idx=decision_option_idx,
+        decision_target_idx=decision_target_idx,
+        decision_mask=decision_mask,
+        uses_none_head=uses_none_head,
+        pending=pending,
+    )
+
+
+def _decode_text_action(
+    trace_kind: TraceKind,
+    pending: PendingState,
+    selected: list[int],
+) -> tuple[ActionTrace, ActionRequest]:
+    selected_idx = selected[0] if selected else 0
+    if trace_kind == "priority":
+        candidates = build_priority_candidates(pending)
+        if not candidates:
+            return ActionTrace("priority", indices=(0,)), {"kind": "pass"}
+        selected_idx = min(selected_idx, len(candidates) - 1)
+        return (
+            ActionTrace("priority", indices=(selected_idx,)),
+            action_from_priority_candidate(candidates[selected_idx]),
+        )
+    if trace_kind == "attackers":
+        binary = tuple(float(value == 1) for value in selected)
+        return (
+            ActionTrace("attackers", binary=binary),
+            action_from_attackers(pending, [value == 1.0 for value in binary]),
+        )
+    if trace_kind == "blockers":
+        indices = tuple(value - 1 for value in selected)
+        return ActionTrace("blockers", indices=indices), action_from_blockers(
+            pending,
+            list(indices),
+        )
+    if trace_kind == "choice_ids":
+        target_id = selected_option_id(pending, selected_idx)
+        return (
+            ActionTrace("choice_ids", indices=(selected_idx,)),
+            action_from_choice_ids([target_id] if target_id else []),
+        )
+    if trace_kind == "choice_color":
+        options = pending.get("options", [])
+        if 0 <= selected_idx < len(options):
+            option = options[selected_idx]
+            color = option.get("color", option.get("id", COLORS[selected_idx % len(COLORS)]))
+        else:
+            color = COLORS[selected_idx % len(COLORS)]
+        return (
+            ActionTrace("choice_color", indices=(selected_idx,)),
+            action_from_choice_color(str(color)),
+        )
+    return (
+        ActionTrace("choice_index", indices=(selected_idx,)),
+        action_from_choice_index(selected_idx),
+    )
+
+
+def _move_text_batch(batch: TextEncodedBatch, device: torch.device) -> TextEncodedBatch:
+    return TextEncodedBatch(
+        token_ids=batch.token_ids.to(device),
+        attention_mask=batch.attention_mask.to(device),
+        card_ref_positions=batch.card_ref_positions.to(device),
+        option_positions=batch.option_positions.to(device),
+        option_mask=batch.option_mask.to(device),
+        target_positions=batch.target_positions.to(device),
+        target_mask=batch.target_mask.to(device),
+        seq_lengths=batch.seq_lengths.to(device),
+    )
+
+
+__all__ = [
+    "TextActorCritic",
+    "TextActorCriticStep",
+    "TextDecisionLayout",
+    "build_text_decision_layout",
+    "infer_text_trace_kind",
+]

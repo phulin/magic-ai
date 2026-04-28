@@ -1,7 +1,13 @@
 import unittest
+from typing import cast
 
 import torch
-from magic_ai.text_encoder.actor_critic import TextActorCritic
+from magic_ai.game_state import PendingState
+from magic_ai.text_encoder.actor_critic import (
+    TextActorCritic,
+    build_text_decision_layout,
+    infer_text_trace_kind,
+)
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig
@@ -129,6 +135,101 @@ class TextActorCriticTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(log_probs).all())
         self.assertTrue(torch.isfinite(entropies).all())
         self.assertTrue(torch.isfinite(values).all())
+
+    def test_sample_text_batch_appends_replay_row(self) -> None:
+        torch.manual_seed(0)
+        model = _model()
+        replay = TextReplayBuffer(
+            capacity=4,
+            max_tokens=4,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            recurrent_layers=1,
+            recurrent_hidden_dim=8,
+        )
+        model.rollout_buffer = replay
+        model.init_lstm_env_states(1)
+        pending = cast(
+            PendingState,
+            {
+                "kind": "priority",
+                "player_idx": 0,
+                "options": [
+                    {"kind": "pass"},
+                    {"kind": "play_land", "card_id": "c1"},
+                ],
+            },
+        )
+        layout = build_text_decision_layout(
+            infer_text_trace_kind(pending),
+            pending,
+            max_options=2,
+            max_targets_per_option=1,
+            max_cached_choices=2,
+        )
+
+        steps = model.sample_text_batch(
+            _batch(batch_size=1),
+            env_indices=[0],
+            perspective_player_indices=[0],
+            layouts=[layout],
+            deterministic=True,
+        )
+
+        self.assertEqual(len(steps), 1)
+        replay_idx = steps[0].replay_idx
+        self.assertIsNotNone(replay_idx)
+        assert replay_idx is not None
+        self.assertEqual(replay.size, 1)
+        self.assertEqual(len(steps[0].selected_choice_cols), 1)
+        log_probs, entropies, values, extras = model.evaluate_replay_batch([replay_idx])
+        self.assertIsNone(extras)
+        self.assertTrue(torch.isfinite(log_probs).all())
+        self.assertTrue(torch.isfinite(entropies).all())
+        self.assertTrue(torch.isfinite(values).all())
+
+    def test_sample_text_batch_handles_may_head(self) -> None:
+        torch.manual_seed(0)
+        model = _model()
+        replay = TextReplayBuffer(
+            capacity=4,
+            max_tokens=4,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            recurrent_layers=1,
+            recurrent_hidden_dim=8,
+        )
+        model.rollout_buffer = replay
+        model.init_lstm_env_states(1)
+        pending = cast(PendingState, {"kind": "may", "player_idx": 0, "options": []})
+        layout = build_text_decision_layout(
+            "may",
+            pending,
+            max_options=2,
+            max_targets_per_option=1,
+            max_cached_choices=2,
+        )
+
+        steps = model.sample_text_batch(
+            _batch(batch_size=1),
+            env_indices=[0],
+            perspective_player_indices=[0],
+            layouts=[layout],
+            deterministic=True,
+        )
+
+        self.assertEqual(steps[0].trace.kind, "may")
+        replay_idx = steps[0].replay_idx
+        self.assertIsNotNone(replay_idx)
+        assert replay_idx is not None
+        batch = replay.gather([replay_idx])
+        self.assertEqual(int(batch.trace_kind_id[0]), 6)
+        self.assertEqual(int(batch.decision_count[0]), 0)
+        self.assertIn(steps[0].may_selected, (0, 1))
 
     def test_evaluate_replay_batch_per_choice_returns_rnad_shape(self) -> None:
         torch.manual_seed(0)

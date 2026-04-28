@@ -104,11 +104,12 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - [x] reset states for completed games
   - [x] gather/scatter state for active env batches
     - Added `magic_ai/text_encoder/actor_critic.py`; sampling/replay evaluation are still pending.
-- [ ] Implement `sample_text_batch(...)` using:
+- [x] Implement `sample_text_batch(...)` using:
   - [ ] native render-plan emission when enabled
   - [ ] Python render-plan emission as fallback
   - [ ] `assemble_batch(...)`
-  - [ ] shared decision replay logic
+  - [x] shared decision replay logic
+  - `TextActorCritic.sample_text_batch(...)` now consumes assembled text batches, samples decision groups/may decisions, updates live LSTM state, appends `TextReplayBuffer` rows, and returns `PolicyStep` entries with `replay_idx`. Render-plan emission and assembly are still owned by the pending collector.
 - [x] Implement `evaluate_replay_batch(...)` for PPO.
   - `TextActorCritic.evaluate_replay_batch(...)` now replays `TextReplayBuffer` rows through `RecurrentTextPolicy`, scores direct option/target logits plus none/may heads, and supports PPO loss/backward.
 - [x] Implement `evaluate_replay_batch_per_choice(...)` for RNaD.
@@ -137,7 +138,7 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - [x] `--render-plan-capacity`
 - [ ] Reuse existing game/deck scheduling where possible.
 - [ ] Collect finished episodes into the trainer's existing `RolloutStep` / `EpisodeBatch` structures.
-- [ ] Ensure sampled text replay rows carry `replay_idx` exactly like slot replay rows.
+- [x] Ensure sampled text replay rows carry `replay_idx` exactly like slot replay rows.
 
 ## Phase 7: `train.py` Integration
 
