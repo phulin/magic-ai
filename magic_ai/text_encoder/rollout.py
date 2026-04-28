@@ -40,15 +40,21 @@ from magic_ai.actions import (
     build_priority_candidates,
 )
 from magic_ai.game_state import (
+    GAME_INFO_DIM,
+    ZONE_SLOT_COUNT,
     GameStateSnapshot,
     PendingOptionState,
     PendingState,
 )
+from magic_ai.native_encoder import NativeBatchEncoder, NativeEncodingError
 from magic_ai.text_encoder.assembler import assemble_batch
 from magic_ai.text_encoder.card_cache import CardTokenCache
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy
 from magic_ai.text_encoder.render import OracleEntry
 from magic_ai.text_encoder.render_plan import emit_render_plan
+
+OPTION_SCALAR_DIM = 14
+TARGET_SCALAR_DIM = 2
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +107,25 @@ def _make_tokenize_fn(tokenizer: PreTrainedTokenizerFast):
         return list(tokenizer.encode(s, add_special_tokens=False))
 
     return tokenize
+
+
+def _build_card_name_to_row(cache: CardTokenCache) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for idx, name in enumerate(cache.row_to_name):
+        if idx == 0 or not name:
+            continue
+        out.setdefault(name, idx)
+    return out
+
+
+def _load_mage_ffi() -> tuple[Any, Any]:
+    if getattr(mage, "_lib", None) is None or getattr(mage, "_ffi", None) is None:
+        mage.load()
+    lib = getattr(mage, "_lib", None)
+    ffi = getattr(mage, "_ffi", None)
+    if lib is None or ffi is None:
+        raise NativeEncodingError("mage native library is not loaded")
+    return lib, ffi
 
 
 def _categorical_sample(
@@ -262,6 +287,10 @@ class TextRolloutWorker:
         sampling_temperature: float = 1.0,
         oracle: dict[str, OracleEntry] | None = None,
         seed: int | None = None,
+        use_native_render_plan: bool = False,
+        render_plan_capacity: int = 4096,
+        max_options: int = 64,
+        max_targets_per_option: int = 4,
     ) -> None:
         self.policy = policy
         self.cache = cache
@@ -270,11 +299,37 @@ class TextRolloutWorker:
         self.device = torch.device(device)
         self.sampling_temperature = float(sampling_temperature)
         self.oracle = oracle
+        self.use_native_render_plan = bool(use_native_render_plan)
+        self.render_plan_capacity = int(render_plan_capacity)
+        self.max_options = int(max_options)
+        self.max_targets_per_option = int(max_targets_per_option)
         self.policy.to(self.device)
         self.policy.eval()
 
         self._card_row_lookup = _build_card_row_lookup(cache)
         self._tokenize_fn = _make_tokenize_fn(tokenizer)
+        self._native_encoder: NativeBatchEncoder | None = None
+        if self.use_native_render_plan:
+            lib, ffi = _load_mage_ffi()
+            self._native_encoder = NativeBatchEncoder(
+                max_options=self.max_options,
+                max_targets_per_option=self.max_targets_per_option,
+                max_cached_choices=max(
+                    self.max_options,
+                    self.max_options * max(1, self.max_targets_per_option),
+                ),
+                zone_slot_count=ZONE_SLOT_COUNT,
+                game_info_dim=GAME_INFO_DIM,
+                option_scalar_dim=OPTION_SCALAR_DIM,
+                target_scalar_dim=TARGET_SCALAR_DIM,
+                lib=lib,
+                ffi=ffi,
+                card_name_to_row=_build_card_name_to_row(cache),
+                emit_render_plan=True,
+                render_plan_capacity=self.render_plan_capacity,
+            )
+            if not self._native_encoder.is_available:
+                raise NativeEncodingError("native render-plan encoder is unavailable")
 
         if seed is not None:
             self._gen: torch.Generator | None = torch.Generator(device="cpu")
@@ -293,9 +348,11 @@ class TextRolloutWorker:
 
     def _score_step(
         self,
+        game: Any,
         snapshot: GameStateSnapshot,
         legal_options: Sequence[PendingOptionState],
         state: _PlayerLSTM,
+        perspective_player_idx: int,
     ) -> tuple[int, int | None, _PlayerLSTM] | None:
         """Run policy for one priority step. Returns (opt_idx, tgt_idx, new_state) or None.
 
@@ -303,17 +360,38 @@ class TextRolloutWorker:
         batch (overflow, missing cards, etc.) and the caller should punt.
         """
 
-        try:
-            plan = emit_render_plan(
-                snapshot,
-                list(legal_options),
-                card_row_lookup=self._card_row_lookup,
-                tokenize=self._tokenize_fn,
-                oracle=self.oracle,
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("emit_render_plan failed: %s; punting to default", exc)
-            return None
+        if self._native_encoder is not None:
+            try:
+                native = self._native_encoder.encode_handles(
+                    [game],
+                    perspective_player_indices=[perspective_player_idx],
+                )
+                if native.render_plan is None or native.render_plan_lengths is None:
+                    logger.warning("native encoder returned no render plan; punting to default")
+                    return None
+                if (
+                    native.render_plan_overflow is not None
+                    and int(native.render_plan_overflow[0]) != 0
+                ):
+                    logger.warning("native render plan overflowed; punting to default")
+                    return None
+                length = int(native.render_plan_lengths[0])
+                plan = native.render_plan[0, :length].detach().cpu().numpy().copy()
+            except Exception as exc:
+                logger.warning("native render-plan encode failed: %s; punting to default", exc)
+                return None
+        else:
+            try:
+                plan = emit_render_plan(
+                    snapshot,
+                    list(legal_options),
+                    card_row_lookup=self._card_row_lookup,
+                    tokenize=self._tokenize_fn,
+                    oracle=self.oracle,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("emit_render_plan failed: %s; punting to default", exc)
+                return None
 
         try:
             batch = assemble_batch(
@@ -459,7 +537,7 @@ class TextRolloutWorker:
                     continue
 
                 state = states[player_idx]
-                scored = self._score_step(snapshot, options, state)
+                scored = self._score_step(game, snapshot, options, state, player_idx)
                 if scored is None:
                     action = _default_action_for(pending)
                     chosen_opt, chosen_tgt = -1, None

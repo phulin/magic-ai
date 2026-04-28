@@ -151,7 +151,9 @@ class TextRolloutSmokeTests(unittest.TestCase):
             states_ref.append(states)
             return states
 
-        def spy(self, snapshot, legal_options, state):  # type: ignore[no-untyped-def]
+        def spy(  # type: ignore[no-untyped-def]
+            self, game, snapshot, legal_options, state, perspective_player_idx
+        ):
             # Recover player_idx by identity-matching ``state`` against the
             # captured ``states`` list — this avoids any reliance on snapshot
             # bookkeeping fields.
@@ -162,7 +164,7 @@ class TextRolloutSmokeTests(unittest.TestCase):
                     player_idx = i
                     break
             h_in = state.h.detach().clone()
-            result = original(self, snapshot, legal_options, state)
+            result = original(self, game, snapshot, legal_options, state, perspective_player_idx)
             if result is not None:
                 _, _, new_state = result
                 events.append((player_idx, h_in, new_state.h.detach().clone()))

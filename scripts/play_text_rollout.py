@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--n-layers", type=int, default=2)
     p.add_argument("--n-heads", type=int, default=4)
+    p.add_argument(
+        "--native-render-plan",
+        action="store_true",
+        help="Use mage-go's native render-plan emitter instead of the Python parity emitter.",
+    )
+    p.add_argument("--render-plan-capacity", type=int, default=4096)
     return p.parse_args()
 
 
@@ -117,6 +123,8 @@ def main() -> int:
         sampling_temperature=args.temperature,
         oracle=oracle,
         seed=base_seed,
+        use_native_render_plan=bool(args.native_render_plan),
+        render_plan_capacity=int(args.render_plan_capacity),
     )
 
     total_steps = 0

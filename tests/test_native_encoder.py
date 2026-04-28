@@ -112,6 +112,32 @@ class NativeEncoderTests(unittest.TestCase):
         )
         self.assertFalse(encoder.is_available)
 
+    def test_render_plan_buffers_are_optional_and_sized_per_env(self) -> None:
+        encoder = NativeBatchEncoder(
+            max_options=4,
+            max_targets_per_option=2,
+            max_cached_choices=8,
+            zone_slot_count=5,
+            game_info_dim=6,
+            option_scalar_dim=7,
+            target_scalar_dim=3,
+            emit_render_plan=True,
+            render_plan_capacity=128,
+        )
+
+        buffers = encoder._alloc(batch_size=3, decision_capacity=12)
+
+        self.assertIsNotNone(buffers.render_plan)
+        self.assertIsNotNone(buffers.render_plan_lengths)
+        self.assertIsNotNone(buffers.render_plan_overflow)
+        assert buffers.render_plan is not None
+        assert buffers.render_plan_lengths is not None
+        assert buffers.render_plan_overflow is not None
+        self.assertEqual(tuple(buffers.render_plan.shape), (3, 128))
+        self.assertEqual(buffers.render_plan.dtype, torch.int32)
+        self.assertEqual(tuple(buffers.render_plan_lengths.shape), (3,))
+        self.assertEqual(tuple(buffers.render_plan_overflow.shape), (3,))
+
     def test_policy_accepts_native_encoded_batch(self) -> None:
         state = cast(GameStateSnapshot, _sample_state())
         pending: PendingState = state["pending"]

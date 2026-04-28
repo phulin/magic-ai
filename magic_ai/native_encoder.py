@@ -82,6 +82,9 @@ class NativeEncodedBatch:
     decision_rows_written: int
     pendings: list[PendingState]
     trace_kinds: list[str]
+    render_plan: Tensor | None = None
+    render_plan_lengths: Tensor | None = None
+    render_plan_overflow: Tensor | None = None
 
 
 class _MageBatchRequest(ctypes.Structure):
@@ -102,6 +105,8 @@ class _MageEncodeConfig(ctypes.Structure):
         ("option_scalar_dim", ctypes.c_int64),
         ("target_scalar_dim", ctypes.c_int64),
         ("decision_capacity", ctypes.c_int64),
+        ("emit_render_plan", ctypes.c_int64),
+        ("render_plan_capacity", ctypes.c_int64),
     ]
 
 
@@ -133,6 +138,9 @@ class _MageEncodeOutputs(ctypes.Structure):
         ("decision_target_idx", ctypes.POINTER(ctypes.c_int64)),
         ("decision_mask", ctypes.POINTER(ctypes.c_uint8)),
         ("uses_none_head", ctypes.POINTER(ctypes.c_uint8)),
+        ("render_plan", ctypes.POINTER(ctypes.c_int32)),
+        ("render_plan_lengths", ctypes.POINTER(ctypes.c_int64)),
+        ("render_plan_overflow", ctypes.POINTER(ctypes.c_int64)),
     ]
 
 
@@ -183,6 +191,9 @@ class _BufferSet:
     decision_target_idx: Tensor
     decision_mask_u8: Tensor
     uses_none_head_u8: Tensor
+    render_plan: Tensor | None = None
+    render_plan_lengths: Tensor | None = None
+    render_plan_overflow: Tensor | None = None
 
 
 @dataclass
@@ -259,6 +270,8 @@ class NativeBatchEncoder:
         ffi: Any | None = None,
         card_name_to_row: dict[str, int] | None = None,
         validate: bool = True,
+        emit_render_plan: bool = False,
+        render_plan_capacity: int = 4096,
     ) -> None:
         self.max_options = max_options
         self.max_targets_per_option = max_targets_per_option
@@ -270,6 +283,8 @@ class NativeBatchEncoder:
         self.lib = lib
         self.ffi = ffi
         self.validate = validate
+        self.emit_render_plan = bool(emit_render_plan)
+        self.render_plan_capacity = int(render_plan_capacity)
         self.is_available = False
         if self.lib is None:
             return
@@ -392,6 +407,15 @@ class NativeBatchEncoder:
             raise NativeEncodingError("NativeBatchEncoder is missing shape metadata")
         if self.option_scalar_dim is None or self.target_scalar_dim is None:
             raise NativeEncodingError("NativeBatchEncoder is missing scalar metadata")
+        render_plan = None
+        render_plan_lengths = None
+        render_plan_overflow = None
+        if self.emit_render_plan:
+            if self.render_plan_capacity <= 0:
+                raise NativeEncodingError("render_plan_capacity must be positive")
+            render_plan = torch.empty((batch_size, self.render_plan_capacity), dtype=torch.int32)
+            render_plan_lengths = torch.empty((batch_size,), dtype=torch.int64)
+            render_plan_overflow = torch.empty((batch_size,), dtype=torch.int64)
         return _BufferSet(
             trace_kind_id=torch.empty((batch_size,), dtype=torch.int64),
             slot_card_rows=torch.empty((batch_size, self.zone_slot_count), dtype=torch.int64),
@@ -445,6 +469,9 @@ class NativeBatchEncoder:
                 (decision_capacity, self.max_cached_choices), dtype=torch.uint8
             ),
             uses_none_head_u8=torch.empty((decision_capacity,), dtype=torch.uint8),
+            render_plan=render_plan,
+            render_plan_lengths=render_plan_lengths,
+            render_plan_overflow=render_plan_overflow,
         )
 
     def _scratch_buffers(self, batch_size: int, decision_capacity: int) -> _BufferSet:
@@ -453,6 +480,7 @@ class NativeBatchEncoder:
             scratch.buffers is None
             or batch_size > scratch.batch_size
             or decision_capacity > scratch.decision_capacity
+            or (self.emit_render_plan and scratch.buffers.render_plan is None)
         ):
             scratch.batch_size = max(batch_size, scratch.batch_size * 2 or 64)
             scratch.decision_capacity = max(decision_capacity, scratch.decision_capacity * 2 or 64)
@@ -486,6 +514,8 @@ class NativeBatchEncoder:
             option_scalar_dim=cast(int, self.option_scalar_dim),
             target_scalar_dim=cast(int, self.target_scalar_dim),
             decision_capacity=0,
+            emit_render_plan=1 if self.emit_render_plan else 0,
+            render_plan_capacity=self.render_plan_capacity if self.emit_render_plan else 0,
         )
         scratch.out_c = _MageEncodeOutputs(
             trace_kind_id=_ptr(buffers.trace_kind_id, ctypes.c_int64),
@@ -514,11 +544,26 @@ class NativeBatchEncoder:
             decision_target_idx=_ptr(buffers.decision_target_idx, ctypes.c_int64),
             decision_mask=_ptr(buffers.decision_mask_u8, ctypes.c_uint8),
             uses_none_head=_ptr(buffers.uses_none_head_u8, ctypes.c_uint8),
+            render_plan=(
+                _ptr(buffers.render_plan, ctypes.c_int32)
+                if buffers.render_plan is not None
+                else None
+            ),
+            render_plan_lengths=(
+                _ptr(buffers.render_plan_lengths, ctypes.c_int64)
+                if buffers.render_plan_lengths is not None
+                else None
+            ),
+            render_plan_overflow=(
+                _ptr(buffers.render_plan_overflow, ctypes.c_int64)
+                if buffers.render_plan_overflow is not None
+                else None
+            ),
         )
 
     @staticmethod
     def _slice_batch_buffers(buffers: _BufferSet, batch_size: int) -> dict[str, Tensor]:
-        return {
+        out = {
             "trace_kind_id": buffers.trace_kind_id[:batch_size],
             "slot_card_rows": buffers.slot_card_rows[:batch_size],
             "slot_occupied": buffers.slot_occupied[:batch_size],
@@ -542,6 +587,13 @@ class NativeBatchEncoder:
             "decision_start": buffers.decision_start[:batch_size],
             "decision_count": buffers.decision_count[:batch_size],
         }
+        if buffers.render_plan is not None:
+            assert buffers.render_plan_lengths is not None
+            assert buffers.render_plan_overflow is not None
+            out["render_plan"] = buffers.render_plan[:batch_size]
+            out["render_plan_lengths"] = buffers.render_plan_lengths[:batch_size]
+            out["render_plan_overflow"] = buffers.render_plan_overflow[:batch_size]
+        return out
 
     def encode_batch(
         self,
@@ -619,6 +671,8 @@ class NativeBatchEncoder:
             option_scalar_dim=cast(int, self.option_scalar_dim),
             target_scalar_dim=cast(int, self.target_scalar_dim),
             decision_capacity=decision_capacity,
+            emit_render_plan=1 if self.emit_render_plan else 0,
+            render_plan_capacity=self.render_plan_capacity if self.emit_render_plan else 0,
         )
         outputs = _MageEncodeOutputs(
             trace_kind_id=_ptr(buffers.trace_kind_id, ctypes.c_int64),
@@ -647,6 +701,21 @@ class NativeBatchEncoder:
             decision_target_idx=_ptr(buffers.decision_target_idx, ctypes.c_int64),
             decision_mask=_ptr(buffers.decision_mask_u8, ctypes.c_uint8),
             uses_none_head=_ptr(buffers.uses_none_head_u8, ctypes.c_uint8),
+            render_plan=(
+                _ptr(buffers.render_plan, ctypes.c_int32)
+                if buffers.render_plan is not None
+                else None
+            ),
+            render_plan_lengths=(
+                _ptr(buffers.render_plan_lengths, ctypes.c_int64)
+                if buffers.render_plan_lengths is not None
+                else None
+            ),
+            render_plan_overflow=(
+                _ptr(buffers.render_plan_overflow, ctypes.c_int64)
+                if buffers.render_plan_overflow is not None
+                else None
+            ),
         )
         lib = cast(Any, self.lib)
         result = lib.MageEncodeBatch(
@@ -711,6 +780,9 @@ class NativeBatchEncoder:
             decision_rows_written=decision_rows_written,
             pendings=pendings,
             trace_kinds=trace_kinds,
+            render_plan=batch.get("render_plan"),
+            render_plan_lengths=batch.get("render_plan_lengths"),
+            render_plan_overflow=batch.get("render_plan_overflow"),
         )
 
     def _encode_batch_cffi(
@@ -744,66 +816,63 @@ class NativeBatchEncoder:
                 "perspective_player_idx": ffi.cast("int64_t *", perspectives_t.data_ptr()),
             },
         )
-        cfg = ffi.new(
-            "MageEncodeConfig *",
-            {
-                "max_options": self.max_options,
-                "max_targets_per_option": self.max_targets_per_option,
-                "max_cached_choices": self.max_cached_choices,
-                "zone_slot_count": cast(int, self.zone_slot_count),
-                "game_info_dim": cast(int, self.game_info_dim),
-                "option_scalar_dim": cast(int, self.option_scalar_dim),
-                "target_scalar_dim": cast(int, self.target_scalar_dim),
-                "decision_capacity": decision_capacity,
-            },
-        )
-        out = ffi.new(
-            "MageEncodeOutputs *",
-            {
-                "trace_kind_id": ffi.cast("int64_t *", buffers.trace_kind_id.data_ptr()),
-                "slot_card_rows": ffi.cast("int64_t *", buffers.slot_card_rows.data_ptr()),
-                "slot_occupied": ffi.cast("float *", buffers.slot_occupied.data_ptr()),
-                "slot_tapped": ffi.cast("float *", buffers.slot_tapped.data_ptr()),
-                "game_info": ffi.cast("float *", buffers.game_info.data_ptr()),
-                "pending_kind_id": ffi.cast("int64_t *", buffers.pending_kind_id.data_ptr()),
-                "num_present_options": ffi.cast(
-                    "int64_t *", buffers.num_present_options.data_ptr()
-                ),
-                "option_kind_ids": ffi.cast("int64_t *", buffers.option_kind_ids.data_ptr()),
-                "option_scalars": ffi.cast("float *", buffers.option_scalars.data_ptr()),
-                "option_mask": ffi.cast("float *", buffers.option_mask.data_ptr()),
-                "option_ref_slot_idx": ffi.cast(
-                    "int64_t *", buffers.option_ref_slot_idx.data_ptr()
-                ),
-                "option_ref_card_row": ffi.cast(
-                    "int64_t *", buffers.option_ref_card_row.data_ptr()
-                ),
-                "target_mask": ffi.cast("float *", buffers.target_mask.data_ptr()),
-                "target_type_ids": ffi.cast("int64_t *", buffers.target_type_ids.data_ptr()),
-                "target_scalars": ffi.cast("float *", buffers.target_scalars.data_ptr()),
-                "target_overflow": ffi.cast("float *", buffers.target_overflow.data_ptr()),
-                "target_ref_slot_idx": ffi.cast(
-                    "int64_t *", buffers.target_ref_slot_idx.data_ptr()
-                ),
-                "target_ref_is_player": ffi.cast(
-                    "uint8_t *", buffers.target_ref_is_player_u8.data_ptr()
-                ),
-                "target_ref_is_self": ffi.cast(
-                    "uint8_t *", buffers.target_ref_is_self_u8.data_ptr()
-                ),
-                "may_mask": ffi.cast("uint8_t *", buffers.may_mask_u8.data_ptr()),
-                "decision_start": ffi.cast("int64_t *", buffers.decision_start.data_ptr()),
-                "decision_count": ffi.cast("int64_t *", buffers.decision_count.data_ptr()),
-                "decision_option_idx": ffi.cast(
-                    "int64_t *", buffers.decision_option_idx.data_ptr()
-                ),
-                "decision_target_idx": ffi.cast(
-                    "int64_t *", buffers.decision_target_idx.data_ptr()
-                ),
-                "decision_mask": ffi.cast("uint8_t *", buffers.decision_mask_u8.data_ptr()),
-                "uses_none_head": ffi.cast("uint8_t *", buffers.uses_none_head_u8.data_ptr()),
-            },
-        )
+        cfg_fields = {
+            "max_options": self.max_options,
+            "max_targets_per_option": self.max_targets_per_option,
+            "max_cached_choices": self.max_cached_choices,
+            "zone_slot_count": cast(int, self.zone_slot_count),
+            "game_info_dim": cast(int, self.game_info_dim),
+            "option_scalar_dim": cast(int, self.option_scalar_dim),
+            "target_scalar_dim": cast(int, self.target_scalar_dim),
+            "decision_capacity": decision_capacity,
+        }
+        if self.emit_render_plan:
+            cfg_fields["emit_render_plan"] = 1
+            cfg_fields["render_plan_capacity"] = self.render_plan_capacity
+        cfg = ffi.new("MageEncodeConfig *", cfg_fields)
+
+        out_fields = {
+            "trace_kind_id": ffi.cast("int64_t *", buffers.trace_kind_id.data_ptr()),
+            "slot_card_rows": ffi.cast("int64_t *", buffers.slot_card_rows.data_ptr()),
+            "slot_occupied": ffi.cast("float *", buffers.slot_occupied.data_ptr()),
+            "slot_tapped": ffi.cast("float *", buffers.slot_tapped.data_ptr()),
+            "game_info": ffi.cast("float *", buffers.game_info.data_ptr()),
+            "pending_kind_id": ffi.cast("int64_t *", buffers.pending_kind_id.data_ptr()),
+            "num_present_options": ffi.cast("int64_t *", buffers.num_present_options.data_ptr()),
+            "option_kind_ids": ffi.cast("int64_t *", buffers.option_kind_ids.data_ptr()),
+            "option_scalars": ffi.cast("float *", buffers.option_scalars.data_ptr()),
+            "option_mask": ffi.cast("float *", buffers.option_mask.data_ptr()),
+            "option_ref_slot_idx": ffi.cast("int64_t *", buffers.option_ref_slot_idx.data_ptr()),
+            "option_ref_card_row": ffi.cast("int64_t *", buffers.option_ref_card_row.data_ptr()),
+            "target_mask": ffi.cast("float *", buffers.target_mask.data_ptr()),
+            "target_type_ids": ffi.cast("int64_t *", buffers.target_type_ids.data_ptr()),
+            "target_scalars": ffi.cast("float *", buffers.target_scalars.data_ptr()),
+            "target_overflow": ffi.cast("float *", buffers.target_overflow.data_ptr()),
+            "target_ref_slot_idx": ffi.cast("int64_t *", buffers.target_ref_slot_idx.data_ptr()),
+            "target_ref_is_player": ffi.cast(
+                "uint8_t *", buffers.target_ref_is_player_u8.data_ptr()
+            ),
+            "target_ref_is_self": ffi.cast("uint8_t *", buffers.target_ref_is_self_u8.data_ptr()),
+            "may_mask": ffi.cast("uint8_t *", buffers.may_mask_u8.data_ptr()),
+            "decision_start": ffi.cast("int64_t *", buffers.decision_start.data_ptr()),
+            "decision_count": ffi.cast("int64_t *", buffers.decision_count.data_ptr()),
+            "decision_option_idx": ffi.cast("int64_t *", buffers.decision_option_idx.data_ptr()),
+            "decision_target_idx": ffi.cast("int64_t *", buffers.decision_target_idx.data_ptr()),
+            "decision_mask": ffi.cast("uint8_t *", buffers.decision_mask_u8.data_ptr()),
+            "uses_none_head": ffi.cast("uint8_t *", buffers.uses_none_head_u8.data_ptr()),
+        }
+        if self.emit_render_plan:
+            assert buffers.render_plan is not None
+            assert buffers.render_plan_lengths is not None
+            assert buffers.render_plan_overflow is not None
+            out_fields["render_plan"] = ffi.cast("int32_t *", buffers.render_plan.data_ptr())
+            out_fields["render_plan_lengths"] = ffi.cast(
+                "int64_t *", buffers.render_plan_lengths.data_ptr()
+            )
+            out_fields["render_plan_overflow"] = ffi.cast(
+                "int64_t *", buffers.render_plan_overflow.data_ptr()
+            )
+        out = ffi.new("MageEncodeOutputs *", out_fields)
         ctypes_lib = self._ctypes_lib
         if ctypes_lib is not None:
             # Reuse the cached ctypes structs (pointers into scratch are
@@ -886,4 +955,7 @@ class NativeBatchEncoder:
             decision_rows_written=decision_rows_written,
             pendings=pendings,
             trace_kinds=trace_kinds,
+            render_plan=batch.get("render_plan"),
+            render_plan_lengths=batch.get("render_plan_lengths"),
+            render_plan_overflow=batch.get("render_plan_overflow"),
         )

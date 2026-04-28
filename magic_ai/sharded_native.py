@@ -54,6 +54,18 @@ def _concat_encoded_batches(results: list[NativeEncodedBatch]) -> NativeEncodedB
     def cat(name: str) -> torch.Tensor:
         return torch.cat([getattr(r, name) for r in results], dim=0)
 
+    render_plan = None
+    render_plan_lengths = None
+    render_plan_overflow = None
+    if all(r.render_plan is not None for r in results):
+        render_plan = torch.cat([cast(torch.Tensor, r.render_plan) for r in results], dim=0)
+        render_plan_lengths = torch.cat(
+            [cast(torch.Tensor, r.render_plan_lengths) for r in results], dim=0
+        )
+        render_plan_overflow = torch.cat(
+            [cast(torch.Tensor, r.render_plan_overflow) for r in results], dim=0
+        )
+
     return NativeEncodedBatch(
         trace_kind_id=cat("trace_kind_id"),
         slot_card_rows=cat("slot_card_rows"),
@@ -84,6 +96,9 @@ def _concat_encoded_batches(results: list[NativeEncodedBatch]) -> NativeEncodedB
         decision_rows_written=sum(r.decision_rows_written for r in results),
         pendings=[p for r in results for p in r.pendings],
         trace_kinds=[k for r in results for k in r.trace_kinds],
+        render_plan=render_plan,
+        render_plan_lengths=render_plan_lengths,
+        render_plan_overflow=render_plan_overflow,
     )
 
 

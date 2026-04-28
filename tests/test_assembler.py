@@ -19,6 +19,17 @@ from magic_ai.text_encoder.render import (
     load_oracle_text,
 )
 from magic_ai.text_encoder.render_plan import (
+    OP_CLOSE_ACTIONS,
+    OP_CLOSE_STATE,
+    OP_CLOSE_ZONE,
+    OP_LIFE,
+    OP_MANA,
+    OP_OPEN_ACTIONS,
+    OP_OPEN_STATE,
+    OP_OPEN_ZONE,
+    OP_OPTION,
+    OP_PLACE_CARD,
+    OP_TURN,
     OWNER_SELF,
     STATUS_TAPPED,
     STATUS_TAPPED_KNOWN,
@@ -144,6 +155,55 @@ def test_status_bits_emit_untapped(cache, tokenizer, name_to_row) -> None:
     untapped_id = tokenizer.convert_tokens_to_ids("<untapped>")
     ids = batch.token_ids[0, : int(batch.seq_lengths[0])].tolist()
     assert untapped_id in ids
+
+
+def test_structured_go_plan_decodes_without_literal_tokens(cache, tokenizer, name_to_row) -> None:
+    bears_row = name_to_row["Grizzly Bears"]
+    plan = np.asarray(
+        [
+            OP_OPEN_STATE,
+            OP_TURN,
+            3,
+            3,  # Precombat Main
+            OP_LIFE,
+            0,
+            20,
+            OP_MANA,
+            0,
+            4,  # G
+            2,
+            OP_OPEN_ZONE,
+            ZONE_BATTLEFIELD,
+            OWNER_SELF,
+            OP_PLACE_CARD,
+            0,
+            bears_row,
+            STATUS_TAPPED,
+            0,
+            OP_CLOSE_ZONE,
+            OP_OPEN_ACTIONS,
+            OP_OPTION,
+            2,  # cast
+            bears_row,
+            0,
+            -1,
+            -1,
+            OP_CLOSE_ACTIONS,
+            OP_CLOSE_STATE,
+        ],
+        dtype=np.int32,
+    )
+
+    batch = assemble_batch([plan], cache, tokenizer, max_tokens=512)
+    decoded = tokenizer.decode(batch.token_ids[0, : int(batch.seq_lengths[0])].tolist())
+
+    assert "turn=3" in decoded
+    assert "life=20" in decoded
+    assert "{G}{G}" in decoded
+    assert "Grizzly Bears" in decoded
+    assert "cast" in decoded
+    assert int(batch.card_ref_positions[0, 0]) >= 0
+    assert int(batch.option_positions[0, 0]) >= 0
 
 
 # ---------------------------------------------------------------------------
