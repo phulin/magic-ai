@@ -78,7 +78,11 @@ from magic_ai.text_encoder.actor_critic import (  # noqa: E402
     build_text_decision_layout,
     infer_text_trace_kind,
 )
-from magic_ai.text_encoder.assembler import assemble_batch  # noqa: E402
+from magic_ai.text_encoder.assembler import (  # noqa: E402
+    AssemblerTokens,
+    assemble_batch,
+    build_assembler_tokens,
+)
 from magic_ai.text_encoder.card_cache import (  # noqa: E402
     DEFAULT_ORACLE_DB_PATH,
     CardTokenCache,
@@ -243,6 +247,11 @@ class TextTrainingBackend:
     cache: CardTokenCache
     oracle: dict[str, OracleEntry]
     tokenizer: Any
+    # Pre-resolved assembler structural-token table (and its lazily-attached
+    # status prefixes + per-cache body_lists memo). Built once at backend
+    # init and threaded through every assemble_batch call so we don't
+    # re-encode the static fragment table or re-derive body_lists per call.
+    assembler_tokens: AssemblerTokens
     native_encoder: ShardedNativeBatchEncoder | None = None
     batch_pool: ThreadPoolExecutor | None = None
     batch_workers: int = 1
@@ -401,6 +410,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         cache=cache,
         oracle=oracle,
         tokenizer=tokenizer,
+        assembler_tokens=build_assembler_tokens(tokenizer),
         native_encoder=native_encoder,
         batch_pool=batch_pool,
         batch_workers=batch_workers,
@@ -465,6 +475,7 @@ def sample_text_policy_batch(
         backend.tokenizer,
         max_tokens=args.text_max_tokens,
         on_overflow="truncate",
+        assembler_tokens=backend.assembler_tokens,
     )
     return backend.policy.sample_text_batch(
         encoded,
@@ -2230,6 +2241,7 @@ def sample_native_text_policy_batch(
         backend.tokenizer,
         max_tokens=args.text_max_tokens,
         on_overflow="truncate",
+        assembler_tokens=backend.assembler_tokens,
     )
 
     layouts: list[Any] = []
