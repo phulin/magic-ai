@@ -198,3 +198,7 @@ Ablation at stage 3 of §7: same supervised warm-start run, scratch vs finetune-
 6. RnaD integration + first self-play run.
 
 Each PR is independently mergeable and revertable; the slot encoder stays the default until stage 5 shows the text encoder is at least at parity on win rate.
+
+## 11. Integration adapter (landed)
+
+`magic_ai/text_encoder/policy.py` ships a self-contained `TextPolicy(nn.Module)` that owns one `TextStateEncoder` plus the policy / target / value heads, takes a `TextEncodedBatch`, and returns a `TextPolicyOutput` dataclass with policy/target/value logits alongside the per-card / per-option / per-target / state vectors and their masks. A static `TextPolicy.encode_snapshots(...)` runs render → tokenize → collate so callers do not have to reach into four modules. This module is the integration target for the eventual `policy.encoder = "text"` branch in `magic_ai/model.py`: the new branch should construct a `TextPolicy` (via `build_text_policy(tokenizer)`), call it on a tokenized batch, and route `TextPolicyOutput` into the existing PPO/RnaD plumbing — `PPOPolicy` itself stays unchanged in this PR.
