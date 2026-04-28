@@ -8,7 +8,8 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 - [x] Keep `slots` as the default path and preserve current behavior.
 - [x] Treat the current `PPOPolicy` + `RolloutBuffer` + native encoder path as the slot backend.
 - [x] Add a separate text backend built from `RecurrentTextPolicy`, `CardTokenCache`, render-plan assembly, and a text replay buffer.
-- [ ] Refactor PPO/RNaD trainer code to depend on a replay-policy interface instead of concrete `PPOPolicy`.
+- [x] Refactor PPO/RNaD trainer code to depend on a replay-policy interface instead of concrete `PPOPolicy`.
+  - `RNaDTrainerState` and `build_trainer_state` are typed against `RNaDTrainablePolicy`. Slot-specific cloning moved onto `PPOPolicy.clone_for_rnad()`, exposed via the protocol so text/other backends can supply their own clone semantics.
 
 ## Phase 1: Name The Existing Boundaries
 
@@ -30,7 +31,7 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - Added `PPOReplayPolicy`, `RNaDReplayPolicy`, and `RNaDTrainablePolicy`.
 - [x] Change type hints in `magic_ai/ppo.py` from concrete `PPOPolicy` to the PPO protocol.
 - [x] Change type hints in `magic_ai/rnad_trainer.py` from concrete `PPOPolicy` to the RNaD protocol where practical.
-  - `run_rnad_update` now accepts `RNaDTrainablePolicy`; clone/build state remains slot-specific because it deep-copies `PPOPolicy` and shares `RolloutBuffer`.
+  - `run_rnad_update`, `RNaDTrainerState`, and `build_trainer_state` are all typed against `RNaDTrainablePolicy`. The deep-copy / shared-buffer logic now lives on `PPOPolicy.clone_for_rnad()` (protocol-required), so the trainer no longer references `PPOPolicy` directly.
 
 ## Phase 2: Extract Shared Decision Replay Logic
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from typing import cast
 
 import torch
 from magic_ai.game_state import GameStateEncoder
@@ -13,11 +14,11 @@ from magic_ai.rnad import RNaDConfig
 from magic_ai.rnad_trainer import (
     _advance_outer_iteration,
     _alpha_for_step,
-    _clone_policy_sharing_buffer,
     _delta_m_for_outer_iteration,
     build_trainer_state,
     resume_from_snapshot_dir,
 )
+from torch import nn
 
 
 def _make_policy() -> PPOPolicy:
@@ -49,7 +50,7 @@ class AlphaScheduleTests(unittest.TestCase):
 class ClonePolicyTests(unittest.TestCase):
     def test_clone_shares_rollout_buffer(self) -> None:
         policy = _make_policy()
-        clone = _clone_policy_sharing_buffer(policy)
+        clone = policy.clone_for_rnad()
         self.assertIs(clone.rollout_buffer, policy.rollout_buffer)
         # nn.Module tracks submodules in ``_modules``; if the buffer is only
         # spliced into ``__dict__`` then ``.to(device)`` and ``named_buffers``
@@ -59,7 +60,7 @@ class ClonePolicyTests(unittest.TestCase):
 
     def test_clone_parameters_are_independent(self) -> None:
         policy = _make_policy()
-        clone = _clone_policy_sharing_buffer(policy)
+        clone = policy.clone_for_rnad()
         clone.value_head.weight.data.fill_(42.0)
         self.assertFalse(torch.equal(policy.value_head.weight.data, clone.value_head.weight.data))
 
@@ -93,17 +94,20 @@ class TrainerStateTests(unittest.TestCase):
                 reg_snapshot_dir=Path(tmp),
                 device=policy.device,
             )
+            target = cast(PPOPolicy, state.target)
+            reg_cur = cast(PPOPolicy, state.reg_cur)
+            reg_prev = cast(PPOPolicy, state.reg_prev)
             # Perturb target so the advance produces observable changes.
             with torch.no_grad():
-                state.target.value_head.weight.fill_(0.75)
-            reg_cur_before = state.reg_cur.value_head.weight.clone()
+                target.value_head.weight.fill_(0.75)
+            reg_cur_before = reg_cur.value_head.weight.clone()
             _advance_outer_iteration(state)
             self.assertEqual(state.outer_iteration, 1)
             self.assertEqual(state.gradient_step, 0)
             # reg_prev should now equal the previous reg_cur value.
-            self.assertTrue(torch.allclose(state.reg_prev.value_head.weight, reg_cur_before))
+            self.assertTrue(torch.allclose(reg_prev.value_head.weight, reg_cur_before))
             # reg_cur should now equal target.
-            self.assertTrue(torch.allclose(state.reg_cur.value_head.weight, torch.tensor(0.75)))
+            self.assertTrue(torch.allclose(reg_cur.value_head.weight, torch.tensor(0.75)))
             self.assertTrue((Path(tmp) / "reg_m001.pt").exists())
 
     def test_resume_loads_snapshots(self) -> None:
@@ -115,18 +119,21 @@ class TrainerStateTests(unittest.TestCase):
                 reg_snapshot_dir=Path(tmp),
                 device=policy.device,
             )
+            target = cast(PPOPolicy, state.target)
+            reg_cur = cast(PPOPolicy, state.reg_cur)
+            reg_prev = cast(PPOPolicy, state.reg_prev)
             with torch.no_grad():
-                state.target.value_head.weight.fill_(0.5)
+                target.value_head.weight.fill_(0.5)
             _advance_outer_iteration(state)
             # Clobber the in-memory regs so resume has real work to do.
             with torch.no_grad():
-                state.reg_cur.value_head.weight.fill_(-99.0)
-                state.reg_prev.value_head.weight.fill_(-99.0)
+                reg_cur.value_head.weight.fill_(-99.0)
+                reg_prev.value_head.weight.fill_(-99.0)
             resume_from_snapshot_dir(state, outer_iteration=1, gradient_step=3)
         self.assertEqual(state.outer_iteration, 1)
         self.assertEqual(state.gradient_step, 3)
         self.assertTrue(
-            torch.allclose(state.reg_cur.value_head.weight, torch.tensor(0.5)),
+            torch.allclose(reg_cur.value_head.weight, torch.tensor(0.5)),
         )
 
 
@@ -151,16 +158,17 @@ class CheckpointRoundTripTests(unittest.TestCase):
                 reg_snapshot_dir=reg_dir,
                 device=policy.device,
             )
+            target = cast(PPOPolicy, state.target)
             # Mutate target so the roundtrip is observable.
             with torch.no_grad():
-                state.target.value_head.weight.fill_(0.321)
+                target.value_head.weight.fill_(0.321)
             state.outer_iteration = 2
             state.gradient_step = 7
             # Ensure reg_m001.pt and reg_m002.pt exist so resume can load both.
             from magic_ai.rnad import save_reg_snapshot
 
-            save_reg_snapshot(state.reg_cur, reg_dir / "reg_m001.pt")
-            save_reg_snapshot(state.target, reg_dir / "reg_m002.pt")
+            save_reg_snapshot(cast(nn.Module, state.reg_cur), reg_dir / "reg_m001.pt")
+            save_reg_snapshot(cast(nn.Module, state.target), reg_dir / "reg_m002.pt")
 
             ckpt_path = tmp / "ckpt.pt"
             optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
@@ -193,7 +201,7 @@ class CheckpointRoundTripTests(unittest.TestCase):
         self.assertEqual(fresh.outer_iteration, 2)
         self.assertEqual(fresh.gradient_step, 7)
         self.assertTrue(
-            torch.allclose(fresh.target.value_head.weight, torch.tensor(0.321)),
+            torch.allclose(cast(PPOPolicy, fresh.target).value_head.weight, torch.tensor(0.321)),
         )
 
 
@@ -326,7 +334,7 @@ class RegPathRelocationTests(unittest.TestCase):
                 device=policy.device,
             )
             with torch.no_grad():
-                state.target.value_head.weight.fill_(0.9)
+                cast(PPOPolicy, state.target).value_head.weight.fill_(0.9)
             _advance_outer_iteration(state)
             optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
             ckpt_path = tmp / "ckpt.pt"

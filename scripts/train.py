@@ -667,10 +667,11 @@ def _restore_rnad_state(
     total_wandb_logs = int(_training_state_dict(checkpoint).get("total_wandb_logs", 0))
     target_sd = payload.get("target")
     if isinstance(target_sd, dict):
-        state.target.load_state_dict(target_sd)
-        for p in state.target.parameters():
+        target_module = cast(PPOPolicy, state.target)
+        target_module.load_state_dict(target_sd)
+        for p in target_module.parameters():
             p.requires_grad_(False)
-        state.target.eval()
+        target_module.eval()
     outer = int(payload.get("outer_iteration", 0))
     grad_step = int(payload.get("gradient_step", 0))
     finetuning = bool(payload.get("is_finetuning", False))
@@ -1434,7 +1435,7 @@ def train_native_batched_envs(
         _restore_rnad_state(rnad_state, resume_checkpoint)
         # The target network runs rollouts under R-NaD; give it its own set
         # of LSTM env buffers (online retains its own for evaluate_replay_batch).
-        rnad_state.target.init_lstm_env_states(args.num_envs)
+        cast(PPOPolicy, rnad_state.target).init_lstm_env_states(args.num_envs)
     restored_state = resume_state or TrainingResumeState()
     completed_games = restored_state.completed_games
     last_saved_games = restored_state.last_saved_games
@@ -1454,7 +1455,9 @@ def train_native_batched_envs(
     # Rollouts sample from the target policy under R-NaD (paper §157-§191),
     # and from the online policy under PPO. The online policy always owns
     # the rollout buffer; target is a Polyak-averaged EMA living alongside.
-    sampling_policy: PPOPolicy = rnad_state.target if rnad_state is not None else policy
+    sampling_policy: PPOPolicy = (
+        cast(PPOPolicy, rnad_state.target) if rnad_state is not None else policy
+    )
 
     def start_game(slot_idx: int, episode_idx: int) -> LiveGame:
         staging_buffer.reset_env(slot_idx)
@@ -2748,7 +2751,7 @@ def save_checkpoint(
             "outer_iteration": rnad_state.outer_iteration,
             "gradient_step": rnad_state.gradient_step,
             "is_finetuning": rnad_state.is_finetuning,
-            "target": rnad_state.target.state_dict(),
+            "target": cast(PPOPolicy, rnad_state.target).state_dict(),
             "reg_snapshot_dir": str(rnad_state.reg_snapshot_dir),
         }
     metadata = {

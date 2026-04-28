@@ -144,6 +144,8 @@ class PolicyStep(NamedTuple):
 class PPOPolicy(nn.Module):
     """Actor-critic network that scores legal mage-go action options."""
 
+    rollout_buffer: RolloutBuffer
+
     def __init__(
         self,
         game_state_encoder: GameStateEncoder,
@@ -283,6 +285,44 @@ class PPOPolicy(nn.Module):
 
     def reset_rollout_buffer(self) -> None:
         self.rollout_buffer.reset()
+
+    def clone_for_rnad(self) -> PPOPolicy:
+        """Deep-copy parameter state, share the rollout buffer.
+
+        Used by R-NaD to build target / regularization siblings of the online
+        policy. The rollout buffer instance is shared rather than cloned to
+        avoid duplicating gigabytes of ingested trajectory tensors.
+
+        The live LSTM env-state cache (``live_lstm_h``/``live_lstm_c``) is
+        *not* cloned: it is the online actor's per-env runtime sampling
+        cache, not trainable model state. The clone gets empty cache buffers;
+        target/reg policies do not sample so they never need to read it, and
+        recurrent-state recomputation during R-NaD updates explicitly re-runs
+        the LSTM from a zero initial hidden state per policy.
+        """
+
+        import copy
+
+        # Deepcopy everything except the rollout buffer, which we splice
+        # back in. Use normal attribute assignment so nn.Module updates
+        # ``_modules`` in lockstep with ``__dict__``: ``object.__setattr__``
+        # would leave the old buffer registered in ``_modules`` and
+        # silently deep-copy it anyway via ``nn.Module.__deepcopy__``'s
+        # traversal of submodules, defeating the whole point of sharing
+        # the buffer.
+        original_buffer = self.rollout_buffer
+        self.rollout_buffer = None  # ty: ignore[invalid-assignment]
+        try:
+            clone = copy.deepcopy(self)
+        finally:
+            self.rollout_buffer = original_buffer
+        clone.rollout_buffer = original_buffer
+        if getattr(clone, "use_lstm", False):
+            empty_h = torch.zeros(clone.hidden_layers, 0, clone.hidden_dim, dtype=torch.float32)
+            empty_c = empty_h.clone()
+            clone.live_lstm_h = empty_h.to(clone.live_lstm_h.device)
+            clone.live_lstm_c = empty_c.to(clone.live_lstm_c.device)
+        return clone
 
     def init_lstm_env_states(self, num_envs: int) -> None:
         if not self.use_lstm:

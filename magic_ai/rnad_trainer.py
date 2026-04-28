@@ -28,7 +28,6 @@ First-cut simplifications (see ``docs/rnad_deviations.md`` for rationale):
 
 from __future__ import annotations
 
-import copy
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -39,7 +38,7 @@ import torch
 from torch import nn
 
 from magic_ai.buffer import RolloutBuffer
-from magic_ai.model import TRACE_KIND_TO_ID, PPOPolicy
+from magic_ai.model import TRACE_KIND_TO_ID
 from magic_ai.ppo import PPOStats, RolloutStep
 from magic_ai.rnad import (
     RNaDConfig,
@@ -65,9 +64,9 @@ class RNaDTrainerState:
     """Live state for a single R-NaD training run."""
 
     config: RNaDConfig
-    target: PPOPolicy
-    reg_cur: PPOPolicy
-    reg_prev: PPOPolicy
+    target: RNaDTrainablePolicy
+    reg_cur: RNaDTrainablePolicy
+    reg_prev: RNaDTrainablePolicy
     reg_snapshot_dir: Path
     gradient_step: int = 0
     outer_iteration: int = 0
@@ -75,47 +74,8 @@ class RNaDTrainerState:
     last_stats: list[RNaDStats] = field(default_factory=list)
 
 
-def _clone_policy_sharing_buffer(src: PPOPolicy) -> PPOPolicy:
-    """Deep-copy parameter state, share the rollout buffer.
-
-    The target/reg policies only need to run forward over the rollout buffer
-    populated by the online policy; by sharing the buffer instance we avoid
-    duplicating gigabytes of ingested trajectory tensors.
-
-    The live LSTM env-state cache (``live_lstm_h``/``live_lstm_c``) is *not*
-    cloned: it is the online actor's per-env runtime sampling cache, not
-    trainable model state. The clone gets empty cache buffers; target/reg
-    policies do not sample so they never need to read it, and recurrent-state
-    recomputation during R-NaD updates explicitly re-runs the LSTM from a
-    zero initial hidden state per policy.
-    """
-
-    # Deepcopy everything except the rollout buffer, which we splice back in.
-    # Use normal attribute assignment so nn.Module updates ``_modules`` in
-    # lockstep with ``__dict__``: ``object.__setattr__`` would leave the old
-    # buffer registered in ``_modules`` and silently deep-copy it anyway via
-    # ``nn.Module.__deepcopy__``'s traversal of submodules, defeating the
-    # whole point of sharing the buffer.
-    original_buffer = src.rollout_buffer
-    src.rollout_buffer = None  # ty: ignore[invalid-assignment]
-    try:
-        clone = copy.deepcopy(src)
-    finally:
-        src.rollout_buffer = original_buffer
-    clone.rollout_buffer = original_buffer
-    if getattr(clone, "use_lstm", False):
-        # Replace the deep-copied live LSTM cache (which mirrors src's per-env
-        # state at clone time) with empty buffers. Target/reg never sample
-        # from a live env, so this is the right starting state.
-        empty_h = torch.zeros(clone.hidden_layers, 0, clone.hidden_dim, dtype=torch.float32)
-        empty_c = empty_h.clone()
-        clone.live_lstm_h = empty_h.to(clone.live_lstm_h.device)
-        clone.live_lstm_c = empty_c.to(clone.live_lstm_c.device)
-    return clone
-
-
 def build_trainer_state(
-    policy: PPOPolicy,
+    policy: RNaDTrainablePolicy,
     *,
     config: RNaDConfig,
     reg_snapshot_dir: Path,
@@ -124,23 +84,23 @@ def build_trainer_state(
     """Construct target + reg_cur + reg_prev from the online policy.
 
     All three siblings start as exact clones of ``policy`` and share its
-    rollout buffer (see :func:`_clone_policy_sharing_buffer`). They are put
-    in ``eval()`` mode and have ``requires_grad`` disabled; only the online
-    ``policy`` receives gradients.
+    rollout buffer (see :meth:`RNaDTrainablePolicy.clone_for_rnad`). They are
+    put in ``eval()`` mode and have ``requires_grad`` disabled; only the
+    online ``policy`` receives gradients.
     """
 
     reg_snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-    target = _clone_policy_sharing_buffer(policy).to(device)
-    reg_cur = _clone_policy_sharing_buffer(policy).to(device)
-    reg_prev = _clone_policy_sharing_buffer(policy).to(device)
+    target = policy.clone_for_rnad().to(device)
+    reg_cur = policy.clone_for_rnad().to(device)
+    reg_prev = policy.clone_for_rnad().to(device)
     for aux in (target, reg_cur, reg_prev):
         aux.eval()
         for p in aux.parameters():
             p.requires_grad_(False)
 
     # Persist the initial reg snapshot so resume has something to load.
-    save_reg_snapshot(reg_cur, reg_snapshot_dir / "reg_m000.pt")
+    save_reg_snapshot(cast(nn.Module, reg_cur), reg_snapshot_dir / "reg_m000.pt")
 
     return RNaDTrainerState(
         config=config,
@@ -193,7 +153,7 @@ def _advance_outer_iteration(state: RNaDTrainerState) -> None:
     # the new reg_cur).
     next_iter = state.outer_iteration + 1
     target_path = state.reg_snapshot_dir / f"reg_m{next_iter:03d}.pt"
-    save_reg_snapshot(state.target, target_path)
+    save_reg_snapshot(cast(nn.Module, state.target), target_path)
 
     # Sink reg_prev parameters with reg_cur's; sink reg_cur parameters with
     # target's. We reuse the nn.Modules rather than reallocating to avoid
@@ -436,7 +396,11 @@ def run_rnad_update(
     trainable = [p for p in policy.parameters() if p.requires_grad]
     grad_norm = float(nn.utils.clip_grad_norm_(trainable, max_norm=state.config.grad_clip))
     optimizer.step()
-    polyak_update_(state.target, cast(nn.Module, policy), gamma=state.config.target_ema_gamma)
+    polyak_update_(
+        cast(nn.Module, state.target),
+        cast(nn.Module, policy),
+        gamma=state.config.target_ema_gamma,
+    )
 
     state.gradient_step += 1
     if state.gradient_step >= current_delta_m:
@@ -493,7 +457,7 @@ def resume_from_snapshot_dir(
     cur_path = state.reg_snapshot_dir / f"reg_m{outer_iteration:03d}.pt"
     prev_idx = max(0, outer_iteration - 1)
     prev_path = state.reg_snapshot_dir / f"reg_m{prev_idx:03d}.pt"
-    load_reg_snapshot_into(state.reg_cur, cur_path)
-    load_reg_snapshot_into(state.reg_prev, prev_path)
+    load_reg_snapshot_into(cast(nn.Module, state.reg_cur), cur_path)
+    load_reg_snapshot_into(cast(nn.Module, state.reg_prev), prev_path)
     state.outer_iteration = outer_iteration
     state.gradient_step = gradient_step

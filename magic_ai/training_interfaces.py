@@ -93,3 +93,17 @@ class RNaDTrainablePolicy(RNaDReplayPolicy, Protocol):
         *args: Any,
         **kwargs: Any,
     ) -> RNaDTrainablePolicy: ...
+
+    def clone_for_rnad(self) -> RNaDTrainablePolicy:
+        """Return a clone suitable for use as a target / regularization policy.
+
+        Implementations must:
+
+        - Deep-copy trainable parameter state.
+        - Share the rollout buffer with ``self`` (target/reg policies replay
+          the same trajectories the online policy collected).
+        - Reset any per-env actor-runtime caches (e.g. live LSTM hidden state)
+          so the clone starts from an empty rollout state — target/reg
+          policies never sample from a live env.
+        """
+        ...
