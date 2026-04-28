@@ -202,3 +202,13 @@ Each PR is independently mergeable and revertable; the slot encoder stays the de
 ## 11. Integration adapter (landed)
 
 `magic_ai/text_encoder/policy.py` ships a self-contained `TextPolicy(nn.Module)` that owns one `TextStateEncoder` plus the policy / target / value heads, takes a `TextEncodedBatch`, and returns a `TextPolicyOutput` dataclass with policy/target/value logits alongside the per-card / per-option / per-target / state vectors and their masks. A static `TextPolicy.encode_snapshots(...)` runs render → tokenize → collate so callers do not have to reach into four modules. This module is the integration target for the eventual `policy.encoder = "text"` branch in `magic_ai/model.py`: the new branch should construct a `TextPolicy` (via `build_text_policy(tokenizer)`), call it on a tokenized batch, and route `TextPolicyOutput` into the existing PPO/RnaD plumbing — `PPOPolicy` itself stays unchanged in this PR.
+
+## 12. Game history
+
+The renderer in §3 produces a single-snapshot prompt — the model sees the current state, not the past. Three options for carrying history, in order of how much they change:
+
+1. **LSTM around `state_vector` (v1, default).** `TextPolicy.state_vector` plays the same per-step role as the slot encoder's output today, so feed it into `PPOPolicy`'s existing LSTM and let the recurrence carry history. Zero RnaD changes; matches §5 ("no changes to RnaD math"). Downside: history is compressed into one vector per step and the transformer cannot directly attend to past states.
+2. **Action-trail prefix (v2 candidate).** Keep the current snapshot full, prepend a `<history>` block of the last ~16 actions taken (`<self> cast Lightning Bolt → Grizzly Bears`, `<opp> activate <card-ref:K>`, `<self> pass`). Costs roughly 100–300 tokens, well inside the 2048-token budget. Captures most decision-relevant history (mana spent, recent plays, attack patterns) without any state diffing on the renderer side, and the text encoder is the only encoder that can use it. New tokens needed: `<history></history>`, plus reusing the existing action-rendering grammar from §6.
+3. **In-prompt history window (defer).** Render the last K full snapshots back-to-back with `<step-N>` delimiters and drop the LSTM. Most natural fit for a transformer, but at ~1.5k tokens per snapshot K=2 already pushes the cap. Mitigation would be diff-only rendering for past steps. Pursue only if (1) and (2) both plateau.
+
+**Plan:** ship (1) for the slot↔text A/B in §7 — isolates "did the encoder get better?" from "did adding history help?". Once parity is shown, A/B (2) vs (1); the delta there is the expected free win the slot encoder cannot match. (3) is on hold pending those results.
