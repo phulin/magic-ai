@@ -115,25 +115,26 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - Text replay now returns the same `ReplayPerChoice` shape used by R-NaD's slot path; recurrent recompute is still pending.
 - [x] Implement recurrent recompute methods needed by RNaD.
   - Added text LSTM state/output recompute methods for episode replay overrides.
-- [ ] Initially disable SPR for text unless/until a text-specific SPR target path is implemented.
+- [x] Initially disable SPR for text unless/until a text-specific SPR target path is implemented.
+  - `TextActorCritic.spr_enabled` is fixed false and rejects SPR replay extras.
 
 ## Phase 6: Text Backend Collector
 
-- [ ] Add `TextTrainingBackend`.
+- [x] Add `TextTrainingBackend`.
 - [ ] Load text artifacts:
-  - [ ] tokenizer
-  - [ ] oracle text
-  - [ ] `data/text_encoder_card_tokens.pt`
-- [ ] Build in-memory card-token cache when the `.pt` cache is missing.
+  - [x] tokenizer
+  - [x] oracle text
+  - [x] `data/text_encoder_card_tokens.pt`
+- [x] Build in-memory card-token cache when the `.pt` cache is missing.
 - [ ] Add CLI args:
-  - [ ] `--card-token-cache`
-  - [ ] `--text-max-tokens`
-  - [ ] `--text-d-model`
-  - [ ] `--text-layers`
-  - [ ] `--text-heads`
-  - [ ] `--text-d-ff`
-  - [ ] `--native-render-plan`
-  - [ ] `--render-plan-capacity`
+  - [x] `--card-token-cache`
+  - [x] `--text-max-tokens`
+  - [x] `--text-d-model`
+  - [x] `--text-layers`
+  - [x] `--text-heads`
+  - [x] `--text-d-ff`
+  - [x] `--native-render-plan`
+  - [x] `--render-plan-capacity`
 - [ ] Reuse existing game/deck scheduling where possible.
 - [ ] Collect finished episodes into the trainer's existing `RolloutStep` / `EpisodeBatch` structures.
 - [ ] Ensure sampled text replay rows carry `replay_idx` exactly like slot replay rows.
@@ -141,7 +142,7 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 ## Phase 7: `train.py` Integration
 
 - [x] Split current setup into `build_slot_backend(...)`.
-- [ ] Add `build_text_backend(...)`.
+- [x] Add `build_text_backend(...)`.
 - [ ] Branch once after argument validation:
   - [x] `args.encoder == "slots"`
   - [ ] `args.encoder == "text"`

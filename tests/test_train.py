@@ -6,6 +6,7 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 import torch
 from magic_ai.game_state import GameStateEncoder
@@ -18,6 +19,7 @@ from scripts.train import (
     _current_transcript_snapshot,
     _restore_opponent_pool,
     build_slot_backend,
+    build_text_backend,
     checkpoint_encoder_kind,
     load_deck_dir,
     load_training_checkpoint,
@@ -319,6 +321,52 @@ class TrainPPOTests(unittest.TestCase):
         self.assertIsNone(backend.batch_pool)
         self.assertEqual(backend.staging_buffer.max_steps_per_trajectory, 4)
         self.assertEqual(backend.policy.live_lstm_h.shape[1], 2)
+
+    def test_build_text_backend_constructs_artifacts_and_replay_buffer(self) -> None:
+        from magic_ai.text_encoder.card_cache import CardTokenCache
+        from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
+
+        class StubTokenizer:
+            pad_token_id = 0
+
+            def __len__(self) -> int:
+                return 32
+
+        cache = CardTokenCache(
+            token_buffer=torch.empty(0, dtype=torch.int32),
+            offsets=torch.tensor([0, 0], dtype=torch.int64),
+            row_to_name=["<unknown>"],
+            engine_card_set_hash="stub",
+        )
+        args = Namespace(
+            card_token_cache=Path("missing-card-cache.pt"),
+            text_d_model=8,
+            text_layers=1,
+            text_heads=2,
+            text_d_ff=16,
+            text_max_tokens=8,
+            hidden_layers=1,
+            num_envs=2,
+            rollout_buffer_capacity=8,
+            rollout_steps=4,
+            max_steps_per_game=4,
+            max_options=3,
+            max_targets_per_option=2,
+        )
+
+        with (
+            patch("scripts.train.load_tokenizer", return_value=StubTokenizer()),
+            patch("scripts.train.load_oracle_text", return_value={"Mountain": {}}),
+            patch("scripts.train.build_card_cache", return_value=cache) as build_cache,
+        ):
+            backend = build_text_backend(args, torch.device("cpu"))
+
+        self.assertEqual(backend.cache, cache)
+        self.assertEqual(set(backend.oracle), {"Mountain"})
+        self.assertIsInstance(backend.replay_buffer, TextReplayBuffer)
+        self.assertIs(backend.policy.rollout_buffer, backend.replay_buffer)
+        self.assertEqual(tuple(backend.policy.live_lstm_h.shape), (1, 4, 8))
+        build_cache.assert_called_once()
 
     def test_save_checkpoint_serializes_resume_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

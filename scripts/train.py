@@ -64,6 +64,17 @@ from magic_ai.sharded_native import (  # noqa: E402
     ShardedNativeBatchEncoder,
     ShardedNativeRolloutDriver,
 )
+from magic_ai.text_encoder.actor_critic import TextActorCritic  # noqa: E402
+from magic_ai.text_encoder.card_cache import (  # noqa: E402
+    CardTokenCache,
+    build_card_cache,
+    load_card_cache,
+)
+from magic_ai.text_encoder.model import TextEncoderConfig  # noqa: E402
+from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig  # noqa: E402
+from magic_ai.text_encoder.render import OracleEntry, load_oracle_text  # noqa: E402
+from magic_ai.text_encoder.replay_buffer import TextReplayBuffer  # noqa: E402
+from magic_ai.text_encoder.tokenizer import load_tokenizer  # noqa: E402
 
 DEFAULT_DECK = {
     "name": "bolt-mountain",
@@ -201,6 +212,14 @@ class SlotTrainingBackend:
     batch_workers: int
 
 
+@dataclass
+class TextTrainingBackend:
+    policy: TextActorCritic
+    replay_buffer: TextReplayBuffer
+    cache: CardTokenCache
+    oracle: dict[str, OracleEntry]
+
+
 def build_slot_backend(args: argparse.Namespace, device: torch.device) -> SlotTrainingBackend:
     game_state_encoder = GameStateEncoder.from_embedding_json(args.embeddings, d_model=args.d_model)
     rollout_capacity = args.rollout_buffer_capacity or max(
@@ -262,6 +281,57 @@ def build_slot_backend(args: argparse.Namespace, device: torch.device) -> SlotTr
         staging_buffer=staging_buffer,
         batch_pool=batch_pool,
         batch_workers=batch_workers,
+    )
+
+
+def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTrainingBackend:
+    tokenizer = load_tokenizer()
+    oracle = load_oracle_text()
+    cache_path = Path(args.card_token_cache)
+    if cache_path.exists():
+        cache = load_card_cache(cache_path)
+    else:
+        cache = build_card_cache(sorted(oracle.keys()), oracle, tokenizer, missing_policy="warn")
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        raise ValueError("text tokenizer must define pad_token_id")
+    cfg = TextEncoderConfig(
+        vocab_size=len(tokenizer),
+        pad_id=int(pad_id),
+        d_model=args.text_d_model,
+        n_layers=args.text_layers,
+        n_heads=args.text_heads,
+        d_ff=args.text_d_ff,
+        max_seq_len=args.text_max_tokens,
+    )
+    recurrent_cfg = RecurrentTextPolicyConfig(
+        encoder=cfg,
+        lstm_hidden=args.text_d_model,
+        lstm_layers=args.hidden_layers,
+    )
+    policy = TextActorCritic(recurrent_cfg).to(device)
+    policy.init_lstm_env_states(args.num_envs)
+    rollout_capacity = args.rollout_buffer_capacity or max(
+        4096, args.rollout_steps + args.max_steps_per_game * args.num_envs
+    )
+    replay_buffer = TextReplayBuffer(
+        capacity=rollout_capacity,
+        max_tokens=args.text_max_tokens,
+        max_options=args.max_options,
+        max_targets_per_option=args.max_targets_per_option,
+        max_decision_groups=args.max_options,
+        max_cached_choices=max(args.max_options, args.max_options * args.max_targets_per_option),
+        recurrent_layers=args.hidden_layers,
+        recurrent_hidden_dim=args.text_d_model,
+        device=device,
+    )
+    policy.rollout_buffer = replay_buffer
+    return TextTrainingBackend(
+        policy=policy,
+        replay_buffer=replay_buffer,
+        cache=cache,
+        oracle=oracle,
     )
 
 
@@ -728,6 +798,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--hidden-layers", type=int, default=4)
     parser.add_argument(
+        "--card-token-cache",
+        type=Path,
+        default=Path("data/text_encoder_card_tokens.pt"),
+        help="text encoder card-token cache (.pt); built in memory from oracle if missing",
+    )
+    parser.add_argument("--text-max-tokens", type=int, default=2048)
+    parser.add_argument("--text-d-model", type=int, default=128)
+    parser.add_argument("--text-layers", type=int, default=2)
+    parser.add_argument("--text-heads", type=int, default=4)
+    parser.add_argument("--text-d-ff", type=int, default=512)
+    parser.add_argument(
+        "--native-render-plan",
+        action="store_true",
+        help="use mage-go native render-plan emission for text encoder rollouts",
+    )
+    parser.add_argument("--render-plan-capacity", type=int, default=4096)
+    parser.add_argument(
         "--lstm",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -846,6 +933,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--gae-lambda must be in [0, 1]")
     if args.hidden_layers < 1:
         raise ValueError("--hidden-layers must be at least 1")
+    if getattr(args, "text_max_tokens", 1) < 1:
+        raise ValueError("--text-max-tokens must be at least 1")
+    if getattr(args, "text_d_model", 1) < 1:
+        raise ValueError("--text-d-model must be at least 1")
+    if getattr(args, "text_layers", 1) < 1:
+        raise ValueError("--text-layers must be at least 1")
+    if getattr(args, "text_heads", 1) < 1:
+        raise ValueError("--text-heads must be at least 1")
+    if getattr(args, "text_d_ff", 1) < 1:
+        raise ValueError("--text-d-ff must be at least 1")
+    if getattr(args, "render_plan_capacity", 1) < 1:
+        raise ValueError("--render-plan-capacity must be at least 1")
     if getattr(args, "encoder", "slots") == "text":
         raise ValueError("--encoder text is not wired into train.py yet")
     if args.torch_compile and not args.no_validate:
