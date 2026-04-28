@@ -151,6 +151,12 @@ class TextStateEncoder(nn.Module):
         # Additive attention bias: 0 at real positions, -inf at pads on the key axis.
         # Shape [B, 1, 1, T] broadcasts over heads and queries.
         key_pad = attention_mask == 0
+        # Guard rows whose entire key axis is masked: softmax over [-inf, ...]
+        # is NaN, which then poisons the whole batch. Such rows produce
+        # meaningless hidden states either way; we just need them to stay
+        # finite so downstream code doesn't crash.
+        all_masked = key_pad.all(dim=-1, keepdim=True)
+        key_pad = key_pad & ~all_masked
         attn_bias = torch.zeros(b, 1, 1, t, device=x.device, dtype=x.dtype)
         attn_bias = attn_bias.masked_fill(key_pad[:, None, None, :], float("-inf"))
         head_dim = self.cfg.d_model // self.cfg.n_heads

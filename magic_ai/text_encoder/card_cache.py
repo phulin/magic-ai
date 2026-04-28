@@ -21,11 +21,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import orjson
 import torch
 from torch import Tensor
 from transformers import PreTrainedTokenizerFast
 
-from magic_ai.text_encoder.render import OracleEntry, render_card_body
+from magic_ai.text_encoder.render import OracleEntry, OracleFace, render_card_body
+
+DEFAULT_ORACLE_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "oracle-cards.json"
 
 logger = logging.getLogger(__name__)
 
@@ -78,11 +81,87 @@ def compute_card_set_hash(registered_names: Sequence[str]) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
+def _scryfall_record_to_entry(record: Mapping[str, Any]) -> OracleEntry:
+    """Convert a Scryfall bulk-data oracle-cards record to an OracleEntry."""
+
+    name = str(record.get("name") or "")
+    pt: str | None = None
+    power = record.get("power")
+    toughness = record.get("toughness")
+    if power is not None and toughness is not None:
+        pt = f"{power}/{toughness}"
+    entry: OracleEntry = {
+        "name": name,
+        "type_line": str(record.get("type_line") or ""),
+        "mana_cost": str(record.get("mana_cost") or ""),
+        "oracle_text": str(record.get("oracle_text") or ""),
+        "power_toughness": pt,
+        "colors": list(record.get("colors") or []),
+    }
+    layout = record.get("layout")
+    if layout:
+        entry["layout"] = str(layout)
+    faces_raw = record.get("card_faces") or []
+    if faces_raw:
+        faces: list[OracleFace] = []
+        for face in faces_raw:
+            face_pt = face.get("power_toughness")
+            if face_pt is None:
+                fp = face.get("power")
+                ft = face.get("toughness")
+                if fp is not None and ft is not None:
+                    face_pt = f"{fp}/{ft}"
+            faces.append(
+                {
+                    "name": str(face.get("name") or ""),
+                    "type_line": str(face.get("type_line") or ""),
+                    "mana_cost": str(face.get("mana_cost") or ""),
+                    "oracle_text": str(face.get("oracle_text") or ""),
+                    "power_toughness": face_pt,
+                }
+            )
+        entry["card_faces"] = faces
+    return entry
+
+
+def load_oracle_db(
+    path: Path | str = DEFAULT_ORACLE_DB_PATH,
+    *,
+    names: Sequence[str] | None = None,
+) -> dict[str, OracleEntry]:
+    """Load Scryfall ``oracle-cards.json`` bulk dump keyed by canonical name.
+
+    Uses orjson because the bulk dump is ~170 MB and ``json.loads`` is the
+    dominant cost on a cold cache build. When ``names`` is provided the
+    return value is restricted to that set; the full dump still has to be
+    parsed once but only the matching subset is converted to ``OracleEntry``.
+    """
+
+    p = Path(path)
+    with p.open("rb") as fh:
+        records = orjson.loads(fh.read())
+    if not isinstance(records, list):
+        raise RuntimeError(f"{p} did not contain a top-level JSON array")
+    wanted: set[str] | None = set(names) if names is not None else None
+    out: dict[str, OracleEntry] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        name = record.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if wanted is not None and name not in wanted:
+            continue
+        out[name] = _scryfall_record_to_entry(record)
+    return out
+
+
 def build_card_cache(
     registered_names: Sequence[str],
-    oracle: Mapping[str, OracleEntry],
-    tokenizer: PreTrainedTokenizerFast,
+    oracle: Mapping[str, OracleEntry] | None = None,
+    tokenizer: PreTrainedTokenizerFast | None = None,
     *,
+    oracle_db_path: Path | str | None = DEFAULT_ORACLE_DB_PATH,
     missing_policy: Literal["raise", "warn", "skip"] = "raise",
 ) -> CardTokenCache:
     """Render + tokenize every registered card body and pack into a flat cache.
@@ -91,13 +170,28 @@ def build_card_cache(
     the caller-supplied order; the dedupe / canonical sort happens only inside
     :func:`compute_card_set_hash`.
 
+    Oracle lookup precedence: callers may pass a pre-built ``oracle`` mapping
+    (test fixtures, custom-card overrides). Names not found there fall back
+    to ``oracle_db_path`` (default: the Scryfall bulk dump
+    ``data/oracle-cards.json``), which is loaded lazily on first miss and
+    only kept in memory for names actually requested.
+
     Coverage: by default raises :class:`MissingOracleTextError` listing every
-    registered name without an oracle entry. ``warn`` logs the same message;
-    ``skip`` writes empty bodies for missing names.
+    registered name still without an oracle entry. ``warn`` logs the same
+    message; ``skip`` writes empty bodies for missing names.
     """
 
+    if tokenizer is None:
+        raise TypeError("tokenizer is required")
+
     names = list(registered_names)
-    missing = [n for n in names if n not in oracle]
+    base_oracle: Mapping[str, OracleEntry] = oracle if oracle is not None else {}
+    missing_in_base = [n for n in names if n not in base_oracle]
+    db_oracle: dict[str, OracleEntry] = {}
+    if missing_in_base and oracle_db_path is not None and Path(oracle_db_path).exists():
+        db_oracle = load_oracle_db(oracle_db_path, names=missing_in_base)
+    merged: dict[str, OracleEntry] = {**db_oracle, **dict(base_oracle)}
+    missing = [n for n in names if n not in merged]
     if missing:
         if missing_policy == "raise":
             raise MissingOracleTextError(missing)
@@ -116,7 +210,7 @@ def build_card_cache(
     offsets: list[int] = [0, 0]  # offsets[0] = offsets[1] = 0
     cursor = 0
     for name in names:
-        entry = oracle.get(name)
+        entry = merged.get(name)
         if entry is None and missing_policy != "skip":
             # Will already have been raised above when policy == "raise".
             # For "warn" we still emit the body using just the name.

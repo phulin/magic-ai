@@ -162,7 +162,27 @@ def _assemble_one(
     cur_target_bucket: list[int] | None = None
     scalar_owner_open: int | None = None
     option_open = False
-    structured_plan = not bool(np.any(plan == OP_LITERAL_TOKENS))
+    # Detect literal-tokens mode by walking the opcode stream — naive
+    # ``np.any(plan == OP_LITERAL_TOKENS)`` scans payload ints too and
+    # spuriously flips when any payload happens to equal the opcode id
+    # (slot indices, card-row ids, and mana amounts routinely do). When
+    # the flag mis-fires, OP_OPTION / OP_TARGET / OP_OPEN_ACTIONS fall
+    # through to the bookkeeping fallback and the encoded batch ends up
+    # with empty option/target positions, which then crashes downstream
+    # gather (or returns CUDA-garbage NaN at sample time).
+    structured_plan = True
+    _scan_i = 0
+    _scan_n = int(plan.shape[0])
+    while _scan_i < _scan_n:
+        _scan_op = int(plan[_scan_i])
+        if _scan_op == OP_LITERAL_TOKENS:
+            structured_plan = False
+            break
+        _scan_arity = OPCODE_ARITY.get(_scan_op)
+        if _scan_arity is None:
+            # Unknown opcode — let the main loop raise with a real error.
+            break
+        _scan_i += 1 + _scan_arity
 
     def emit_text(text: str) -> None:
         out.extend(int(t) for t in tokenizer.encode(text, add_special_tokens=False))

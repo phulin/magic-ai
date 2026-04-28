@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "mage-go",
+    "orjson>=3.11",
     "python-dotenv>=1.2.2",
     "torch>=2.11.0",
     "transformers>=5.5.4",

@@ -10,8 +10,8 @@ Examples
     # Use the engine's card list (requires libmage to be built):
     python scripts/build_text_encoder_card_cache.py
 
-    # Use the oracle JSON's name list (no libmage needed):
-    python scripts/build_text_encoder_card_cache.py --names-from oracle
+    # Use a custom Scryfall oracle-cards bulk dump:
+    python scripts/build_text_encoder_card_cache.py --oracle-db /path/oracle-cards.json
 """
 
 from __future__ import annotations
@@ -25,14 +25,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from magic_ai.text_encoder.card_cache import (  # noqa: E402
+    DEFAULT_ORACLE_DB_PATH,
     build_card_cache,
     cache_length_stats,
     fetch_registered_card_names_from_engine,
+    load_oracle_db,
     save_card_cache,
-)
-from magic_ai.text_encoder.render import (  # noqa: E402
-    DEFAULT_ORACLE_PATH,
-    load_oracle_text,
 )
 from magic_ai.text_encoder.tokenizer import load_tokenizer  # noqa: E402
 
@@ -40,26 +38,16 @@ from magic_ai.text_encoder.tokenizer import load_tokenizer  # noqa: E402
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
-        "--oracle",
+        "--oracle-db",
         type=Path,
-        default=Path(DEFAULT_ORACLE_PATH),
-        help="Path to card_oracle_embeddings.json (default: data/card_oracle_embeddings.json).",
+        default=DEFAULT_ORACLE_DB_PATH,
+        help="Scryfall oracle-cards.json bulk dump (default: data/oracle-cards.json).",
     )
     p.add_argument(
         "--output",
         type=Path,
         default=REPO_ROOT / "data" / "text_encoder_card_tokens.pt",
         help="Where to write the PyTorch cache.",
-    )
-    p.add_argument(
-        "--names-from",
-        choices=("engine", "oracle"),
-        default="engine",
-        help=(
-            "Where to draw the registered-card-name list from. "
-            "'engine' calls MageRegisteredCards() (requires libmage). "
-            "'oracle' uses the names present in --oracle (handy when libmage isn't built)."
-        ),
     )
     p.add_argument(
         "--missing",
@@ -73,17 +61,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     tokenizer = load_tokenizer()
-    oracle = load_oracle_text(args.oracle)
-
-    if args.names_from == "engine":
-        names = fetch_registered_card_names_from_engine()
-    else:
-        names = sorted(oracle.keys())
+    names = fetch_registered_card_names_from_engine()
+    oracle = load_oracle_db(args.oracle_db, names=names)
 
     cache = build_card_cache(
         names,
         oracle,
         tokenizer,
+        oracle_db_path=args.oracle_db,
         missing_policy=args.missing,
     )
     save_card_cache(cache, args.output)

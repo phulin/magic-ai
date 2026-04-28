@@ -80,13 +80,16 @@ from magic_ai.text_encoder.actor_critic import (  # noqa: E402
 )
 from magic_ai.text_encoder.assembler import assemble_batch  # noqa: E402
 from magic_ai.text_encoder.card_cache import (  # noqa: E402
+    DEFAULT_ORACLE_DB_PATH,
     CardTokenCache,
     build_card_cache,
+    fetch_registered_card_names_from_engine,
     load_card_cache,
+    load_oracle_db,
 )
 from magic_ai.text_encoder.model import TextEncoderConfig  # noqa: E402
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig  # noqa: E402
-from magic_ai.text_encoder.render import OracleEntry, load_oracle_text  # noqa: E402
+from magic_ai.text_encoder.render import OracleEntry  # noqa: E402
 from magic_ai.text_encoder.render_plan import emit_render_plan  # noqa: E402
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer  # noqa: E402
 from magic_ai.text_encoder.tokenizer import (  # noqa: E402
@@ -320,12 +323,20 @@ def build_slot_backend(args: argparse.Namespace, device: torch.device) -> SlotTr
 
 def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTrainingBackend:
     tokenizer = load_tokenizer()
-    oracle = load_oracle_text()
     cache_path = Path(args.card_token_cache)
+    oracle_db_path = Path(getattr(args, "oracle_db", DEFAULT_ORACLE_DB_PATH))
+    registered_names = fetch_registered_card_names_from_engine()
+    oracle = load_oracle_db(oracle_db_path, names=registered_names)
     if cache_path.exists():
         cache = load_card_cache(cache_path)
     else:
-        cache = build_card_cache(sorted(oracle.keys()), oracle, tokenizer, missing_policy="warn")
+        cache = build_card_cache(
+            registered_names,
+            oracle,
+            tokenizer,
+            oracle_db_path=oracle_db_path,
+            missing_policy="warn",
+        )
 
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
@@ -1055,6 +1066,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("data/text_encoder_card_tokens.pt"),
         help="text encoder card-token cache (.pt); built in memory from oracle if missing",
+    )
+    parser.add_argument(
+        "--oracle-db",
+        type=Path,
+        default=DEFAULT_ORACLE_DB_PATH,
+        help="Scryfall oracle-cards.json bulk dump for text encoder oracle text",
     )
     parser.add_argument("--text-max-tokens", type=int, default=2048)
     parser.add_argument("--text-d-model", type=int, default=128)

@@ -502,7 +502,11 @@ class TrainPPOTests(unittest.TestCase):
 
         with (
             patch("scripts.train.load_tokenizer", return_value=StubTokenizer()),
-            patch("scripts.train.load_oracle_text", return_value={"Mountain": {}}),
+            patch("scripts.train.load_oracle_db", return_value={"Mountain": {}}),
+            patch(
+                "scripts.train.fetch_registered_card_names_from_engine",
+                return_value=["Mountain"],
+            ),
             patch("scripts.train.build_card_cache", return_value=cache) as build_cache,
         ):
             backend = build_text_backend(args, torch.device("cpu"))
@@ -585,7 +589,11 @@ class TrainPPOTests(unittest.TestCase):
 
         with (
             patch("scripts.train.load_tokenizer", return_value=StubTokenizer()),
-            patch("scripts.train.load_oracle_text", return_value={"Mountain": {}}),
+            patch("scripts.train.load_oracle_db", return_value={"Mountain": {}}),
+            patch(
+                "scripts.train.fetch_registered_card_names_from_engine",
+                return_value=["Mountain"],
+            ),
             patch("scripts.train.build_card_cache", return_value=cache),
             patch("scripts.train.emit_render_plan", return_value=object()) as emit,
             patch("scripts.train.assemble_batch", return_value=encoded_batch()) as assemble,
