@@ -9,10 +9,12 @@ from typing import cast
 from unittest.mock import patch
 
 import torch
-from magic_ai.game_state import GameStateEncoder
+from magic_ai.game_state import GameStateEncoder, GameStateSnapshot, PendingState
 from magic_ai.model import PPOPolicy
 from magic_ai.opponent_pool import OpponentPool, SnapshotSchedule
 from magic_ai.ppo import PPOStats, RolloutStep, gae_returns
+from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from scripts.train import (
     RetrospectiveLogSchedule,
     TrainingResumeState,
@@ -28,6 +30,7 @@ from scripts.train import (
     log_retrospective_table,
     retrospective_rating_rows,
     sample_decks,
+    sample_text_policy_batch,
     save_checkpoint,
     validate_args,
     validate_checkpoint_encoder,
@@ -368,6 +371,99 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(tuple(backend.policy.live_lstm_h.shape), (1, 4, 8))
         build_cache.assert_called_once()
 
+    def test_sample_text_policy_batch_emits_assembles_and_appends_replay(self) -> None:
+        from magic_ai.text_encoder.card_cache import CardTokenCache
+
+        class StubTokenizer:
+            pad_token_id = 0
+
+            def __len__(self) -> int:
+                return 32
+
+        def encoded_batch() -> TextEncodedBatch:
+            token_ids = torch.tensor([[1, 4, 5, 2]], dtype=torch.long)
+            attention_mask = torch.ones_like(token_ids)
+            card_ref_positions = torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long)
+            option_positions = torch.tensor([[1, 2]], dtype=torch.long)
+            option_mask = torch.tensor([[True, True]])
+            target_positions = torch.full((1, 2, 1), -1, dtype=torch.long)
+            target_mask = torch.zeros((1, 2, 1), dtype=torch.bool)
+            seq_lengths = torch.tensor([4], dtype=torch.long)
+            return TextEncodedBatch(
+                token_ids=token_ids,
+                attention_mask=attention_mask,
+                card_ref_positions=card_ref_positions,
+                option_positions=option_positions,
+                option_mask=option_mask,
+                target_positions=target_positions,
+                target_mask=target_mask,
+                seq_lengths=seq_lengths,
+            )
+
+        cache = CardTokenCache(
+            token_buffer=torch.empty(0, dtype=torch.int32),
+            offsets=torch.tensor([0, 0], dtype=torch.int64),
+            row_to_name=["<unknown>"],
+            engine_card_set_hash="stub",
+        )
+        args = Namespace(
+            card_token_cache=Path("missing-card-cache.pt"),
+            text_d_model=8,
+            text_layers=1,
+            text_heads=2,
+            text_d_ff=16,
+            text_max_tokens=8,
+            hidden_layers=1,
+            num_envs=1,
+            rollout_buffer_capacity=8,
+            rollout_steps=4,
+            max_steps_per_game=4,
+            max_options=2,
+            max_targets_per_option=1,
+            native_render_plan=False,
+        )
+        snapshot = cast(
+            dict[str, object],
+            {
+                "players": [{"Name": "A"}, {"Name": "B"}],
+                "active_player": "A",
+                "turn": 1,
+                "step": "Precombat Main",
+            },
+        )
+        pending = cast(
+            dict[str, object],
+            {
+                "kind": "priority",
+                "player_idx": 0,
+                "options": [{"kind": "pass"}, {"kind": "play_land", "card_id": "c1"}],
+            },
+        )
+
+        with (
+            patch("scripts.train.load_tokenizer", return_value=StubTokenizer()),
+            patch("scripts.train.load_oracle_text", return_value={"Mountain": {}}),
+            patch("scripts.train.build_card_cache", return_value=cache),
+            patch("scripts.train.emit_render_plan", return_value=object()) as emit,
+            patch("scripts.train.assemble_batch", return_value=encoded_batch()) as assemble,
+        ):
+            backend = build_text_backend(args, torch.device("cpu"))
+            steps = sample_text_policy_batch(
+                args,
+                backend,
+                [cast(GameStateSnapshot, snapshot)],
+                [cast(PendingState, pending)],
+                env_indices=[0],
+                perspective_player_indices=[0],
+                deterministic=True,
+            )
+
+        self.assertEqual(len(steps), 1)
+        self.assertIsNotNone(steps[0].replay_idx)
+        self.assertEqual(backend.replay_buffer.size, 1)
+        emit.assert_called_once()
+        assemble.assert_called_once()
+
     def test_save_checkpoint_serializes_resume_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint_path = Path(tmpdir) / "ppo.pt"
@@ -511,6 +607,31 @@ class TrainPPOTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "--gae-lambda must be in \\[0, 1\\]"):
+            validate_args(args)
+
+    def test_validate_args_allows_text_ppo_but_rejects_text_rnad(self) -> None:
+        args = Namespace(
+            episodes=1,
+            num_envs=1,
+            rollout_steps=1,
+            max_steps_per_game=1,
+            minibatch_size=1,
+            hidden_layers=1,
+            gae_lambda=0.95,
+            torch_compile=False,
+            no_validate=False,
+            deck_json=None,
+            deck_dir=None,
+            eval_games_per_snapshot=0,
+            eval_recency_tau=4.0,
+            eval_num_envs=None,
+            encoder="text",
+            trainer="ppo",
+        )
+
+        validate_args(args)
+        args.trainer = "rnad"
+        with self.assertRaisesRegex(ValueError, "supports --trainer ppo only"):
             validate_args(args)
 
 

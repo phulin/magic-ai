@@ -64,7 +64,12 @@ from magic_ai.sharded_native import (  # noqa: E402
     ShardedNativeBatchEncoder,
     ShardedNativeRolloutDriver,
 )
-from magic_ai.text_encoder.actor_critic import TextActorCritic  # noqa: E402
+from magic_ai.text_encoder.actor_critic import (  # noqa: E402
+    TextActorCritic,  # noqa: E402
+    build_text_decision_layout,
+    infer_text_trace_kind,
+)
+from magic_ai.text_encoder.assembler import assemble_batch  # noqa: E402
 from magic_ai.text_encoder.card_cache import (  # noqa: E402
     CardTokenCache,
     build_card_cache,
@@ -73,6 +78,7 @@ from magic_ai.text_encoder.card_cache import (  # noqa: E402
 from magic_ai.text_encoder.model import TextEncoderConfig  # noqa: E402
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig  # noqa: E402
 from magic_ai.text_encoder.render import OracleEntry, load_oracle_text  # noqa: E402
+from magic_ai.text_encoder.render_plan import emit_render_plan  # noqa: E402
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer  # noqa: E402
 from magic_ai.text_encoder.tokenizer import load_tokenizer  # noqa: E402
 
@@ -219,6 +225,7 @@ class TextTrainingBackend:
     replay_buffer: TextReplayBuffer
     cache: CardTokenCache
     oracle: dict[str, OracleEntry]
+    tokenizer: Any
 
 
 def build_slot_backend(args: argparse.Namespace, device: torch.device) -> SlotTrainingBackend:
@@ -333,7 +340,89 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         replay_buffer=replay_buffer,
         cache=cache,
         oracle=oracle,
+        tokenizer=tokenizer,
     )
+
+
+def sample_text_policy_batch(
+    args: argparse.Namespace,
+    backend: TextTrainingBackend,
+    snapshots: list[GameStateSnapshot],
+    pendings: list[PendingState],
+    *,
+    env_indices: list[int],
+    perspective_player_indices: list[int],
+    deterministic: bool = False,
+) -> list[Any]:
+    """Emit/assemble text batches and sample policy actions with replay rows."""
+
+    n = len(snapshots)
+    if n == 0:
+        return []
+    if len(pendings) != n or len(env_indices) != n or len(perspective_player_indices) != n:
+        raise ValueError("snapshots, pendings, env_indices, and players differ")
+    if getattr(args, "native_render_plan", False):
+        raise NotImplementedError("native render-plan emission is not wired into train.py yet")
+
+    card_row_lookup = _build_text_card_row_lookup(backend.cache)
+
+    def tokenize(text: str) -> list[int]:
+        return list(backend.tokenizer.encode(text, add_special_tokens=False))
+
+    plans = []
+    layouts = []
+    max_cached_choices = backend.replay_buffer.max_cached_choices
+    for snapshot, pending in zip(snapshots, pendings, strict=True):
+        snapshot_for_render = copy.deepcopy(snapshot)
+        snapshot_for_render["pending"] = pending
+        options = list(pending.get("options", []) or [])
+        plans.append(
+            emit_render_plan(
+                snapshot_for_render,
+                options,
+                card_row_lookup=card_row_lookup,
+                tokenize=tokenize,
+                oracle=backend.oracle,
+            )
+        )
+        trace_kind = infer_text_trace_kind(pending)
+        layouts.append(
+            build_text_decision_layout(
+                trace_kind,
+                pending,
+                max_options=args.max_options,
+                max_targets_per_option=args.max_targets_per_option,
+                max_cached_choices=max_cached_choices,
+            )
+        )
+
+    encoded = assemble_batch(
+        plans,
+        backend.cache,
+        backend.tokenizer,
+        max_tokens=args.text_max_tokens,
+        on_overflow="truncate",
+    )
+    return backend.policy.sample_text_batch(
+        encoded,
+        env_indices=env_indices,
+        perspective_player_indices=perspective_player_indices,
+        layouts=layouts,
+        deterministic=deterministic,
+    )
+
+
+def _build_text_card_row_lookup(cache: CardTokenCache) -> Callable[[str], int]:
+    name_to_row: dict[str, int] = {}
+    for idx, name in enumerate(cache.row_to_name):
+        if idx == 0 or not name:
+            continue
+        name_to_row.setdefault(name, idx)
+
+    def lookup(name: str) -> int:
+        return name_to_row.get(name, 0)
+
+    return lookup
 
 
 def _current_transcript_snapshot(game: Any) -> tuple[GameStateSnapshot, PendingState]:
@@ -574,11 +663,20 @@ def main() -> None:
 
     device = torch.device(args.device)
     torch.set_float32_matmul_precision("high")
-    slot_backend = build_slot_backend(args, device)
-    policy = slot_backend.policy
-    native_encoder = slot_backend.native_encoder
-    staging_buffer = slot_backend.staging_buffer
-    batch_pool = slot_backend.batch_pool
+    encoder_kind = getattr(args, "encoder", "slots")
+    batch_pool: ThreadPoolExecutor | None = None
+    slot_backend: SlotTrainingBackend | None = None
+    if encoder_kind == "slots":
+        slot_backend = build_slot_backend(args, device)
+        policy = slot_backend.policy
+        native_encoder = slot_backend.native_encoder
+        staging_buffer = slot_backend.staging_buffer
+        batch_pool = slot_backend.batch_pool
+    else:
+        text_backend = build_text_backend(args, device)
+        policy = text_backend.policy
+        native_encoder = None
+        staging_buffer = None
     # Paper §199: R-NaD uses Adam with b1=0.0 (no momentum). This is
     # load-bearing for stability: nonzero b1 lets policy updates accumulate
     # directional drift across batches, which combined with NeuRD's raw-logit
@@ -600,6 +698,36 @@ def main() -> None:
             optimizer.load_state_dict(checkpoint["optimizer"])
 
     mage = importlib.import_module("mage")
+    if encoder_kind == "text":
+        final_resume_state, final_rnad_state = train_text_envs(
+            args,
+            mage,
+            deck_pool,
+            text_backend,
+            optimizer,
+            resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
+        )
+        save_checkpoint(
+            args.output,
+            policy,
+            optimizer,
+            args,
+            opponent_pool=None,
+            snapshot_schedule=None,
+            retrospective_schedule=None,
+            resume_state=final_resume_state,
+            wandb_run_id=active_wandb_run_id,
+            run_artifact_dir=run_artifact_dir,
+            rnad_state=final_rnad_state,
+        )
+        print(f"step={final_resume_state.total_wandb_logs} saved checkpoint -> {args.output}")
+        wandb.finish()
+        return
+
+    assert native_encoder is not None
+    assert staging_buffer is not None
+    assert slot_backend is not None
+    slot_policy = cast(PPOPolicy, policy)
     try:
         native_rollout = ShardedNativeRolloutDriver.for_mage(
             mage, workers=slot_backend.batch_workers, pool=batch_pool
@@ -624,13 +752,13 @@ def main() -> None:
             int(training_state.get("retrospective_schedule_next_idx", 0)),
             len(retrospective_schedule.thresholds),
         )
-        opponent_policy = build_opponent_policy(policy, device)
+        opponent_policy = build_opponent_policy(slot_policy, device)
 
     final_resume_state, final_rnad_state = train_native_batched_envs(
         args,
         mage,
         deck_pool,
-        policy,
+        slot_policy,
         native_encoder,
         optimizer,
         native_rollout,
@@ -645,7 +773,7 @@ def main() -> None:
 
     save_checkpoint(
         args.output,
-        policy,
+        slot_policy,
         optimizer,
         args,
         opponent_pool=opponent_pool,
@@ -950,8 +1078,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--text-d-ff must be at least 1")
     if getattr(args, "render_plan_capacity", 1) < 1:
         raise ValueError("--render-plan-capacity must be at least 1")
-    if getattr(args, "encoder", "slots") == "text":
-        raise ValueError("--encoder text is not wired into train.py yet")
+    if getattr(args, "encoder", "slots") == "text" and args.trainer != "ppo":
+        raise ValueError("--encoder text currently supports --trainer ppo only")
     if args.torch_compile and not args.no_validate:
         raise ValueError("--torch-compile requires --no-validate")
     if args.deck_json is not None and args.deck_dir is not None:
@@ -1719,6 +1847,227 @@ def train_native_batched_envs(
     )
 
 
+def train_text_envs(
+    args: argparse.Namespace,
+    mage: Any,
+    deck_pool: list[dict[str, Any]],
+    backend: TextTrainingBackend,
+    optimizer: torch.optim.Optimizer,
+    *,
+    resume_state: TrainingResumeState | None = None,
+) -> tuple[TrainingResumeState, None]:
+    """Slow Python text-encoder PPO loop.
+
+    This intentionally stays separate from the native slot loop. It provides a
+    correctness path for `--encoder text`; performance work can later replace
+    the single-env Python stepping with native render-plan batching.
+    """
+
+    restored_state = resume_state or TrainingResumeState()
+    completed_games = restored_state.completed_games
+    last_saved_games = restored_state.last_saved_games
+    total_rollout_steps = restored_state.total_rollout_steps
+    total_generated_rollout_steps = restored_state.total_generated_rollout_steps
+    total_wandb_logs = restored_state.total_wandb_logs
+    run_step = getattr(wandb.run, "step", None) if wandb.run is not None else None
+    if isinstance(run_step, int):
+        total_wandb_logs = max(total_wandb_logs, run_step)
+
+    pending_steps: list[RolloutStep] = []
+    pending_returns: list[torch.Tensor] = []
+    win_stats = WinFractionStats()
+    backend.replay_buffer.reset()
+    backend.policy.init_lstm_env_states(1)
+    last_step_time = time.monotonic()
+
+    def cli_step_prefix() -> str:
+        return f"step={total_wandb_logs}"
+
+    def tracked_wandb_log(payload: dict[str, Any]) -> None:
+        nonlocal total_wandb_logs
+        if wandb.run is None:
+            return
+        wandb.log(payload)
+        total_wandb_logs += 1
+
+    def run_update(*, final: bool = False) -> None:
+        nonlocal total_rollout_steps, last_step_time
+        if not pending_steps:
+            return
+        rollout_returns = torch.cat(pending_returns)
+        rollout_step_count = len(pending_steps)
+        stats = ppo_update(
+            backend.policy,
+            optimizer,
+            pending_steps,
+            rollout_returns,
+            epochs=args.ppo_epochs,
+            minibatch_size=args.minibatch_size,
+            clip_epsilon=args.clip_epsilon,
+            value_coef=args.value_coef,
+            entropy_coef=args.entropy_coef,
+            max_grad_norm=args.max_grad_norm,
+            spr_coef=args.spr_coef if args.spr else 0.0,
+        )
+        now = time.monotonic()
+        elapsed = now - last_step_time
+        last_step_time = now
+        print(
+            cli_step_prefix(),
+            "final_update[ppo,text]" if final else "update[ppo,text]",
+            f"games={completed_games}",
+            f"steps={rollout_step_count}",
+            f"dt={elapsed:.1f}s",
+            f"loss={stats.loss:.4f}",
+            f"policy={stats.policy_loss:.4f}",
+            f"value={stats.value_loss:.4f}",
+            f"entropy={stats.entropy:.4f}",
+            f"kl={stats.approx_kl:.4f}",
+            f"clip={stats.clip_fraction:.3f}",
+            flush=True,
+        )
+        total_rollout_steps += rollout_step_count
+        log_ppo_stats(
+            stats,
+            games=completed_games,
+            steps=rollout_step_count,
+            total_rollout_steps=total_rollout_steps,
+            total_generated_rollout_steps=total_generated_rollout_steps,
+            win_stats=win_stats,
+            value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
+            log_fn=tracked_wandb_log,
+            run_active=True,
+        )
+        backend.replay_buffer.reset()
+        pending_steps.clear()
+        pending_returns.clear()
+        win_stats.reset()
+
+    for episode_idx in range(completed_games, args.episodes):
+        backend.policy.reset_lstm_env_states([0])
+        seed = args.seed + episode_idx
+        deck_a, deck_b = sample_decks(deck_pool, seed)
+        game = mage.new_game(
+            deck_a,
+            deck_b,
+            name_a=args.name_a,
+            name_b=args.name_b,
+            seed=seed,
+            shuffle=not args.no_shuffle,
+            hand_size=args.hand_size,
+        )
+        episode_steps: list[RolloutStep] = []
+        winner_idx = -1
+        try:
+            for _action_idx in range(args.max_steps_per_game):
+                game.refresh_state()
+                if game.is_over:
+                    winner_idx = _winner_idx_from_game(game)
+                    break
+                pending = cast(PendingState | None, game.pending or game.legal())
+                if pending is None:
+                    game.step({"kind": "pass"})
+                    continue
+                snapshot = cast(GameStateSnapshot, copy.deepcopy(game.state))
+                player_idx = int(pending.get("player_idx", 0) or 0)
+                if player_idx not in (0, 1):
+                    player_idx = 0
+                policy_steps = sample_text_policy_batch(
+                    args,
+                    backend,
+                    [snapshot],
+                    [pending],
+                    env_indices=[0],
+                    perspective_player_indices=[player_idx],
+                    deterministic=args.deterministic_rollout,
+                )
+                if not policy_steps:
+                    game.step({"kind": "pass"})
+                    continue
+                policy_step = policy_steps[0]
+                game.step(dict(policy_step.action))
+                episode_steps.append(
+                    RolloutStep(
+                        perspective_player_idx=player_idx,
+                        old_log_prob=float(policy_step.log_prob.detach().cpu()),
+                        value=float(policy_step.value.detach().cpu()),
+                        replay_idx=policy_step.replay_idx,
+                    )
+                )
+            game.refresh_state()
+            if game.is_over:
+                winner_idx = _winner_idx_from_game(game)
+        finally:
+            try:
+                game.close()
+            except Exception:
+                pass
+
+        completed_games += 1
+        if winner_idx == 0:
+            win_stats.p1_wins += 1
+        elif winner_idx == 1:
+            win_stats.p2_wins += 1
+        else:
+            win_stats.draws += 1
+        if episode_steps:
+            pending_steps.extend(episode_steps)
+            pending_returns.append(
+                gae_returns(
+                    episode_steps,
+                    winner_idx=winner_idx,
+                    gamma=args.gamma,
+                    gae_lambda=args.gae_lambda,
+                    draw_penalty=args.draw_penalty,
+                )
+            )
+            total_generated_rollout_steps += len(episode_steps)
+        if len(pending_steps) >= args.rollout_steps:
+            run_update()
+
+        if (
+            args.save_every
+            and completed_games > 0
+            and completed_games % args.save_every == 0
+            and completed_games != last_saved_games
+        ):
+            save_checkpoint(
+                args.output,
+                backend.policy,
+                optimizer,
+                args,
+                resume_state=TrainingResumeState(
+                    completed_games=completed_games,
+                    last_saved_games=completed_games,
+                    total_rollout_steps=total_rollout_steps,
+                    total_generated_rollout_steps=total_generated_rollout_steps,
+                    total_wandb_logs=total_wandb_logs,
+                ),
+            )
+            last_saved_games = completed_games
+
+    run_update(final=True)
+    return (
+        TrainingResumeState(
+            completed_games=completed_games,
+            last_saved_games=last_saved_games,
+            total_rollout_steps=total_rollout_steps,
+            total_generated_rollout_steps=total_generated_rollout_steps,
+            total_wandb_logs=total_wandb_logs,
+        ),
+        None,
+    )
+
+
+def _winner_idx_from_game(game: Any) -> int:
+    winner_id = getattr(game, "winner", None) or ""
+    players = (getattr(game, "state", None) or {}).get("players", []) or []
+    for idx, player in enumerate(players):
+        if player.get("ID", "") == winner_id or player.get("Name", "") == winner_id:
+            return idx
+    return -1
+
+
 def take_snapshot_and_eval(
     *,
     args: argparse.Namespace,
@@ -1944,7 +2293,7 @@ def card_name_key(name: str) -> str:
 
 def save_checkpoint(
     path: Path,
-    policy: PPOPolicy,
+    policy: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     args: argparse.Namespace,
     *,

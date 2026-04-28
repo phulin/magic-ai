@@ -7,7 +7,7 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 - [x] Add `--encoder {slots,text}` to `scripts/train.py`.
 - [x] Keep `slots` as the default path and preserve current behavior.
 - [x] Treat the current `PPOPolicy` + `RolloutBuffer` + native encoder path as the slot backend.
-- [ ] Add a separate text backend built from `RecurrentTextPolicy`, `CardTokenCache`, render-plan assembly, and a text replay buffer.
+- [x] Add a separate text backend built from `RecurrentTextPolicy`, `CardTokenCache`, render-plan assembly, and a text replay buffer.
 - [ ] Refactor PPO/RNaD trainer code to depend on a replay-policy interface instead of concrete `PPOPolicy`.
 
 ## Phase 1: Name The Existing Boundaries
@@ -106,10 +106,10 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
     - Added `magic_ai/text_encoder/actor_critic.py`; sampling/replay evaluation are still pending.
 - [x] Implement `sample_text_batch(...)` using:
   - [ ] native render-plan emission when enabled
-  - [ ] Python render-plan emission as fallback
-  - [ ] `assemble_batch(...)`
+  - [x] Python render-plan emission as fallback
+  - [x] `assemble_batch(...)`
   - [x] shared decision replay logic
-  - `TextActorCritic.sample_text_batch(...)` now consumes assembled text batches, samples decision groups/may decisions, updates live LSTM state, appends `TextReplayBuffer` rows, and returns `PolicyStep` entries with `replay_idx`. Render-plan emission and assembly are still owned by the pending collector.
+  - `TextActorCritic.sample_text_batch(...)` now consumes assembled text batches, samples decision groups/may decisions, updates live LSTM state, appends `TextReplayBuffer` rows, and returns `PolicyStep` entries with `replay_idx`. `scripts.train.sample_text_policy_batch(...)` owns Python render-plan emission and `assemble_batch(...)`; native render-plan emission is still pending.
 - [x] Implement `evaluate_replay_batch(...)` for PPO.
   - `TextActorCritic.evaluate_replay_batch(...)` now replays `TextReplayBuffer` rows through `RecurrentTextPolicy`, scores direct option/target logits plus none/may heads, and supports PPO loss/backward.
 - [x] Implement `evaluate_replay_batch_per_choice(...)` for RNaD.
@@ -136,8 +136,9 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - [x] `--text-d-ff`
   - [x] `--native-render-plan`
   - [x] `--render-plan-capacity`
-- [ ] Reuse existing game/deck scheduling where possible.
-- [ ] Collect finished episodes into the trainer's existing `RolloutStep` / `EpisodeBatch` structures.
+- [x] Reuse existing game/deck scheduling where possible.
+- [x] Collect finished episodes into the trainer's existing `RolloutStep` / `EpisodeBatch` structures.
+  - `train_text_envs(...)` is a slow single-slot Python PPO loop that reuses `sample_decks(...)`, accumulates `RolloutStep`s, computes GAE returns, and runs `ppo_update(...)`.
 - [x] Ensure sampled text replay rows carry `replay_idx` exactly like slot replay rows.
 
 ## Phase 7: `train.py` Integration
@@ -146,13 +147,14 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 - [x] Add `build_text_backend(...)`.
 - [ ] Branch once after argument validation:
   - [x] `args.encoder == "slots"`
-  - [ ] `args.encoder == "text"`
+  - [x] `args.encoder == "text"`
 - [ ] Keep the main training loop backend-oriented:
-  - [ ] collect rollout
-  - [ ] compute returns or RNaD episode batch
-  - [ ] run selected trainer update
-  - [ ] save checkpoint
-  - [ ] log metrics
+  - [x] collect rollout
+  - [x] compute returns or RNaD episode batch
+  - [x] run selected trainer update
+  - [x] save checkpoint
+  - [x] log metrics
+  - Text PPO now has a separate correctness loop; R-NaD remains slot-only in `train.py`.
 - [ ] Save checkpoint metadata including:
   - [x] encoder kind
   - [ ] text config when `encoder=text`

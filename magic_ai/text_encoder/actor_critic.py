@@ -269,6 +269,18 @@ class TextActorCritic(nn.Module):
         entropies = entropies + decision_entropies
         return log_probs, entropies, output.values, None
 
+    def compute_spr_loss(
+        self,
+        step_indices: Tensor,
+        *,
+        extras: Any | None = None,
+    ) -> Tensor:
+        del step_indices, extras
+        raise ValueError("TextActorCritic does not implement SPR")
+
+    def update_spr_target(self, decay: float | None = None) -> None:
+        del decay
+
     def evaluate_replay_batch_per_choice(
         self,
         replay_rows: list[int],
