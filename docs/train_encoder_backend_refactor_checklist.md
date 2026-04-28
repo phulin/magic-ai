@@ -34,13 +34,15 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
 
 ## Phase 2: Extract Shared Decision Replay Logic
 
-- [ ] Extract the decision-group distribution code out of `PPOPolicy` into a backend-neutral helper module.
+- [x] Extract the decision-group distribution code out of `PPOPolicy` into a backend-neutral helper module.
+  - Added `magic_ai/replay_decisions.py`; `PPOPolicy` now delegates decision logits, flat distribution, and validation helpers to it.
 - [ ] Preserve support for:
-  - [ ] priority choices
-  - [ ] targets
-  - [ ] attackers/blockers multi-decision groups
-  - [ ] blocker/pass "none" choice
+  - [x] priority choices
+  - [x] targets
+  - [x] attackers/blockers multi-decision groups
+  - [x] blocker/pass "none" choice
   - [ ] may Bernoulli head
+    - May remains in `PPOPolicy.evaluate_replay_batch*`; only decision-group scoring was extracted in this pass.
 - [ ] Define a common forward-output shape for replay scoring:
   - [ ] `values`
   - [ ] `option_vectors`
@@ -49,18 +51,20 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - [ ] `none_logits`
   - [ ] `may_logits`
   - [ ] recurrent hidden vector for auxiliary losses
-- [ ] Keep slot behavior byte-for-byte or test-equivalent after extraction.
-- [ ] Add tests that compare old slot replay log-probs against the extracted helper.
+- [x] Keep slot behavior byte-for-byte or test-equivalent after extraction.
+- [x] Add tests that compare old slot replay log-probs against the extracted helper.
+  - Added `tests/test_replay_decisions.py` for manual logits/entropy expectations and the `PPOPolicy` adapter path.
 
 ## Phase 3: Slot Backend Wrapper
 
-- [ ] Add a small `SlotTrainingBackend` wrapper around current setup.
-- [ ] Move slot-specific construction out of `main()`:
-  - [ ] `GameStateEncoder.from_embedding_json(...)`
-  - [ ] `PPOPolicy(...)`
-  - [ ] `ShardedNativeBatchEncoder.for_policy(...)`
-  - [ ] `NativeTrajectoryBuffer(...)`
-- [ ] Keep current rollout collection logic working through the slot backend.
+- [x] Add a small `SlotTrainingBackend` wrapper around current setup.
+- [x] Move slot-specific construction out of `main()`:
+  - [x] `GameStateEncoder.from_embedding_json(...)`
+  - [x] `PPOPolicy(...)`
+  - [x] `ShardedNativeBatchEncoder.for_policy(...)`
+  - [x] `NativeTrajectoryBuffer(...)`
+- [x] Keep current rollout collection logic working through the slot backend.
+  - `main()` now builds a `SlotTrainingBackend` and passes its existing policy, native encoder, and staging buffer into the unchanged loop.
 - [ ] Keep checkpoint save/load metadata compatible with existing slot checkpoints.
 - [ ] Verify `--encoder slots` produces the same smoke behavior as before.
 

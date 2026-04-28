@@ -15,6 +15,7 @@ from scripts.train import (
     TrainingResumeState,
     _current_transcript_snapshot,
     _restore_opponent_pool,
+    build_slot_backend,
     load_deck_dir,
     load_training_checkpoint,
     log_args_to_wandb_summary,
@@ -199,6 +200,42 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(payloads[0]["total_generated_rollout_steps"], 34)
         self.assertEqual(payloads[0]["games"], 8)
         self.assertEqual(payloads[0]["return_mean"], 0.5)
+
+    def test_build_slot_backend_constructs_current_slot_components(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            embeddings_path = Path(tmpdir) / "embeddings.json"
+            embeddings_path.write_text(
+                json.dumps({"cards": [{"name": "Mountain", "embedding": [0.0, 0.1]}]})
+            )
+            args = Namespace(
+                embeddings=embeddings_path,
+                d_model=8,
+                rollout_buffer_capacity=None,
+                rollout_steps=16,
+                max_steps_per_game=4,
+                num_envs=2,
+                hidden_dim=16,
+                hidden_layers=1,
+                max_options=4,
+                max_targets_per_option=2,
+                lstm=True,
+                spr=False,
+                spr_action_dim=16,
+                spr_ema_decay=0.99,
+                spr_k=3,
+                spr_proj_dim=16,
+                no_validate=False,
+                torch_compile=False,
+                batch_workers=1,
+            )
+
+            backend = build_slot_backend(args, torch.device("cpu"))
+
+        self.assertIsInstance(backend.policy, PPOPolicy)
+        self.assertEqual(backend.batch_workers, 1)
+        self.assertIsNone(backend.batch_pool)
+        self.assertEqual(backend.staging_buffer.max_steps_per_trajectory, 4)
+        self.assertEqual(backend.policy.live_lstm_h.shape[1], 2)
 
     def test_save_checkpoint_serializes_resume_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

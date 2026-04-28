@@ -148,6 +148,79 @@ class WinFractionStats:
         self.draws = 0
 
 
+@dataclass
+class SlotTrainingBackend:
+    policy: PPOPolicy
+    native_encoder: ShardedNativeBatchEncoder
+    staging_buffer: NativeTrajectoryBuffer
+    batch_pool: ThreadPoolExecutor | None
+    batch_workers: int
+
+
+def build_slot_backend(args: argparse.Namespace, device: torch.device) -> SlotTrainingBackend:
+    game_state_encoder = GameStateEncoder.from_embedding_json(args.embeddings, d_model=args.d_model)
+    rollout_capacity = args.rollout_buffer_capacity or max(
+        4096, args.rollout_steps + args.max_steps_per_game * args.num_envs
+    )
+    policy = PPOPolicy(
+        game_state_encoder,
+        hidden_dim=args.hidden_dim,
+        hidden_layers=args.hidden_layers,
+        max_options=args.max_options,
+        max_targets_per_option=args.max_targets_per_option,
+        rollout_capacity=rollout_capacity,
+        use_lstm=args.lstm,
+        spr_enabled=args.spr,
+        spr_action_dim=args.spr_action_dim,
+        spr_ema_decay=args.spr_ema_decay,
+        spr_k=args.spr_k,
+        spr_proj_dim=args.spr_proj_dim,
+        validate=not args.no_validate,
+        compile_forward=args.torch_compile,
+    ).to(device)
+    policy.init_lstm_env_states(args.num_envs)
+    if device.type == "cuda":
+        # Force cuBLAS handle creation before rollout ingestion creates temporary
+        # CUDA copy tensors that PyTorch may hold in its caching allocator.
+        _ = torch.empty((1, 1), device=device) @ torch.empty((1, 1), device=device)
+
+    batch_workers = max(1, args.batch_workers)
+    batch_pool = (
+        ThreadPoolExecutor(max_workers=batch_workers, thread_name_prefix="mage-batch")
+        if batch_workers > 1
+        else None
+    )
+    native_encoder = ShardedNativeBatchEncoder.for_policy(
+        policy, workers=batch_workers, pool=batch_pool
+    )
+    staging_decision_capacity_per_env = max(
+        1,
+        (policy.rollout_buffer.decision_capacity // max(1, policy.rollout_buffer.capacity))
+        * args.max_steps_per_game,
+    )
+    staging_buffer = NativeTrajectoryBuffer(
+        num_envs=args.num_envs,
+        max_steps_per_trajectory=args.max_steps_per_game,
+        decision_capacity_per_env=staging_decision_capacity_per_env,
+        max_options=args.max_options,
+        max_targets_per_option=args.max_targets_per_option,
+        max_cached_choices=policy.max_cached_choices,
+        zone_slot_count=policy.rollout_buffer.slot_card_rows.shape[1],
+        game_info_dim=policy.rollout_buffer.game_info.shape[1],
+        option_scalar_dim=policy.rollout_buffer.option_scalars.shape[2],
+        target_scalar_dim=policy.rollout_buffer.target_scalars.shape[3],
+        recurrent_layers=policy.hidden_layers if policy.use_lstm else 0,
+        recurrent_hidden_dim=policy.hidden_dim if policy.use_lstm else 0,
+    ).to(device)
+    return SlotTrainingBackend(
+        policy=policy,
+        native_encoder=native_encoder,
+        staging_buffer=staging_buffer,
+        batch_pool=batch_pool,
+        batch_workers=batch_workers,
+    )
+
+
 def _current_transcript_snapshot(game: Any) -> tuple[GameStateSnapshot, PendingState]:
     # Native batch rollout advances the engine without updating the Python
     # wrapper's cached state, so refresh before every transcript snapshot.
@@ -357,40 +430,11 @@ def main() -> None:
 
     device = torch.device(args.device)
     torch.set_float32_matmul_precision("high")
-    game_state_encoder = GameStateEncoder.from_embedding_json(args.embeddings, d_model=args.d_model)
-    rollout_capacity = args.rollout_buffer_capacity or max(
-        4096, args.rollout_steps + args.max_steps_per_game * args.num_envs
-    )
-    policy = PPOPolicy(
-        game_state_encoder,
-        hidden_dim=args.hidden_dim,
-        hidden_layers=args.hidden_layers,
-        max_options=args.max_options,
-        max_targets_per_option=args.max_targets_per_option,
-        rollout_capacity=rollout_capacity,
-        use_lstm=args.lstm,
-        spr_enabled=args.spr,
-        spr_action_dim=args.spr_action_dim,
-        spr_ema_decay=args.spr_ema_decay,
-        spr_k=args.spr_k,
-        spr_proj_dim=args.spr_proj_dim,
-        validate=not args.no_validate,
-        compile_forward=args.torch_compile,
-    ).to(device)
-    policy.init_lstm_env_states(args.num_envs)
-    if device.type == "cuda":
-        # Force cuBLAS handle creation before rollout ingestion creates temporary
-        # CUDA copy tensors that PyTorch may hold in its caching allocator.
-        _ = torch.empty((1, 1), device=device) @ torch.empty((1, 1), device=device)
-    batch_workers = max(1, args.batch_workers)
-    batch_pool = (
-        ThreadPoolExecutor(max_workers=batch_workers, thread_name_prefix="mage-batch")
-        if batch_workers > 1
-        else None
-    )
-    native_encoder = ShardedNativeBatchEncoder.for_policy(
-        policy, workers=batch_workers, pool=batch_pool
-    )
+    slot_backend = build_slot_backend(args, device)
+    policy = slot_backend.policy
+    native_encoder = slot_backend.native_encoder
+    staging_buffer = slot_backend.staging_buffer
+    batch_pool = slot_backend.batch_pool
     # Paper §199: R-NaD uses Adam with b1=0.0 (no momentum). This is
     # load-bearing for stability: nonzero b1 lets policy updates accumulate
     # directional drift across batches, which combined with NeuRD's raw-logit
@@ -405,26 +449,6 @@ def main() -> None:
         )
     else:
         optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
-    staging_decision_capacity_per_env = max(
-        1,
-        (policy.rollout_buffer.decision_capacity // max(1, policy.rollout_buffer.capacity))
-        * args.max_steps_per_game,
-    )
-    staging_buffer = NativeTrajectoryBuffer(
-        num_envs=args.num_envs,
-        max_steps_per_trajectory=args.max_steps_per_game,
-        decision_capacity_per_env=staging_decision_capacity_per_env,
-        max_options=args.max_options,
-        max_targets_per_option=args.max_targets_per_option,
-        max_cached_choices=policy.max_cached_choices,
-        zone_slot_count=policy.rollout_buffer.slot_card_rows.shape[1],
-        game_info_dim=policy.rollout_buffer.game_info.shape[1],
-        option_scalar_dim=policy.rollout_buffer.option_scalars.shape[2],
-        target_scalar_dim=policy.rollout_buffer.target_scalars.shape[3],
-        recurrent_layers=policy.hidden_layers if policy.use_lstm else 0,
-        recurrent_hidden_dim=policy.hidden_dim if policy.use_lstm else 0,
-    ).to(device)
-
     checkpoint = load_training_checkpoint(args.checkpoint, map_location=device)
     if checkpoint is not None:
         policy.load_state_dict(checkpoint["policy"])
@@ -434,7 +458,7 @@ def main() -> None:
     mage = importlib.import_module("mage")
     try:
         native_rollout = ShardedNativeRolloutDriver.for_mage(
-            mage, workers=batch_workers, pool=batch_pool
+            mage, workers=slot_backend.batch_workers, pool=batch_pool
         )
     except NativeRolloutUnavailable as exc:
         raise SystemExit(f"native rollout is unavailable: {exc}") from exc

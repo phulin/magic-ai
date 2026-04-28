@@ -47,6 +47,14 @@ from magic_ai.lstm_recompute import (
     lstm_recompute_per_step_states,
 )
 from magic_ai.native_encoder import NativeEncodedBatch
+from magic_ai.replay_decisions import (
+    ReplayPerChoice,
+    decision_logits_reference,
+    flat_decision_distribution,
+    flat_decision_distribution_impl,
+    validate_decision_indices,
+    validate_flat_scored_indices,
+)
 
 TraceKind = Literal[
     "priority",
@@ -1907,7 +1915,7 @@ class PPOPolicy(nn.Module):
                 dynamic=True,
             )
         self._compiled_flat_decision_distribution_impl = torch.compile(
-            PPOPolicy._flat_decision_distribution_impl,
+            flat_decision_distribution_impl,
             dynamic=True,
         )
 
@@ -2066,7 +2074,7 @@ class PPOPolicy(nn.Module):
         query: Tensor,
         none_logits: Tensor,
     ) -> Tensor:
-        return self._decision_logits_reference(
+        return decision_logits_reference(
             step_positions=step_positions,
             option_idx=option_idx,
             target_idx=target_idx,
@@ -2076,6 +2084,7 @@ class PPOPolicy(nn.Module):
             target_vectors=target_vectors,
             query=query,
             none_logits=none_logits,
+            validate=self.validate,
         )
 
     def _decision_logits_reference(
@@ -2091,63 +2100,18 @@ class PPOPolicy(nn.Module):
         query: Tensor,
         none_logits: Tensor,
     ) -> Tensor:
-        """Compute masked logits for a concatenated set of decision groups.
-
-        ``step_positions`` maps each of the ``total_groups`` rows to its
-        position in the minibatch (0..n-1) so the corresponding
-        option_vectors / target_vectors / query / none_logits row is selected.
-        """
-
-        d_model = option_vectors.shape[-1]
-        max_targets = target_vectors.shape[-2]
-
-        self._validate_decision_indices(
+        return decision_logits_reference(
             step_positions=step_positions,
             option_idx=option_idx,
             target_idx=target_idx,
             masks=masks,
             uses_none=uses_none,
-            max_steps=option_vectors.shape[0],
-            max_options=option_vectors.shape[1],
-            max_targets=max_targets,
+            option_vectors=option_vectors,
+            target_vectors=target_vectors,
+            query=query,
+            none_logits=none_logits,
+            validate=True,
         )
-
-        option_idx_clamped = option_idx.clamp(0, option_vectors.shape[1] - 1)
-        target_idx_clamped = target_idx.clamp(0, max_targets - 1)
-        options_for_groups = option_vectors[step_positions]
-        option_gather = torch.gather(
-            options_for_groups,
-            dim=1,
-            index=option_idx_clamped.unsqueeze(-1).expand(-1, -1, d_model),
-        )
-        option_present = (option_idx >= 0).unsqueeze(-1)
-        option_part = torch.where(option_present, option_gather, torch.zeros_like(option_gather))
-
-        targets_for_groups = target_vectors[step_positions]
-        opt_gather = torch.gather(
-            targets_for_groups,
-            dim=1,
-            index=option_idx_clamped.unsqueeze(-1)
-            .unsqueeze(-1)
-            .expand(-1, -1, max_targets, d_model),
-        )
-        target_gather = torch.gather(
-            opt_gather,
-            dim=2,
-            index=target_idx_clamped.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, d_model),
-        ).squeeze(2)
-        target_present = (target_idx >= 0).unsqueeze(-1)
-        target_part = torch.where(target_present, target_gather, torch.zeros_like(target_gather))
-
-        decision_vectors = option_part + target_part
-        query_for_groups = query[step_positions]
-        logits = torch.einsum("gcd,gd->gc", decision_vectors, query_for_groups)
-
-        if uses_none.any():
-            none_for_groups = none_logits[step_positions[uses_none]]
-            logits[uses_none, 0] = none_for_groups
-
-        return logits.masked_fill(~masks, -torch.inf)
 
     @staticmethod
     def _flat_decision_distribution_impl(
@@ -2161,73 +2125,17 @@ class PPOPolicy(nn.Module):
         query: Tensor,
         none_logits: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Compile-friendly body of :meth:`_flat_decision_distribution`.
-
-        Drops the host-side ``.any()`` early-outs (they were forcing CUDA
-        syncs that broke graph capture) and the ``self.validate`` /
-        ``self._validate_flat_scored_indices`` references so this can be
-        ``torch.compile``'d. Empty boolean masks make the index_put / gather
-        ops no-ops, so dropping the early-outs is semantically equivalent.
-        """
-
-        valid = masks.nonzero(as_tuple=False)
-        device = masks.device
-        group_idx = valid[:, 0]
-        choice_cols = valid[:, 1]
-        flat_step_positions = step_positions[group_idx]
-
-        # Force bool dtype: callers may pass uses_none as uint8 (the encoder
-        # stores it as u8); torch.compile's fake-tensor pass rejects uint8
-        # mask indexing even though eager accepts it with a deprecation
-        # warning.
-        is_none = uses_none[group_idx].bool() & (choice_cols == 0)
-        is_scored = ~is_none
-        scored_pos = is_scored.nonzero(as_tuple=False).squeeze(-1)
-        scored_groups = group_idx[scored_pos]
-        scored_steps = flat_step_positions[scored_pos]
-        scored_cols = choice_cols[scored_pos]
-
-        scored_option_idx = option_idx[scored_groups, scored_cols]
-        scored_target_idx = target_idx[scored_groups, scored_cols]
-
-        scored_option_vectors = option_vectors[scored_steps, scored_option_idx]
-        # Build the per-scored-entry target vector functionally: writing into a
-        # zeros tensor with index_put (out-of-place) avoids the in-place
-        # index_put_ that anomaly mode flags.
-        has_target = scored_target_idx >= 0
-        hat_pos = has_target.nonzero(as_tuple=False).squeeze(-1)
-        target_present = target_vectors[
-            scored_steps[hat_pos],
-            scored_option_idx[hat_pos],
-            scored_target_idx[hat_pos],
-        ]
-        scored_target_vectors = torch.zeros_like(scored_option_vectors).index_put(
-            (hat_pos,), target_present
+        return flat_decision_distribution_impl(
+            step_positions,
+            option_idx,
+            target_idx,
+            masks,
+            uses_none,
+            option_vectors,
+            target_vectors,
+            query,
+            none_logits,
         )
-
-        decision_vectors = scored_option_vectors + scored_target_vectors
-        scored_values = (decision_vectors * query[scored_steps]).sum(dim=-1)
-        # Combine the two branches without in-place writes: start from the
-        # full-size none branch (correct on is_none entries) and scatter the
-        # scored values over the is_scored positions.
-        none_full = none_logits[flat_step_positions]
-        flat_logits = none_full.scatter(0, scored_pos, scored_values)
-
-        group_count = step_positions.shape[0]
-        group_max = torch.full((group_count,), -torch.inf, dtype=query.dtype, device=device)
-        group_max.scatter_reduce_(0, group_idx, flat_logits, reduce="amax", include_self=True)
-
-        stabilized = flat_logits - group_max[group_idx]
-        exp_logits = stabilized.exp()
-        group_exp_sum = torch.zeros(group_count, dtype=query.dtype, device=device)
-        group_exp_sum.scatter_add_(0, group_idx, exp_logits)
-        flat_log_probs = stabilized - group_exp_sum[group_idx].log()
-
-        probs = flat_log_probs.exp()
-        group_entropies = torch.zeros(group_count, dtype=query.dtype, device=device)
-        group_entropies.scatter_add_(0, group_idx, -(probs * flat_log_probs))
-
-        return group_idx, choice_cols, flat_logits, flat_log_probs, group_entropies
 
     def _flat_decision_distribution(
         self,
@@ -2244,41 +2152,19 @@ class PPOPolicy(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Return flat valid-choice logits plus grouped log-probs/entropies."""
 
-        valid = masks.nonzero(as_tuple=False)
-        if valid.numel() == 0:
-            raise ValueError("decision groups must include at least one valid choice")
-
-        if self.validate:
-            group_idx_v = valid[:, 0]
-            choice_cols_v = valid[:, 1]
-            is_none_v = uses_none[group_idx_v] & (choice_cols_v == 0)
-            is_scored_v = ~is_none_v
-            scored_groups_v = group_idx_v[is_scored_v]
-            scored_cols_v = choice_cols_v[is_scored_v]
-            scored_steps_v = step_positions[group_idx_v][is_scored_v]
-            self._validate_flat_scored_indices(
-                scored_groups=scored_groups_v,
-                scored_cols=scored_cols_v,
-                scored_steps=scored_steps_v,
-                scored_option_idx=option_idx[scored_groups_v, scored_cols_v],
-                scored_target_idx=target_idx[scored_groups_v, scored_cols_v],
-                max_steps=option_vectors.shape[0],
-                max_options=option_vectors.shape[1],
-                max_targets=target_vectors.shape[2],
-            )
-
         self._maybe_init_compiled_functions()
-        fn = self._compiled_flat_decision_distribution_impl or self._flat_decision_distribution_impl
-        return fn(
-            step_positions,
-            option_idx,
-            target_idx,
-            masks,
-            uses_none,
-            option_vectors,
-            target_vectors,
-            query,
-            none_logits,
+        return flat_decision_distribution(
+            step_positions=step_positions,
+            option_idx=option_idx,
+            target_idx=target_idx,
+            masks=masks,
+            uses_none=uses_none,
+            option_vectors=option_vectors,
+            target_vectors=target_vectors,
+            query=query,
+            none_logits=none_logits,
+            validate=self.validate,
+            compiled_fn=self._compiled_flat_decision_distribution_impl,
         )
 
     @staticmethod
@@ -2293,26 +2179,15 @@ class PPOPolicy(nn.Module):
         max_options: int,
         max_targets: int,
     ) -> None:
-        bad = (
-            (scored_steps < 0)
-            | (scored_steps >= max_steps)
-            | (scored_option_idx < 0)
-            | (scored_option_idx >= max_options)
-            | (scored_target_idx >= max_targets)
-        )
-        if not bad.any():
-            return
-
-        bad_pos = int(bad.nonzero(as_tuple=False)[0, 0].item())
-        group = int(scored_groups[bad_pos].item())
-        col = int(scored_cols[bad_pos].item())
-        step = int(scored_steps[bad_pos].item())
-        option = int(scored_option_idx[bad_pos].item())
-        target = int(scored_target_idx[bad_pos].item())
-        raise ValueError(
-            "invalid decision gather index: "
-            f"group={group} col={col} step={step} option={option} target={target} "
-            f"bounds=(steps={max_steps}, options={max_options}, targets={max_targets})"
+        validate_flat_scored_indices(
+            scored_groups=scored_groups,
+            scored_cols=scored_cols,
+            scored_steps=scored_steps,
+            scored_option_idx=scored_option_idx,
+            scored_target_idx=scored_target_idx,
+            max_steps=max_steps,
+            max_options=max_options,
+            max_targets=max_targets,
         )
 
     @staticmethod
@@ -2327,23 +2202,12 @@ class PPOPolicy(nn.Module):
         max_options: int,
         max_targets: int,
     ) -> None:
-        valid = masks.nonzero(as_tuple=False)
-        if valid.numel() == 0:
-            return
-        groups = valid[:, 0]
-        cols = valid[:, 1]
-        scored = ~(uses_none[groups] & cols.eq(0))
-        if not scored.any():
-            return
-        scored_groups = groups[scored]
-        scored_cols = cols[scored]
-        scored_steps = step_positions[scored_groups]
-        PPOPolicy._validate_flat_scored_indices(
-            scored_groups=scored_groups,
-            scored_cols=scored_cols,
-            scored_steps=scored_steps,
-            scored_option_idx=option_idx[scored_groups, scored_cols],
-            scored_target_idx=target_idx[scored_groups, scored_cols],
+        validate_decision_indices(
+            step_positions=step_positions,
+            option_idx=option_idx,
+            target_idx=target_idx,
+            masks=masks,
+            uses_none=uses_none,
             max_steps=max_steps,
             max_options=max_options,
             max_targets=max_targets,
@@ -2697,56 +2561,6 @@ class _ForwardBatch:
     option_vectors: Tensor
     target_vectors: Tensor
     hidden: Tensor
-
-
-@dataclass(frozen=True)
-class ReplayPerChoice:
-    """Per-choice decision-group tensors from ``evaluate_replay_batch_per_choice``.
-
-    Lets the R-NaD trainer apply the full per-action NeuRD loss (paper
-    §188) rather than the sampled-action policy-gradient estimator.
-
-    ``flat_logits`` and ``flat_log_probs`` are concatenated across all
-    decision groups in all batch rows. ``group_idx`` maps each flat entry
-    to its **step index** in the original replay batch (i.e., the same
-    indexing space as ``values``), so downstream code can align per-step
-    v-trace targets with per-choice logits in one lookup. ``choice_cols``
-    is the original decision-choice index (0..max_cached_choices) for
-    each flat entry. ``is_sampled_flat`` is a boolean mask over the same
-    flat axis as ``flat_logits``: it is ``True`` at exactly the cells
-    whose ``(decision-group, choice_col)`` pair was sampled at rollout
-    time. For multi-decision-group steps this preserves the per-group
-    sampled identity (one ``True`` per decision group), which a single
-    per-step column cannot represent.
-
-    ``may_is_active`` is a boolean mask of shape ``(n,)`` flagging steps
-    whose action came from the Bernoulli may head rather than a
-    decision group; the per-step sampled-action log-prob for those
-    steps lives in the ``log_probs`` return value of
-    :meth:`evaluate_replay_batch_per_choice` (alongside the scalar
-    decision-group log-probs). The full-NeuRD trajectory update uses
-    this mask to apply sampled-action NeuRD to the may head on may
-    steps, since the may head is a 1-logit Bernoulli and ``flat_logits``
-    only covers decision-group choices.
-    """
-
-    flat_logits: Tensor
-    flat_log_probs: Tensor
-    group_idx: Tensor
-    choice_cols: Tensor
-    is_sampled_flat: Tensor
-    may_is_active: Tensor
-    may_logits_per_step: Tensor
-    may_selected_per_step: Tensor
-    # Per-flat-entry, the index of the decision group it belongs to (unique
-    # across the whole batch — multiple decision groups in the same step get
-    # distinct values, unlike ``group_idx`` which maps to step index). Length
-    # = total number of decision groups in the batch.
-    decision_group_id_flat: Tensor
-    # Per-decision-group, the batch step index it lives in. Length = total
-    # number of decision groups in the batch. ``group_idx[f] = step_for_flat[
-    # decision_group_id_flat[f]]`` by construction.
-    step_for_decision_group: Tensor
 
 
 @dataclass(frozen=True)
