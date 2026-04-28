@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, cast
 
@@ -323,6 +323,46 @@ class PPOPolicy(nn.Module):
             clone.live_lstm_h = empty_h.to(clone.live_lstm_h.device)
             clone.live_lstm_c = empty_c.to(clone.live_lstm_c.device)
         return clone
+
+    def count_active_replay_steps(
+        self,
+        per_episode_replay_rows: Sequence[Sequence[int]],
+    ) -> tuple[int, int]:
+        """Compute R-NaD ``(cl_count, pl_count)`` totals from rollout-buffer fields.
+
+        Mirrors the counts that :func:`magic_ai.rnad.rnad_trajectory_loss`
+        accumulates by summing each per-episode loss helper's ``count``
+        return across both ``own_idx`` perspectives. See
+        :class:`RNaDTrainablePolicy.count_active_replay_steps` for the
+        contract.
+        """
+
+        if not per_episode_replay_rows:
+            return 0, 0
+
+        rb = self.rollout_buffer
+        flat_rows: list[int] = [r for ep in per_episode_replay_rows for r in ep]
+        device = rb.trace_kind_id.device
+        step_indices = torch.tensor(flat_rows, dtype=torch.long, device=device)
+        cl_count_total = int(step_indices.numel())
+        trace_kind = rb.trace_kind_id[step_indices]
+        may_count_total = int((trace_kind == TRACE_KIND_TO_ID["may"]).sum().item())
+
+        decision_starts = rb.decision_start[step_indices]
+        decision_counts = rb.decision_count[step_indices]
+        active_mask = decision_counts > 0
+        flat_count_total = 0
+        if active_mask.any():
+            pos_t = active_mask.nonzero(as_tuple=False).squeeze(-1)
+            active_counts = decision_counts[pos_t]
+            max_count = int(active_counts.max().item())
+            offsets = torch.arange(max_count, dtype=torch.long, device=device).unsqueeze(0)
+            expanded_offsets = offsets.expand(pos_t.shape[0], -1)
+            valid_offsets = expanded_offsets < active_counts.unsqueeze(1)
+            idx_t = (decision_starts[pos_t].unsqueeze(1) + offsets)[valid_offsets]
+            flat_count_total = int(rb.decision_mask[idx_t].sum().item())
+
+        return cl_count_total, may_count_total + flat_count_total
 
     def init_lstm_env_states(self, num_envs: int) -> None:
         if not self.use_lstm:

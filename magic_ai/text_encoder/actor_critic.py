@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import copy
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -82,6 +83,56 @@ class TextActorCritic(nn.Module):
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
+
+    def clone_for_rnad(self) -> TextActorCritic:
+        """Deep-copy parameter state, share the replay buffer.
+
+        See :meth:`magic_ai.training_interfaces.RNaDTrainablePolicy.clone_for_rnad`
+        for the contract. Live per-env LSTM cache is reset on the clone since
+        target/reg policies never sample from a live env.
+        """
+
+        original_buffer = self.rollout_buffer
+        self.rollout_buffer = None
+        try:
+            clone = copy.deepcopy(self)
+        finally:
+            self.rollout_buffer = original_buffer
+        clone.rollout_buffer = original_buffer
+        clone._num_envs = 0
+        clone._players_per_env = self._players_per_env
+        clone.live_lstm_h = torch.zeros(
+            self.lstm_layers, 0, self.lstm_hidden, dtype=torch.float32, device=clone.device
+        )
+        clone.live_lstm_c = torch.zeros_like(clone.live_lstm_h)
+        return clone
+
+    def count_active_replay_steps(
+        self,
+        per_episode_replay_rows: Sequence[Sequence[int]],
+    ) -> tuple[int, int]:
+        """Compute R-NaD ``(cl_count, pl_count)`` totals from text replay rows.
+
+        TextReplayBuffer stores decisions as ``(capacity, max_decision_groups,
+        max_cached_choices)`` per step (no flat ``decision_start`` table), so
+        the per-choice count is just the active-cell sum of ``decision_mask``
+        over the selected rows.
+        """
+
+        if not per_episode_replay_rows:
+            return 0, 0
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+
+        rb = self.rollout_buffer
+        flat_rows: list[int] = [r for ep in per_episode_replay_rows for r in ep]
+        device = rb.trace_kind_id.device
+        step_indices = torch.tensor(flat_rows, dtype=torch.long, device=device)
+        cl_count_total = int(step_indices.numel())
+        trace_kind = rb.trace_kind_id[step_indices]
+        may_count_total = int((trace_kind == TRACE_KIND_TO_ID["may"]).sum().item())
+        flat_count_total = int(rb.decision_mask[step_indices].sum().item())
+        return cl_count_total, may_count_total + flat_count_total
 
     def init_lstm_env_states(self, num_envs: int, *, players_per_env: int = 2) -> None:
         if num_envs < 1:
@@ -297,12 +348,15 @@ class TextActorCritic(nn.Module):
         lstm_state_override: tuple[Tensor, Tensor] | None = None,
         hidden_override: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice]:
-        if hidden_override is not None:
-            raise ValueError("TextActorCritic does not support hidden_override")
         if self.rollout_buffer is None:
             raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
         batch = self.rollout_buffer.gather(replay_rows)
-        if lstm_state_override is not None:
+        if hidden_override is not None:
+            output, _state = self.policy(
+                batch.encoded,
+                state_hidden_override=hidden_override.to(self.device),
+            )
+        elif lstm_state_override is not None:
             output, _state = self.policy(
                 batch.encoded,
                 h_in=lstm_state_override[0],

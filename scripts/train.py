@@ -740,6 +740,7 @@ def train_selected_backend(
                 native_rollout,
                 text_backend.native_encoder,
                 resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
+                resume_checkpoint=checkpoint_cpu,
             )
         else:
             resume_state, rnad_state = train_text_envs(
@@ -1198,8 +1199,8 @@ def validate_args(args: argparse.Namespace) -> None:
     if getattr(args, "render_plan_capacity", 1) < 1:
         raise ValueError("--render-plan-capacity must be at least 1")
     if getattr(args, "encoder", "slots") == "text":
-        if args.trainer != "ppo":
-            raise ValueError("--encoder text currently supports --trainer ppo only")
+        if args.trainer == "rnad" and not getattr(args, "native_render_plan", False):
+            raise ValueError("--encoder text --trainer rnad requires --native-render-plan")
         args.spr = False
     if args.torch_compile and not args.no_validate:
         raise ValueError("--torch-compile requires --no-validate")
@@ -2190,6 +2191,7 @@ def sample_native_text_policy_batch(
     env_indices: list[int],
     perspective_player_indices: list[int],
     deterministic: bool = False,
+    sampling_policy: TextActorCritic | None = None,
 ) -> list[Any]:
     if native_batch.render_plan is None or native_batch.render_plan_lengths is None:
         raise NativeEncodingError("native encoder did not return render plans")
@@ -2233,7 +2235,8 @@ def sample_native_text_policy_batch(
             )
         )
 
-    return backend.policy.sample_text_batch(
+    actor = sampling_policy if sampling_policy is not None else backend.policy
+    return actor.sample_text_batch(
         encoded,
         env_indices=env_indices,
         perspective_player_indices=perspective_player_indices,
@@ -2252,7 +2255,8 @@ def train_text_native_batched_envs(
     native_encoder: ShardedNativeBatchEncoder,
     *,
     resume_state: TrainingResumeState | None = None,
-) -> tuple[TrainingResumeState, None]:
+    resume_checkpoint: dict[str, Any] | None = None,
+) -> tuple[TrainingResumeState, RNaDTrainerState | None]:
     if not native_encoder.is_available:
         raise SystemExit("native text rollout requires MageEncodeBatch")
 
@@ -2268,9 +2272,36 @@ def train_text_native_batched_envs(
 
     pending_steps: list[RolloutStep] = []
     pending_returns: list[torch.Tensor] = []
+    pending_episodes: list[EpisodeBatch] = []
+    rnad_state: RNaDTrainerState | None = None
+    if args.trainer == "rnad":
+        rnad_state = build_trainer_state(
+            backend.policy,
+            config=RNaDConfig(
+                eta=args.rnad_eta,
+                delta_m=args.rnad_delta_m,
+                num_outer_iterations=args.rnad_m,
+                neurd_beta=args.rnad_neurd_beta,
+                neurd_clip=args.rnad_neurd_clip,
+                target_ema_gamma=args.rnad_target_ema,
+                finetune_eps=args.rnad_finetune_eps,
+                finetune_n_disc=args.rnad_finetune_ndisc,
+                learning_rate=args.learning_rate,
+                q_corr_rho_bar=args.rnad_q_corr_rho_bar,
+                bptt_chunk_size=args.rnad_bptt_chunk_size,
+                step_minibatch_size=args.minibatch_size,
+            ),
+            reg_snapshot_dir=args.output.parent / "rnad",
+            device=backend.policy.device,
+        )
+        _restore_rnad_state(rnad_state, resume_checkpoint)
+        cast(TextActorCritic, rnad_state.target).init_lstm_env_states(args.num_envs)
     win_stats = WinFractionStats()
     backend.replay_buffer.reset()
     backend.policy.init_lstm_env_states(args.num_envs)
+    sampling_policy: TextActorCritic = (
+        cast(TextActorCritic, rnad_state.target) if rnad_state is not None else backend.policy
+    )
     next_episode_idx = completed_games
     live_games: list[LiveGame] = []
     free_slots = list(range(args.num_envs - 1, -1, -1))
@@ -2288,6 +2319,8 @@ def train_text_native_batched_envs(
 
     def start_game(slot_idx: int, episode_idx: int) -> LiveGame:
         backend.policy.reset_lstm_env_states([slot_idx])
+        if sampling_policy is not backend.policy:
+            sampling_policy.reset_lstm_env_states([slot_idx])
         seed = args.seed + episode_idx
         deck_a, deck_b = sample_decks(deck_pool, seed)
         return LiveGame(
@@ -2332,6 +2365,13 @@ def train_text_native_batched_envs(
                         draw_penalty=args.draw_penalty,
                     )
                 )
+                if rnad_state is not None:
+                    pending_episodes.append(
+                        EpisodeBatch(
+                            steps=list(env.episode_steps),
+                            winner_idx=int(winner_idx),
+                        )
+                    )
                 total_generated_rollout_steps += len(env.episode_steps)
             free_slots.append(env.slot_idx)
             if winner_idx == 0:
@@ -2348,37 +2388,72 @@ def train_text_native_batched_envs(
             return
         rollout_returns = torch.cat(pending_returns)
         rollout_step_count = len(pending_steps)
-        stats = ppo_update(
-            backend.policy,
-            optimizer,
-            pending_steps,
-            rollout_returns,
-            epochs=args.ppo_epochs,
-            minibatch_size=args.minibatch_size,
-            clip_epsilon=args.clip_epsilon,
-            value_coef=args.value_coef,
-            entropy_coef=args.entropy_coef,
-            max_grad_norm=args.max_grad_norm,
-            spr_coef=0.0,
-        )
+        if rnad_state is not None and pending_episodes:
+            stats = run_rnad_update(
+                backend.policy,
+                optimizer,
+                rnad_state,
+                pending_episodes,
+            )
+            trainer_label = "rnad,text,native"
+        else:
+            stats = ppo_update(
+                backend.policy,
+                optimizer,
+                pending_steps,
+                rollout_returns,
+                epochs=args.ppo_epochs,
+                minibatch_size=args.minibatch_size,
+                clip_epsilon=args.clip_epsilon,
+                value_coef=args.value_coef,
+                entropy_coef=args.entropy_coef,
+                max_grad_norm=args.max_grad_norm,
+                spr_coef=0.0,
+            )
+            trainer_label = "ppo,text,native"
         now = time.monotonic()
         elapsed = now - last_step_time
         last_step_time = now
-        print(
+        fields = [
             cli_step_prefix(),
-            "final_update[ppo,text,native]" if final else "update[ppo,text,native]",
+            f"final_update[{trainer_label}]" if final else f"update[{trainer_label}]",
             f"games={completed_games}",
             f"steps={rollout_step_count}",
             f"dt={elapsed:.1f}s",
             f"loss={stats.loss:.4f}",
             f"policy={stats.policy_loss:.4f}",
             f"value={stats.value_loss:.4f}",
-            f"entropy={stats.entropy:.4f}",
-            f"kl={stats.approx_kl:.4f}",
-            f"clip={stats.clip_fraction:.3f}",
-            flush=True,
-        )
+        ]
+        if rnad_state is None:
+            fields.extend(
+                [
+                    f"entropy={stats.entropy:.4f}",
+                    f"kl={stats.approx_kl:.4f}",
+                    f"clip={stats.clip_fraction:.3f}",
+                ]
+            )
+        else:
+            fields.append(f"rnad_m={rnad_state.outer_iteration}")
+        print(*fields, flush=True)
         total_rollout_steps += rollout_step_count
+        value_metrics = rollout_value_metrics(pending_steps, rollout_returns)
+        if rnad_state is not None and rnad_state.last_stats:
+            rs = rnad_state.last_stats[0]
+            value_metrics.update(
+                {
+                    "rnad/sampled_log_ratio_mean": rs.sampled_log_ratio_mean,
+                    "rnad/sampled_log_ratio_absmax": rs.sampled_log_ratio_absmax,
+                    "rnad/is_bias_up_mean": rs.is_bias_up_mean,
+                    "rnad/is_bias_down_mean": rs.is_bias_down_mean,
+                    "rnad/v_target_reg_share": rs.v_target_reg_share,
+                    "rnad/q_clip_fraction": rs.q_clip_fraction,
+                    "rnad/v_hat_mean": rs.v_hat_mean,
+                    "rnad/transformed_reward_mean": rs.transformed_reward_mean,
+                    "rnad/grad_norm": rs.grad_norm,
+                    "rnad/outer_iteration": rnad_state.outer_iteration,
+                    "rnad/gradient_step": rnad_state.gradient_step,
+                }
+            )
         log_ppo_stats(
             stats,
             games=completed_games,
@@ -2386,13 +2461,14 @@ def train_text_native_batched_envs(
             total_rollout_steps=total_rollout_steps,
             total_generated_rollout_steps=total_generated_rollout_steps,
             win_stats=win_stats,
-            value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
+            value_metrics=value_metrics,
             log_fn=tracked_wandb_log,
             run_active=True,
         )
         backend.replay_buffer.reset()
         pending_steps.clear()
         pending_returns.clear()
+        pending_episodes.clear()
         win_stats.reset()
 
     maybe_start_games()
@@ -2433,6 +2509,7 @@ def train_text_native_batched_envs(
                     env_indices=ready_env_indices,
                     perspective_player_indices=ready_players,
                     deterministic=args.deterministic_rollout,
+                    sampling_policy=sampling_policy,
                 )
             counts = [len(s.selected_choice_cols) for s in policy_steps]
             starts: list[int] = list(itertools.accumulate(counts, initial=0))[:-1]
@@ -2473,7 +2550,7 @@ def train_text_native_batched_envs(
             total_generated_rollout_steps=total_generated_rollout_steps,
             total_wandb_logs=total_wandb_logs,
         ),
-        None,
+        rnad_state,
     )
 
 

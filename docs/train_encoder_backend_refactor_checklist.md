@@ -156,7 +156,7 @@ Goal: wire the text/render-plan encoder into `scripts/train.py` as an option wit
   - [x] run selected trainer update
   - [x] save checkpoint
   - [x] log metrics
-  - `main()` now dispatches through `train_selected_backend(...)` and uses one final checkpoint-save path. Text PPO still uses the separate Python correctness collector internally; R-NaD remains slot-only in `train.py`.
+  - `main()` now dispatches through `train_selected_backend(...)` and uses one final checkpoint-save path. Both PPO and R-NaD route through the native batched text rollout when `--native-render-plan` is set; the Python single-slot collector remains as a slow PPO fallback. `--encoder text --trainer rnad` requires `--native-render-plan`.
 - [x] Save checkpoint metadata including:
   - [x] encoder kind
   - [x] text config when `encoder=text`

@@ -8,12 +8,10 @@ different buffers and encoders.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any, Protocol
 
 from torch import Tensor, nn
-
-from magic_ai.buffer import RolloutBuffer
 
 
 class PPOReplayPolicy(Protocol):
@@ -70,12 +68,24 @@ class RNaDReplayPolicy(Protocol):
 class RNaDTrainablePolicy(RNaDReplayPolicy, Protocol):
     """Online R-NaD policy surface used by the trainer orchestration."""
 
-    rollout_buffer: RolloutBuffer
-
     def evaluate_replay_batch(
         self,
         replay_rows: list[int],
     ) -> tuple[Tensor, Tensor, Tensor, Any]: ...
+
+    def count_active_replay_steps(
+        self,
+        per_episode_replay_rows: Sequence[Sequence[int]],
+    ) -> tuple[int, int]:
+        """Return ``(cl_count, pl_count)`` totals for the given replay rows.
+
+        ``cl_count`` is the total replay-step count (paper §164 critic-loss
+        normalizer). ``pl_count`` is the may-active step count plus the total
+        number of valid (decision-group, choice-column) cells across active
+        decision groups (NeuRD policy-loss normalizer). Backends compute this
+        from their own replay-buffer layout.
+        """
+        ...
 
     def named_parameters(
         self,

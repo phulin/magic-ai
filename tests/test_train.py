@@ -957,7 +957,7 @@ class TrainPPOTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--gae-lambda must be in \\[0, 1\\]"):
             validate_args(args)
 
-    def test_validate_args_allows_text_ppo_but_rejects_text_rnad(self) -> None:
+    def test_validate_args_text_rnad_requires_native_render_plan(self) -> None:
         args = Namespace(
             episodes=1,
             num_envs=1,
@@ -976,12 +976,13 @@ class TrainPPOTests(unittest.TestCase):
             encoder="text",
             trainer="ppo",
             spr=True,
+            native_render_plan=False,
         )
 
         validate_args(args)
         self.assertFalse(args.spr)
         args.trainer = "rnad"
-        with self.assertRaisesRegex(ValueError, "supports --trainer ppo only"):
+        with self.assertRaisesRegex(ValueError, "requires --native-render-plan"):
             validate_args(args)
 
 

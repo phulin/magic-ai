@@ -37,8 +37,6 @@ from typing import cast
 import torch
 from torch import nn
 
-from magic_ai.buffer import RolloutBuffer
-from magic_ai.model import TRACE_KIND_TO_ID
 from magic_ai.ppo import PPOStats, RolloutStep
 from magic_ai.rnad import (
     RNaDConfig,
@@ -172,56 +170,6 @@ def _advance_outer_iteration(state: RNaDTrainerState) -> None:
         state.is_finetuning = True
 
 
-def _count_active_steps(
-    rb: RolloutBuffer,
-    per_episode_replay_rows: Sequence[Sequence[int]],
-) -> tuple[int, int]:
-    """Compute the issue-7 ``cl_count`` / ``pl_count`` normalizer totals from
-    rollout-buffer fields alone -- no policy forward required.
-
-    Mirrors the counts that :func:`rnad_trajectory_loss` would accumulate by
-    summing each per-episode loss helper's ``count`` return value across
-    both ``own_idx`` perspectives:
-
-    - ``cl_count`` = ``critic_loss`` count summed over ``own_idx`` =
-      total number of (step, perspective) pairs where ``perspective ==
-      own_idx``. Since every step has exactly one perspective in
-      ``{0, 1}``, this collapses to the total replay-step count.
-    - ``pl_count`` = ``may_neurd_loss`` count + ``neurd_loss_per_choice``
-      count, both summed over ``own_idx``. The may count collapses to
-      the total number of may-active steps in the batch; the per-choice
-      count collapses to the total number of valid (decision-group,
-      choice-column) cells across all active decision-group entries
-      (``rb.decision_mask[idx_t].sum()``).
-    """
-
-    if not per_episode_replay_rows:
-        return 0, 0
-
-    flat_rows: list[int] = [r for ep in per_episode_replay_rows for r in ep]
-    device = rb.trace_kind_id.device
-    step_indices = torch.tensor(flat_rows, dtype=torch.long, device=device)
-    cl_count_total = int(step_indices.numel())
-    trace_kind = rb.trace_kind_id[step_indices]
-    may_count_total = int((trace_kind == TRACE_KIND_TO_ID["may"]).sum().item())
-
-    decision_starts = rb.decision_start[step_indices]
-    decision_counts = rb.decision_count[step_indices]
-    active_mask = decision_counts > 0
-    flat_count_total = 0
-    if active_mask.any():
-        pos_t = active_mask.nonzero(as_tuple=False).squeeze(-1)
-        active_counts = decision_counts[pos_t]
-        max_count = int(active_counts.max().item())
-        offsets = torch.arange(max_count, dtype=torch.long, device=device).unsqueeze(0)
-        expanded_offsets = offsets.expand(pos_t.shape[0], -1)
-        valid_offsets = expanded_offsets < active_counts.unsqueeze(1)
-        idx_t = (decision_starts[pos_t].unsqueeze(1) + offsets)[valid_offsets]
-        flat_count_total = int(rb.decision_mask[idx_t].sum().item())
-
-    return cl_count_total, may_count_total + flat_count_total
-
-
 def run_rnad_update(
     policy: RNaDTrainablePolicy,
     optimizer: torch.optim.Optimizer,
@@ -278,8 +226,7 @@ def run_rnad_update(
     if not per_episode_replay_rows:
         raise ValueError("no non-empty episodes to update on")
 
-    cl_count_total, pl_count_total = _count_active_steps(
-        policy.rollout_buffer,
+    cl_count_total, pl_count_total = policy.count_active_replay_steps(
         per_episode_replay_rows,
     )
 
@@ -339,7 +286,7 @@ def run_rnad_update(
     # ``rnad_batched_trajectory_loss`` runs each policy's LSTM scan and
     # per-choice forward once per chunk (4 forwards per chunk instead of
     # 4 × n_episodes_per_chunk). Each chunk's loss is normalized by the
-    # *global* cl/pl counts from ``_count_active_steps`` and backwarded
+    # *global* cl/pl counts from ``count_active_replay_steps`` and backwarded
     # independently so activations free between chunks; gradients
     # accumulate across chunks and a single ``optimizer.step()`` runs
     # at the end. With ``episode_minibatch_size <= 0`` (default) the

@@ -77,9 +77,9 @@ class TrainerStateTests(unittest.TestCase):
             )
             self.assertTrue((Path(tmp) / "reg_m000.pt").exists())
             # target/regs share the buffer with online.
-            self.assertIs(state.target.rollout_buffer, policy.rollout_buffer)
-            self.assertIs(state.reg_cur.rollout_buffer, policy.rollout_buffer)
-            self.assertIs(state.reg_prev.rollout_buffer, policy.rollout_buffer)
+            self.assertIs(cast(PPOPolicy, state.target).rollout_buffer, policy.rollout_buffer)
+            self.assertIs(cast(PPOPolicy, state.reg_cur).rollout_buffer, policy.rollout_buffer)
+            self.assertIs(cast(PPOPolicy, state.reg_prev).rollout_buffer, policy.rollout_buffer)
             for p in state.target.parameters():
                 self.assertFalse(p.requires_grad)
             for p in state.reg_cur.parameters():

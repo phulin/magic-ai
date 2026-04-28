@@ -88,6 +88,8 @@ class RecurrentTextPolicy(nn.Module):
         batch: TextEncodedBatch,
         h_in: Tensor | None = None,
         c_in: Tensor | None = None,
+        *,
+        state_hidden_override: Tensor | None = None,
     ) -> tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]]:
         encoded = self.text_policy.encode_only(batch)
 
@@ -96,11 +98,24 @@ class RecurrentTextPolicy(nn.Module):
         if h_in is None or c_in is None:
             h_in, c_in = self.init_state(b, device)
 
-        # Treat each forward as a single time step. Multi-step support (T > 1)
-        # can be added by accepting [B, T, ...] inputs and looping/scanning.
-        x = self.in_proj(encoded.state_vector).unsqueeze(1)  # [B, 1, lstm_hidden]
-        y, (h_out, c_out) = self.lstm(x, (h_in, c_in))
-        state_hidden = y.squeeze(1)  # [B, lstm_hidden]
+        if state_hidden_override is not None:
+            # R-NaD recomputes the LSTM hidden states once per policy across the
+            # whole batch, then asks each policy to score with those hiddens —
+            # skip the per-step LSTM here and consume the override directly.
+            if state_hidden_override.shape != (b, self.lstm_hidden):
+                raise ValueError(
+                    "state_hidden_override must have shape "
+                    f"({b}, {self.lstm_hidden}); got {tuple(state_hidden_override.shape)}"
+                )
+            state_hidden = state_hidden_override
+            h_out, c_out = h_in, c_in
+        else:
+            # Treat each forward as a single time step. Multi-step support
+            # (T > 1) can be added by accepting [B, T, ...] inputs and
+            # looping/scanning.
+            x = self.in_proj(encoded.state_vector).unsqueeze(1)  # [B, 1, lstm_hidden]
+            y, (h_out, c_out) = self.lstm(x, (h_in, c_in))
+            state_hidden = y.squeeze(1)  # [B, lstm_hidden]
 
         # Project back to d_model so the heads (built around d_model) consume
         # the LSTM output in place of the pooled state vector.

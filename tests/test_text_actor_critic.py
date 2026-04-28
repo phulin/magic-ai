@@ -334,6 +334,181 @@ class TextActorCriticTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "equal length"):
             model.lstm_env_state_inputs([0], [0, 1])
 
+    def test_clone_for_rnad_shares_replay_buffer(self) -> None:
+        model = _model()
+        replay = TextReplayBuffer(
+            capacity=4,
+            max_tokens=4,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            recurrent_layers=1,
+            recurrent_hidden_dim=8,
+        )
+        model.rollout_buffer = replay
+        model.init_lstm_env_states(2)
+
+        clone = model.clone_for_rnad()
+        self.assertIs(clone.rollout_buffer, replay)
+        self.assertEqual(tuple(clone.live_lstm_h.shape), (1, 0, 8))
+        self.assertEqual(tuple(clone.live_lstm_c.shape), (1, 0, 8))
+        # Parameter independence.
+        with torch.no_grad():
+            clone.none_head.weight.fill_(0.5)
+        self.assertFalse(torch.equal(model.none_head.weight, clone.none_head.weight))
+
+    def test_run_rnad_update_on_text_policy(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        import torch.optim as optim
+        from magic_ai.ppo import RolloutStep
+        from magic_ai.rnad import RNaDConfig
+        from magic_ai.rnad_trainer import EpisodeBatch, build_trainer_state, run_rnad_update
+
+        torch.manual_seed(0)
+        model = _model()
+        replay = TextReplayBuffer(
+            capacity=8,
+            max_tokens=4,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            recurrent_layers=1,
+            recurrent_hidden_dim=8,
+        )
+        model.rollout_buffer = replay
+        rows: list[int] = []
+        # All rows use batch_index=0 so both decision options are unmasked
+        # (batch row 1 only has one valid option in the test fixture).
+        for perspective in (0, 1, 0, 1):
+            rows.append(
+                replay.append(
+                    encoded=_batch(batch_size=2),
+                    batch_index=0,
+                    trace_kind_id=0,
+                    decision_option_idx=torch.tensor([[0, 1]]),
+                    decision_target_idx=torch.tensor([[-1, -1]]),
+                    decision_mask=torch.tensor([[True, True]]),
+                    uses_none_head=torch.tensor([False]),
+                    selected_indices=torch.tensor([1]),
+                    may_selected=0.0,
+                    old_log_prob=-0.5,
+                    value=0.0,
+                    perspective_player_idx=perspective,
+                    lstm_h_in=torch.zeros(1, 8),
+                    lstm_c_in=torch.zeros(1, 8),
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = build_trainer_state(
+                model,
+                config=RNaDConfig(delta_m=2, num_outer_iterations=1),
+                reg_snapshot_dir=Path(tmp),
+                device=model.device,
+            )
+            optimizer = optim.Adam(model.parameters(), lr=1e-3)
+            episodes = [
+                EpisodeBatch(
+                    steps=[
+                        RolloutStep(
+                            perspective_player_idx=0,
+                            old_log_prob=-0.5,
+                            value=0.0,
+                            replay_idx=rows[0],
+                        ),
+                        RolloutStep(
+                            perspective_player_idx=1,
+                            old_log_prob=-0.5,
+                            value=0.0,
+                            replay_idx=rows[1],
+                        ),
+                    ],
+                    winner_idx=0,
+                ),
+                EpisodeBatch(
+                    steps=[
+                        RolloutStep(
+                            perspective_player_idx=0,
+                            old_log_prob=-0.5,
+                            value=0.0,
+                            replay_idx=rows[2],
+                        ),
+                        RolloutStep(
+                            perspective_player_idx=1,
+                            old_log_prob=-0.5,
+                            value=0.0,
+                            replay_idx=rows[3],
+                        ),
+                    ],
+                    winner_idx=1,
+                ),
+            ]
+            stats = run_rnad_update(model, optimizer, state, episodes)
+
+        import math
+
+        self.assertTrue(math.isfinite(stats.loss))
+        self.assertTrue(math.isfinite(stats.policy_loss))
+        self.assertTrue(math.isfinite(stats.value_loss))
+
+    def test_count_active_replay_steps(self) -> None:
+        model = _model()
+        replay = TextReplayBuffer(
+            capacity=4,
+            max_tokens=4,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            recurrent_layers=1,
+            recurrent_hidden_dim=8,
+        )
+        model.rollout_buffer = replay
+        row_priority = replay.append(
+            encoded=_batch(batch_size=1),
+            batch_index=0,
+            trace_kind_id=0,  # priority
+            decision_option_idx=torch.tensor([[0, 1]]),
+            decision_target_idx=torch.tensor([[-1, -1]]),
+            decision_mask=torch.tensor([[True, True]]),
+            uses_none_head=torch.tensor([False]),
+            selected_indices=torch.tensor([0]),
+            may_selected=0.0,
+            old_log_prob=-0.5,
+            value=0.1,
+            perspective_player_idx=0,
+            lstm_h_in=torch.zeros(1, 8),
+            lstm_c_in=torch.zeros(1, 8),
+        )
+        from magic_ai.model import TRACE_KIND_TO_ID
+
+        row_may = replay.append(
+            encoded=_batch(batch_size=1),
+            batch_index=0,
+            trace_kind_id=TRACE_KIND_TO_ID["may"],
+            decision_option_idx=torch.tensor([[-1, -1]]),
+            decision_target_idx=torch.tensor([[-1, -1]]),
+            decision_mask=torch.tensor([[False, False]]),
+            uses_none_head=torch.tensor([False]),
+            selected_indices=torch.tensor([-1]),
+            may_selected=1.0,
+            old_log_prob=-0.5,
+            value=0.0,
+            perspective_player_idx=1,
+            lstm_h_in=torch.zeros(1, 8),
+            lstm_c_in=torch.zeros(1, 8),
+        )
+
+        cl, pl = model.count_active_replay_steps([[row_priority, row_may]])
+        self.assertEqual(cl, 2)
+        # priority row contributes 2 valid choice cells; may row contributes
+        # 1 may-active step; total pl = 3.
+        self.assertEqual(pl, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
