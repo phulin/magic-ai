@@ -38,7 +38,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Final
 
-import numpy as np
+import torch
 
 from magic_ai.game_state import (
     GameCardState,
@@ -266,8 +266,8 @@ class RenderPlanWriter:
 
     # -- finalize ---------------------------------------------------------
 
-    def finalize(self) -> np.ndarray:
-        return np.asarray(self._buf, dtype=np.int32)
+    def finalize(self) -> torch.Tensor:
+        return torch.tensor(self._buf, dtype=torch.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -354,8 +354,8 @@ def emit_render_plan(
     tokenize: Callable[[str], list[int]],
     oracle: dict[str, OracleEntry] | None = None,
     max_card_refs: int = MAX_CARD_REFS,
-) -> np.ndarray:
-    """Walk ``snapshot`` (and ``actions``) and emit a render-plan int32 array.
+) -> torch.Tensor:
+    """Walk ``snapshot`` (and ``actions``) and emit a render-plan int32 tensor.
 
     The traversal exactly matches :class:`SnapshotRenderer.render` so that
     the assembler's reconstruction is byte-equal to ``tokenize_snapshot

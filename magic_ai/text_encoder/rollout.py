@@ -376,7 +376,7 @@ class TextRolloutWorker:
                     logger.warning("native render plan overflowed; punting to default")
                     return None
                 length = int(native.render_plan_lengths[0])
-                plan = native.render_plan[0, :length].detach().cpu().numpy().copy()
+                plan = native.render_plan[0, :length].clone()
             except Exception as exc:
                 logger.warning("native render-plan encode failed: %s; punting to default", exc)
                 return None

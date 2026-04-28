@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import pytest
+import torch
 from magic_ai.text_encoder.assembler import assemble_batch
 from magic_ai.text_encoder.card_cache import build_card_cache
 from magic_ai.text_encoder.render import (
@@ -159,7 +159,7 @@ def test_status_bits_emit_untapped(cache, tokenizer, name_to_row) -> None:
 
 def test_structured_go_plan_decodes_without_literal_tokens(cache, tokenizer, name_to_row) -> None:
     bears_row = name_to_row["Grizzly Bears"]
-    plan = np.asarray(
+    plan = torch.tensor(
         [
             OP_OPEN_STATE,
             OP_TURN,
@@ -191,7 +191,7 @@ def test_structured_go_plan_decodes_without_literal_tokens(cache, tokenizer, nam
             OP_CLOSE_ACTIONS,
             OP_CLOSE_STATE,
         ],
-        dtype=np.int32,
+        dtype=torch.int32,
     )
 
     batch = assemble_batch([plan], cache, tokenizer, max_tokens=512)
@@ -244,6 +244,6 @@ def test_overflow_truncate_path(cache, tokenizer, name_to_row) -> None:
 
 
 def test_unknown_opcode_raises(cache, tokenizer) -> None:
-    plan = np.asarray([999], dtype=np.int32)
+    plan = torch.tensor([999], dtype=torch.int32)
     with pytest.raises(ValueError, match="unknown opcode"):
         assemble_batch([plan], cache, tokenizer, max_tokens=8)

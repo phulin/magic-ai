@@ -19,7 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-import numpy as np
 import torch
 from dotenv import load_dotenv
 
@@ -2229,11 +2228,14 @@ def sample_native_text_policy_batch(
         overflow_idx = int(native_batch.render_plan_overflow.nonzero(as_tuple=False)[0, 0].item())
         raise NativeEncodingError(f"native render plan overflowed for batch row {overflow_idx}")
 
-    plans: list[np.ndarray] = []
-    lengths = native_batch.render_plan_lengths.detach().cpu().tolist()
-    render_plan_cpu = native_batch.render_plan.detach().cpu()
-    for row_idx, length in enumerate(lengths):
-        plans.append(render_plan_cpu[row_idx, : int(length)].numpy().astype(np.int32, copy=True))
+    # ``render_plan_lengths`` is a small CPU int64 tensor — ``.tolist()`` is
+    # a single C-loop materialization, no GPU sync. Slice the CPU int32
+    # render-plan tensor directly into the assembler; no numpy round-trip.
+    lengths = native_batch.render_plan_lengths.tolist()
+    render_plan_cpu = native_batch.render_plan
+    plans: list[torch.Tensor] = [
+        render_plan_cpu[row_idx, : int(length)] for row_idx, length in enumerate(lengths)
+    ]
 
     encoded = assemble_batch(
         plans,

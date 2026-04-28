@@ -18,7 +18,6 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-import numpy as np
 import torch
 from transformers import PreTrainedTokenizerFast
 
@@ -246,11 +245,16 @@ class _AssembledExample:
 
 
 def _assemble_one(
-    plan: np.ndarray,
+    plan: torch.Tensor,
     cache: CardTokenCache,
     toks: AssemblerTokens,
     body_lists: list[list[int]],
 ) -> _AssembledExample:
+    # Materialize the int32 plan as a Python list once so the inner
+    # walker does plain int indexing instead of paying ``.item()`` cost
+    # on each tensor element. ``plan`` is a small CPU int32 tensor.
+    plan_list: list[int] = plan.tolist() if isinstance(plan, torch.Tensor) else list(plan)
+    plan_len = len(plan_list)
     out: list[int] = []
     card_ref_positions: dict[int, int] = {}
     option_positions: list[int] = []
@@ -272,9 +276,8 @@ def _assemble_one(
     # gather (or returns CUDA-garbage NaN at sample time).
     structured_plan = True
     _scan_i = 0
-    _scan_n = int(plan.shape[0])
-    while _scan_i < _scan_n:
-        _scan_op = int(plan[_scan_i])
+    while _scan_i < plan_len:
+        _scan_op = plan_list[_scan_i]
         if _scan_op == OP_LITERAL_TOKENS:
             structured_plan = False
             break
@@ -315,20 +318,20 @@ def _assemble_one(
             option_open = False
 
     i = 0
-    n = int(plan.shape[0])
+    n = plan_len
     while i < n:
-        op = int(plan[i])
+        op = plan_list[i]
         arity = OPCODE_ARITY.get(op)
         if arity is None:
             raise ValueError(f"unknown opcode {op} at position {i}")
 
         if op == OP_LITERAL_TOKENS:
             close_scalar_owner()
-            length = int(plan[i + 1])
+            length = plan_list[i + 1]
             slice_start = i + 2
             slice_end = slice_start + length
             for j in range(slice_start, slice_end):
-                tid = int(plan[j])
+                tid = plan_list[j]
                 pos = len(out)
                 out.append(tid)
                 # Anchor recovery while walking literal slices.
@@ -351,7 +354,7 @@ def _assemble_one(
 
         if structured_plan:
             if scalar_owner_open is not None:
-                keep_open_for_mana = op == OP_MANA and int(plan[i + 1]) == scalar_owner_open
+                keep_open_for_mana = op == OP_MANA and plan_list[i + 1] == scalar_owner_open
                 if not keep_open_for_mana:
                     close_scalar_owner()
 
@@ -368,8 +371,8 @@ def _assemble_one(
                 continue
 
             if op == OP_TURN:
-                turn = int(plan[i + 1])
-                step_id = int(plan[i + 2])
+                turn = plan_list[i + 1]
+                step_id = plan_list[i + 2]
                 step = _STEP_NAMES[step_id] if 0 <= step_id < len(_STEP_NAMES) else "Unknown"
                 emit_text(f" turn={turn} step={step} ")
                 i += 1 + arity
@@ -377,17 +380,17 @@ def _assemble_one(
 
             if op == OP_LIFE:
                 close_scalar_owner()
-                owner = int(plan[i + 1])
-                life = int(plan[i + 2])
+                owner = plan_list[i + 1]
+                life = plan_list[i + 2]
                 emit_text(("<self>" if owner == 0 else "<opp>") + f" life={life} mana=")
                 scalar_owner_open = owner
                 i += 1 + arity
                 continue
 
             if op == OP_MANA:
-                owner = int(plan[i + 1])
-                color_id = int(plan[i + 2])
-                amount = int(plan[i + 3])
+                owner = plan_list[i + 1]
+                color_id = plan_list[i + 2]
+                amount = plan_list[i + 3]
                 if scalar_owner_open is None:
                     emit_text("<self> mana=" if owner == 0 else "<opp> mana=")
                     scalar_owner_open = owner
@@ -400,8 +403,8 @@ def _assemble_one(
 
             if op == OP_OPEN_ZONE:
                 close_option()
-                zone = int(plan[i + 1])
-                owner = int(plan[i + 2])
+                zone = plan_list[i + 1]
+                owner = plan_list[i + 2]
                 zone_stack.append((zone, owner))
                 tag = _ZONE_TAGS.get(zone, "zone")
                 owner_tag = "self" if owner == 0 else "opp"
@@ -432,11 +435,11 @@ def _assemble_one(
 
             if op == OP_OPTION:
                 close_option()
-                kind_id = int(plan[i + 1])
-                source_row = int(plan[i + 2])
-                source_uuid_idx = int(plan[i + 3])
-                _mana_cost_id = int(plan[i + 4])
-                ability_idx = int(plan[i + 5])
+                kind_id = plan_list[i + 1]
+                source_row = plan_list[i + 2]
+                source_uuid_idx = plan_list[i + 3]
+                _mana_cost_id = plan_list[i + 4]
+                ability_idx = plan_list[i + 5]
                 pos = len(out)
                 out.append(toks.option_id)
                 option_positions.append(pos)
@@ -457,8 +460,8 @@ def _assemble_one(
                 continue
 
             if op == OP_TARGET:
-                target_row = int(plan[i + 1])
-                target_uuid_idx = int(plan[i + 2])
+                target_row = plan_list[i + 1]
+                target_uuid_idx = plan_list[i + 2]
                 pos = len(out)
                 out.append(toks.target_open_id)
                 if cur_target_bucket is not None:
@@ -475,10 +478,10 @@ def _assemble_one(
                 continue
 
         if op == OP_PLACE_CARD:
-            _slot_idx = int(plan[i + 1])
-            row = int(plan[i + 2])
-            status = int(plan[i + 3])
-            uuid_idx = int(plan[i + 4])
+            _slot_idx = plan_list[i + 1]
+            row = plan_list[i + 2]
+            status = plan_list[i + 3]
+            uuid_idx = plan_list[i + 4]
             # Emit <card-ref:K> if attached.
             emit_card_ref(uuid_idx)
             # Memcpy the card body — the trailing ``" </card>"`` was already
@@ -517,7 +520,7 @@ def _assemble_one(
             continue
 
         if op == OP_OPEN_RAW_CARD:
-            uuid_idx = int(plan[i + 1])
+            uuid_idx = plan_list[i + 1]
             emit_card_ref(uuid_idx)
             i += 1 + arity
             continue
@@ -583,7 +586,7 @@ def _attach_status_prefixes(toks: AssemblerTokens, tokenizer: PreTrainedTokenize
 
 
 def assemble_batch(
-    plans: Sequence[np.ndarray],
+    plans: Sequence[torch.Tensor],
     cache: CardTokenCache,
     tokenizer: PreTrainedTokenizerFast,
     *,
@@ -596,7 +599,7 @@ def assemble_batch(
     Parameters
     ----------
     plans:
-        Sequence of int32 render-plan arrays, one per env.
+        Sequence of 1-D int32 CPU render-plan tensors, one per env.
     cache:
         Pre-tokenized card-body cache.
     tokenizer:
