@@ -657,112 +657,84 @@ class TextActorCritic(nn.Module):
         log_probs = output.values.new_zeros(n)
         entropies = output.values.new_zeros(n)
         forward = self._replay_scoring_forward(output)
-        flat_logits_parts: list[Tensor] = []
-        flat_log_prob_parts: list[Tensor] = []
-        group_idx_parts: list[Tensor] = []
-        choice_col_parts: list[Tensor] = []
-        is_sampled_parts: list[Tensor] = []
-        decision_group_id_parts: list[Tensor] = []
-        step_for_decision_groups: list[int] = []
-        decision_group_id = 0
-        # Hoist the per-step / per-group ``.item()`` syncs into three batched
-        # ``.tolist()`` materializations; the inner loop then runs entirely
-        # off CPU-side Python ints. Previously this function spent ~6s of
-        # 120s in ``Tensor.item`` on shandalar.
-        decision_count_cpu = decision_count.tolist()
-        selected_indices_cpu = batch.selected_indices.tolist()
-        mask_any_cpu = batch.decision_mask.any(dim=-1).tolist()
-        # Vectorized prelude: instead of calling
-        # ``_direct_decision_logits`` once per (step, group) — which on
-        # shandalar fired ~22k times and was the dominant gather/clamp
-        # cost — gather all active (step, group) pairs into flat tensors
-        # and call ``direct_decision_logits_from_forward`` exactly once.
         device = forward.values.device
-        flat_step_positions: list[int] = []
-        flat_step_groups: list[tuple[int, int]] = []
-        for step_idx in range(n):
-            group_count = int(decision_count_cpu[step_idx])
-            for group_idx in range(group_count):
-                flat_step_positions.append(step_idx)
-                flat_step_groups.append((step_idx, group_idx))
-        if flat_step_groups:
-            steps_t = torch.tensor(
-                [sg[0] for sg in flat_step_groups], dtype=torch.long, device=device
+
+        decision_count_long = decision_count.to(dtype=torch.long)
+        g_total = int(decision_count_long.sum().item())
+        if g_total == 0:
+            if not return_per_choice:
+                return log_probs, entropies
+            empty_long = torch.zeros(0, dtype=torch.long, device=device)
+            empty_bool = torch.zeros(0, dtype=torch.bool, device=device)
+            return (
+                log_probs,
+                entropies,
+                ReplayPerChoice(
+                    flat_logits=output.values.new_zeros(0),
+                    flat_log_probs=output.values.new_zeros(0),
+                    group_idx=empty_long,
+                    choice_cols=empty_long,
+                    is_sampled_flat=empty_bool,
+                    may_is_active=torch.zeros(n, dtype=torch.bool, device=device),
+                    may_logits_per_step=output.values.new_zeros(n),
+                    may_selected_per_step=output.values.new_zeros(n),
+                    decision_group_id_flat=empty_long,
+                    step_for_decision_group=empty_long,
+                ),
             )
-            groups_t = torch.tensor(
-                [sg[1] for sg in flat_step_groups], dtype=torch.long, device=device
-            )
-            flat_option_idx = batch.decision_option_idx[steps_t, groups_t]
-            flat_target_idx = batch.decision_target_idx[steps_t, groups_t]
-            flat_masks = batch.decision_mask[steps_t, groups_t]
-            flat_uses_none = batch.uses_none_head[steps_t, groups_t]
-            step_positions_t = torch.tensor(flat_step_positions, dtype=torch.long, device=device)
-            all_logits = direct_decision_logits_from_forward(
-                forward,
-                step_positions=step_positions_t,
-                option_idx=flat_option_idx,
-                target_idx=flat_target_idx,
-                masks=flat_masks,
-                uses_none=flat_uses_none,
-            )
-        else:
-            all_logits = output.values.new_zeros(0, batch.decision_mask.shape[-1])
-        flat_idx = 0
-        for step_idx in range(n):
-            group_count = int(decision_count_cpu[step_idx])
-            for group_idx in range(group_count):
-                mask = batch.decision_mask[step_idx, group_idx]
-                if not mask_any_cpu[step_idx][group_idx]:
-                    raise ValueError("decision group must include at least one valid choice")
-                logits = all_logits[flat_idx]
-                flat_idx += 1
-                valid_logits = logits[mask]
-                valid_cols = mask.nonzero(as_tuple=False).squeeze(-1)
-                selected = int(selected_indices_cpu[step_idx][group_idx])
-                # Index of the selected column inside ``valid_cols``.
-                # ``argmax`` of the bool→int8 cast is sync-free (the
-                # equivalent ``nonzero`` allocates based on the count, which
-                # forces a GPU sync). ``valid_cols`` is sorted ascending so
-                # there is at most one match; argmax returns the first.
-                # An invalid ``selected`` would silently give 0, so guard
-                # via a single batched check after the loop.
-                is_sel = valid_cols == selected
-                selected_pos = is_sel.to(torch.int8).argmax()
-                group_log_probs = torch.log_softmax(valid_logits, dim=0)
-                probs = group_log_probs.exp()
-                log_probs[step_idx] = log_probs[step_idx] + group_log_probs[selected_pos]
-                entropies[step_idx] = entropies[step_idx] - (probs * group_log_probs).sum()
-                if return_per_choice:
-                    flat_logits_parts.append(valid_logits)
-                    flat_log_prob_parts.append(group_log_probs)
-                    group_idx_parts.append(torch.full_like(valid_cols, step_idx))
-                    choice_col_parts.append(valid_cols)
-                    is_sampled_parts.append(is_sel)
-                    decision_group_id_parts.append(torch.full_like(valid_cols, decision_group_id))
-                    step_for_decision_groups.append(step_idx)
-                decision_group_id += 1
+
+        # Flatten (step, group) pairs in step-major / group-ascending order.
+        # ``decision_group_id`` is the position in this flat list, so ordering
+        # has to match what the per-choice consumers in ``rnad`` expect.
+        steps_t = torch.arange(n, device=device).repeat_interleave(decision_count_long)
+        group_starts = torch.cumsum(decision_count_long, dim=0) - decision_count_long
+        groups_t = torch.arange(g_total, device=device) - group_starts[steps_t]
+
+        flat_option_idx = batch.decision_option_idx[steps_t, groups_t]
+        flat_target_idx = batch.decision_target_idx[steps_t, groups_t]
+        flat_masks = batch.decision_mask[steps_t, groups_t]
+        flat_uses_none = batch.uses_none_head[steps_t, groups_t]
+        flat_selected = batch.selected_indices[steps_t, groups_t].to(dtype=torch.long)
+
+        if not bool(flat_masks.any(dim=-1).all()):
+            raise ValueError("decision group must include at least one valid choice")
+
+        all_logits = direct_decision_logits_from_forward(
+            forward,
+            step_positions=steps_t,
+            option_idx=flat_option_idx,
+            target_idx=flat_target_idx,
+            masks=flat_masks,
+            uses_none=flat_uses_none,
+        )
+
+        masked_logits = all_logits.masked_fill(~flat_masks, float("-inf"))
+        log_probs_dense = torch.log_softmax(masked_logits, dim=-1)
+        probs_dense = log_probs_dense.exp()
+        # ``-inf * 0`` at masked positions would be NaN; zero them explicitly.
+        entropy_terms = torch.where(
+            flat_masks, probs_dense * log_probs_dense, log_probs_dense.new_zeros(())
+        )
+
+        per_group_log_prob = log_probs_dense.gather(-1, flat_selected.unsqueeze(-1)).squeeze(-1)
+        per_group_entropy = -entropy_terms.sum(dim=-1)
+
+        log_probs = log_probs.scatter_add(0, steps_t, per_group_log_prob)
+        entropies = entropies.scatter_add(0, steps_t, per_group_entropy)
+
         if not return_per_choice:
             return log_probs, entropies
-        if flat_logits_parts:
-            flat_logits = torch.cat(flat_logits_parts, dim=0)
-            flat_log_probs = torch.cat(flat_log_prob_parts, dim=0)
-            group_idx_out = torch.cat(group_idx_parts, dim=0)
-            choice_cols = torch.cat(choice_col_parts, dim=0)
-            is_sampled_flat = torch.cat(is_sampled_parts, dim=0)
-            decision_group_id_flat = torch.cat(decision_group_id_parts, dim=0)
-            step_for_decision_group = torch.tensor(
-                step_for_decision_groups,
-                dtype=torch.long,
-                device=output.values.device,
-            )
-        else:
-            flat_logits = output.values.new_zeros(0)
-            flat_log_probs = output.values.new_zeros(0)
-            group_idx_out = torch.zeros(0, dtype=torch.long, device=output.values.device)
-            choice_cols = torch.zeros(0, dtype=torch.long, device=output.values.device)
-            is_sampled_flat = torch.zeros(0, dtype=torch.bool, device=output.values.device)
-            decision_group_id_flat = torch.zeros(0, dtype=torch.long, device=output.values.device)
-            step_for_decision_group = torch.zeros(0, dtype=torch.long, device=output.values.device)
+
+        # ``nonzero`` returns row-major (group, col-ascending), matching the
+        # original per-group ``mask.nonzero()`` concatenation order.
+        flat_indices = flat_masks.nonzero(as_tuple=False)
+        decision_group_id_flat = flat_indices[:, 0]
+        choice_cols = flat_indices[:, 1]
+        flat_logits = all_logits[decision_group_id_flat, choice_cols]
+        flat_log_probs = log_probs_dense[decision_group_id_flat, choice_cols]
+        is_sampled_flat = choice_cols == flat_selected[decision_group_id_flat]
+        group_idx_out = steps_t[decision_group_id_flat]
+
         return (
             log_probs,
             entropies,
@@ -772,11 +744,11 @@ class TextActorCritic(nn.Module):
                 group_idx=group_idx_out,
                 choice_cols=choice_cols,
                 is_sampled_flat=is_sampled_flat,
-                may_is_active=torch.zeros(n, dtype=torch.bool, device=output.values.device),
+                may_is_active=torch.zeros(n, dtype=torch.bool, device=device),
                 may_logits_per_step=output.values.new_zeros(n),
                 may_selected_per_step=output.values.new_zeros(n),
                 decision_group_id_flat=decision_group_id_flat,
-                step_for_decision_group=step_for_decision_group,
+                step_for_decision_group=steps_t,
             ),
         )
 
