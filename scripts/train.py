@@ -403,7 +403,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             workers=batch_workers,
             pool=batch_pool,
         )
-    return TextTrainingBackend(
+    backend = TextTrainingBackend(
         policy=policy,
         replay_buffer=replay_buffer,
         cache=cache,
@@ -414,6 +414,28 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         batch_pool=batch_pool,
         batch_workers=batch_workers,
     )
+    # Phase 5: register the closed-vocabulary token tables with the
+    # mage-go side so the rollout hot path can dispatch through
+    # MageEncodeTokens. Falls back gracefully if the native lib doesn't
+    # have MageRegisterTokenTables (older libmage.so), with a clear
+    # warning so users know to rebuild.
+    if getattr(args, "text_native_assembler", True):
+        try:
+            from magic_ai.text_encoder.native_token_tables import (
+                register_native_token_tables,
+            )
+            from magic_ai.text_encoder.token_tables import build_token_tables
+
+            tables = build_token_tables(tokenizer, cache)
+            register_native_token_tables(tables)
+            print("native token assembler registered (MageEncodeTokens path)")
+        except Exception as exc:  # pragma: no cover - environment-dependent
+            print(
+                f"warning: MageRegisterTokenTables unavailable ({exc}); "
+                "falling back to Python assembler. Rebuild libmage.so to enable."
+            )
+            args.text_native_assembler = False
+    return backend
 
 
 def sample_text_policy_batch(
@@ -1094,6 +1116,14 @@ def parse_args() -> argparse.Namespace:
         help="use mage-go native render-plan emission for text encoder rollouts",
     )
     parser.add_argument("--render-plan-capacity", type=int, default=4096)
+    parser.add_argument(
+        "--text-native-assembler",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="run the text-encoder assembler natively in mage-go via "
+        "MageEncodeTokens (default: on; pass --no-text-native-assembler to "
+        "fall back to the Python assemble_batch path)",
+    )
     parser.add_argument(
         "--lstm",
         action=argparse.BooleanOptionalAction,
@@ -2219,32 +2249,40 @@ def sample_native_text_policy_batch(
     perspective_player_indices: list[int],
     deterministic: bool = False,
     sampling_policy: TextActorCritic | None = None,
+    text_batch: Any | None = None,
 ) -> list[Any]:
-    if native_batch.render_plan is None or native_batch.render_plan_lengths is None:
-        raise NativeEncodingError("native encoder did not return render plans")
-    if native_batch.render_plan_overflow is not None and bool(
-        native_batch.render_plan_overflow.any()
-    ):
-        overflow_idx = int(native_batch.render_plan_overflow.nonzero(as_tuple=False)[0, 0].item())
-        raise NativeEncodingError(f"native render plan overflowed for batch row {overflow_idx}")
+    if text_batch is not None:
+        # Phase 5: native assembler already produced the TextEncodedBatch.
+        # Skip the render-plan slice + Python ``assemble_batch`` call.
+        encoded = text_batch
+    else:
+        if native_batch.render_plan is None or native_batch.render_plan_lengths is None:
+            raise NativeEncodingError("native encoder did not return render plans")
+        if native_batch.render_plan_overflow is not None and bool(
+            native_batch.render_plan_overflow.any()
+        ):
+            overflow_idx = int(
+                native_batch.render_plan_overflow.nonzero(as_tuple=False)[0, 0].item()
+            )
+            raise NativeEncodingError(f"native render plan overflowed for batch row {overflow_idx}")
 
-    # ``render_plan_lengths`` is a small CPU int64 tensor — ``.tolist()`` is
-    # a single C-loop materialization, no GPU sync. Slice the CPU int32
-    # render-plan tensor directly into the assembler; no numpy round-trip.
-    lengths = native_batch.render_plan_lengths.tolist()
-    render_plan_cpu = native_batch.render_plan
-    plans: list[torch.Tensor] = [
-        render_plan_cpu[row_idx, : int(length)] for row_idx, length in enumerate(lengths)
-    ]
-
-    encoded = assemble_batch(
-        plans,
-        backend.cache,
-        backend.tokenizer,
-        max_tokens=args.text_max_tokens,
-        on_overflow="truncate",
-        assembler_tokens=backend.assembler_tokens,
-    )
+        # ``render_plan_lengths`` is a small CPU int64 tensor — ``.tolist()``
+        # is a single C-loop materialization, no GPU sync. Slice the CPU
+        # int32 render-plan tensor directly into the assembler; no numpy
+        # round-trip.
+        lengths = native_batch.render_plan_lengths.tolist()
+        render_plan_cpu = native_batch.render_plan
+        plans: list[torch.Tensor] = [
+            render_plan_cpu[row_idx, : int(length)] for row_idx, length in enumerate(lengths)
+        ]
+        encoded = assemble_batch(
+            plans,
+            backend.cache,
+            backend.tokenizer,
+            max_tokens=args.text_max_tokens,
+            on_overflow="truncate",
+            assembler_tokens=backend.assembler_tokens,
+        )
 
     layouts: list[Any] = []
     starts = native_batch.decision_start.detach().cpu().tolist()
@@ -2528,10 +2566,22 @@ def train_text_native_batched_envs(
         if ready_envs:
             ready_env_indices = [env.slot_idx for env in ready_envs]
             ready_games = [env.game for env in ready_envs]
-            native_batch = native_encoder.encode_handles(
-                ready_games,
-                perspective_player_indices=ready_players,
-            )
+            text_batch: Any | None = None
+            if getattr(args, "text_native_assembler", True):
+                native_batch, nat_outputs = native_encoder.encode_tokens(
+                    ready_games,
+                    perspective_player_indices=ready_players,
+                    max_tokens=args.text_max_tokens,
+                    max_options=args.max_options,
+                    max_targets=args.max_targets_per_option,
+                    max_card_refs=256,
+                )
+                text_batch = nat_outputs.to_text_encoded_batch()
+            else:
+                native_batch = native_encoder.encode_handles(
+                    ready_games,
+                    perspective_player_indices=ready_players,
+                )
             with torch.no_grad():
                 policy_steps = sample_native_text_policy_batch(
                     args,
@@ -2541,6 +2591,7 @@ def train_text_native_batched_envs(
                     perspective_player_indices=ready_players,
                     deterministic=args.deterministic_rollout,
                     sampling_policy=sampling_policy,
+                    text_batch=text_batch,
                 )
             counts = [len(s.selected_choice_cols) for s in policy_steps]
             starts: list[int] = list(itertools.accumulate(counts, initial=0))[:-1]

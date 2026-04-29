@@ -223,6 +223,35 @@ class ShardedNativeBatchEncoder:
             )
         return cls(encoders, pool=pool if workers > 1 else None)
 
+    def encode_tokens(
+        self,
+        games: list[Any],
+        *,
+        perspective_player_indices: list[int],
+        max_tokens: int,
+        max_options: int,
+        max_targets: int,
+        max_card_refs: int,
+    ) -> tuple[NativeEncodedBatch, Any]:
+        """Run the native text-encoder assembler (Phase 5 cutover).
+
+        Single-shard path: delegates to the first encoder. Multi-shard
+        sharding for ``encode_tokens`` is a follow-up; for now the rollout
+        hot path stages a single encode-tokens call per ready batch.
+        """
+
+        from magic_ai.text_encoder.native_assembler import encode_tokens
+
+        return encode_tokens(
+            self._encoders[0],
+            games,
+            perspective_player_indices=perspective_player_indices,
+            max_tokens=max_tokens,
+            max_options=max_options,
+            max_targets=max_targets,
+            max_card_refs=max_card_refs,
+        )
+
     def encode_handles(
         self,
         games: list[Any],
