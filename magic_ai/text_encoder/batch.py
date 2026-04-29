@@ -62,6 +62,89 @@ class TextEncodedBatch:
     seq_lengths: Tensor  # [B] int64
 
 
+@dataclass
+class PackedTextBatch:
+    """Batch with all rows concatenated along one sequence axis.
+
+    Anchor positions are absolute offsets into the packed row (i.e. they
+    have already been shifted by ``cu_seqlens[:-1]``). ``-1`` is preserved
+    as the absent-slot sentinel so downstream gather logic is unchanged
+    versus the padded path.
+    """
+
+    token_ids: Tensor  # [T_packed] int64
+    seq_id: Tensor  # [T_packed] int64, document index for each token
+    pos_in_seq: Tensor  # [T_packed] int64, RoPE position (resets per doc)
+    cu_seqlens: Tensor  # [B + 1] int64, cumulative per-doc lengths
+    seq_lengths: Tensor  # [B] int64
+
+    state_positions: Tensor  # [B] int64, packed-offset of each row's first token
+    card_ref_positions: Tensor  # [B, MAX_CARD_REFS] int64, -1 = absent
+    option_positions: Tensor  # [B, max_opts] int64
+    option_mask: Tensor  # [B, max_opts] bool
+    target_positions: Tensor  # [B, max_opts, max_targets] int64
+    target_mask: Tensor  # [B, max_opts, max_targets] bool
+
+
+def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
+    """Pack a padded :class:`TextEncodedBatch` into a :class:`PackedTextBatch`.
+
+    Fully vectorized: no Python-level per-row loop. Live tokens are
+    selected via ``attention_mask`` and concatenated; ``seq_id`` and
+    ``pos_in_seq`` are derived from the per-row sequence lengths with
+    :func:`torch.repeat_interleave` and an :func:`arange` subtraction.
+    Anchors are rebased by adding the per-row base offset, with ``-1``
+    sentinels preserved through a ``where``.
+    """
+
+    seq_lens = padded.seq_lengths.to(torch.int64)
+    if seq_lens.dim() != 1:
+        raise ValueError("seq_lengths must be 1-D")
+    batch_size = int(seq_lens.numel())
+    cu = torch.zeros(batch_size + 1, dtype=torch.int64, device=seq_lens.device)
+    cu[1:] = seq_lens.cumsum(0)
+    t_packed = int(cu[-1].item())
+
+    live = padded.attention_mask.to(torch.bool)
+    token_ids = padded.token_ids[live].to(torch.int64)
+    if int(token_ids.numel()) != t_packed:
+        raise ValueError(
+            "attention_mask live-count mismatch with seq_lengths "
+            f"({int(token_ids.numel())} vs {t_packed})"
+        )
+
+    seq_id = torch.repeat_interleave(
+        torch.arange(batch_size, dtype=torch.int64, device=seq_lens.device), seq_lens
+    )
+    base = cu[:-1]  # [B] int64
+    pos_in_seq = torch.arange(t_packed, dtype=torch.int64, device=seq_lens.device) - (
+        base.repeat_interleave(seq_lens)
+    )
+
+    def _rebase(pos: Tensor) -> Tensor:
+        # ``pos`` is [B, ...] int64 with -1 for absent slots. Add the
+        # per-row base offset, broadcasting over trailing dims, while
+        # preserving the -1 sentinel.
+        valid = pos >= 0
+        shape = [batch_size] + [1] * (pos.dim() - 1)
+        shifted = pos + base.view(shape)
+        return torch.where(valid, shifted, pos)
+
+    return PackedTextBatch(
+        token_ids=token_ids,
+        seq_id=seq_id,
+        pos_in_seq=pos_in_seq,
+        cu_seqlens=cu,
+        seq_lengths=seq_lens,
+        state_positions=base.clone(),
+        card_ref_positions=_rebase(padded.card_ref_positions.to(torch.int64)),
+        option_positions=_rebase(padded.option_positions.to(torch.int64)),
+        target_positions=_rebase(padded.target_positions.to(torch.int64)),
+        option_mask=padded.option_mask.to(torch.bool),
+        target_mask=padded.target_mask.to(torch.bool),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tokenize a single rendered snapshot
 # ---------------------------------------------------------------------------

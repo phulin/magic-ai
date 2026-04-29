@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
 
-from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 
 # flex_attention only generates the fused FA-style kernel under torch.compile;
 # called eagerly it materializes the full [B, H, T, T] score tensor and emits
@@ -76,6 +76,20 @@ def _key_pad_mask_mod(key_pad: Tensor):
     def mask_mod(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
         del h, q_idx
         return ~key_pad[b, kv_idx]
+
+    return mask_mod
+
+
+def _document_mask_mod(seq_id: Tensor):
+    """flex_attention mask_mod for sequence packing.
+
+    ``seq_id`` is [T_packed] int. The kernel allows attention only when
+    ``seq_id[q] == seq_id[kv]``, giving a block-diagonal allowed region.
+    """
+
+    def mask_mod(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
+        del b, h
+        return seq_id[q_idx] == seq_id[kv_idx]
 
     return mask_mod
 
@@ -233,6 +247,55 @@ class TextStateEncoder(nn.Module):
         x = self.final_norm(x)
         return x
 
+    def forward_packed(self, batch: PackedTextBatch) -> Tensor:
+        """Run the encoder over a packed (varlen) batch.
+
+        Returns hidden states of shape ``[T_packed, D]``. Documents are
+        kept independent via a flex_attention mask_mod that compares
+        ``seq_id[q]`` to ``seq_id[kv]``; RoPE positions are reset per
+        document by gathering the precomputed sin/cos table at
+        ``pos_in_seq``. No Python loop over documents.
+        """
+
+        token_ids = batch.token_ids.to(torch.long)  # [T]
+        t = int(token_ids.shape[0])
+        x = self.tok_emb(token_ids).unsqueeze(0)  # [1, T, D]
+        seq_id = batch.seq_id.to(device=x.device, dtype=torch.long)
+        pos = batch.pos_in_seq.to(device=x.device, dtype=torch.long)
+
+        head_dim = self.cfg.d_model // self.cfg.n_heads
+        # Cache size has to cover the largest in-doc position; the
+        # configured ``max_seq_len`` is the model's hard upper bound,
+        # and any individual document is ``<= max_seq_len`` by
+        # construction.
+        cache_len = self.cfg.max_seq_len
+        cos_full, sin_full = _build_rope_cache(cache_len, head_dim, x.device, x.dtype)
+        # [T, D/2] — same shape the dense path feeds into ``_apply_rope``,
+        # so the existing rope kernel works unchanged.
+        cos = cos_full.index_select(0, pos)
+        sin = sin_full.index_select(0, pos)
+
+        if x.device.type == "cuda":
+            block_mask = _create_block_mask(
+                _document_mask_mod(seq_id),
+                B=1,
+                H=None,
+                Q_LEN=t,
+                KV_LEN=t,
+                device=x.device,
+            )
+            attn_bias = x.new_zeros(())
+        else:
+            block_mask = cast(BlockMask, None)
+            same = seq_id[:, None] == seq_id[None, :]  # [T, T] bool
+            attn_bias = torch.zeros(1, 1, t, t, device=x.device, dtype=x.dtype)
+            attn_bias = attn_bias.masked_fill(~same[None, None, :, :], float("-inf"))
+
+        for block in self.blocks:
+            x = block(x, block_mask, attn_bias, cos, sin)
+        x = self.final_norm(x)
+        return x.squeeze(0)  # [T, D]
+
 
 def _gather_at(hidden: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
     """Gather hidden states at integer positions; -1 entries become zeros.
@@ -272,6 +335,40 @@ def gather_target_vectors(hidden: Tensor, batch: TextEncodedBatch) -> tuple[Tens
 def gather_state_vector(hidden: Tensor, batch: TextEncodedBatch) -> Tensor:
     del batch  # position 0 is always the <bos>/<state> opener.
     return hidden[:, 0, :]
+
+
+def _gather_packed(hidden: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
+    """Gather from a packed ``[T_packed, D]`` hidden at integer offsets.
+
+    ``positions`` is any int tensor whose values are absolute offsets
+    into the packed row, with ``-1`` for absent slots.
+    """
+
+    mask = positions >= 0
+    safe = positions.clamp(min=0).to(torch.long)
+    flat = safe.reshape(-1)
+    gathered = hidden.index_select(0, flat).reshape(*positions.shape, hidden.shape[-1])
+    gathered = gathered * mask.unsqueeze(-1).to(gathered.dtype)
+    return gathered, mask
+
+
+def gather_card_vectors_packed(hidden: Tensor, batch: PackedTextBatch) -> tuple[Tensor, Tensor]:
+    return _gather_packed(hidden, batch.card_ref_positions)
+
+
+def gather_option_vectors_packed(hidden: Tensor, batch: PackedTextBatch) -> tuple[Tensor, Tensor]:
+    vecs, _ = _gather_packed(hidden, batch.option_positions)
+    return vecs, batch.option_mask
+
+
+def gather_target_vectors_packed(hidden: Tensor, batch: PackedTextBatch) -> tuple[Tensor, Tensor]:
+    vecs, _ = _gather_packed(hidden, batch.target_positions)
+    return vecs, batch.target_mask
+
+
+def gather_state_vector_packed(hidden: Tensor, batch: PackedTextBatch) -> Tensor:
+    idx = batch.state_positions.to(torch.long)
+    return hidden.index_select(0, idx)
 
 
 class _MLP(nn.Module):
@@ -347,4 +444,8 @@ __all__ = [
     "gather_option_vectors",
     "gather_target_vectors",
     "gather_state_vector",
+    "gather_card_vectors_packed",
+    "gather_option_vectors_packed",
+    "gather_target_vectors_packed",
+    "gather_state_vector_packed",
 ]
