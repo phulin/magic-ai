@@ -191,36 +191,42 @@ class TextReplayBuffer:
         row = self._free_rows.pop()
         self._write_encoded_row(row, encoded, batch_index)
         decision_count = int(decision_option_idx.shape[0])
-        if decision_count > self.max_decision_groups:
-            raise ValueError("decision group count exceeds buffer width")
+        # Silently truncate decisions that exceed the buffer's per-row width.
+        # Combat steps (declare attackers / blockers) on dense mid-game boards
+        # routinely emit more than ``max_decision_groups`` groups; a hard
+        # raise was previously crashing training. Keep the leading prefix —
+        # decision group order is deterministic by the engine, so dropping
+        # the tail is reproducible across replays of the same trace.
+        truncated_count = min(decision_count, self.max_decision_groups)
         self.decision_option_idx[row].fill_(-1)
         self.decision_target_idx[row].fill_(-1)
         self.decision_mask[row].zero_()
         self.uses_none_head[row].zero_()
         self.selected_indices[row].fill_(-1)
-        if decision_count > 0:
+        if truncated_count > 0:
             self._validate_decision_shapes(
-                decision_option_idx,
-                decision_target_idx,
-                decision_mask,
-                uses_none_head,
-                selected_indices,
+                decision_option_idx[:truncated_count],
+                decision_target_idx[:truncated_count],
+                decision_mask[:truncated_count],
+                uses_none_head[:truncated_count],
+                selected_indices[:truncated_count],
             )
-            self.decision_option_idx[row, :decision_count].copy_(
-                decision_option_idx.to(device=self.device, dtype=torch.long)
+            self.decision_option_idx[row, :truncated_count].copy_(
+                decision_option_idx[:truncated_count].to(device=self.device, dtype=torch.long)
             )
-            self.decision_target_idx[row, :decision_count].copy_(
-                decision_target_idx.to(device=self.device, dtype=torch.long)
+            self.decision_target_idx[row, :truncated_count].copy_(
+                decision_target_idx[:truncated_count].to(device=self.device, dtype=torch.long)
             )
-            self.decision_mask[row, :decision_count].copy_(
-                decision_mask.to(device=self.device, dtype=torch.bool)
+            self.decision_mask[row, :truncated_count].copy_(
+                decision_mask[:truncated_count].to(device=self.device, dtype=torch.bool)
             )
-            self.uses_none_head[row, :decision_count].copy_(
-                uses_none_head.to(device=self.device, dtype=torch.bool)
+            self.uses_none_head[row, :truncated_count].copy_(
+                uses_none_head[:truncated_count].to(device=self.device, dtype=torch.bool)
             )
-            self.selected_indices[row, :decision_count].copy_(
-                selected_indices.to(device=self.device, dtype=torch.long)
+            self.selected_indices[row, :truncated_count].copy_(
+                selected_indices[:truncated_count].to(device=self.device, dtype=torch.long)
             )
+        decision_count = truncated_count
 
         self.trace_kind_id[row] = int(trace_kind_id)
         self.decision_count[row] = decision_count

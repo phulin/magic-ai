@@ -55,6 +55,7 @@ from magic_ai.text_encoder.render import (
     OracleEntry,
     _resolve_perspective_idx,
 )
+from magic_ai.text_encoder.token_tables import LIFE_MAX, LIFE_MIN
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, step_token
 
 # ---------------------------------------------------------------------------
@@ -513,6 +514,9 @@ def emit_render_plan(
             mana_tokens = ""
         else:
             life = int(player.get("Life", 0) or 0)
+            # OP_LIFE on the native path bounds-checks against [LIFE_MIN, LIFE_MAX];
+            # clamp here to keep Python ↔ Go emit byte-equal on extreme totals.
+            life = max(LIFE_MIN, min(LIFE_MAX, life))
             mana_tokens = _mana_pool_tokens(player)
         open_tag = "<self>" if scope == "self" else "<opp>"
         close_tag = "</self>" if scope == "self" else "</opp>"

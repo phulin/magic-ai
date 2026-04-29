@@ -2501,28 +2501,86 @@ def train_text_native_batched_envs(
             return
         rollout_returns = torch.cat(pending_returns)
         rollout_step_count = len(pending_steps)
-        if rnad_state is not None and pending_episodes:
-            stats = run_rnad_update(
-                backend.policy,
-                optimizer,
-                rnad_state,
-                pending_episodes,
+        snapshot_armed = args.cuda_memory_snapshot is not None and torch.cuda.is_available()
+        if snapshot_armed:
+            print(
+                cli_step_prefix(),
+                f"[mem] before update[{args.trainer},text,native]: "
+                f"{torch.cuda.memory_allocated() / 1e9:.2f} GB live, "
+                f"{torch.cuda.memory_reserved() / 1e9:.2f} GB reserved",
+                flush=True,
             )
+            torch.cuda.memory._record_memory_history(max_entries=100_000)
+        if rnad_state is not None and pending_episodes:
+            try:
+                stats = run_rnad_update(
+                    backend.policy,
+                    optimizer,
+                    rnad_state,
+                    pending_episodes,
+                )
+            except torch.OutOfMemoryError:
+                if snapshot_armed:
+                    path = Path(args.cuda_memory_snapshot)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        torch.cuda.memory._dump_snapshot(str(path))
+                        print(
+                            cli_step_prefix(),
+                            f"[mem] OOM in update[{args.trainer},text,native]; "
+                            f"allocator history dumped to {path}. "
+                            "Load at https://pytorch.org/memory_viz",
+                            flush=True,
+                        )
+                    except Exception as dump_exc:
+                        print(
+                            cli_step_prefix(),
+                            f"[mem] _dump_snapshot failed: {type(dump_exc).__name__}: {dump_exc}",
+                            flush=True,
+                        )
+                raise
+            finally:
+                if snapshot_armed:
+                    torch.cuda.memory._record_memory_history(enabled=None)
             trainer_label = "rnad,text,native"
         else:
-            stats = ppo_update(
-                backend.policy,
-                optimizer,
-                pending_steps,
-                rollout_returns,
-                epochs=args.ppo_epochs,
-                minibatch_size=args.minibatch_size,
-                clip_epsilon=args.clip_epsilon,
-                value_coef=args.value_coef,
-                entropy_coef=args.entropy_coef,
-                max_grad_norm=args.max_grad_norm,
-                spr_coef=0.0,
-            )
+            try:
+                stats = ppo_update(
+                    backend.policy,
+                    optimizer,
+                    pending_steps,
+                    rollout_returns,
+                    epochs=args.ppo_epochs,
+                    minibatch_size=args.minibatch_size,
+                    clip_epsilon=args.clip_epsilon,
+                    value_coef=args.value_coef,
+                    entropy_coef=args.entropy_coef,
+                    max_grad_norm=args.max_grad_norm,
+                    spr_coef=0.0,
+                )
+            except torch.OutOfMemoryError:
+                if snapshot_armed:
+                    path = Path(args.cuda_memory_snapshot)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        torch.cuda.memory._dump_snapshot(str(path))
+                        print(
+                            cli_step_prefix(),
+                            f"[mem] OOM in update[{args.trainer},text,native]; "
+                            f"allocator history dumped to {path}. "
+                            "Load at https://pytorch.org/memory_viz",
+                            flush=True,
+                        )
+                    except Exception as dump_exc:
+                        print(
+                            cli_step_prefix(),
+                            f"[mem] _dump_snapshot failed: {type(dump_exc).__name__}: {dump_exc}",
+                            flush=True,
+                        )
+                raise
+            finally:
+                if snapshot_armed:
+                    torch.cuda.memory._record_memory_history(enabled=None)
             trainer_label = "ppo,text,native"
         now = time.monotonic()
         elapsed = now - last_step_time
