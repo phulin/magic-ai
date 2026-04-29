@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 
@@ -238,6 +238,69 @@ class TextReplayBuffer:
         self._occupied[row] = True
         return row
 
+    def append_packed(
+        self,
+        *,
+        encoded: PackedTextBatch,
+        batch_index: int,
+        trace_kind_id: int,
+        decision_option_idx: Tensor,
+        decision_target_idx: Tensor,
+        decision_mask: Tensor,
+        uses_none_head: Tensor,
+        selected_indices: Tensor,
+        may_selected: float,
+        old_log_prob: float,
+        value: float,
+        perspective_player_idx: int,
+        lstm_h_in: Tensor | None = None,
+        lstm_c_in: Tensor | None = None,
+    ) -> int:
+        if not self._free_rows:
+            raise RuntimeError("TextReplayBuffer is full")
+        row = self._free_rows.pop()
+        self._write_packed_encoded_row(row, encoded, batch_index)
+        decision_count = int(decision_option_idx.shape[0])
+        truncated_count = min(decision_count, self.max_decision_groups)
+        self.decision_option_idx[row].fill_(-1)
+        self.decision_target_idx[row].fill_(-1)
+        self.decision_mask[row].zero_()
+        self.uses_none_head[row].zero_()
+        self.selected_indices[row].fill_(-1)
+        if truncated_count > 0:
+            self._validate_decision_shapes(
+                decision_option_idx[:truncated_count],
+                decision_target_idx[:truncated_count],
+                decision_mask[:truncated_count],
+                uses_none_head[:truncated_count],
+                selected_indices[:truncated_count],
+            )
+            self.decision_option_idx[row, :truncated_count].copy_(
+                decision_option_idx[:truncated_count].to(device=self.device, dtype=torch.long)
+            )
+            self.decision_target_idx[row, :truncated_count].copy_(
+                decision_target_idx[:truncated_count].to(device=self.device, dtype=torch.long)
+            )
+            self.decision_mask[row, :truncated_count].copy_(
+                decision_mask[:truncated_count].to(device=self.device, dtype=torch.bool)
+            )
+            self.uses_none_head[row, :truncated_count].copy_(
+                uses_none_head[:truncated_count].to(device=self.device, dtype=torch.bool)
+            )
+            self.selected_indices[row, :truncated_count].copy_(
+                selected_indices[:truncated_count].to(device=self.device, dtype=torch.long)
+            )
+
+        self.trace_kind_id[row] = int(trace_kind_id)
+        self.decision_count[row] = truncated_count
+        self.may_selected[row] = float(may_selected)
+        self.old_log_prob[row] = float(old_log_prob)
+        self.value[row] = float(value)
+        self.perspective_player_idx[row] = int(perspective_player_idx)
+        self._write_recurrent_state(row, lstm_h_in, lstm_c_in)
+        self._occupied[row] = True
+        return row
+
     def gather(self, replay_rows: list[int]) -> TextReplayBatch:
         if not replay_rows:
             raise ValueError("replay_rows must not be empty")
@@ -327,6 +390,66 @@ class TextReplayBuffer:
         # Device-side copy: no .item() sync, just a 0-d tensor write.
         self.seq_lengths[row] = encoded.seq_lengths[batch_index]
 
+    def _write_packed_encoded_row(
+        self,
+        row: int,
+        encoded: PackedTextBatch,
+        batch_index: int,
+    ) -> None:
+        self._validate_packed_batch_index(encoded, batch_index)
+        start = int(encoded.cu_seqlens[batch_index].item())
+        end = int(encoded.cu_seqlens[batch_index + 1].item())
+        token_width = end - start
+        if token_width > self.max_tokens:
+            raise ValueError("encoded packed row token width exceeds buffer max_tokens")
+
+        self.token_ids[row].zero_()
+        self.attention_mask[row].zero_()
+        self.card_ref_positions[row].fill_(-1)
+        self.option_positions[row].fill_(-1)
+        self.option_mask[row].zero_()
+        self.target_positions[row].fill_(-1)
+        self.target_mask[row].zero_()
+
+        self.token_ids[row, :token_width].copy_(
+            encoded.token_ids[start:end].to(device=self.device, dtype=torch.int32)
+        )
+        self.attention_mask[row, :token_width] = True
+
+        base = int(encoded.state_positions[batch_index].item())
+
+        def rebase(pos: Tensor) -> Tensor:
+            valid = pos >= 0
+            shifted = pos - base
+            return torch.where(valid, shifted, pos)
+
+        self.card_ref_positions[row].copy_(
+            rebase(encoded.card_ref_positions[batch_index]).to(
+                device=self.device, dtype=torch.int32
+            )
+        )
+        option_width = min(encoded.option_positions.shape[1], self.max_options)
+        target_width = min(encoded.target_positions.shape[2], self.max_targets_per_option)
+        self.option_positions[row, :option_width].copy_(
+            rebase(encoded.option_positions[batch_index, :option_width]).to(
+                device=self.device, dtype=torch.int32
+            )
+        )
+        self.option_mask[row, :option_width].copy_(
+            encoded.option_mask[batch_index, :option_width].to(device=self.device)
+        )
+        self.target_positions[row, :option_width, :target_width].copy_(
+            rebase(encoded.target_positions[batch_index, :option_width, :target_width]).to(
+                device=self.device, dtype=torch.int32
+            )
+        )
+        self.target_mask[row, :option_width, :target_width].copy_(
+            encoded.target_mask[batch_index, :option_width, :target_width].to(device=self.device)
+        )
+        self.seq_lengths[row] = encoded.seq_lengths[batch_index].to(
+            device=self.device, dtype=torch.int32
+        )
+
     def _write_recurrent_state(
         self,
         row: int,
@@ -354,6 +477,17 @@ class TextReplayBuffer:
             raise IndexError("batch_index out of range")
         if encoded.token_ids.shape[1] > self.max_tokens:
             raise ValueError("encoded batch token width exceeds buffer max_tokens")
+        if encoded.card_ref_positions.shape[1] != self.max_card_refs:
+            raise ValueError("encoded card_ref_positions width does not match buffer")
+        if encoded.option_positions.shape[1] > self.max_options:
+            raise ValueError("encoded option width exceeds buffer max_options")
+        if encoded.target_positions.shape[2] > self.max_targets_per_option:
+            raise ValueError("encoded target width exceeds buffer max_targets_per_option")
+
+    def _validate_packed_batch_index(self, encoded: PackedTextBatch, batch_index: int) -> None:
+        batch_size = int(encoded.seq_lengths.shape[0])
+        if batch_index < 0 or batch_index >= batch_size:
+            raise IndexError("batch_index out of range")
         if encoded.card_ref_positions.shape[1] != self.max_card_refs:
             raise ValueError("encoded card_ref_positions width does not match buffer")
         if encoded.option_positions.shape[1] > self.max_options:

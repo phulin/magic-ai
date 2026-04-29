@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.policy import EncodedSnapshots, TextPolicy
 
@@ -124,16 +124,50 @@ class RecurrentTextPolicy(nn.Module):
         # downstream LSTM + heads run in fp32.
         target_dtype = self.in_proj.weight.dtype
         encoded = _cast_encoded(encoded, target_dtype)
+        return self._forward_encoded(
+            encoded,
+            h_in=h_in,
+            c_in=c_in,
+            state_hidden_override=state_hidden_override,
+        )
 
+    def forward_packed(
+        self,
+        batch: PackedTextBatch,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
+        *,
+        state_hidden_override: Tensor | None = None,
+    ) -> tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]]:
+        device_type = batch.token_ids.device.type
+        autocast_enabled = device_type == "cuda"
+        with torch.autocast(
+            device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+        ):
+            encoded = self.text_policy.encode_packed_only(batch)
+        target_dtype = self.in_proj.weight.dtype
+        encoded = _cast_encoded(encoded, target_dtype)
+        return self._forward_encoded(
+            encoded,
+            h_in=h_in,
+            c_in=c_in,
+            state_hidden_override=state_hidden_override,
+        )
+
+    def _forward_encoded(
+        self,
+        encoded: EncodedSnapshots,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
+        *,
+        state_hidden_override: Tensor | None = None,
+    ) -> tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]]:
         b = encoded.state_vector.shape[0]
         device = encoded.state_vector.device
         if h_in is None or c_in is None:
             h_in, c_in = self.init_state(b, device)
 
         if state_hidden_override is not None:
-            # R-NaD recomputes the LSTM hidden states once per policy across the
-            # whole batch, then asks each policy to score with those hiddens —
-            # skip the per-step LSTM here and consume the override directly.
             if state_hidden_override.shape != (b, self.lstm_hidden):
                 raise ValueError(
                     "state_hidden_override must have shape "
@@ -142,15 +176,10 @@ class RecurrentTextPolicy(nn.Module):
             state_hidden = state_hidden_override
             h_out, c_out = h_in, c_in
         else:
-            # Treat each forward as a single time step. Multi-step support
-            # (T > 1) can be added by accepting [B, T, ...] inputs and
-            # looping/scanning.
-            x = self.in_proj(encoded.state_vector).unsqueeze(1)  # [B, 1, lstm_hidden]
+            x = self.in_proj(encoded.state_vector).unsqueeze(1)
             y, (h_out, c_out) = self.lstm(x, (h_in, c_in))
-            state_hidden = y.squeeze(1)  # [B, lstm_hidden]
+            state_hidden = y.squeeze(1)
 
-        # Project back to d_model so the heads (built around d_model) consume
-        # the LSTM output in place of the pooled state vector.
         state_for_heads = self.out_proj(state_hidden)
         policy_logits, target_logits, values = self.text_policy.run_heads(
             encoded, state_vec=state_for_heads

@@ -2292,8 +2292,11 @@ def sample_native_text_policy_batch(
     deterministic: bool = False,
     sampling_policy: TextActorCritic | None = None,
     text_batch: Any | None = None,
+    packed_text_batch: Any | None = None,
 ) -> list[Any]:
-    if text_batch is not None:
+    if packed_text_batch is not None:
+        encoded = None
+    elif text_batch is not None:
         # Phase 5: native assembler already produced the TextEncodedBatch.
         # Skip the render-plan slice + Python ``assemble_batch`` call.
         encoded = text_batch
@@ -2355,6 +2358,7 @@ def sample_native_text_policy_batch(
         perspective_player_indices=perspective_player_indices,
         layouts=layouts,
         deterministic=deterministic,
+        packed_batch=packed_text_batch,
     )
 
 
@@ -2669,8 +2673,9 @@ def train_text_native_batched_envs(
             ready_env_indices = [env.slot_idx for env in ready_envs]
             ready_games = [env.game for env in ready_envs]
             text_batch: Any | None = None
+            packed_text_batch: Any | None = None
             if getattr(args, "text_native_assembler", True):
-                native_batch, nat_outputs = native_encoder.encode_tokens(
+                native_batch, nat_outputs = native_encoder.encode_tokens_packed(
                     ready_games,
                     perspective_player_indices=ready_players,
                     max_tokens=args.text_max_tokens,
@@ -2678,7 +2683,7 @@ def train_text_native_batched_envs(
                     max_targets=args.max_targets_per_option,
                     max_card_refs=256,
                 )
-                text_batch = nat_outputs.to_text_encoded_batch()
+                packed_text_batch = nat_outputs.to_packed_text_batch()
             else:
                 native_batch = native_encoder.encode_handles(
                     ready_games,
@@ -2694,6 +2699,7 @@ def train_text_native_batched_envs(
                     deterministic=args.deterministic_rollout,
                     sampling_policy=sampling_policy,
                     text_batch=text_batch,
+                    packed_text_batch=packed_text_batch,
                 )
             counts = [len(s.selected_choice_cols) for s in policy_steps]
             starts: list[int] = list(itertools.accumulate(counts, initial=0))[:-1]

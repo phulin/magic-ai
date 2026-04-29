@@ -32,7 +32,7 @@ from magic_ai.replay_decisions import (
     direct_decision_logits_from_forward,
     score_may_decisions_from_forward,
 )
-from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 from magic_ai.text_encoder.policy import EncodedSnapshots
 from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
@@ -196,12 +196,13 @@ class TextActorCritic(nn.Module):
 
     def sample_text_batch(
         self,
-        batch: TextEncodedBatch,
+        batch: TextEncodedBatch | None,
         *,
         env_indices: list[int],
         perspective_player_indices: list[int],
         layouts: list[TextDecisionLayout],
         deterministic: bool = False,
+        packed_batch: PackedTextBatch | None = None,
     ) -> list[PolicyStep]:
         """Sample a live text-encoded batch and append replay rows.
 
@@ -212,15 +213,27 @@ class TextActorCritic(nn.Module):
 
         if self.rollout_buffer is None:
             raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
-        n = int(batch.token_ids.shape[0])
+        if batch is None and packed_batch is None:
+            raise ValueError("batch or packed_batch is required")
+        n = (
+            int(packed_batch.seq_lengths.shape[0])
+            if packed_batch is not None
+            else int(cast(TextEncodedBatch, batch).token_ids.shape[0])
+        )
         if n == 0:
             return []
         if len(env_indices) != n or len(perspective_player_indices) != n or len(layouts) != n:
             raise ValueError("batch, env_indices, perspective_player_indices, and layouts differ")
 
-        moved = _move_text_batch(batch, self.device)
+        moved = _move_text_batch(batch, self.device) if batch is not None else None
+        moved_packed = (
+            _move_packed_text_batch(packed_batch, self.device) if packed_batch is not None else None
+        )
         h_in, c_in = self.lstm_env_state_inputs(env_indices, perspective_player_indices)
-        output, (h_out, c_out) = self.policy(moved, h_in=h_in, c_in=c_in)
+        if moved_packed is not None:
+            output, (h_out, c_out) = self.policy.forward_packed(moved_packed, h_in=h_in, c_in=c_in)
+        else:
+            output, (h_out, c_out) = self.policy(moved, h_in=h_in, c_in=c_in)
         self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
 
         none_logits = self.none_head(output.state_hidden).squeeze(-1)
@@ -429,22 +442,31 @@ class TextActorCritic(nn.Module):
             else:
                 trace, action = _decode_text_action(trace_kind, layout.pending, selected_cols)
 
-            replay_idx = self.rollout_buffer.append(
-                encoded=moved,
-                batch_index=step_idx,
-                trace_kind_id=TRACE_KIND_TO_ID[trace_kind],
-                decision_option_idx=layout.decision_option_idx,
-                decision_target_idx=layout.decision_target_idx,
-                decision_mask=layout.decision_mask,
-                uses_none_head=layout.uses_none_head,
-                selected_indices=torch.tensor(selected_cols, dtype=torch.long),
-                may_selected=float(may_selected),
-                old_log_prob=float(log_prob_cpu[step_idx]),
-                value=float(value_cpu[step_idx]),
-                perspective_player_idx=int(perspective_player_indices[step_idx]),
-                lstm_h_in=h_in[:, step_idx].detach(),
-                lstm_c_in=c_in[:, step_idx].detach(),
-            )
+            append_kwargs = {
+                "batch_index": step_idx,
+                "trace_kind_id": TRACE_KIND_TO_ID[trace_kind],
+                "decision_option_idx": layout.decision_option_idx,
+                "decision_target_idx": layout.decision_target_idx,
+                "decision_mask": layout.decision_mask,
+                "uses_none_head": layout.uses_none_head,
+                "selected_indices": torch.tensor(selected_cols, dtype=torch.long),
+                "may_selected": float(may_selected),
+                "old_log_prob": float(log_prob_cpu[step_idx]),
+                "value": float(value_cpu[step_idx]),
+                "perspective_player_idx": int(perspective_player_indices[step_idx]),
+                "lstm_h_in": h_in[:, step_idx].detach(),
+                "lstm_c_in": c_in[:, step_idx].detach(),
+            }
+            if packed_batch is not None:
+                replay_idx = self.rollout_buffer.append_packed(
+                    encoded=packed_batch,
+                    **append_kwargs,
+                )
+            else:
+                replay_idx = self.rollout_buffer.append(
+                    encoded=cast(TextEncodedBatch, moved),
+                    **append_kwargs,
+                )
             results.append(
                 PolicyStep(
                     action=action,
@@ -1228,6 +1250,29 @@ def _move_text_batch(batch: TextEncodedBatch, device: torch.device) -> TextEncod
         target_positions=batch.target_positions.to(device, non_blocking=nb),
         target_mask=target_mask,
         seq_lengths=batch.seq_lengths.to(device, non_blocking=nb),
+    )
+
+
+def _move_packed_text_batch(batch: PackedTextBatch, device: torch.device) -> PackedTextBatch:
+    nb = device.type == "cuda"
+    option_mask = batch.option_mask.to(device, non_blocking=nb)
+    target_mask = batch.target_mask.to(device, non_blocking=nb)
+    if option_mask.dtype != torch.bool:
+        option_mask = option_mask.to(dtype=torch.bool)
+    if target_mask.dtype != torch.bool:
+        target_mask = target_mask.to(dtype=torch.bool)
+    return PackedTextBatch(
+        token_ids=batch.token_ids.to(device, non_blocking=nb),
+        seq_id=batch.seq_id.to(device, non_blocking=nb),
+        pos_in_seq=batch.pos_in_seq.to(device, non_blocking=nb),
+        cu_seqlens=batch.cu_seqlens.to(device, non_blocking=nb),
+        seq_lengths=batch.seq_lengths.to(device, non_blocking=nb),
+        state_positions=batch.state_positions.to(device, non_blocking=nb),
+        card_ref_positions=batch.card_ref_positions.to(device, non_blocking=nb),
+        option_positions=batch.option_positions.to(device, non_blocking=nb),
+        option_mask=option_mask,
+        target_positions=batch.target_positions.to(device, non_blocking=nb),
+        target_mask=target_mask,
     )
 
 

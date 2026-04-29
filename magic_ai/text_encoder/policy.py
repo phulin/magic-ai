@@ -23,6 +23,7 @@ from transformers import PreTrainedTokenizerFast
 
 from magic_ai.game_state import GameStateSnapshot, PendingOptionState
 from magic_ai.text_encoder.batch import (
+    PackedTextBatch,
     TextEncodedBatch,
     collate,
     pack_batch,
@@ -117,11 +118,16 @@ class TextPolicy(nn.Module):
         # don't change. Wins scale with how skewed the per-row sequence
         # lengths are; equal-length batches are no slower.
         packed = pack_batch(batch)
-        hidden = self.encoder.forward_packed(packed)
-        card_vecs, card_mask = gather_card_vectors_packed(hidden, packed)
-        option_vecs, option_mask = gather_option_vectors_packed(hidden, packed)
-        target_vecs, target_mask = gather_target_vectors_packed(hidden, packed)
-        state_vec = gather_state_vector_packed(hidden, packed)
+        return self.encode_packed_only(packed)
+
+    def encode_packed_only(self, batch: PackedTextBatch) -> EncodedSnapshots:
+        """Run the encoder + pool ops on an already-packed batch."""
+
+        hidden = self.encoder.forward_packed(batch)
+        card_vecs, card_mask = gather_card_vectors_packed(hidden, batch)
+        option_vecs, option_mask = gather_option_vectors_packed(hidden, batch)
+        target_vecs, target_mask = gather_target_vectors_packed(hidden, batch)
+        state_vec = gather_state_vector_packed(hidden, batch)
         return EncodedSnapshots(
             card_vectors=card_vecs,
             card_mask=card_mask,

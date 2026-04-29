@@ -254,6 +254,30 @@ class ShardedNativeBatchEncoder:
             max_card_refs=max_card_refs,
         )
 
+    def encode_tokens_packed(
+        self,
+        games: list[Any],
+        *,
+        perspective_player_indices: list[int],
+        max_tokens: int,
+        max_options: int,
+        max_targets: int,
+        max_card_refs: int,
+    ) -> tuple[NativeEncodedBatch, Any]:
+        """Run the native packed text-encoder assembler."""
+
+        from magic_ai.text_encoder.native_assembler import encode_tokens_packed
+
+        return encode_tokens_packed(
+            self._encoders[0],
+            games,
+            perspective_player_indices=perspective_player_indices,
+            max_tokens=max_tokens,
+            max_options=max_options,
+            max_targets=max_targets,
+            max_card_refs=max_card_refs,
+        )
+
     def encode_handles(
         self,
         games: list[Any],

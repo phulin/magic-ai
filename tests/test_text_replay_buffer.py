@@ -1,7 +1,7 @@
 import unittest
 
 import torch
-from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.batch import TextEncodedBatch, pack_batch
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -109,6 +109,61 @@ class TextReplayBufferTests(unittest.TestCase):
         assert gathered.lstm_c_in is not None
         torch.testing.assert_close(gathered.lstm_h_in[0], h_in)
         torch.testing.assert_close(gathered.lstm_c_in[0], c_in)
+
+    def test_append_packed_and_gather_round_trip(self) -> None:
+        buffer = _buffer()
+        encoded = _encoded_batch()
+        packed = pack_batch(encoded)
+        decision_option_idx = torch.tensor([[0, 1, -1, -1]])
+        decision_target_idx = torch.tensor([[-1, 0, -1, -1]])
+        decision_mask = torch.tensor([[True, True, False, False]])
+        uses_none_head = torch.tensor([False])
+        selected_indices = torch.tensor([1])
+        h_in = torch.full((1, 6), 0.25)
+        c_in = torch.full((1, 6), -0.5)
+
+        row = buffer.append_packed(
+            encoded=packed,
+            batch_index=0,
+            trace_kind_id=3,
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            selected_indices=selected_indices,
+            may_selected=0.0,
+            old_log_prob=-1.25,
+            value=0.75,
+            perspective_player_idx=1,
+            lstm_h_in=h_in,
+            lstm_c_in=c_in,
+        )
+        gathered = buffer.gather([row])
+
+        torch.testing.assert_close(
+            gathered.encoded.token_ids[0], encoded.token_ids[0], check_dtype=False
+        )
+        torch.testing.assert_close(
+            gathered.encoded.attention_mask[0], encoded.attention_mask[0], check_dtype=False
+        )
+        torch.testing.assert_close(
+            gathered.encoded.card_ref_positions[0],
+            encoded.card_ref_positions[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered.encoded.option_positions[0],
+            encoded.option_positions[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered.encoded.target_positions[0],
+            encoded.target_positions[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(gathered.decision_mask[0, :1], decision_mask)
+        self.assertEqual(int(gathered.decision_count[0]), 1)
+        self.assertAlmostEqual(float(gathered.old_log_prob[0]), -1.25)
 
     def test_release_reuses_rows_and_reset_clears_occupancy(self) -> None:
         buffer = _buffer()
