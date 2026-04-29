@@ -97,7 +97,10 @@ def test_single_card_plan_decodes_card_name(cache, tokenizer, name_to_row, oracl
 
     batch = assemble_batch([w.finalize()], cache, tokenizer, max_tokens=512)
     decoded = tokenizer.decode(batch.token_ids[0, : int(batch.seq_lengths[0])].tolist())
-    assert "Lightning Bolt" in decoded
+    # Card names are anonymized inside the body to ``<card-name>``; the
+    # mana cost / type / anonymized rules text are what surface instead.
+    assert "<mana-cost>{R}</mana-cost>" in decoded
+    assert "<rules-text>" in decoded
 
     # <card-ref:0> appears in the stream and is anchored.
     card_ref_id = tokenizer.convert_tokens_to_ids("<card-ref:0>")
@@ -197,11 +200,14 @@ def test_structured_go_plan_decodes_without_literal_tokens(cache, tokenizer, nam
     batch = assemble_batch([plan], cache, tokenizer, max_tokens=512)
     decoded = tokenizer.decode(batch.token_ids[0, : int(batch.seq_lengths[0])].tolist())
 
-    assert "turn=3" in decoded
-    assert "life=20" in decoded
-    assert "{G}{G}" in decoded
-    assert "Grizzly Bears" in decoded
-    assert "cast" in decoded
+    assert "<turn>3</turn>" in decoded
+    assert "<life>20</life>" in decoded
+    # Floating mana surfaces as two green glyphs in the pool block.
+    assert "<mana-pool>{G}{G}</mana-pool>" in decoded
+    # Card names are anonymized in the body — assert the structural surface
+    # instead. Grizzly Bears is a vanilla 2/2 with no oracle text.
+    assert "<pt>2/2</pt>" in decoded
+    assert "<cast>" in decoded
     assert int(batch.card_ref_positions[0, 0]) >= 0
     assert int(batch.option_positions[0, 0]) >= 0
 

@@ -92,21 +92,61 @@ def test_zone_tags_match(tokenizer, tables) -> None:
             assert tables.zone_close[(zone_id, owner_id)] == _enc(tokenizer, f"</{tag}></{owner}>")
 
 
+_ACTION_KIND_TOKEN_BY_ID: dict[int, str] = {
+    0: "<pass>",
+    1: "<play>",
+    2: "<cast>",
+    3: "<activate>",
+    4: "<attack>",
+    5: "<block>",
+    6: "<choice>",  # not in vocab — falls back to literal text
+}
+
+
+_POOL_MANA_BY_SYMBOL: dict[str, str] = {
+    "W": "<mana:W>",
+    "U": "<mana:U>",
+    "B": "<mana:B>",
+    "R": "<mana:R>",
+    "G": "<mana:G>",
+    "C": "<mana:C>",
+}
+
+
+_STEP_NAME_TO_TOKEN: dict[str, str] = {
+    "Untap": "<step:untap>",
+    "Upkeep": "<step:upkeep>",
+    "Draw": "<step:draw>",
+    "Precombat Main": "<step:precombat-main>",
+    "Begin Combat": "<step:begin-combat>",
+    "Declare Attackers": "<step:declare-attackers>",
+    "Declare Blockers": "<step:declare-blockers>",
+    "Combat Damage": "<step:combat-damage>",
+    "End Combat": "<step:end-combat>",
+    "Postcombat Main": "<step:postcombat-main>",
+    "End": "<step:end>",
+    "Cleanup": "<step:cleanup>",
+}
+
+
 def test_action_verbs_match(tokenizer, tables) -> None:
-    for kind_id, verb in ACTION_VERBS_BY_ID.items():
-        assert tables.action_verb[kind_id] == _enc(tokenizer, f" {verb}")
+    for kind_id, _verb in ACTION_VERBS_BY_ID.items():
+        tok_str = _ACTION_KIND_TOKEN_BY_ID.get(kind_id, "")
+        expected = _enc(tokenizer, tok_str) if tok_str else []
+        assert tables.action_verb[kind_id] == expected
 
 
 def test_mana_glyphs_match(tokenizer, tables) -> None:
     for color_id, sym in enumerate(MANA_SYMBOLS):
-        assert tables.mana_glyph[color_id] == _enc(tokenizer, f"{{{sym}}}")
+        assert tables.mana_glyph[color_id] == _enc(tokenizer, _POOL_MANA_BY_SYMBOL[sym])
 
 
 def test_turn_step_match(tokenizer, tables) -> None:
     for turn in (TURN_MIN, 1, 7, 42, TURN_MAX):
         for step_id, step in enumerate(STEP_NAMES):
+            step_tok = _STEP_NAME_TO_TOKEN.get(step, "")
             assert tables.turn_step[(turn, step_id)] == _enc(
-                tokenizer, f" turn={turn} step={step} "
+                tokenizer, f"<turn>{turn}</turn>{step_tok}"
             )
 
 
@@ -114,7 +154,7 @@ def test_life_owner_match(tokenizer, tables) -> None:
     for life in (LIFE_MIN, -1, 0, 20, 100, LIFE_MAX):
         for owner_id, owner in enumerate(OWNER_NAMES):
             assert tables.life_owner[(life, owner_id)] == _enc(
-                tokenizer, f"<{owner}> life={life} mana="
+                tokenizer, f"<{owner}><life>{life}</life><mana-pool>"
             )
 
 
@@ -125,7 +165,7 @@ def test_ability_match(tokenizer, tables) -> None:
 
 def test_count_match(tokenizer, tables) -> None:
     for n in (COUNT_MIN, 1, 5, 53, COUNT_MAX):
-        assert tables.count[n] == _enc(tokenizer, f" count={n}")
+        assert tables.count[n] == _enc(tokenizer, str(n))
 
 
 def test_card_ref_singletons(tokenizer, tables) -> None:

@@ -7,7 +7,7 @@ stream that can be walked using only ``OPCODE_ARITY`` per the ABI doc.
 
 from __future__ import annotations
 
-import numpy as np
+import torch
 from magic_ai.text_encoder.render_plan import (
     OP_CLOSE_ACTIONS,
     OP_CLOSE_STATE,
@@ -44,7 +44,7 @@ def test_writer_round_trip() -> None:
     w.emit_close_state()
 
     buf = w.finalize()
-    assert buf.dtype == np.int32
+    assert buf.dtype == torch.int32
 
     # Walk + decode by header alone.
     seen: list[tuple[int, list[int]]] = []

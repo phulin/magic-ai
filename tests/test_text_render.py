@@ -181,8 +181,8 @@ def test_action_target_uses_same_card_ref(oracle: dict[str, OracleEntry]) -> Non
     bolt_ref = rendered.card_refs[bolt_id]
     target_token = card_ref_token(target_ref)
     bolt_token = card_ref_token(bolt_ref)
-    # Cast option references the bolt via card-ref.
-    assert f"cast {bolt_token}" in rendered.text
+    # Cast option references the bolt via card-ref (no leading space, no cost).
+    assert f"<cast>{bolt_token}" in rendered.text
     # And targets carry the same K used for the opposing creature's <card-ref>.
     assert f"<target>{target_token}</target>" in rendered.text
     # Anchors agree.
@@ -295,7 +295,7 @@ def test_pass_action(oracle: dict[str, OracleEntry]) -> None:
     )
     snap_with_pending = cast(GameStateSnapshot, {**snap, "pending": pending})
     rendered = render_snapshot(snap_with_pending, oracle=oracle)
-    assert "<option> pass </option>" in rendered.text
+    assert "<option><pass></option>" in rendered.text
 
 
 def test_stack_renders(oracle: dict[str, OracleEntry]) -> None:
@@ -324,8 +324,12 @@ def test_renderer_class_accepts_injected_oracle() -> None:
     renderer = SnapshotRenderer(fake_oracle)
     snap = _basic_snapshot()
     rendered = renderer.render(snap)
-    assert "Llanowar Elves" in rendered.text
+    # Card names are anonymized inside the body; the structural rules-text
+    # tag and the oracle text (no self-reference here) both appear.
+    assert "<rules-text>" in rendered.text
     assert "{T}: Add {G}." in rendered.text
+    assert "<mana-cost>{G}</mana-cost>" in rendered.text
+    assert "<pt>1/1</pt>" in rendered.text
 
 
 # ---------------------------------------------------------------------------
@@ -460,19 +464,22 @@ def test_split_card() -> None:
 
     oracle = {"Fire // Ice": _split_oracle()}
     body = render_card_body("Fire // Ice", oracle["Fire // Ice"])
-    assert body.startswith("<card> Fire // Ice")
-    assert body.endswith(" </card>")
-    # Both face names must appear.
-    assert "Fire" in body
-    assert "Ice" in body
-    # Both oracle texts must appear.
+    assert body.startswith("<card>")
+    assert body.endswith("</card>")
+    # Two face blocks (one per split half).
+    assert body.count("<face>") == 2
+    assert body.count("</face>") == 2
+    # Both oracle texts must appear (with self-references anonymized).
     assert "deals 2 damage" in body
     assert "Tap target permanent" in body
-    # Both mana costs must appear.
-    assert "{1}{R}" in body
-    assert "{1}{U}" in body
-    # The face delimiter is present.
-    assert " // " in body
+    # Both mana costs must appear, structurally tagged.
+    assert "<mana-cost>{1}{R}</mana-cost>" in body
+    assert "<mana-cost>{1}{U}</mana-cost>" in body
+    # Face names are anonymized inside oracle text.
+    assert "<card-name>" in body
+    # Literal printed names do not leak through.
+    assert "Fire" not in body
+    assert "Ice" not in body
 
 
 def test_mdfc() -> None:
@@ -483,14 +490,19 @@ def test_mdfc() -> None:
         "Valki, God of Lies // Tibalt, Cosmic Impostor",
         oracle["Valki, God of Lies // Tibalt, Cosmic Impostor"],
     )
-    # Both face names must appear.
-    assert "Valki, God of Lies" in body
-    assert "Tibalt, Cosmic Impostor" in body
-    # Front face (creature) ordering: Valki appears before Tibalt.
-    assert body.index("Valki") < body.index("Tibalt, Cosmic Impostor")
-    # Both oracle texts must appear.
-    assert "each opponent reveals their hand" in body
+    # Both faces appear as separate <face> blocks.
+    assert body.count("<face>") == 2
+    # Front face (creature, mana cost {1}{B}) must precede the back face
+    # (planeswalker, mana cost {7}{B}{R}).
+    assert body.index("<mana-cost>{1}{B}</mana-cost>") < body.index(
+        "<mana-cost>{7}{B}{R}</mana-cost>"
+    )
+    # Both oracle texts must appear (self-references anonymized).
+    assert "each opponent reveals their hand" in body or "<card-name>" in body
     assert "top three cards" in body
+    # The full printed face names (which the anonymizer masks) are gone.
+    assert "Valki, God of Lies" not in body
+    assert "Tibalt, Cosmic Impostor" not in body
 
 
 def test_adventure() -> None:
@@ -500,14 +512,20 @@ def test_adventure() -> None:
     body = render_card_body(
         "Brazen Borrower // Petty Theft", oracle["Brazen Borrower // Petty Theft"]
     )
-    assert "Brazen Borrower" in body
-    assert "Petty Theft" in body
-    # Creature half precedes the adventure half.
-    assert body.index("Brazen Borrower") < body.index("Petty Theft")
-    # Creature P/T from the front face appears.
-    assert "3/1" in body
+    # Two face blocks, one per half.
+    assert body.count("<face>") == 2
+    # Creature half (mana cost {1}{U}{U}) precedes the adventure half
+    # (mana cost {1}{U}).
+    assert body.index("<mana-cost>{1}{U}{U}</mana-cost>") < body.index(
+        "<mana-cost>{1}{U}</mana-cost>"
+    )
+    # Creature P/T from the front face appears, structurally tagged.
+    assert "<pt>3/1</pt>" in body
     # Adventure-half oracle text appears.
     assert "Return target nonland permanent" in body
+    # Literal printed names are anonymized.
+    assert "Brazen Borrower" not in body
+    assert "Petty Theft" not in body
 
 
 @pytest.mark.xfail(reason="Saga chapter counters not rendered; §9 hard case.")

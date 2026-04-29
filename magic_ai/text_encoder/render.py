@@ -31,6 +31,7 @@ from magic_ai.text_encoder.tokenizer import (
     _CARD_TYPE_WORDS,
     MAX_CARD_REFS,
     card_ref_token,
+    step_token,
 )
 
 DEFAULT_ORACLE_PATH = Path(__file__).resolve().parents[2] / "data" / "card_oracle_embeddings.json"
@@ -465,6 +466,29 @@ def _mana_pool_text(player: PlayerState | None) -> str:
     return "".join(parts)
 
 
+_POOL_MANA_TOKEN_BY_COLOR: dict[str, str] = {
+    "White": "<mana:W>",
+    "Blue": "<mana:U>",
+    "Black": "<mana:B>",
+    "Red": "<mana:R>",
+    "Green": "<mana:G>",
+    "Colorless": "<mana:C>",
+}
+
+
+def _mana_pool_tokens(player: PlayerState | None) -> str:
+    """Concatenated ``<mana:X>`` tokens for a player's floating pool."""
+
+    if player is None:
+        return ""
+    pool = player.get("ManaPool") or {}
+    parts: list[str] = []
+    for color, token in _POOL_MANA_TOKEN_BY_COLOR.items():
+        amount = int(pool.get(color, 0) or 0)  # type: ignore[arg-type]
+        parts.extend(token for _ in range(amount))
+    return "".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Renderer
 # ---------------------------------------------------------------------------
@@ -487,6 +511,8 @@ class SnapshotRenderer:
     ) -> None:
         self._oracle = oracle if oracle is not None else {}
         self._max_card_refs = max_card_refs
+        self._cur_self_id: str = ""
+        self._cur_opp_id: str = ""
 
     # -- public ------------------------------------------------------------
 
@@ -505,25 +531,33 @@ class SnapshotRenderer:
         players = snapshot["players"]
         self_player = players[perspective]
         opp_player = players[1 - perspective] if len(players) == 2 else None
+        self._cur_self_id = str(self_player.get("ID", "")) if self_player else ""
+        self._cur_opp_id = str(opp_player.get("ID", "")) if opp_player else ""
 
         buf.append("<bos><state>")
-        # Top-level game info
+        # Top-level game info: <turn>N</turn><step:...>
         turn = snapshot.get("turn", 0)
-        step = snapshot.get("step", "")
-        buf.append(f" turn={turn} step={step} ")
+        step = snapshot.get("step", "") or ""
+        try:
+            step_tok = step_token(step)
+        except KeyError:
+            step_tok = ""
+        buf.append(f"<turn>{int(turn)}</turn>{step_tok}")
 
         # Player blocks
         self._render_player_block(buf, "self", self_player)
         self._render_player_block(buf, "opp", opp_player)
 
-        # Battlefield / hand / graveyard / exile
+        # Battlefield / hand / graveyard / exile.
+        # Skip the opponent's hand entirely (fog of war). Skip empty Exile.
         for owner, attr, open_tag, close_tag in _RENDER_ZONES:
+            if owner == "opp" and attr == "Hand":
+                continue
             owner_open = "<self>" if owner == "self" else "<opp>"
             owner_close = "</self>" if owner == "self" else "</opp>"
             player = self_player if owner == "self" else opp_player
             cards = _player_zone(player, attr)
             if attr == "Exile" and not cards:
-                # Skip empty exile entirely.
                 continue
             buf.append(owner_open)
             buf.append(open_tag)
@@ -531,14 +565,12 @@ class SnapshotRenderer:
             buf.append(close_tag)
             buf.append(owner_close)
 
-        # Library counts (count only — hidden information).
-        buf.append("<self><library>")
-        buf.append(f" count={int(self_player.get('LibraryCount', 0) or 0)} ")
-        buf.append("</library></self>")
+        # Library counts: <self><library>{N}</library></self> (and opp).
+        self_lib = int(self_player.get("LibraryCount", 0) or 0)
+        buf.append(f"<self><library>{self_lib}</library></self>")
         if opp_player is not None:
-            buf.append("<opp><library>")
-            buf.append(f" count={int(opp_player.get('LibraryCount', 0) or 0)} ")
-            buf.append("</library></opp>")
+            opp_lib = int(opp_player.get("LibraryCount", 0) or 0)
+            buf.append(f"<opp><library>{opp_lib}</library></opp>")
 
         # Stack
         buf.append("<stack>")
@@ -546,9 +578,14 @@ class SnapshotRenderer:
             self._render_stack_object(buf, stack_obj, card_refs)
         buf.append("</stack>")
 
-        # Command zone — not represented in the snapshot today; emit empty for
-        # forward compatibility per §3 (closers preserved for empty zones).
-        buf.append("<command></command>")
+        # Command zone — only emitted when at least one player has a non-empty
+        # Command zone. Today the snapshot does not surface command-zone
+        # contents, so this is rare in practice.
+        has_command = any(
+            (p or {}).get("Command") for p in (self_player, opp_player) if p is not None
+        )
+        if has_command:
+            buf.append("<command></command>")
 
         # Actions
         if actions is None:
@@ -600,14 +637,13 @@ class SnapshotRenderer:
     ) -> None:
         open_tag = "<self>" if scope == "self" else "<opp>"
         close_tag = "</self>" if scope == "self" else "</opp>"
-        buf.append(open_tag)
         if player is None:
-            buf.append(" life=0 mana= ")
+            life = 0
+            mana_tokens = ""
         else:
             life = int(player.get("Life", 0) or 0)
-            mana = _mana_pool_text(player)
-            buf.append(f" life={life} mana={mana} ")
-        buf.append(close_tag)
+            mana_tokens = _mana_pool_tokens(player)
+        buf.append(f"{open_tag}<life>{life}</life><mana-pool>{mana_tokens}</mana-pool>{close_tag}")
 
     def _render_zone_cards(
         self,
@@ -668,11 +704,11 @@ class SnapshotRenderer:
         cid = obj.get("id", "")
         name = obj.get("name", "") or ""
         ref_idx = card_refs.get(cid)
-        buf.append("<card>")
+        # Mirror _emit_stack_object exactly: spaces around the inner content.
         if ref_idx is not None:
-            buf.append(card_ref_token(ref_idx))
-        buf.append(name)
-        buf.append("</card>")
+            buf.append(f"<card> {card_ref_token(ref_idx)} {name} </card>")
+        else:
+            buf.append(f"<card> {name} </card>")
 
     # -- actions -----------------------------------------------------------
 
@@ -702,7 +738,6 @@ class SnapshotRenderer:
         kind = (option.get("kind") or "").lower()
         card_id = option.get("card_id") or option.get("permanent_id") or ""
         card_name = option.get("card_name") or ""
-        cost = option.get("mana_cost") or ""
         targets = option.get("valid_targets") or []
         target_anchors: list[TargetAnchor] = []
 
@@ -716,16 +751,12 @@ class SnapshotRenderer:
         if kind in ("cast", "cast_spell", "play", "play_land"):
             buf.append("<play>" if kind in ("play", "play_land") else "<cast>")
             emit_card(card_id, card_name)
-            if cost:
-                buf.append(f" cost {cost}")
         elif kind in ("activate", "activate_ability", "activated_ability"):
             buf.append("<activate>")
             emit_card(card_id, card_name)
             ability_idx = option.get("ability_index")
             if ability_idx is not None:
                 buf.append(f" ability {int(ability_idx)}")
-            if cost:
-                buf.append(f" cost {cost}")
         elif kind == "pass":
             buf.append("<pass>")
         elif kind == "attack":
@@ -775,9 +806,13 @@ class SnapshotRenderer:
         tid = target.get("id", "")
         ref = card_refs.get(tid)
         char_start = sum(len(s) for s in buf)
-        buf.append(" <target>")
+        buf.append("<target>")
         if ref is not None:
             buf.append(card_ref_token(ref))
+        elif tid and tid == self._cur_self_id:
+            buf.append("<self>")
+        elif tid and tid == self._cur_opp_id:
+            buf.append("<opp>")
         else:
             label = target.get("label") or tid
             if label:

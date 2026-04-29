@@ -84,10 +84,14 @@ def test_save_and_load_roundtrip(small_cache: CardTokenCache, tmp_path: Path) ->
 
 
 def test_slice_decodes_to_card_name(small_cache: CardTokenCache, tokenizer) -> None:
-    for k, name in enumerate(TEST_NAMES, start=1):
+    # Card names are anonymized inside the body — the encoder learns from
+    # rules-text mechanics, not from the printed name. Each cached slice must
+    # still be a well-formed ``<card>...</card>`` fragment.
+    for k, _name in enumerate(TEST_NAMES, start=1):
         ids = small_cache.body_tokens(k)
         decoded = tokenizer.decode(ids.tolist(), skip_special_tokens=False)
-        assert name in decoded, f"{name} missing from decoded slice: {decoded!r}"
+        assert decoded.startswith("<card>"), decoded
+        assert decoded.endswith("</card>"), decoded
 
 
 def test_missing_raises_lists_name(oracle: dict[str, OracleEntry], tokenizer) -> None:
@@ -263,8 +267,11 @@ def test_cached_tokens_match_snapshot_render_multi_face(
     cache = build_card_cache([name], multi_oracle, tokenizer)
 
     body_text = render_card_body(name, multi_oracle[name])
-    assert "Valki, God of Lies" in body_text
-    assert "Tibalt, Cosmic Impostor" in body_text
+    # Card names are anonymized inside the body; both faces still surface as
+    # separate ``<face>`` blocks with their own mana costs.
+    assert body_text.count("<face>") == 2
+    assert "<mana-cost>{1}{B}</mana-cost>" in body_text
+    assert "<mana-cost>{7}{B}{R}</mana-cost>" in body_text
 
     rendered = render_snapshot(_single_card_snapshot(name), [], oracle=multi_oracle)
     assert body_text in rendered.text
