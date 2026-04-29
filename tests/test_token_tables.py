@@ -94,7 +94,7 @@ def test_zone_tags_match(tokenizer, tables) -> None:
 
 def test_action_verbs_match(tokenizer, tables) -> None:
     for kind_id, verb in ACTION_VERBS_BY_ID.items():
-        assert tables.action_verb[kind_id] == _enc(tokenizer, verb)
+        assert tables.action_verb[kind_id] == _enc(tokenizer, f" {verb}")
 
 
 def test_mana_glyphs_match(tokenizer, tables) -> None:

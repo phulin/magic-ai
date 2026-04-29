@@ -55,11 +55,19 @@ from magic_ai.text_encoder.render_plan import (
     ZONE_LIBRARY,
     ZONE_STACK,
 )
+from magic_ai.text_encoder.token_tables import (
+    CARD_CLOSER_TEXT as _TT_CARD_CLOSER_TEXT,
+)
+from magic_ai.text_encoder.token_tables import (
+    Frag,
+    TokenTables,
+    build_token_tables,
+)
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 logger = logging.getLogger(__name__)
 
-CARD_CLOSER_TEXT = " </card>"
+CARD_CLOSER_TEXT = _TT_CARD_CLOSER_TEXT
 
 _STEP_NAMES: tuple[str, ...] = (
     "Untap",
@@ -130,6 +138,18 @@ class AssemblerTokens:
     # snapshots — replaces the per-card .tolist()/tail-compare/.tolist() in
     # the OP_PLACE_CARD hot path.
     _body_lists_cache: dict[int, list[list[int]]] = field(default_factory=dict)
+    # Per-(cache id) memo of card-name display-string token lists, mirroring
+    # ``_body_lists_cache``. Built lazily from the tokenizer the first time the
+    # assembler sees a given cache.
+    _name_lists_cache: dict[int, list[list[int]]] = field(default_factory=dict)
+    # Closed-vocabulary token tables (Phase 1 of the assembler-port). Populated
+    # at build time from the tokenizer. The walker dispatches every emit-text
+    # call through these tables, so the live tokenizer never fires on the hot
+    # path. ``tables.card_body`` / ``tables.card_name`` are *not* populated
+    # here — those live in the per-cache ``_body_lists_cache`` /
+    # ``_name_lists_cache`` memos so a single AssemblerTokens can be reused
+    # across caches.
+    tables: TokenTables | None = None
 
 
 def _single_id(tokenizer: PreTrainedTokenizerFast, token: str) -> int:
@@ -157,6 +177,10 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
     )
     toks.card_ref_id_to_k = {ref_id: k for k, ref_id in enumerate(toks.card_ref_ids)}
     toks._tokenizer = tokenizer
+    # Build the closed-vocabulary token table. ``cache=None`` skips the
+    # per-row card_body / card_name fields; those live in the per-cache memos
+    # below. Anything tokenizer-only is now precomputed here.
+    toks.tables = build_token_tables(tokenizer, cache=None)
     frags = toks.fragment_ids
     # Static structural fragments.
     for s in (
@@ -222,6 +246,26 @@ def _body_lists(toks: AssemblerTokens, cache: CardTokenCache) -> list[list[int]]
     return rows
 
 
+def _name_lists(toks: AssemblerTokens, cache: CardTokenCache) -> list[list[int]]:
+    """Return per-row tokenized display-name lists for ``cache``.
+
+    Built once per cache and memoized on ``toks`` keyed by ``id(cache)``. The
+    assembler emits ``cache.row_to_name[row]`` as a single fragment via
+    ``emit_text``; precomputing the BPE for each row lets the hot path do a
+    single ``out.extend(name_lists[row])`` instead of a tokenizer call.
+    """
+    key = id(cache)
+    cached = toks._name_lists_cache.get(key)
+    if cached is not None:
+        return cached
+    tok = toks._tokenizer
+    if tok is None:
+        raise RuntimeError("AssemblerTokens has no tokenizer attached")
+    rows: list[list[int]] = [_encode(tok, name) for name in cache.row_to_name]
+    toks._name_lists_cache[key] = rows
+    return rows
+
+
 def _fragment(toks: AssemblerTokens, text: str) -> list[int]:
     """Return the cached token-id list for ``text``, encoding lazily on miss."""
     cached = toks.fragment_ids.get(text)
@@ -253,6 +297,7 @@ def _assemble_one(
     cache: CardTokenCache,
     toks: AssemblerTokens,
     body_lists: list[list[int]],
+    name_lists: list[list[int]],
 ) -> _AssembledExample:
     # Materialize the int32 plan as a Python list once so the inner
     # walker does plain int indexing instead of paying ``.item()`` cost
@@ -260,6 +305,16 @@ def _assemble_one(
     plan_list: list[int] = plan.tolist() if isinstance(plan, torch.Tensor) else list(plan)
     plan_len = len(plan_list)
     ref_id_to_k = toks.card_ref_id_to_k
+    if toks.tables is None:
+        raise RuntimeError("AssemblerTokens.tables not populated")
+    tables = toks.tables
+    frag_table = tables.structural
+    zone_open_table = tables.zone_open
+    zone_close_table = tables.zone_close
+    action_verb_table = tables.action_verb
+    turn_step_table = tables.turn_step
+    life_owner_table = tables.life_owner
+    ability_table = tables.ability
     out: list[int] = []
     card_ref_positions: dict[int, int] = {}
     option_positions: list[int] = []
@@ -292,9 +347,6 @@ def _assemble_one(
             break
         _scan_i += 1 + _scan_arity
 
-    def emit_text(text: str) -> None:
-        out.extend(_fragment(toks, text))
-
     def emit_card_ref(uuid_idx: int) -> bool:
         # Returns True iff a ``<card-ref:K>`` token was emitted. Caller may
         # fall back to a row-name on False. ``uuid_idx >= MAX_CARD_REFS``
@@ -313,13 +365,13 @@ def _assemble_one(
         nonlocal scalar_owner_open
         if scalar_owner_open is None:
             return
-        emit_text(" </self>" if scalar_owner_open == 0 else " </opp>")
+        out.extend(frag_table[Frag.CLOSE_SELF if scalar_owner_open == 0 else Frag.CLOSE_OPP])
         scalar_owner_open = None
 
     def close_option() -> None:
         nonlocal option_open
         if option_open:
-            emit_text(" </option>")
+            out.extend(frag_table[Frag.CLOSE_OPTION])
             option_open = False
 
     i = 0
@@ -364,22 +416,29 @@ def _assemble_one(
                     close_scalar_owner()
 
             if op == OP_OPEN_STATE:
-                emit_text("<bos><state>")
+                out.extend(frag_table[Frag.BOS_STATE])
                 i += 1
                 continue
 
             if op == OP_CLOSE_STATE:
                 close_option()
                 close_scalar_owner()
-                emit_text("</state><eos>")
+                out.extend(frag_table[Frag.CLOSE_STATE_EOS])
                 i += 1
                 continue
 
             if op == OP_TURN:
                 turn = plan_list[i + 1]
                 step_id = plan_list[i + 2]
-                step = _STEP_NAMES[step_id] if 0 <= step_id < len(_STEP_NAMES) else "Unknown"
-                emit_text(f" turn={turn} step={step} ")
+                if not (0 <= step_id < len(_STEP_NAMES)):
+                    step_id = len(_STEP_NAMES) - 1  # "Unknown"
+                ts = turn_step_table.get((turn, step_id))
+                if ts is None:
+                    raise ValueError(
+                        f"OP_TURN out of bounds: turn={turn} step_id={step_id} "
+                        f"(allowed turn range {tables.turn_min}..{tables.turn_max})"
+                    )
+                out.extend(ts)
                 i += 1 + arity
                 continue
 
@@ -387,7 +446,13 @@ def _assemble_one(
                 close_scalar_owner()
                 owner = plan_list[i + 1]
                 life = plan_list[i + 2]
-                emit_text(("<self>" if owner == 0 else "<opp>") + f" life={life} mana=")
+                lo = life_owner_table.get((life, owner))
+                if lo is None:
+                    raise ValueError(
+                        f"OP_LIFE out of bounds: life={life} owner={owner} "
+                        f"(allowed life range {tables.life_min}..{tables.life_max})"
+                    )
+                out.extend(lo)
                 scalar_owner_open = owner
                 i += 1 + arity
                 continue
@@ -397,7 +462,7 @@ def _assemble_one(
                 color_id = plan_list[i + 2]
                 amount = plan_list[i + 3]
                 if scalar_owner_open is None:
-                    emit_text("<self> mana=" if owner == 0 else "<opp> mana=")
+                    out.extend(frag_table[Frag.SELF_MANA if owner == 0 else Frag.OPP_MANA])
                     scalar_owner_open = owner
                 if 0 <= color_id < len(toks.mana_glyph_ids) and amount > 0:
                     glyph_ids = toks.mana_glyph_ids[color_id]
@@ -411,9 +476,7 @@ def _assemble_one(
                 zone = plan_list[i + 1]
                 owner = plan_list[i + 2]
                 zone_stack.append((zone, owner))
-                tag = _ZONE_TAGS.get(zone, "zone")
-                owner_tag = "self" if owner == 0 else "opp"
-                emit_text(f"<{owner_tag}><{tag}>")
+                out.extend(zone_open_table[(zone, owner)])
                 i += 1 + arity
                 continue
 
@@ -421,20 +484,18 @@ def _assemble_one(
                 close_option()
                 if zone_stack:
                     zone, owner = zone_stack.pop()
-                    tag = _ZONE_TAGS.get(zone, "zone")
-                    owner_tag = "self" if owner == 0 else "opp"
-                    emit_text(f"</{tag}></{owner_tag}>")
+                    out.extend(zone_close_table[(zone, owner)])
                 i += 1
                 continue
 
             if op == OP_OPEN_ACTIONS:
-                emit_text("<actions>")
+                out.extend(frag_table[Frag.OPEN_ACTIONS])
                 i += 1
                 continue
 
             if op == OP_CLOSE_ACTIONS:
                 close_option()
-                emit_text("</actions>")
+                out.extend(frag_table[Frag.CLOSE_ACTIONS])
                 i += 1
                 continue
 
@@ -451,16 +512,30 @@ def _assemble_one(
                 cur_target_bucket = []
                 target_positions.append(cur_target_bucket)
                 option_open = True
-                verb = _ACTION_KINDS.get(kind_id, "unknown")
-                emit_text(f" {verb}")
-                if verb not in ("pass", "choice", "unknown"):
-                    emit_text(" ")
-                    if not emit_card_ref(source_uuid_idx) and (
-                        0 <= source_row < len(cache.row_to_name)
-                    ):
-                        emit_text(cache.row_to_name[source_row])
+                # ``action_verb_table`` already folds in the leading space, so
+                # the dispatch is one ``out.extend`` per action verb. An
+                # unknown ``kind_id`` falls through to a one-shot encode of
+                # the literal " unknown" string — not reachable on a well-
+                # formed plan but kept for legacy parity.
+                verb_ids_opt = action_verb_table.get(kind_id)
+                kind_known = verb_ids_opt is not None
+                verb_ids = verb_ids_opt if verb_ids_opt is not None else _fragment(toks, " unknown")
+                out.extend(verb_ids)
+                # ``kind_id`` 0 (pass) and 6 (choice) skip the source-row /
+                # ability suffix, matching the legacy "verb in (pass, choice,
+                # unknown)" guard.
+                if kind_known and kind_id not in (0, 6):
+                    out.extend(frag_table[Frag.SPACE])
+                    if not emit_card_ref(source_uuid_idx) and (0 <= source_row < len(name_lists)):
+                        out.extend(name_lists[source_row])
                 if ability_idx >= 0 and kind_id == 3:
-                    emit_text(f" ability {ability_idx}")
+                    ab = ability_table.get(ability_idx)
+                    if ab is None:
+                        raise ValueError(
+                            f"OP_OPTION out of bounds: ability_idx={ability_idx} "
+                            f"(allowed range {tables.ability_min}..{tables.ability_max})"
+                        )
+                    out.extend(ab)
                 i += 1 + arity
                 continue
 
@@ -471,13 +546,13 @@ def _assemble_one(
                 out.append(toks.target_open_id)
                 if cur_target_bucket is not None:
                     cur_target_bucket.append(pos)
-                emit_text(" ")
+                out.extend(frag_table[Frag.SPACE])
                 if not emit_card_ref(target_uuid_idx):
-                    if 0 <= target_row < len(cache.row_to_name):
-                        emit_text(cache.row_to_name[target_row])
+                    if 0 <= target_row < len(name_lists):
+                        out.extend(name_lists[target_row])
                     else:
-                        emit_text("target")
-                emit_text(" ")
+                        out.extend(frag_table[Frag.TARGET_FALLBACK])
+                out.extend(frag_table[Frag.SPACE])
                 out.append(toks.target_close_id)
                 i += 1 + arity
                 continue
@@ -625,7 +700,10 @@ def assemble_batch(
     _attach_status_prefixes(toks, tokenizer)
     body_lists = _body_lists(toks, cache)
 
-    assembled: list[_AssembledExample] = [_assemble_one(p, cache, toks, body_lists) for p in plans]
+    name_lists = _name_lists(toks, cache)
+    assembled: list[_AssembledExample] = [
+        _assemble_one(p, cache, toks, body_lists, name_lists) for p in plans
+    ]
 
     seq_lengths = [len(ex.token_ids) for ex in assembled]
     actual_max = max(seq_lengths)

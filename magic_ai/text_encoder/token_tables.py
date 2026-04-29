@@ -144,7 +144,7 @@ class TokenTables:
     --------------------
     ``structural[Frag]`` -> token-id list for the given symbolic fragment.
     ``zone_open[(zone_id, owner_id)]``, ``zone_close[(zone_id, owner_id)]``.
-    ``action_verb[kind_id]`` (no leading space — caller emits SPACE first).
+    ``action_verb[kind_id]`` -> tokens for ``f" {verb}"`` (leading space folded in).
     ``mana_glyph[color_id]`` -> tokens for ``"{C}"``.
     ``turn_step[(turn, step_id)]`` -> tokens for ``f" turn={turn} step={step} "``.
     ``life_owner[(life, owner_id)]`` -> tokens for ``f"<self> life={life} mana="`` (or ``<opp>``).
@@ -216,7 +216,7 @@ def _strip_card_closer(body: list[int], closer: list[int]) -> list[int]:
 
 def build_token_tables(
     tokenizer: PreTrainedTokenizerFast,
-    cache: CardTokenCache,
+    cache: CardTokenCache | None = None,
 ) -> TokenTables:
     """Precompute every token-id sequence the assembler may emit at runtime.
 
@@ -252,9 +252,10 @@ def build_token_tables(
             tables.zone_open[(zone_id, owner_id)] = _encode(tokenizer, f"<{owner}><{tag}>")
             tables.zone_close[(zone_id, owner_id)] = _encode(tokenizer, f"</{tag}></{owner}>")
 
-    # Action verbs (no leading space; assembler emits SPACE first).
+    # Action verbs (assembler emits ``f" {verb}"`` as a single fragment, so
+    # the table folds the leading space in to keep BPE merges intact).
     for kind_id, verb in ACTION_VERBS_BY_ID.items():
-        tables.action_verb[kind_id] = _encode(tokenizer, verb)
+        tables.action_verb[kind_id] = _encode(tokenizer, f" {verb}")
 
     # Mana glyphs per color id.
     tables.mana_glyph = [_encode(tokenizer, f"{{{sym}}}") for sym in MANA_SYMBOLS]
@@ -281,17 +282,18 @@ def build_token_tables(
     tables.card_ref = [_single(tokenizer, f"<card-ref:{k}>") for k in range(MAX_CARD_REFS)]
 
     # Per-row card body (trailing " </card>" stripped) and display-name tokens.
-    num_rows = len(cache.row_to_name)
-    body_tokens_buf = cache.token_buffer
-    body_offsets = cache.offsets
-    tables.card_body = []
-    tables.card_name = []
-    for row in range(num_rows):
-        start = int(body_offsets[row])
-        end = int(body_offsets[row + 1])
-        body = body_tokens_buf[start:end].tolist()
-        tables.card_body.append(_strip_card_closer(body, card_closer))
-        tables.card_name.append(_encode(tokenizer, cache.row_to_name[row]))
+    if cache is not None:
+        num_rows = len(cache.row_to_name)
+        body_tokens_buf = cache.token_buffer
+        body_offsets = cache.offsets
+        tables.card_body = []
+        tables.card_name = []
+        for row in range(num_rows):
+            start = int(body_offsets[row])
+            end = int(body_offsets[row + 1])
+            body = body_tokens_buf[start:end].tolist()
+            tables.card_body.append(_strip_card_closer(body, card_closer))
+            tables.card_name.append(_encode(tokenizer, cache.row_to_name[row]))
 
     return tables
 
