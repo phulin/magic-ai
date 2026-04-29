@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import mage
 import torch
@@ -25,7 +25,15 @@ from magic_ai.text_encoder.batch import TextEncodedBatch
 
 @dataclass
 class NativeAssemblerOutputs:
-    """Allocated output tensors for one ``MageEncodeTokens`` call."""
+    """Allocated output tensors for one ``MageEncodeTokens`` call.
+
+    The tensors are reused across calls (caller passes the same
+    ``NativeAssemblerOutputs`` instance to ``encode_tokens(..., outputs=...)``).
+    Because the underlying ``data_ptr()`` values are stable, we cache the
+    cffi struct that bundles those pointers on this dataclass — so the
+    hot-path call costs one ctypes ``ffi.cast(...)`` per output ONCE,
+    amortized across every reuse, instead of every call.
+    """
 
     token_ids: torch.Tensor  # (B, max_tokens) int64
     attention_mask: torch.Tensor  # (B, max_tokens) int64
@@ -36,6 +44,11 @@ class NativeAssemblerOutputs:
     target_mask: torch.Tensor  # (B, max_options, max_targets) uint8
     card_ref_positions: torch.Tensor  # (B, max_card_refs) int64
     token_overflow: torch.Tensor  # (B,) int32
+    # Cached cffi structs over the above tensors. Built lazily on first
+    # use; valid for the lifetime of this dataclass (tensors must not be
+    # reallocated). Set to None to force a rebuild.
+    _tok_out_cffi: Any = None
+    _tok_cfg_cffi: Any = None
 
     def to_text_encoded_batch(self) -> TextEncodedBatch:
         """Slice/widen the dense outputs into a ``TextEncodedBatch`` matching
@@ -143,97 +156,60 @@ def encode_tokens(
     # and call MageEncodeTokens with both struct pointers in one shot, so
     # the encoder doesn't redo work the native side will do anyway.
     decision_capacity = max(1, batch_size * encoder.max_options)
-    buffers = encoder._scratch_buffers(batch_size, decision_capacity)
+    encoder._scratch_buffers(batch_size, decision_capacity)
     scratch = encoder._scratch
-    handles_t = scratch.handles_t[:batch_size]
-    perspectives_t = scratch.perspectives_t[:batch_size]
+
+    # Build (or reuse) cached cffi structs over the encoder's scratch
+    # tensors. Rebuilt only when scratch is reallocated. Pre-cache check
+    # was the dominant Python-side cost on this path before the cache.
+    if scratch.req_cffi is None or scratch.cfg_cffi is None or scratch.enc_out_cffi is None:
+        encoder.rebuild_cffi_structs(ffi, decision_capacity)
+    req = scratch.req_cffi
+    cfg = scratch.cfg_cffi
+    enc_out = scratch.enc_out_cffi
+    # Per-call mutable fields on the cached structs.
+    req.n = batch_size
+    cfg.decision_capacity = decision_capacity
+
+    # Fill the handle/perspective scratch buffers via numpy views (which
+    # alias the same memory the cached req struct's pointers reference).
     handles_np = scratch.handles_np
     for i, g in enumerate(games):
         handles_np[i] = getattr(g, "_id", None) or g.handle
     scratch.perspectives_np[:batch_size] = perspective_player_indices
 
-    req = ffi.new(
-        "MageBatchRequest *",
-        {
-            "n": batch_size,
-            "handles": ffi.cast("int64_t *", handles_t.data_ptr()),
-            "perspective_player_idx": ffi.cast("int64_t *", perspectives_t.data_ptr()),
-        },
-    )
-    cfg = ffi.new(
-        "MageEncodeConfig *",
-        {
-            "max_options": encoder.max_options,
-            "max_targets_per_option": encoder.max_targets_per_option,
-            "max_cached_choices": encoder.max_cached_choices,
-            "zone_slot_count": cast(int, encoder.zone_slot_count),
-            "game_info_dim": cast(int, encoder.game_info_dim),
-            "option_scalar_dim": cast(int, encoder.option_scalar_dim),
-            "target_scalar_dim": cast(int, encoder.target_scalar_dim),
-            "decision_capacity": decision_capacity,
-            "emit_render_plan": 1,
-            "render_plan_capacity": encoder.render_plan_capacity,
-        },
-    )
+    # Cache the token-assembler config / outputs structs on the
+    # NativeAssemblerOutputs dataclass so reuse across calls is free.
+    if outputs._tok_cfg_cffi is None:
+        outputs._tok_cfg_cffi = ffi.new(
+            "MageTokenAssemblerConfig *",
+            {
+                "max_tokens": max_tokens,
+                "max_options": max_options,
+                "max_targets": max_targets,
+                "max_card_refs": max_card_refs,
+            },
+        )
+    if outputs._tok_out_cffi is None:
+        outputs._tok_out_cffi = ffi.new(
+            "MageTokenAssemblerOutputs *",
+            {
+                "token_ids": ffi.cast("int64_t *", outputs.token_ids.data_ptr()),
+                "attention_mask": ffi.cast("int64_t *", outputs.attention_mask.data_ptr()),
+                "seq_lengths": ffi.cast("int64_t *", outputs.seq_lengths.data_ptr()),
+                "option_positions": ffi.cast("int64_t *", outputs.option_positions.data_ptr()),
+                "option_mask": ffi.cast("uint8_t *", outputs.option_mask.data_ptr()),
+                "target_positions": ffi.cast("int64_t *", outputs.target_positions.data_ptr()),
+                "target_mask": ffi.cast("uint8_t *", outputs.target_mask.data_ptr()),
+                "card_ref_positions": ffi.cast("int64_t *", outputs.card_ref_positions.data_ptr()),
+                "token_overflow": ffi.cast("int32_t *", outputs.token_overflow.data_ptr()),
+            },
+        )
+    tok_cfg = outputs._tok_cfg_cffi
+    tok_out = outputs._tok_out_cffi
 
-    # Existing-encoder outputs.
-    enc_out_fields: dict[str, Any] = {
-        "trace_kind_id": ffi.cast("int64_t *", buffers.trace_kind_id.data_ptr()),
-        "slot_card_rows": ffi.cast("int64_t *", buffers.slot_card_rows.data_ptr()),
-        "slot_occupied": ffi.cast("float *", buffers.slot_occupied.data_ptr()),
-        "slot_tapped": ffi.cast("float *", buffers.slot_tapped.data_ptr()),
-        "game_info": ffi.cast("float *", buffers.game_info.data_ptr()),
-        "pending_kind_id": ffi.cast("int64_t *", buffers.pending_kind_id.data_ptr()),
-        "num_present_options": ffi.cast("int64_t *", buffers.num_present_options.data_ptr()),
-        "option_kind_ids": ffi.cast("int64_t *", buffers.option_kind_ids.data_ptr()),
-        "option_scalars": ffi.cast("float *", buffers.option_scalars.data_ptr()),
-        "option_mask": ffi.cast("float *", buffers.option_mask.data_ptr()),
-        "option_ref_slot_idx": ffi.cast("int64_t *", buffers.option_ref_slot_idx.data_ptr()),
-        "option_ref_card_row": ffi.cast("int64_t *", buffers.option_ref_card_row.data_ptr()),
-        "target_mask": ffi.cast("float *", buffers.target_mask.data_ptr()),
-        "target_type_ids": ffi.cast("int64_t *", buffers.target_type_ids.data_ptr()),
-        "target_scalars": ffi.cast("float *", buffers.target_scalars.data_ptr()),
-        "target_overflow": ffi.cast("float *", buffers.target_overflow.data_ptr()),
-        "target_ref_slot_idx": ffi.cast("int64_t *", buffers.target_ref_slot_idx.data_ptr()),
-        "target_ref_is_player": ffi.cast("uint8_t *", buffers.target_ref_is_player_u8.data_ptr()),
-        "target_ref_is_self": ffi.cast("uint8_t *", buffers.target_ref_is_self_u8.data_ptr()),
-        "may_mask": ffi.cast("uint8_t *", buffers.may_mask_u8.data_ptr()),
-        "decision_start": ffi.cast("int64_t *", buffers.decision_start.data_ptr()),
-        "decision_count": ffi.cast("int64_t *", buffers.decision_count.data_ptr()),
-        "decision_option_idx": ffi.cast("int64_t *", buffers.decision_option_idx.data_ptr()),
-        "decision_target_idx": ffi.cast("int64_t *", buffers.decision_target_idx.data_ptr()),
-        "decision_mask": ffi.cast("uint8_t *", buffers.decision_mask_u8.data_ptr()),
-        "uses_none_head": ffi.cast("uint8_t *", buffers.uses_none_head_u8.data_ptr()),
-        "render_plan": ffi.cast("int32_t *", buffers.render_plan.data_ptr()),
-        "render_plan_lengths": ffi.cast("int64_t *", buffers.render_plan_lengths.data_ptr()),
-        "render_plan_overflow": ffi.cast("int64_t *", buffers.render_plan_overflow.data_ptr()),
-    }
-    enc_out = ffi.new("MageEncodeOutputs *", enc_out_fields)
-
-    tok_cfg = ffi.new(
-        "MageTokenAssemblerConfig *",
-        {
-            "max_tokens": max_tokens,
-            "max_options": max_options,
-            "max_targets": max_targets,
-            "max_card_refs": max_card_refs,
-        },
-    )
-    tok_out = ffi.new(
-        "MageTokenAssemblerOutputs *",
-        {
-            "token_ids": ffi.cast("int64_t *", outputs.token_ids.data_ptr()),
-            "attention_mask": ffi.cast("int64_t *", outputs.attention_mask.data_ptr()),
-            "seq_lengths": ffi.cast("int64_t *", outputs.seq_lengths.data_ptr()),
-            "option_positions": ffi.cast("int64_t *", outputs.option_positions.data_ptr()),
-            "option_mask": ffi.cast("uint8_t *", outputs.option_mask.data_ptr()),
-            "target_positions": ffi.cast("int64_t *", outputs.target_positions.data_ptr()),
-            "target_mask": ffi.cast("uint8_t *", outputs.target_mask.data_ptr()),
-            "card_ref_positions": ffi.cast("int64_t *", outputs.card_ref_positions.data_ptr()),
-            "token_overflow": ffi.cast("int32_t *", outputs.token_overflow.data_ptr()),
-        },
-    )
-
+    buffers = scratch.buffers
+    assert buffers is not None
     result = lib.MageEncodeTokens(req, cfg, enc_out, tok_cfg, tok_out)
     if result.error_code != 0:
         message = "MageEncodeTokens failed"

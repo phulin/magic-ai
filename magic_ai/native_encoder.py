@@ -211,6 +211,15 @@ class _EncoderScratch:
     req_c: _MageBatchRequest | None = None
     cfg_c: _MageEncodeConfig | None = None
     out_c: _MageEncodeOutputs | None = None
+    # cffi mirrors of the same structs, used by the native_assembler.encode_tokens
+    # path. cffi struct construction was the dominant Python-side cost on
+    # the rollout hot path before this cache (~1 ms/call building 50+
+    # ``ffi.cast(..., tensor.data_ptr())`` fields). Rebuilt on
+    # reallocation; per-call work is just updating ``n`` and
+    # ``decision_capacity``.
+    req_cffi: Any = None
+    cfg_cffi: Any = None
+    enc_out_cffi: Any = None
 
 
 def _ptr(tensor: Tensor, ctype: Any) -> Any:
@@ -491,8 +500,91 @@ class NativeBatchEncoder:
             scratch.perspectives_np = scratch.perspectives_t.numpy()
             if self._ctypes_lib is not None:
                 self._rebuild_encode_structs()
+            # Drop cached cffi structs — pointers into the just-realloced
+            # scratch are stale. Rebuilt lazily on next encode_tokens call.
+            scratch.req_cffi = None
+            scratch.cfg_cffi = None
+            scratch.enc_out_cffi = None
         assert scratch.buffers is not None
         return scratch.buffers
+
+    def rebuild_cffi_structs(self, ffi: Any, decision_capacity: int) -> None:
+        """Build (or rebuild) cached cffi structs over the current scratch.
+
+        Called by ``native_assembler.encode_tokens`` when its cached
+        structs are stale (first call, or scratch was reallocated since
+        the last call). Per-call hot-path work is then just mutating
+        ``req_cffi.n`` and ``cfg_cffi.decision_capacity``.
+        """
+        scratch = self._scratch
+        buffers = scratch.buffers
+        handles_t = scratch.handles_t
+        perspectives_t = scratch.perspectives_t
+        assert buffers is not None and handles_t is not None and perspectives_t is not None
+
+        scratch.req_cffi = ffi.new(
+            "MageBatchRequest *",
+            {
+                "n": 0,
+                "handles": ffi.cast("int64_t *", handles_t.data_ptr()),
+                "perspective_player_idx": ffi.cast("int64_t *", perspectives_t.data_ptr()),
+            },
+        )
+        cfg_fields: dict[str, Any] = {
+            "max_options": self.max_options,
+            "max_targets_per_option": self.max_targets_per_option,
+            "max_cached_choices": self.max_cached_choices,
+            "zone_slot_count": cast(int, self.zone_slot_count),
+            "game_info_dim": cast(int, self.game_info_dim),
+            "option_scalar_dim": cast(int, self.option_scalar_dim),
+            "target_scalar_dim": cast(int, self.target_scalar_dim),
+            "decision_capacity": decision_capacity,
+            "emit_render_plan": 1 if self.emit_render_plan else 0,
+            "render_plan_capacity": self.render_plan_capacity if self.emit_render_plan else 0,
+        }
+        scratch.cfg_cffi = ffi.new("MageEncodeConfig *", cfg_fields)
+
+        out_fields: dict[str, Any] = {
+            "trace_kind_id": ffi.cast("int64_t *", buffers.trace_kind_id.data_ptr()),
+            "slot_card_rows": ffi.cast("int64_t *", buffers.slot_card_rows.data_ptr()),
+            "slot_occupied": ffi.cast("float *", buffers.slot_occupied.data_ptr()),
+            "slot_tapped": ffi.cast("float *", buffers.slot_tapped.data_ptr()),
+            "game_info": ffi.cast("float *", buffers.game_info.data_ptr()),
+            "pending_kind_id": ffi.cast("int64_t *", buffers.pending_kind_id.data_ptr()),
+            "num_present_options": ffi.cast("int64_t *", buffers.num_present_options.data_ptr()),
+            "option_kind_ids": ffi.cast("int64_t *", buffers.option_kind_ids.data_ptr()),
+            "option_scalars": ffi.cast("float *", buffers.option_scalars.data_ptr()),
+            "option_mask": ffi.cast("float *", buffers.option_mask.data_ptr()),
+            "option_ref_slot_idx": ffi.cast("int64_t *", buffers.option_ref_slot_idx.data_ptr()),
+            "option_ref_card_row": ffi.cast("int64_t *", buffers.option_ref_card_row.data_ptr()),
+            "target_mask": ffi.cast("float *", buffers.target_mask.data_ptr()),
+            "target_type_ids": ffi.cast("int64_t *", buffers.target_type_ids.data_ptr()),
+            "target_scalars": ffi.cast("float *", buffers.target_scalars.data_ptr()),
+            "target_overflow": ffi.cast("float *", buffers.target_overflow.data_ptr()),
+            "target_ref_slot_idx": ffi.cast("int64_t *", buffers.target_ref_slot_idx.data_ptr()),
+            "target_ref_is_player": ffi.cast(
+                "uint8_t *", buffers.target_ref_is_player_u8.data_ptr()
+            ),
+            "target_ref_is_self": ffi.cast("uint8_t *", buffers.target_ref_is_self_u8.data_ptr()),
+            "may_mask": ffi.cast("uint8_t *", buffers.may_mask_u8.data_ptr()),
+            "decision_start": ffi.cast("int64_t *", buffers.decision_start.data_ptr()),
+            "decision_count": ffi.cast("int64_t *", buffers.decision_count.data_ptr()),
+            "decision_option_idx": ffi.cast("int64_t *", buffers.decision_option_idx.data_ptr()),
+            "decision_target_idx": ffi.cast("int64_t *", buffers.decision_target_idx.data_ptr()),
+            "decision_mask": ffi.cast("uint8_t *", buffers.decision_mask_u8.data_ptr()),
+            "uses_none_head": ffi.cast("uint8_t *", buffers.uses_none_head_u8.data_ptr()),
+        }
+        if buffers.render_plan is not None:
+            out_fields["render_plan"] = ffi.cast("int32_t *", buffers.render_plan.data_ptr())
+        if buffers.render_plan_lengths is not None:
+            out_fields["render_plan_lengths"] = ffi.cast(
+                "int64_t *", buffers.render_plan_lengths.data_ptr()
+            )
+        if buffers.render_plan_overflow is not None:
+            out_fields["render_plan_overflow"] = ffi.cast(
+                "int64_t *", buffers.render_plan_overflow.data_ptr()
+            )
+        scratch.enc_out_cffi = ffi.new("MageEncodeOutputs *", out_fields)
 
     def _rebuild_encode_structs(self) -> None:
         scratch = self._scratch
