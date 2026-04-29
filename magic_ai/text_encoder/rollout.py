@@ -291,6 +291,7 @@ class TextRolloutWorker:
         render_plan_capacity: int = 4096,
         max_options: int = 64,
         max_targets_per_option: int = 4,
+        dedup_card_bodies: bool = False,
     ) -> None:
         self.policy = policy
         self.cache = cache
@@ -303,6 +304,7 @@ class TextRolloutWorker:
         self.render_plan_capacity = int(render_plan_capacity)
         self.max_options = int(max_options)
         self.max_targets_per_option = int(max_targets_per_option)
+        self.dedup_card_bodies = bool(dedup_card_bodies)
         self.policy.to(self.device)
         self.policy.eval()
 
@@ -327,6 +329,7 @@ class TextRolloutWorker:
                 card_name_to_row=_build_card_name_to_row(cache),
                 emit_render_plan=True,
                 render_plan_capacity=self.render_plan_capacity,
+                dedup_card_bodies=self.dedup_card_bodies,
             )
             if not self._native_encoder.is_available:
                 raise NativeEncodingError("native render-plan encoder is unavailable")
@@ -388,6 +391,7 @@ class TextRolloutWorker:
                     card_row_lookup=self._card_row_lookup,
                     tokenize=self._tokenize_fn,
                     oracle=self.oracle,
+                    dedup_card_bodies=self.dedup_card_bodies,
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("emit_render_plan failed: %s; punting to default", exc)

@@ -95,6 +95,19 @@ OP_END_CARD: Final = 18
 OP_OPEN_RAW_CARD: Final = 19
 OP_CLOSE_RAW_CARD: Final = 20
 
+# v2 (card-body-dedup) opcodes. The body of each unique card-cache row is
+# emitted once at the top of the snapshot inside an
+# ``OP_OPEN_DICT … OP_DICT_ENTRY(row)* … OP_CLOSE_DICT`` block, and each
+# per-zone occurrence is emitted as ``OP_PLACE_CARD_REF`` (same payload as
+# OP_PLACE_CARD but the assembler emits ``<card-ref:K> <card>
+# <dict-entry:row> [status] </card>`` instead of splicing the body). v1
+# emitters never produce these opcodes; v1 assembler/v1 plan combinations
+# remain byte-equal to the legacy renderer.
+OP_OPEN_DICT: Final = 21
+OP_CLOSE_DICT: Final = 22
+OP_DICT_ENTRY: Final = 23
+OP_PLACE_CARD_REF: Final = 24
+
 # Fixed arity per opcode (number of int32 payload slots after the opcode
 # header). ``-1`` marks a variable-length opcode whose first payload word is
 # ``length`` and whose total in-stream size is ``2 + length``.
@@ -119,6 +132,10 @@ OPCODE_ARITY: Final[dict[int, int]] = {
     OP_END_CARD: 0,
     OP_OPEN_RAW_CARD: 1,
     OP_CLOSE_RAW_CARD: 0,
+    OP_OPEN_DICT: 0,
+    OP_CLOSE_DICT: 0,
+    OP_DICT_ENTRY: 1,
+    OP_PLACE_CARD_REF: 4,
 }
 
 # ---------------------------------------------------------------------------
@@ -257,6 +274,30 @@ class RenderPlanWriter:
     def emit_close_raw_card(self) -> None:
         self._buf.append(OP_CLOSE_RAW_CARD)
 
+    # -- v2 card-body-dedup -----------------------------------------------
+
+    def emit_open_dict(self) -> None:
+        self._buf.append(OP_OPEN_DICT)
+
+    def emit_close_dict(self) -> None:
+        self._buf.append(OP_CLOSE_DICT)
+
+    def emit_dict_entry(self, card_row_id: int) -> None:
+        self._buf.extend((OP_DICT_ENTRY, int(card_row_id)))
+
+    def emit_place_card_ref(
+        self, slot_idx: int, card_row_id: int, status_bits: int, uuid_idx: int
+    ) -> None:
+        self._buf.extend(
+            (
+                OP_PLACE_CARD_REF,
+                int(slot_idx),
+                int(card_row_id),
+                int(status_bits),
+                int(uuid_idx),
+            )
+        )
+
     # -- literal token slice (variable length) ----------------------------
 
     def emit_literal_tokens(self, tokens: Sequence[int]) -> None:
@@ -354,6 +395,7 @@ def emit_render_plan(
     tokenize: Callable[[str], list[int]],
     oracle: dict[str, OracleEntry] | None = None,
     max_card_refs: int = MAX_CARD_REFS,
+    dedup_card_bodies: bool = False,
 ) -> torch.Tensor:
     """Walk ``snapshot`` (and ``actions``) and emit a render-plan int32 tensor.
 
@@ -388,6 +430,32 @@ def emit_render_plan(
     w.emit_open_state()
     # Replace `<bos><state>` opener — that's a literal-tokens chunk.
     w.emit_literal_tokens(tokenize("<bos><state>"))
+
+    # v2 card-body dedup: emit the body of every unique cache row that
+    # appears in this snapshot, in deterministic row order, as a
+    # ``<dict>...</dict>`` block right after ``<bos><state>``. Per-zone
+    # occurrences below switch from full-body splice to short references.
+    if dedup_card_bodies:
+        unique_rows: list[int] = []
+        seen_rows: set[int] = set()
+        for owner, attr, _open_tag, _close_tag in _RENDER_ZONES:
+            if attr == "Exile":
+                player = self_player if owner == "self" else opp_player
+                if not _player_zone(player, attr):
+                    continue
+            player = self_player if owner == "self" else opp_player
+            for card in _player_zone(player, attr):
+                name = card.get("Name", "") or ""
+                row = card_row_lookup(name)
+                if row in seen_rows:
+                    continue
+                seen_rows.add(row)
+                unique_rows.append(row)
+        unique_rows.sort()
+        w.emit_open_dict()
+        for row in unique_rows:
+            w.emit_dict_entry(row)
+        w.emit_close_dict()
 
     # Top-level: " turn=N step=X ".
     turn = snapshot.get("turn", 0)
@@ -426,8 +494,11 @@ def emit_render_plan(
             name = card.get("Name", "") or ""
             row = card_row_lookup(name)
             status = _status_bits_from_card(card)
-            w.emit_place_card(slot_idx, row, status, ref_idx)
-            w.emit_end_card()
+            if dedup_card_bodies:
+                w.emit_place_card_ref(slot_idx, row, status, ref_idx)
+            else:
+                w.emit_place_card(slot_idx, row, status, ref_idx)
+                w.emit_end_card()
         w.emit_close_zone()
         w.emit_literal_tokens(tokenize(f"{close_tag}{owner_close}"))
 

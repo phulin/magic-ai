@@ -65,6 +65,8 @@ STRUCTURAL_TOKENS: tuple[str, ...] = (
     "<target>",
     "</target>",
     "<sep>",
+    "<dict>",
+    "</dict>",
 )
 
 # Status flags — bare tokens emitted inside a ``<card>`` block.
@@ -156,11 +158,43 @@ def card_ref_token(k: int) -> str:
 
 CARD_REF_TOKENS: tuple[str, ...] = tuple(card_ref_token(k) for k in range(MAX_CARD_REFS))
 
+# ---------------------------------------------------------------------------
+# Per-snapshot card-body dictionary references.
+#
+# Under the v2 render plan, each unique card body is emitted once at the top
+# of the snapshot inside a ``<dict>...</dict>`` block, prefixed by a
+# ``<dict-entry:R>`` token (R = card-token-cache row). Each occurrence of a
+# card in any zone is then a short ``<card-ref:K> <card> <dict-entry:R> ...
+# </card>`` reference instead of a full body splice. ``<card-ref:K>`` is the
+# per-permanent identity handle (range MAX_CARD_REFS); ``<dict-entry:R>`` is
+# the per-cache-row body handle (range MAX_DICT_ENTRIES). The two namespaces
+# are deliberately disjoint so the encoder can learn distinct roles.
+# ---------------------------------------------------------------------------
+
+MAX_DICT_ENTRIES = 512
+
+
+def dict_entry_token(r: int) -> str:
+    """Return the per-snapshot dictionary-entry token string for cache row ``r``."""
+
+    if not 0 <= r < MAX_DICT_ENTRIES:
+        raise ValueError(f"dict-entry index {r} out of range [0, {MAX_DICT_ENTRIES})")
+    return f"<dict-entry:{r}>"
+
+
+DICT_ENTRY_TOKENS: tuple[str, ...] = tuple(dict_entry_token(r) for r in range(MAX_DICT_ENTRIES))
+
 # Union of every custom token, ordered (structural, status, mana, loyalty,
-# card-ref). The build script feeds this whole tuple to ``add_special_tokens``
-# so each entry is guaranteed a single id and is never BPE-split.
+# card-ref, dict-entry). The build script feeds this whole tuple to
+# ``add_special_tokens`` so each entry is guaranteed a single id and is
+# never BPE-split.
 ALL_CUSTOM_TOKENS: tuple[str, ...] = (
-    STRUCTURAL_TOKENS + STATUS_TOKENS + MANA_TOKENS + LOYALTY_TOKENS + CARD_REF_TOKENS
+    STRUCTURAL_TOKENS
+    + STATUS_TOKENS
+    + MANA_TOKENS
+    + LOYALTY_TOKENS
+    + CARD_REF_TOKENS
+    + DICT_ENTRY_TOKENS
 )
 
 

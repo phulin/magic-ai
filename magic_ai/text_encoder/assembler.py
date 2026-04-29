@@ -26,22 +26,26 @@ from magic_ai.text_encoder.card_cache import CardTokenCache
 from magic_ai.text_encoder.render_plan import (
     OP_ATTACHED_TO,
     OP_CLOSE_ACTIONS,
+    OP_CLOSE_DICT,
     OP_CLOSE_PLAYER,
     OP_CLOSE_RAW_CARD,
     OP_CLOSE_STATE,
     OP_CLOSE_ZONE,
     OP_COUNTER,
+    OP_DICT_ENTRY,
     OP_END_CARD,
     OP_LIFE,
     OP_LITERAL_TOKENS,
     OP_MANA,
     OP_OPEN_ACTIONS,
+    OP_OPEN_DICT,
     OP_OPEN_PLAYER,
     OP_OPEN_RAW_CARD,
     OP_OPEN_STATE,
     OP_OPEN_ZONE,
     OP_OPTION,
     OP_PLACE_CARD,
+    OP_PLACE_CARD_REF,
     OP_TARGET,
     OP_TURN,
     OPCODE_ARITY,
@@ -63,7 +67,7 @@ from magic_ai.text_encoder.token_tables import (
     TokenTables,
     build_token_tables,
 )
-from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, MAX_DICT_ENTRIES
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +124,15 @@ class AssemblerTokens:
     untapped_id: int
     card_ref_ids: list[int]  # length MAX_CARD_REFS
     card_closer_ids: list[int]  # tokens of " </card>"
+    # v2 card-body-dedup token ids. ``<dict>`` / ``</dict>`` are
+    # structural tokens; ``<dict-entry:R>`` is one id per cache row in the
+    # MAX_DICT_ENTRIES namespace. ``card_open_id`` is the ``<card>``
+    # structural token id, used by the per-occurrence ref form
+    # ``<card-ref:K> <card> <dict-entry:R> [status] </card>``.
+    dict_open_id: int = 0
+    dict_close_id: int = 0
+    dict_entry_ids: list[int] = field(default_factory=list)
+    card_open_id: int = 0
     # ref_id -> K reverse map for the literal-tokens walker, which would
     # otherwise scan card_ref_ids per token.
     card_ref_id_to_k: dict[int, int] = field(default_factory=dict)
@@ -174,6 +187,12 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
         untapped_id=_single_id(tokenizer, "<untapped>"),
         card_ref_ids=[_single_id(tokenizer, f"<card-ref:{k}>") for k in range(MAX_CARD_REFS)],
         card_closer_ids=list(tokenizer.encode(CARD_CLOSER_TEXT, add_special_tokens=False)),
+        dict_open_id=_single_id(tokenizer, "<dict>"),
+        dict_close_id=_single_id(tokenizer, "</dict>"),
+        dict_entry_ids=[
+            _single_id(tokenizer, f"<dict-entry:{r}>") for r in range(MAX_DICT_ENTRIES)
+        ],
+        card_open_id=_single_id(tokenizer, "<card>"),
     )
     toks.card_ref_id_to_k = {ref_id: k for k, ref_id in enumerate(toks.card_ref_ids)}
     toks._tokenizer = tokenizer
@@ -556,6 +575,51 @@ def _assemble_one(
                 out.append(toks.target_close_id)
                 i += 1 + arity
                 continue
+
+        if op == OP_OPEN_DICT:
+            out.append(toks.dict_open_id)
+            i += 1
+            continue
+
+        if op == OP_CLOSE_DICT:
+            out.append(toks.dict_close_id)
+            i += 1
+            continue
+
+        if op == OP_DICT_ENTRY:
+            row = plan_list[i + 1]
+            if 0 <= row < len(toks.dict_entry_ids):
+                out.append(toks.dict_entry_ids[row])
+            if 0 <= row < len(body_lists):
+                out.extend(body_lists[row])
+            # Bodies have ``" </card>"`` stripped at memo time; the dict
+            # entry stands on its own (no status flag inside the dict), so
+            # we reattach the closer immediately.
+            out.extend(toks.card_closer_ids)
+            i += 1 + arity
+            continue
+
+        if op == OP_PLACE_CARD_REF:
+            _slot_idx = plan_list[i + 1]
+            row = plan_list[i + 2]
+            status = plan_list[i + 3]
+            uuid_idx = plan_list[i + 4]
+            # Per-occurrence reference form:
+            #   <card-ref:K> <card> <dict-entry:R> [<sep> <tapped>] </card>
+            emit_card_ref(uuid_idx)
+            out.append(toks.card_open_id)
+            if 0 <= row < len(toks.dict_entry_ids):
+                out.append(toks.dict_entry_ids[row])
+            if status & STATUS_TAPPED_KNOWN:
+                if status & STATUS_TAPPED:
+                    out.extend(_status_prefix_tapped(toks))
+                else:
+                    out.extend(_status_prefix_untapped(toks))
+            elif status & STATUS_TAPPED:
+                out.extend(_status_prefix_tapped(toks))
+            out.extend(toks.card_closer_ids)
+            i += 1 + arity
+            continue
 
         if op == OP_PLACE_CARD:
             _slot_idx = plan_list[i + 1]

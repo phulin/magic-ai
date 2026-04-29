@@ -107,6 +107,7 @@ class _MageEncodeConfig(ctypes.Structure):
         ("decision_capacity", ctypes.c_int64),
         ("emit_render_plan", ctypes.c_int64),
         ("render_plan_capacity", ctypes.c_int64),
+        ("dedup_card_bodies", ctypes.c_int64),
     ]
 
 
@@ -281,6 +282,7 @@ class NativeBatchEncoder:
         validate: bool = True,
         emit_render_plan: bool = False,
         render_plan_capacity: int = 4096,
+        dedup_card_bodies: bool = False,
     ) -> None:
         self.max_options = max_options
         self.max_targets_per_option = max_targets_per_option
@@ -294,6 +296,7 @@ class NativeBatchEncoder:
         self.validate = validate
         self.emit_render_plan = bool(emit_render_plan)
         self.render_plan_capacity = int(render_plan_capacity)
+        self.dedup_card_bodies = bool(dedup_card_bodies)
         self.is_available = False
         if self.lib is None:
             return
@@ -553,6 +556,7 @@ class NativeBatchEncoder:
             "decision_capacity": decision_capacity,
             "emit_render_plan": 1 if self.emit_render_plan else 0,
             "render_plan_capacity": self.render_plan_capacity if self.emit_render_plan else 0,
+            "dedup_card_bodies": 1 if self.dedup_card_bodies else 0,
         }
         scratch.cfg_cffi = ffi.new("MageEncodeConfig *", cfg_fields)
 
@@ -620,6 +624,7 @@ class NativeBatchEncoder:
             decision_capacity=0,
             emit_render_plan=1 if self.emit_render_plan else 0,
             render_plan_capacity=self.render_plan_capacity if self.emit_render_plan else 0,
+            dedup_card_bodies=1 if self.dedup_card_bodies else 0,
         )
         scratch.out_c = _MageEncodeOutputs(
             trace_kind_id=_ptr(buffers.trace_kind_id, ctypes.c_int64),
@@ -777,6 +782,7 @@ class NativeBatchEncoder:
             decision_capacity=decision_capacity,
             emit_render_plan=1 if self.emit_render_plan else 0,
             render_plan_capacity=self.render_plan_capacity if self.emit_render_plan else 0,
+            dedup_card_bodies=1 if self.dedup_card_bodies else 0,
         )
         outputs = _MageEncodeOutputs(
             trace_kind_id=_ptr(buffers.trace_kind_id, ctypes.c_int64),
@@ -933,6 +939,8 @@ class NativeBatchEncoder:
         if self.emit_render_plan:
             cfg_fields["emit_render_plan"] = 1
             cfg_fields["render_plan_capacity"] = self.render_plan_capacity
+        if self.dedup_card_bodies:
+            cfg_fields["dedup_card_bodies"] = 1
         cfg = ffi.new("MageEncodeConfig *", cfg_fields)
 
         out_fields = {

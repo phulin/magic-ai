@@ -402,6 +402,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             validate=not getattr(args, "no_validate", False),
             workers=batch_workers,
             pool=batch_pool,
+            dedup_card_bodies=bool(getattr(args, "card_body_dedup", False)),
         )
     backend = TextTrainingBackend(
         policy=policy,
@@ -1116,6 +1117,14 @@ def parse_args() -> argparse.Namespace:
         help="use mage-go native render-plan emission for text encoder rollouts",
     )
     parser.add_argument("--render-plan-capacity", type=int, default=4096)
+    parser.add_argument(
+        "--card-body-dedup",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="emit each unique card body once at the top of the snapshot and "
+        "reference it from per-zone occurrences (~3-4x token reduction on "
+        "card-heavy snapshots; default: off)",
+    )
     parser.add_argument(
         "--text-native-assembler",
         action=argparse.BooleanOptionalAction,

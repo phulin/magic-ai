@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
         help="Use mage-go's native render-plan emitter instead of the Python parity emitter.",
     )
     p.add_argument("--render-plan-capacity", type=int, default=4096)
+    p.add_argument(
+        "--card-body-dedup",
+        action="store_true",
+        help="Emit each unique card body once at the top, reference per-zone "
+        "occurrences (v2 ``<dict>`` opcode set).",
+    )
     return p.parse_args()
 
 
@@ -125,6 +131,7 @@ def main() -> int:
         seed=base_seed,
         use_native_render_plan=bool(args.native_render_plan),
         render_plan_capacity=int(args.render_plan_capacity),
+        dedup_card_bodies=bool(args.card_body_dedup),
     )
 
     total_steps = 0

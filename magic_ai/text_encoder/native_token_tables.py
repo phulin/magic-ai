@@ -103,6 +103,7 @@ class _Packed:
     card_body_offsets: torch.Tensor
     card_name_tokens: torch.Tensor
     card_name_offsets: torch.Tensor
+    dict_entry_ids: torch.Tensor
     struct: Any = field(default=None)
 
 
@@ -206,6 +207,7 @@ def register_native_token_tables(tables: TokenTables) -> None:
 
     card_body_tokens, card_body_offsets = _pack_int64_offsets([list(b) for b in tables.card_body])
     card_name_tokens, card_name_offsets = _pack_int64_offsets([list(n) for n in tables.card_name])
+    dict_entry_ids = torch.as_tensor(tables.dict_entry, dtype=torch.int32)
 
     packed = _Packed(
         structural_tokens=structural_tokens,
@@ -234,6 +236,7 @@ def register_native_token_tables(tables: TokenTables) -> None:
         card_body_offsets=card_body_offsets,
         card_name_tokens=card_name_tokens,
         card_name_offsets=card_name_offsets,
+        dict_entry_ids=dict_entry_ids,
     )
 
     struct = ffi.new(
@@ -290,6 +293,10 @@ def register_native_token_tables(tables: TokenTables) -> None:
             "card_body_offsets": _i64_ptr(ffi, card_body_offsets),
             "card_name_tokens": _i32_ptr(ffi, card_name_tokens),
             "card_name_offsets": _i64_ptr(ffi, card_name_offsets),
+            "dict_open_id": tables.dict_open_id,
+            "dict_close_id": tables.dict_close_id,
+            "card_open_id": tables.card_open_id,
+            "dict_entry_ids": _i32_ptr(ffi, dict_entry_ids),
         },
     )
     packed.struct = struct

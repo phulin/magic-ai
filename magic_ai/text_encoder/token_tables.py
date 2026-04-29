@@ -168,6 +168,13 @@ class TokenTables:
     status_tapped: list[int]
     status_untapped: list[int]
 
+    # v2 card-body dedup specials. ``card_open_id`` is ``<card>``, used when
+    # an occurrence references a dict entry. Default zero so existing call
+    # sites that don't fill these still construct the dataclass.
+    dict_open_id: int = 0
+    dict_close_id: int = 0
+    card_open_id: int = 0
+
     structural: dict[Frag, list[int]] = field(default_factory=dict)
     zone_open: dict[tuple[int, int], list[int]] = field(default_factory=dict)
     zone_close: dict[tuple[int, int], list[int]] = field(default_factory=dict)
@@ -180,6 +187,9 @@ class TokenTables:
     card_ref: list[int] = field(default_factory=list)
     card_body: list[list[int]] = field(default_factory=list)
     card_name: list[list[int]] = field(default_factory=list)
+    # v2 card-body dedup: dict_entry[row] -> single-id ``<dict-entry:row>``.
+    # Aligned with ``card_body`` (one entry per cache row).
+    dict_entry: list[int] = field(default_factory=list)
 
     # Bounds (echoed for downstream consumers / FFI).
     turn_min: int = TURN_MIN
@@ -240,6 +250,9 @@ def build_token_tables(
         card_closer=card_closer,
         status_tapped=status_tapped,
         status_untapped=status_untapped,
+        dict_open_id=_single(tokenizer, "<dict>"),
+        dict_close_id=_single(tokenizer, "</dict>"),
+        card_open_id=_single(tokenizer, "<card>"),
     )
 
     # Static structural fragments.
@@ -288,12 +301,14 @@ def build_token_tables(
         body_offsets = cache.offsets
         tables.card_body = []
         tables.card_name = []
+        tables.dict_entry = []
         for row in range(num_rows):
             start = int(body_offsets[row])
             end = int(body_offsets[row + 1])
             body = body_tokens_buf[start:end].tolist()
             tables.card_body.append(_strip_card_closer(body, card_closer))
             tables.card_name.append(_encode(tokenizer, cache.row_to_name[row]))
+            tables.dict_entry.append(_single(tokenizer, f"<dict-entry:{row}>"))
 
     return tables
 

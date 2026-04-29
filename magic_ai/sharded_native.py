@@ -180,6 +180,7 @@ class ShardedNativeBatchEncoder:
         validate: bool,
         workers: int,
         pool: ThreadPoolExecutor | None,
+        dedup_card_bodies: bool = False,
     ) -> ShardedNativeBatchEncoder:
         if workers < 1:
             raise ValueError("workers must be >= 1")
@@ -219,6 +220,7 @@ class ShardedNativeBatchEncoder:
                     validate=validate,
                     emit_render_plan=emit_render_plan,
                     render_plan_capacity=render_plan_capacity,
+                    dedup_card_bodies=dedup_card_bodies,
                 )
             )
         return cls(encoders, pool=pool if workers > 1 else None)
