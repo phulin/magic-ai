@@ -720,8 +720,8 @@ def _attach_status_prefixes(toks: AssemblerTokens, tokenizer: PreTrainedTokenize
     # so once they've been attached we can skip re-encoding on every call.
     if toks._status_tapped and toks._status_untapped:
         return
-    toks._status_tapped = list(tokenizer.encode(" <sep> <tapped>", add_special_tokens=False))
-    toks._status_untapped = list(tokenizer.encode(" <sep> <untapped>", add_special_tokens=False))
+    toks._status_tapped = list(tokenizer.encode("<tapped>", add_special_tokens=False))
+    toks._status_untapped = list(tokenizer.encode("<untapped>", add_special_tokens=False))
 
 
 # ---------------------------------------------------------------------------

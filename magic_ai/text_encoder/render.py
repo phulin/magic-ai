@@ -28,6 +28,7 @@ from magic_ai.game_state import (
     TargetState,
 )
 from magic_ai.text_encoder.tokenizer import (
+    _CARD_TYPE_WORDS,
     MAX_CARD_REFS,
     card_ref_token,
 )
@@ -177,25 +178,103 @@ def load_oracle_text(path: str | Path = DEFAULT_ORACLE_PATH) -> dict[str, Oracle
 # ---------------------------------------------------------------------------
 
 
-def _render_face_fields(parts: list[str], face: OracleFace | OracleEntry) -> None:
-    """Append ``<sep>``-joined per-face fields to ``parts``.
+CARD_NAME_PLACEHOLDER = "<card-name>"
 
-    Shared by single-face and multi-face rendering: emits Type / mana cost /
-    P/T / oracle text in that order, skipping whichever fields are empty.
+
+def _anonymize_self_references(text: str, names: Sequence[str]) -> str:
+    """Replace every occurrence of any card / face name with ``<card-name>``.
+
+    The encoder is meant to learn from rules-text mechanics, not card-name
+    identity. Self-references inside oracle text are masked so that a card's
+    abilities cannot be cross-referenced to its name string. ``names`` is
+    matched longest-first so e.g. ``"Lightning Bolt"`` is replaced before its
+    substring ``"Lightning"`` is considered. Matching is case-sensitive
+    because Scryfall canonicalizes printed names.
     """
 
+    if not text:
+        return text
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name and name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    ordered.sort(key=len, reverse=True)
+    out = text
+    for name in ordered:
+        out = out.replace(name, CARD_NAME_PLACEHOLDER)
+    return out
+
+
+_TYPE_LINE_DASH = "—"  # U+2014 em-dash, the Scryfall canonical separator.
+
+
+def _split_type_line(type_line: str) -> tuple[list[str], str] | None:
+    """Return ``(type_tokens, subtype_text)`` parsed from ``type_line``.
+
+    Returns ``None`` when the pre-dash portion contains a word that isn't a
+    recognized MTG supertype / card type — caller falls back to literal text.
+    """
+
+    if not type_line:
+        return ([], "")
+    pre, _dash, post = type_line.partition(_TYPE_LINE_DASH)
+    type_tokens: list[str] = []
+    for word in pre.split():
+        canon = word.lower()
+        if canon not in _CARD_TYPE_WORDS:
+            return None
+        type_tokens.append(f"<{canon}>")
+    return (type_tokens, post.strip())
+
+
+def _is_planeswalker_face(face: OracleFace | OracleEntry) -> bool:
     type_line = face.get("type_line", "") or ""
+    return "Planeswalker" in type_line
+
+
+def _render_face_fields(
+    parts: list[str], face: OracleFace | OracleEntry, names: Sequence[str] = ()
+) -> None:
+    """Append a face's fields to ``parts`` as token-delimited records.
+
+    Layout::
+
+        <type1><type2>...<subtypes>SUBTYPES</subtypes>
+        <mana-cost>COST</mana-cost>
+        (<pt>P/T</pt> | <loyalty>N</loyalty>)?
+        <rules-text>ORACLE</rules-text>
+
+    Empty fields are skipped entirely. Only oracle text has self-references
+    rewritten to ``<card-name>``; subtype text is kept as-is.
+    """
+
+    parsed = _split_type_line(face.get("type_line", "") or "")
+    if parsed is None:
+        # Unrecognized type word — fall back to the literal type line so we
+        # don't lose information.
+        parts.append(face.get("type_line", "") or "")
+    else:
+        type_tokens, subtype_text = parsed
+        parts.extend(type_tokens)
+        if subtype_text:
+            parts.append(f"<subtypes>{subtype_text}</subtypes>")
+
     mana_cost = face.get("mana_cost", "") or ""
-    pt = face.get("power_toughness")
-    text = render_oracle_text(face.get("oracle_text", "") or "")
-    if type_line:
-        parts.append(f" <sep> {type_line}")
     if mana_cost:
-        parts.append(f" <sep> {mana_cost}")
+        parts.append(f"<mana-cost>{mana_cost}</mana-cost>")
+
+    pt = face.get("power_toughness")
     if pt:
-        parts.append(f" <sep> {pt}")
+        if _is_planeswalker_face(face):
+            parts.append(f"<loyalty>{pt}</loyalty>")
+        else:
+            parts.append(f"<pt>{pt}</pt>")
+
+    text = _anonymize_self_references(render_oracle_text(face.get("oracle_text", "") or ""), names)
     if text:
-        parts.append(f" <sep> {text}")
+        parts.append(f"<rules-text>{text}</rules-text>")
 
 
 # Layouts whose ``card_faces`` represent two halves the model should see
@@ -282,21 +361,23 @@ def render_card_body(name: str, oracle: OracleEntry | None) -> str:
     :class:`SnapshotRenderer` so the cache and slow-path agree byte-for-byte.
     """
 
-    parts: list[str] = ["<card> ", name]
+    parts: list[str] = ["<card>"]
     if oracle is not None and _is_multi_face(oracle):
         faces = _ordered_faces(name, oracle)
-        # Emit the first face's fields after the (already-written) top-level
-        # ``Name``. Subsequent faces get their own name re-emitted after the
-        # `` // `` separator.
-        if faces:
-            _render_face_fields(parts, faces[0])
-            for face in faces[1:]:
-                parts.append(" <sep> // <sep> ")
-                parts.append(face.get("name", "") or "")
-                _render_face_fields(parts, face)
+        # Collect every face name (plus the canonical printed name) so each
+        # face's oracle text has *all* name variants masked.
+        all_names: list[str] = [name]
+        for face in faces:
+            face_name = face.get("name", "") or ""
+            if face_name:
+                all_names.append(face_name)
+        for face in faces:
+            parts.append("<face>")
+            _render_face_fields(parts, face, all_names)
+            parts.append("</face>")
     elif oracle is not None:
-        _render_face_fields(parts, oracle)
-    parts.append(" </card>")
+        _render_face_fields(parts, oracle, (name,))
+    parts.append("</card>")
     return "".join(parts)
 
 
@@ -567,15 +648,15 @@ class SnapshotRenderer:
         # closing tag so the cache and slow-path agree byte-for-byte on the
         # static portion.
         body = render_card_body(name, self._oracle.get(name))
-        closing = " </card>"
+        closing = "</card>"
         assert body.endswith(closing)
         buf.append(body[: -len(closing)])
         # Status flags — only what the snapshot actually carries.
         tapped = card.get("Tapped")
         if tapped is True:
-            buf.append(" <sep> <tapped>")
+            buf.append("<tapped>")
         elif tapped is False:
-            buf.append(" <sep> <untapped>")
+            buf.append("<untapped>")
         buf.append(closing)
 
     def _render_stack_object(
@@ -587,11 +668,11 @@ class SnapshotRenderer:
         cid = obj.get("id", "")
         name = obj.get("name", "") or ""
         ref_idx = card_refs.get(cid)
-        buf.append("<card> ")
+        buf.append("<card>")
         if ref_idx is not None:
-            buf.append(card_ref_token(ref_idx) + " ")
+            buf.append(card_ref_token(ref_idx))
         buf.append(name)
-        buf.append(" </card>")
+        buf.append("</card>")
 
     # -- actions -----------------------------------------------------------
 
@@ -616,7 +697,7 @@ class SnapshotRenderer:
         card_refs: dict[str, int],
     ) -> None:
         char_start = sum(len(s) for s in buf)
-        buf.append("<option> ")
+        buf.append("<option>")
 
         kind = (option.get("kind") or "").lower()
         card_id = option.get("card_id") or option.get("permanent_id") or ""
@@ -632,14 +713,13 @@ class SnapshotRenderer:
             elif fallback_name:
                 buf.append(fallback_name)
 
-        if kind in ("cast", "play", "play_land"):
-            verb = "play" if kind in ("play", "play_land") else "cast"
-            buf.append(f"{verb} ")
+        if kind in ("cast", "cast_spell", "play", "play_land"):
+            buf.append("<play>" if kind in ("play", "play_land") else "<cast>")
             emit_card(card_id, card_name)
             if cost:
                 buf.append(f" cost {cost}")
-        elif kind in ("activate", "activated_ability"):
-            buf.append("activate ")
+        elif kind in ("activate", "activate_ability", "activated_ability"):
+            buf.append("<activate>")
             emit_card(card_id, card_name)
             ability_idx = option.get("ability_index")
             if ability_idx is not None:
@@ -647,17 +727,17 @@ class SnapshotRenderer:
             if cost:
                 buf.append(f" cost {cost}")
         elif kind == "pass":
-            buf.append("pass")
+            buf.append("<pass>")
         elif kind == "attack":
-            buf.append("attack with ")
+            buf.append("<attack>")
             emit_card(card_id, card_name)
         elif kind == "block":
-            buf.append("block with ")
+            buf.append("<block>")
             emit_card(card_id, card_name)
         elif kind == "mulligan":
-            buf.append("mulligan")
+            buf.append("<mulligan>")
         elif kind == "keep":
-            buf.append("keep")
+            buf.append("<keep>")
         else:
             # Generic fallback: kind + label (label retained verbatim).
             label = option.get("label") or ""
@@ -671,7 +751,7 @@ class SnapshotRenderer:
         for target_idx, target in enumerate(targets):
             self._render_target(buf, target_anchors, option_index, target_idx, target, card_refs)
 
-        buf.append(" </option>")
+        buf.append("</option>")
         char_end = sum(len(s) for s in buf)
         result.option_anchors.append(
             OptionAnchor(

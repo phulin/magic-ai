@@ -67,6 +67,158 @@ STRUCTURAL_TOKENS: tuple[str, ...] = (
     "<sep>",
     "<dict>",
     "</dict>",
+    # Self-reference token: stands in for any occurrence of this card's
+    # printed name (or any face name) inside its own oracle text. The card's
+    # printed name is *not* emitted at the top of the body, so the encoder
+    # has no string-matchable identity handle and must read the rules text.
+    "<card-name>",
+)
+
+# ---------------------------------------------------------------------------
+# Card-type / supertype tokens — one atomic id per word that may appear before
+# the em-dash in a Scryfall ``type_line``. Subtypes (after the em-dash) are
+# rendered as plain text so the encoder can read them as words.
+# ---------------------------------------------------------------------------
+
+# Canonical lowercase form -> token string. The full set of MTG supertypes and
+# card types per the Comprehensive Rules; closed enough to be a one-time list.
+_CARD_TYPE_WORDS: tuple[str, ...] = (
+    # Supertypes
+    "basic",
+    "legendary",
+    "ongoing",
+    "snow",
+    "world",
+    "host",
+    # Card types
+    "artifact",
+    "battle",
+    "conspiracy",
+    "creature",
+    "dungeon",
+    "enchantment",
+    "instant",
+    "kindred",
+    "land",
+    "phenomenon",
+    "plane",
+    "planeswalker",
+    "scheme",
+    "sorcery",
+    "tribal",
+    "vanguard",
+)
+
+CARD_TYPE_TOKENS: tuple[str, ...] = tuple(f"<{w}>" for w in _CARD_TYPE_WORDS)
+
+
+def card_type_token(word: str) -> str:
+    """Return the canonical ``<word>`` token for a type-line word.
+
+    ``word`` is matched case-insensitively against the closed set of MTG
+    supertypes and card types; raises ``KeyError`` for unknown words.
+    """
+
+    canon = word.strip().lower()
+    if canon not in _CARD_TYPE_WORDS:
+        raise KeyError(f"unknown card-type word {word!r}")
+    return f"<{canon}>"
+
+
+# ---------------------------------------------------------------------------
+# Field-delimiter tokens — one paired open/close per body field.
+# ---------------------------------------------------------------------------
+
+CARD_FIELD_TOKENS: tuple[str, ...] = (
+    "<subtypes>",
+    "</subtypes>",
+    "<mana-cost>",
+    "</mana-cost>",
+    "<rules-text>",
+    "</rules-text>",
+    "<pt>",
+    "</pt>",
+    "<loyalty>",
+    "</loyalty>",
+    "<face>",
+    "</face>",
+)
+
+# ---------------------------------------------------------------------------
+# Action-kind tokens — one atomic id per option ``kind`` the engine emits.
+# Replaces the literal text verbs (``"cast "``, ``"pass"``, ``"attack with "``)
+# the renderer used to splice into each ``<option>`` block.
+# ---------------------------------------------------------------------------
+
+ACTION_KIND_TOKENS: tuple[str, ...] = (
+    "<cast>",
+    "<play>",
+    "<pass>",
+    "<attack>",
+    "<block>",
+    "<mulligan>",
+    "<keep>",
+    "<activate>",
+)
+
+# ---------------------------------------------------------------------------
+# Step / phase tokens — one atomic id per game-step value the engine emits.
+# ---------------------------------------------------------------------------
+
+# (Engine step name, canonical token suffix). The order matches
+# ``magic_ai.text_encoder.token_tables.STEP_NAMES`` so that step ids on the
+# Go side line up with these strings.
+_STEP_NAME_TO_SUFFIX: tuple[tuple[str, str], ...] = (
+    ("Untap", "untap"),
+    ("Upkeep", "upkeep"),
+    ("Draw", "draw"),
+    ("Precombat Main", "precombat-main"),
+    ("Begin Combat", "begin-combat"),
+    ("Declare Attackers", "declare-attackers"),
+    ("Declare Blockers", "declare-blockers"),
+    ("Combat Damage", "combat-damage"),
+    ("End Combat", "end-combat"),
+    ("Postcombat Main", "postcombat-main"),
+    ("End", "end"),
+    ("Cleanup", "cleanup"),
+)
+
+STEP_TOKENS: tuple[str, ...] = tuple(f"<step:{suffix}>" for _name, suffix in _STEP_NAME_TO_SUFFIX)
+
+
+def step_token(step_name: str) -> str:
+    """Return the ``<step:...>`` token for an engine step name."""
+
+    for name, suffix in _STEP_NAME_TO_SUFFIX:
+        if name == step_name:
+            return f"<step:{suffix}>"
+    raise KeyError(f"unknown step name {step_name!r}")
+
+
+# ---------------------------------------------------------------------------
+# Top-level scalar wrappers + mana-pool tokens.
+# ---------------------------------------------------------------------------
+
+SCALAR_WRAPPER_TOKENS: tuple[str, ...] = (
+    "<turn>",
+    "</turn>",
+    "<life>",
+    "</life>",
+    "<mana-pool>",
+    "</mana-pool>",
+)
+
+# Pool mana symbols, distinct from the bracketed cost glyphs (``{G}`` etc.).
+# Pool tokens denote "this color is currently floating in the player's pool";
+# cost glyphs denote "this color appears in a cost description". Keeping the
+# namespaces separate lets the encoder learn them as different roles.
+POOL_MANA_TOKENS: tuple[str, ...] = (
+    "<mana:W>",
+    "<mana:U>",
+    "<mana:B>",
+    "<mana:R>",
+    "<mana:G>",
+    "<mana:C>",
 )
 
 # Status flags — bare tokens emitted inside a ``<card>`` block.
@@ -195,6 +347,12 @@ ALL_CUSTOM_TOKENS: tuple[str, ...] = (
     + LOYALTY_TOKENS
     + CARD_REF_TOKENS
     + DICT_ENTRY_TOKENS
+    + CARD_TYPE_TOKENS
+    + CARD_FIELD_TOKENS
+    + ACTION_KIND_TOKENS
+    + STEP_TOKENS
+    + SCALAR_WRAPPER_TOKENS
+    + POOL_MANA_TOKENS
 )
 
 

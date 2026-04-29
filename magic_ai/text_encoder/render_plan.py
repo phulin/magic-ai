@@ -55,7 +55,7 @@ from magic_ai.text_encoder.render import (
     OracleEntry,
     _resolve_perspective_idx,
 )
-from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, step_token
 
 # ---------------------------------------------------------------------------
 # Opcodes (per ABI §5; ``OP_LITERAL_TOKENS`` added in PR 13-C, see module docstring)
@@ -340,6 +340,30 @@ def _mana_pool_text(player: PlayerState | None) -> str:
     return "".join(parts)
 
 
+# Map engine color names ("White", ...) to the pool-mana token strings.
+_POOL_MANA_TOKEN_BY_COLOR: dict[str, str] = {
+    "White": "<mana:W>",
+    "Blue": "<mana:U>",
+    "Black": "<mana:B>",
+    "Red": "<mana:R>",
+    "Green": "<mana:G>",
+    "Colorless": "<mana:C>",
+}
+
+
+def _mana_pool_tokens(player: PlayerState | None) -> str:
+    """Return concatenated ``<mana:X>`` tokens for a player's floating pool."""
+
+    if player is None:
+        return ""
+    pool = player.get("ManaPool") or {}
+    parts: list[str] = []
+    for color, token in _POOL_MANA_TOKEN_BY_COLOR.items():
+        amount = int(pool.get(color, 0) or 0)  # type: ignore[arg-type]
+        parts.extend(token for _ in range(amount))
+    return "".join(parts)
+
+
 def _assign_card_refs(
     snapshot: GameStateSnapshot, max_card_refs: int = MAX_CARD_REFS
 ) -> dict[str, int]:
@@ -457,25 +481,38 @@ def emit_render_plan(
             w.emit_dict_entry(row)
         w.emit_close_dict()
 
-    # Top-level: " turn=N step=X ".
+    # Top-level: <turn>N</turn><step:X>.
     turn = snapshot.get("turn", 0)
     step = snapshot.get("step", "") or ""
-    w.emit_literal_tokens(tokenize(f" turn={turn} step={step} "))
+    try:
+        step_tok = step_token(step)
+    except KeyError:
+        step_tok = ""
+    w.emit_literal_tokens(tokenize(f"<turn>{int(turn)}</turn>{step_tok}"))
 
-    # Per-player blocks: <self> life=N mana=... </self> ; <opp> ...
+    # Per-player blocks: <self><life>N</life><mana-pool>...</mana-pool></self>
     for scope, player in (("self", self_player), ("opp", opp_player)):
         if player is None:
             life = 0
-            mana = ""
+            mana_tokens = ""
         else:
             life = int(player.get("Life", 0) or 0)
-            mana = _mana_pool_text(player)
+            mana_tokens = _mana_pool_tokens(player)
         open_tag = "<self>" if scope == "self" else "<opp>"
         close_tag = "</self>" if scope == "self" else "</opp>"
-        w.emit_literal_tokens(tokenize(f"{open_tag} life={life} mana={mana} {close_tag}"))
+        w.emit_literal_tokens(
+            tokenize(
+                f"{open_tag}<life>{life}</life><mana-pool>{mana_tokens}</mana-pool>{close_tag}"
+            )
+        )
 
     # Zone blocks: render each (owner, zone) just like SnapshotRenderer does.
+    # Skip the opponent's hand entirely — fog of war (cards in opp hand are
+    # hidden information). Hand-size is not currently surfaced; if needed it
+    # would be a public-info scalar emitted alongside life / mana-pool.
     for owner, attr, open_tag, close_tag in _RENDER_ZONES:
+        if owner == "opp" and attr == "Hand":
+            continue
         owner_open = "<self>" if owner == "self" else "<opp>"
         owner_close = "</self>" if owner == "self" else "</opp>"
         player = self_player if owner == "self" else opp_player
@@ -504,10 +541,10 @@ def emit_render_plan(
 
     # Library counts.
     self_lib = int(self_player.get("LibraryCount", 0) or 0)
-    w.emit_literal_tokens(tokenize(f"<self><library> count={self_lib} </library></self>"))
+    w.emit_literal_tokens(tokenize(f"<self><library>{self_lib}</library></self>"))
     if opp_player is not None:
         opp_lib = int(opp_player.get("LibraryCount", 0) or 0)
-        w.emit_literal_tokens(tokenize(f"<opp><library> count={opp_lib} </library></opp>"))
+        w.emit_literal_tokens(tokenize(f"<opp><library>{opp_lib}</library></opp>"))
 
     # Stack
     w.emit_literal_tokens(tokenize("<stack>"))
@@ -524,8 +561,10 @@ def emit_render_plan(
         actions = pending.get("options", []) if pending is not None else []
     w.emit_literal_tokens(tokenize("<actions>"))
     w.emit_open_actions()  # bookkeeping
+    self_id = str(self_player.get("ID", "")) if self_player else ""
+    opp_id = str(opp_player.get("ID", "")) if opp_player else ""
     for option in actions:
-        _emit_option(w, option, refs, tokenize)
+        _emit_option(w, option, refs, tokenize, self_id=self_id, opp_id=opp_id)
     w.emit_close_actions()
     w.emit_literal_tokens(tokenize("</actions>"))
 
@@ -563,6 +602,9 @@ def _emit_option(
     option: PendingOptionState,
     refs: dict[str, int],
     tokenize: Callable[[str], list[int]],
+    *,
+    self_id: str = "",
+    opp_id: str = "",
 ) -> None:
     """Emit a single option as a literal-tokens block.
 
@@ -574,10 +616,9 @@ def _emit_option(
     kind = (option.get("kind") or "").lower()
     card_id = option.get("card_id") or option.get("permanent_id") or ""
     card_name = option.get("card_name") or ""
-    cost = option.get("mana_cost") or ""
     targets = option.get("valid_targets") or []
 
-    parts: list[str] = ["<option> "]
+    parts: list[str] = ["<option>"]
 
     def emit_card_token(cid: str, fallback: str) -> None:
         ref = refs.get(cid)
@@ -586,32 +627,27 @@ def _emit_option(
         elif fallback:
             parts.append(fallback)
 
-    if kind in ("cast", "play", "play_land"):
-        verb = "play" if kind in ("play", "play_land") else "cast"
-        parts.append(f"{verb} ")
+    if kind in ("cast", "cast_spell", "play", "play_land"):
+        parts.append("<play>" if kind in ("play", "play_land") else "<cast>")
         emit_card_token(card_id, card_name)
-        if cost:
-            parts.append(f" cost {cost}")
-    elif kind in ("activate", "activated_ability"):
-        parts.append("activate ")
+    elif kind in ("activate", "activate_ability", "activated_ability"):
+        parts.append("<activate>")
         emit_card_token(card_id, card_name)
         ability_idx = option.get("ability_index")
         if ability_idx is not None:
             parts.append(f" ability {int(ability_idx)}")
-        if cost:
-            parts.append(f" cost {cost}")
     elif kind == "pass":
-        parts.append("pass")
+        parts.append("<pass>")
     elif kind == "attack":
-        parts.append("attack with ")
+        parts.append("<attack>")
         emit_card_token(card_id, card_name)
     elif kind == "block":
-        parts.append("block with ")
+        parts.append("<block>")
         emit_card_token(card_id, card_name)
     elif kind == "mulligan":
-        parts.append("mulligan")
+        parts.append("<mulligan>")
     elif kind == "keep":
-        parts.append("keep")
+        parts.append("<keep>")
     else:
         label = option.get("label") or ""
         if kind:
@@ -622,18 +658,29 @@ def _emit_option(
             parts.append(label)
 
     for target in targets:
-        _append_target_text(parts, target, refs)
+        _append_target_text(parts, target, refs, self_id=self_id, opp_id=opp_id)
 
-    parts.append(" </option>")
+    parts.append("</option>")
     w.emit_literal_tokens(tokenize("".join(parts)))
 
 
-def _append_target_text(parts: list[str], target: TargetState, refs: dict[str, int]) -> None:
+def _append_target_text(
+    parts: list[str],
+    target: TargetState,
+    refs: dict[str, int],
+    *,
+    self_id: str = "",
+    opp_id: str = "",
+) -> None:
     tid = target.get("id", "")
     ref = refs.get(tid)
-    parts.append(" <target>")
+    parts.append("<target>")
     if ref is not None:
         parts.append(f"<card-ref:{ref}>")
+    elif tid and tid == self_id:
+        parts.append("<self>")
+    elif tid and tid == opp_id:
+        parts.append("<opp>")
     else:
         label = target.get("label") or tid
         if label:

@@ -27,9 +27,9 @@ from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 # Closed vocabulary constants (mirrored from assembler.py / render_plan.py).
 # ---------------------------------------------------------------------------
 
-CARD_CLOSER_TEXT = " </card>"
-STATUS_TAPPED_TEXT = " <sep> <tapped>"
-STATUS_UNTAPPED_TEXT = " <sep> <untapped>"
+CARD_CLOSER_TEXT = "</card>"
+STATUS_TAPPED_TEXT = "<tapped>"
+STATUS_UNTAPPED_TEXT = "<untapped>"
 
 STEP_NAMES: tuple[str, ...] = (
     "Untap",
@@ -113,16 +113,21 @@ class Frag(IntEnum):
 _FRAG_TEXT: dict[Frag, str] = {
     Frag.BOS_STATE: "<bos><state>",
     Frag.CLOSE_STATE_EOS: "</state><eos>",
-    Frag.CLOSE_SELF: " </self>",
-    Frag.CLOSE_OPP: " </opp>",
-    Frag.CLOSE_OPTION: " </option>",
+    # CLOSE_SELF / CLOSE_OPP also close the ``<mana-pool>`` opened by
+    # ``life_owner`` so the Go assembler produces matched tags.
+    Frag.CLOSE_SELF: "</mana-pool></self>",
+    Frag.CLOSE_OPP: "</mana-pool></opp>",
+    Frag.CLOSE_OPTION: "</option>",
     Frag.OPEN_ACTIONS: "<actions>",
     Frag.CLOSE_ACTIONS: "</actions>",
-    Frag.OPEN_TARGET: " <target>",
+    Frag.OPEN_TARGET: "<target>",
     Frag.SPACE: " ",
     Frag.TARGET_FALLBACK: "target",
-    Frag.SELF_MANA: "<self> mana=",
-    Frag.OPP_MANA: "<opp> mana=",
+    # SELF_MANA / OPP_MANA: emitted when an opMana opcode arrives without a
+    # preceding opLife (i.e. mana-only block). Open ``<self><mana-pool>`` so
+    # the closer ``</mana-pool></self>`` matches.
+    Frag.SELF_MANA: "<self><mana-pool>",
+    Frag.OPP_MANA: "<opp><mana-pool>",
 }
 
 
@@ -265,31 +270,72 @@ def build_token_tables(
             tables.zone_open[(zone_id, owner_id)] = _encode(tokenizer, f"<{owner}><{tag}>")
             tables.zone_close[(zone_id, owner_id)] = _encode(tokenizer, f"</{tag}></{owner}>")
 
-    # Action verbs (assembler emits ``f" {verb}"`` as a single fragment, so
-    # the table folds the leading space in to keep BPE merges intact).
-    for kind_id, verb in ACTION_VERBS_BY_ID.items():
-        tables.action_verb[kind_id] = _encode(tokenizer, f" {verb}")
+    # Action verbs — one atomic kind token per kind id (the leading space the
+    # old encoding folded in is gone since the kind is now a single special
+    # token immediately following ``<option>``).
+    _ACTION_KIND_TOKEN_BY_ID: dict[int, str] = {
+        0: "<pass>",
+        1: "<play>",
+        2: "<cast>",
+        3: "<activate>",
+        4: "<attack>",
+        5: "<block>",
+        6: "<choice>",  # not in vocab — falls back to literal text
+    }
+    for kind_id, _verb in ACTION_VERBS_BY_ID.items():
+        tok_str = _ACTION_KIND_TOKEN_BY_ID.get(kind_id, "")
+        tables.action_verb[kind_id] = _encode(tokenizer, tok_str) if tok_str else []
 
-    # Mana glyphs per color id.
-    tables.mana_glyph = [_encode(tokenizer, f"{{{sym}}}") for sym in MANA_SYMBOLS]
+    # Pool mana — one ``<mana:X>`` token per color (used by the opMana opcode,
+    # which emits floating mana inside ``<mana-pool>...</mana-pool>``). The
+    # cost-glyph counterpart ``{X}`` is used only inside ``<mana-cost>`` and
+    # ``<rules-text>`` and lives in its own namespace.
+    _POOL_MANA_BY_SYMBOL: dict[str, str] = {
+        "W": "<mana:W>",
+        "U": "<mana:U>",
+        "B": "<mana:B>",
+        "R": "<mana:R>",
+        "G": "<mana:G>",
+        "C": "<mana:C>",
+    }
+    tables.mana_glyph = [_encode(tokenizer, _POOL_MANA_BY_SYMBOL[sym]) for sym in MANA_SYMBOLS]
 
-    # turn × step (single fragment so BPE merges across the boundary stay
-    # exact). Keyed by (turn, step_id).
+    # turn × step → ``<turn>{turn}</turn><step:...>``. Step ids past the named
+    # set (e.g. STEP_NAMES "Unknown") drop the step token.
+    _STEP_NAME_TO_TOKEN: dict[str, str] = {
+        "Untap": "<step:untap>",
+        "Upkeep": "<step:upkeep>",
+        "Draw": "<step:draw>",
+        "Precombat Main": "<step:precombat-main>",
+        "Begin Combat": "<step:begin-combat>",
+        "Declare Attackers": "<step:declare-attackers>",
+        "Declare Blockers": "<step:declare-blockers>",
+        "Combat Damage": "<step:combat-damage>",
+        "End Combat": "<step:end-combat>",
+        "Postcombat Main": "<step:postcombat-main>",
+        "End": "<step:end>",
+        "Cleanup": "<step:cleanup>",
+    }
     for turn in range(TURN_MIN, TURN_MAX + 1):
         for step_id, step in enumerate(STEP_NAMES):
-            tables.turn_step[(turn, step_id)] = _encode(tokenizer, f" turn={turn} step={step} ")
+            step_tok = _STEP_NAME_TO_TOKEN.get(step, "")
+            tables.turn_step[(turn, step_id)] = _encode(tokenizer, f"<turn>{turn}</turn>{step_tok}")
 
-    # life × owner. The assembler emits "<self>" / "<opp>" + " life=N mana="
-    # as a single string, so the table folds them together.
+    # life × owner → ``<{owner}><life>{life}</life><mana-pool>``. The matching
+    # ``</mana-pool></{owner}>`` is emitted by Frag.CLOSE_SELF / CLOSE_OPP.
     for life in range(LIFE_MIN, LIFE_MAX + 1):
         for owner_id, owner in enumerate(OWNER_NAMES):
-            tables.life_owner[(life, owner_id)] = _encode(tokenizer, f"<{owner}> life={life} mana=")
+            tables.life_owner[(life, owner_id)] = _encode(
+                tokenizer, f"<{owner}><life>{life}</life><mana-pool>"
+            )
 
     for n in range(ABILITY_MIN, ABILITY_MAX + 1):
         tables.ability[n] = _encode(tokenizer, f" ability {n}")
 
+    # count[N] → just the bare integer; library blocks emit ``<library>{N}</library>``
+    # with the integer slotted in by the assembler.
     for n in range(COUNT_MIN, COUNT_MAX + 1):
-        tables.count[n] = _encode(tokenizer, f" count={n}")
+        tables.count[n] = _encode(tokenizer, str(n))
 
     # card-ref single-id table.
     tables.card_ref = [_single(tokenizer, f"<card-ref:{k}>") for k in range(MAX_CARD_REFS)]
