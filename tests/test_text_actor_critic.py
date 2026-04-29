@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from typing import cast
 
 import torch
@@ -189,6 +190,47 @@ class TextActorCriticTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(log_probs).all())
         self.assertTrue(torch.isfinite(entropies).all())
         self.assertTrue(torch.isfinite(values).all())
+
+    def test_sample_native_tensor_batch_appends_replay_rows(self) -> None:
+        torch.manual_seed(0)
+        model = _model()
+        replay = TextReplayBuffer(
+            capacity=4,
+            max_tokens=4,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            recurrent_layers=1,
+            recurrent_hidden_dim=8,
+        )
+        model.rollout_buffer = replay
+        model.init_lstm_env_states(2)
+        native_batch = SimpleNamespace(
+            trace_kind_id=torch.tensor([0, 0], dtype=torch.long),
+            decision_count=torch.tensor([1, 1], dtype=torch.long),
+            decision_rows_written=2,
+            decision_option_idx=torch.tensor([[0, 1], [0, -1]], dtype=torch.long),
+            decision_target_idx=torch.tensor([[-1, -1], [-1, -1]], dtype=torch.long),
+            decision_mask=torch.tensor([[True, True], [True, False]], dtype=torch.bool),
+            uses_none_head=torch.tensor([False, False], dtype=torch.bool),
+        )
+
+        out = model.sample_native_tensor_batch(
+            native_batch=native_batch,
+            env_indices=[0, 1],
+            perspective_player_indices=[0, 0],
+            text_batch=_batch(batch_size=2),
+            deterministic=True,
+        )
+
+        self.assertEqual(out.decision_counts, [1, 1])
+        self.assertEqual(len(out.selected_choice_cols), 2)
+        self.assertEqual(len(out.replay_rows), 2)
+        self.assertEqual(replay.size, 2)
+        gathered = replay.gather(out.replay_rows)
+        self.assertEqual(tuple(gathered.encoded.token_ids.shape), (2, 4))
+        self.assertTrue(torch.isfinite(gathered.old_log_prob).all())
 
     def test_sample_text_batch_handles_may_head(self) -> None:
         torch.manual_seed(0)

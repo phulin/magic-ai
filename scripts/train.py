@@ -2690,33 +2690,23 @@ def train_text_native_batched_envs(
                     perspective_player_indices=ready_players,
                 )
             with torch.no_grad():
-                policy_steps = sample_native_text_policy_batch(
-                    args,
-                    backend,
-                    native_batch,
+                policy_batch = sampling_policy.sample_native_tensor_batch(
+                    native_batch=native_batch,
                     env_indices=ready_env_indices,
                     perspective_player_indices=ready_players,
-                    deterministic=args.deterministic_rollout,
-                    sampling_policy=sampling_policy,
                     text_batch=text_batch,
-                    packed_text_batch=packed_text_batch,
+                    packed_batch=packed_text_batch,
+                    deterministic=args.deterministic_rollout,
                 )
-            counts = [len(s.selected_choice_cols) for s in policy_steps]
+            counts = policy_batch.decision_counts
             starts: list[int] = list(itertools.accumulate(counts, initial=0))[:-1]
-            selected_cols: list[int] = [c for s in policy_steps for c in s.selected_choice_cols]
-            may_selected = [s.may_selected for s in policy_steps]
-            # Batch the per-step D2H of log_prob/value into one stack+.tolist()
-            # so we incur 2 GPU syncs total instead of 2*N.
-            if policy_steps:
-                log_probs_cpu = (
-                    torch.stack([s.log_prob for s in policy_steps]).detach().cpu().tolist()
-                )
-                values_cpu = torch.stack([s.value for s in policy_steps]).detach().cpu().tolist()
-            else:
-                log_probs_cpu = []
-                values_cpu = []
-            for step_idx, (env, player_idx, policy_step) in enumerate(
-                zip(ready_envs, ready_players, policy_steps, strict=True)
+            selected_cols = policy_batch.selected_choice_cols
+            may_selected = policy_batch.may_selected
+            log_probs_cpu = policy_batch.old_log_prob
+            values_cpu = policy_batch.value
+            replay_rows_cpu = policy_batch.replay_rows
+            for step_idx, (env, player_idx, replay_idx) in enumerate(
+                zip(ready_envs, ready_players, replay_rows_cpu, strict=True)
             ):
                 env.action_count += 1
                 env.episode_steps.append(
@@ -2724,7 +2714,7 @@ def train_text_native_batched_envs(
                         perspective_player_idx=int(player_idx),
                         old_log_prob=float(log_probs_cpu[step_idx]),
                         value=float(values_cpu[step_idx]),
-                        replay_idx=policy_step.replay_idx,
+                        replay_idx=int(replay_idx),
                     )
                 )
             native_rollout.step_by_choice(

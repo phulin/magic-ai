@@ -301,6 +301,133 @@ class TextReplayBuffer:
         self._occupied[row] = True
         return row
 
+    def append_batch(
+        self,
+        *,
+        encoded: TextEncodedBatch,
+        trace_kind_id: Tensor,
+        decision_count: Tensor,
+        decision_option_idx: Tensor,
+        decision_target_idx: Tensor,
+        decision_mask: Tensor,
+        uses_none_head: Tensor,
+        selected_indices: Tensor,
+        may_selected: Tensor,
+        old_log_prob: Tensor,
+        value: Tensor,
+        perspective_player_idx: Tensor,
+        lstm_h_in: Tensor | None = None,
+        lstm_c_in: Tensor | None = None,
+    ) -> Tensor:
+        batch_size = int(encoded.token_ids.shape[0])
+        if batch_size == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        if len(self._free_rows) < batch_size:
+            raise RuntimeError("TextReplayBuffer is full")
+        rows_list = [self._free_rows.pop() for _ in range(batch_size)]
+        rows = torch.tensor(rows_list, dtype=torch.long, device=self.device)
+
+        token_width = int(encoded.token_ids.shape[1])
+        attention_width = int(encoded.attention_mask.shape[1])
+        self.token_ids[rows].zero_()
+        self.attention_mask[rows].zero_()
+        self.card_ref_positions[rows].fill_(-1)
+        self.option_positions[rows].fill_(-1)
+        self.option_mask[rows].zero_()
+        self.target_positions[rows].fill_(-1)
+        self.target_mask[rows].zero_()
+        self.token_ids[rows[:, None], torch.arange(token_width, device=self.device)] = (
+            encoded.token_ids.to(device=self.device, dtype=torch.int32)
+        )
+        self.attention_mask[rows[:, None], torch.arange(attention_width, device=self.device)] = (
+            encoded.attention_mask.to(device=self.device, dtype=torch.bool)
+        )
+        self.card_ref_positions[rows] = encoded.card_ref_positions.to(
+            device=self.device, dtype=torch.int32
+        )
+        option_width = min(int(encoded.option_positions.shape[1]), self.max_options)
+        target_width = min(int(encoded.target_positions.shape[2]), self.max_targets_per_option)
+        if option_width > 0:
+            self.option_positions[rows[:, None], torch.arange(option_width, device=self.device)] = (
+                encoded.option_positions[:, :option_width].to(device=self.device, dtype=torch.int32)
+            )
+            self.option_mask[rows[:, None], torch.arange(option_width, device=self.device)] = (
+                encoded.option_mask[:, :option_width].to(device=self.device, dtype=torch.bool)
+            )
+        if option_width > 0 and target_width > 0:
+            self.target_positions[
+                rows[:, None, None],
+                torch.arange(option_width, device=self.device)[None, :, None],
+                torch.arange(target_width, device=self.device)[None, None, :],
+            ] = encoded.target_positions[:, :option_width, :target_width].to(
+                device=self.device, dtype=torch.int32
+            )
+            self.target_mask[
+                rows[:, None, None],
+                torch.arange(option_width, device=self.device)[None, :, None],
+                torch.arange(target_width, device=self.device)[None, None, :],
+            ] = encoded.target_mask[:, :option_width, :target_width].to(
+                device=self.device, dtype=torch.bool
+            )
+        self.seq_lengths[rows] = encoded.seq_lengths.to(device=self.device, dtype=torch.int32)
+
+        decision_count_dev = decision_count.to(device=self.device, dtype=torch.long)
+        stored_count = decision_count_dev.clamp(max=self.max_decision_groups)
+        self.decision_option_idx[rows].fill_(-1)
+        self.decision_target_idx[rows].fill_(-1)
+        self.decision_mask[rows].zero_()
+        self.uses_none_head[rows].zero_()
+        self.selected_indices[rows].fill_(-1)
+        g_total = int(decision_option_idx.shape[0])
+        if g_total > 0:
+            step_for_group = torch.repeat_interleave(
+                torch.arange(batch_size, device=self.device), decision_count_dev
+            )
+            group_starts = torch.cumsum(decision_count_dev, dim=0) - decision_count_dev
+            group_in_step = torch.arange(g_total, device=self.device) - group_starts[step_for_group]
+            keep = group_in_step < self.max_decision_groups
+            kept_steps = step_for_group[keep]
+            kept_groups = group_in_step[keep]
+            flat_keep = keep.nonzero(as_tuple=False).squeeze(-1)
+            replay_rows = rows[kept_steps]
+            self.decision_option_idx[replay_rows, kept_groups] = decision_option_idx[flat_keep].to(
+                device=self.device, dtype=torch.int16
+            )
+            self.decision_target_idx[replay_rows, kept_groups] = decision_target_idx[flat_keep].to(
+                device=self.device, dtype=torch.int16
+            )
+            self.decision_mask[replay_rows, kept_groups] = decision_mask[flat_keep].to(
+                device=self.device, dtype=torch.bool
+            )
+            self.uses_none_head[replay_rows, kept_groups] = uses_none_head[flat_keep].to(
+                device=self.device, dtype=torch.bool
+            )
+            self.selected_indices[replay_rows, kept_groups] = selected_indices[flat_keep].to(
+                device=self.device, dtype=torch.int16
+            )
+
+        self.trace_kind_id[rows] = trace_kind_id.to(device=self.device, dtype=torch.int8)
+        self.decision_count[rows] = stored_count.to(dtype=torch.int16)
+        self.may_selected[rows] = may_selected.to(device=self.device, dtype=torch.float32)
+        self.old_log_prob[rows] = old_log_prob.to(device=self.device, dtype=torch.float32)
+        self.value[rows] = value.to(device=self.device, dtype=torch.float32)
+        self.perspective_player_idx[rows] = perspective_player_idx.to(
+            device=self.device, dtype=torch.int8
+        )
+        if self.lstm_h_in is not None and self.lstm_c_in is not None:
+            if lstm_h_in is None or lstm_c_in is None:
+                raise ValueError("h_in and c_in are required for recurrent text replay")
+            self.lstm_h_in[rows] = lstm_h_in.permute(1, 0, 2).to(
+                device=self.device, dtype=torch.float32
+            )
+            self.lstm_c_in[rows] = lstm_c_in.permute(1, 0, 2).to(
+                device=self.device, dtype=torch.float32
+            )
+        elif lstm_h_in is not None or lstm_c_in is not None:
+            raise ValueError("buffer was constructed without recurrent state storage")
+        self._occupied[rows] = True
+        return rows
+
     def gather(self, replay_rows: list[int]) -> TextReplayBatch:
         if not replay_rows:
             raise ValueError("replay_rows must not be empty")

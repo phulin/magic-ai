@@ -76,6 +76,16 @@ class TextDecisionLayout:
     pending: PendingState
 
 
+@dataclass(frozen=True)
+class NativeTextSampleBatch:
+    decision_counts: list[int]
+    selected_choice_cols: list[int]
+    may_selected: list[int]
+    old_log_prob: list[float]
+    value: list[float]
+    replay_rows: list[int]
+
+
 class TextActorCritic(nn.Module):
     """Thin stateful wrapper around :class:`RecurrentTextPolicy`.
 
@@ -480,6 +490,189 @@ class TextActorCritic(nn.Module):
                 )
             )
         return results
+
+    def sample_native_tensor_batch(
+        self,
+        *,
+        native_batch: Any,
+        env_indices: list[int],
+        perspective_player_indices: list[int],
+        text_batch: TextEncodedBatch | None = None,
+        packed_batch: PackedTextBatch | None = None,
+        deterministic: bool = False,
+    ) -> NativeTextSampleBatch:
+        """Sample a native text batch without Python loops over tensor rows/groups."""
+
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+        if text_batch is None and packed_batch is None:
+            raise ValueError("text_batch or packed_batch is required")
+        batch_size = (
+            int(packed_batch.seq_lengths.shape[0])
+            if packed_batch is not None
+            else int(cast(TextEncodedBatch, text_batch).token_ids.shape[0])
+        )
+        if batch_size == 0:
+            return NativeTextSampleBatch([], [], [], [], [], [])
+        if len(env_indices) != batch_size or len(perspective_player_indices) != batch_size:
+            raise ValueError("batch, env_indices, and perspective_player_indices differ")
+
+        moved_text = _move_text_batch(text_batch, self.device) if text_batch is not None else None
+        moved_packed = (
+            _move_packed_text_batch(packed_batch, self.device) if packed_batch is not None else None
+        )
+        h_in, c_in = self.lstm_env_state_inputs(env_indices, perspective_player_indices)
+        if moved_packed is not None:
+            output, (h_out, c_out) = self.policy.forward_packed(moved_packed, h_in=h_in, c_in=c_in)
+            replay_encoded = _dense_from_packed_batch(
+                moved_packed,
+                max_tokens=self.rollout_buffer.max_tokens,
+                pad_id=self.policy.cfg.encoder.pad_id,
+            )
+        else:
+            moved = cast(TextEncodedBatch, moved_text)
+            output, (h_out, c_out) = self.policy(moved, h_in=h_in, c_in=c_in)
+            replay_encoded = moved
+        self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
+
+        trace_kind_id = native_batch.trace_kind_id.to(self.device, dtype=torch.long)
+        decision_count = native_batch.decision_count.to(self.device, dtype=torch.long)
+        decision_rows = int(native_batch.decision_rows_written)
+        max_cached_choices = int(native_batch.decision_mask.shape[1])
+        device = output.values.device
+
+        none_logits = self.none_head(output.state_hidden).squeeze(-1)
+        may_logits = self.may_head(output.state_hidden).squeeze(-1)
+        step_log_probs = output.values.new_zeros(batch_size)
+        step_entropies = output.values.new_zeros(batch_size)
+
+        if decision_rows > 0:
+            option_idx = native_batch.decision_option_idx[:decision_rows].to(
+                device, dtype=torch.long, non_blocking=device.type == "cuda"
+            )
+            target_idx = native_batch.decision_target_idx[:decision_rows].to(
+                device, dtype=torch.long, non_blocking=device.type == "cuda"
+            )
+            decision_mask = native_batch.decision_mask[:decision_rows].to(
+                device, dtype=torch.bool, non_blocking=device.type == "cuda"
+            )
+            uses_none = native_batch.uses_none_head[:decision_rows].to(
+                device, dtype=torch.bool, non_blocking=device.type == "cuda"
+            )
+            step_for_group = torch.repeat_interleave(
+                torch.arange(batch_size, device=device), decision_count
+            )
+            logits = _direct_decision_logits_batched(
+                output,
+                none_logits,
+                step_for_group=step_for_group,
+                option_idx=option_idx,
+                target_idx=target_idx,
+                uses_none=uses_none,
+            )
+            visible_mask = _visible_decision_mask(
+                output,
+                step_for_group=step_for_group,
+                option_idx=option_idx,
+                target_idx=target_idx,
+                decision_mask=decision_mask,
+                uses_none=uses_none,
+            )
+            group_has_visible = visible_mask.any(dim=-1, keepdim=True)
+            effective_mask = torch.where(group_has_visible, visible_mask, decision_mask)
+            group_has_engine_choice = decision_mask.any(dim=-1, keepdim=True)
+            col0 = torch.arange(max_cached_choices, device=device).eq(0)
+            sentinel_mask = col0[None, :].expand_as(effective_mask)
+            effective_mask = torch.where(group_has_engine_choice, effective_mask, sentinel_mask)
+            safe_logits = torch.where(group_has_visible, logits, torch.zeros_like(logits))
+            masked_logits = safe_logits.masked_fill(~effective_mask, float("-inf"))
+            if deterministic:
+                selected = masked_logits.argmax(dim=-1)
+            else:
+                uniform = torch.rand_like(masked_logits).clamp_(1e-7, 1.0 - 1e-7)
+                gumbel = -torch.log(-torch.log(uniform))
+                selected = (masked_logits + gumbel).argmax(dim=-1)
+            log_probs_dense = torch.log_softmax(masked_logits, dim=-1)
+            group_log_probs = log_probs_dense.gather(1, selected[:, None]).squeeze(1)
+            probs = log_probs_dense.exp()
+            safe_log_probs = torch.where(
+                effective_mask, log_probs_dense, log_probs_dense.new_zeros(())
+            )
+            group_entropies = -(probs * safe_log_probs).sum(dim=-1)
+            step_log_probs = step_log_probs.scatter_add(0, step_for_group, group_log_probs)
+            step_entropies = step_entropies.scatter_add(0, step_for_group, group_entropies)
+        else:
+            option_idx = torch.empty((0, max_cached_choices), dtype=torch.long, device=device)
+            target_idx = torch.empty_like(option_idx)
+            decision_mask = torch.empty((0, max_cached_choices), dtype=torch.bool, device=device)
+            uses_none = torch.empty(0, dtype=torch.bool, device=device)
+            selected = torch.empty(0, dtype=torch.long, device=device)
+
+        may_mask = trace_kind_id == TRACE_KIND_TO_ID["may"]
+        if deterministic:
+            may_selected_t = (may_logits >= 0).to(dtype=output.values.dtype)
+        else:
+            may_selected_t = torch.bernoulli(torch.sigmoid(may_logits))
+        may_log_prob = -torch.nn.functional.binary_cross_entropy_with_logits(
+            may_logits,
+            may_selected_t,
+            reduction="none",
+        )
+        may_prob = torch.sigmoid(may_logits)
+        may_entropy = torch.nn.functional.binary_cross_entropy(
+            may_prob,
+            may_prob,
+            reduction="none",
+        )
+        may_mask_f = may_mask.to(dtype=output.values.dtype)
+        step_log_probs = step_log_probs + may_log_prob * may_mask_f
+        step_entropies = step_entropies + may_entropy * may_mask_f
+        del step_entropies
+
+        perspective_t = torch.tensor(
+            perspective_player_indices, dtype=torch.long, device=self.device
+        )
+        replay_rows = self.rollout_buffer.append_batch(
+            encoded=replay_encoded,
+            trace_kind_id=trace_kind_id,
+            decision_count=decision_count,
+            decision_option_idx=option_idx,
+            decision_target_idx=target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none,
+            selected_indices=selected,
+            may_selected=may_selected_t,
+            old_log_prob=step_log_probs.detach(),
+            value=output.values.detach(),
+            perspective_player_idx=perspective_t,
+            lstm_h_in=h_in.detach(),
+            lstm_c_in=c_in.detach(),
+        )
+
+        host = torch.cat(
+            [
+                decision_count.to(dtype=torch.float32),
+                may_selected_t.to(dtype=torch.float32),
+                step_log_probs.detach(),
+                output.values.detach(),
+                replay_rows.to(dtype=torch.float32),
+            ]
+        ).cpu()
+        b = batch_size
+        decision_counts = host[:b].to(dtype=torch.long).tolist()
+        may_selected = host[b : 2 * b].to(dtype=torch.long).tolist()
+        old_log_prob = host[2 * b : 3 * b].tolist()
+        value = host[3 * b : 4 * b].tolist()
+        replay_rows_cpu = host[4 * b : 5 * b].to(dtype=torch.long).tolist()
+        selected_choice_cols = selected.detach().cpu().tolist()
+        return NativeTextSampleBatch(
+            decision_counts=[int(x) for x in decision_counts],
+            selected_choice_cols=[int(x) for x in selected_choice_cols],
+            may_selected=[int(x) for x in may_selected],
+            old_log_prob=[float(x) for x in old_log_prob],
+            value=[float(x) for x in value],
+            replay_rows=[int(x) for x in replay_rows_cpu],
+        )
 
     def evaluate_replay_batch(
         self,
@@ -1225,6 +1418,118 @@ def _decode_text_action(
     return (
         ActionTrace("choice_index", indices=(selected_idx,)),
         action_from_choice_index(selected_idx),
+    )
+
+
+def _direct_decision_logits_batched(
+    output: RecurrentTextPolicyOutput,
+    none_logits: Tensor,
+    *,
+    step_for_group: Tensor,
+    option_idx: Tensor,
+    target_idx: Tensor,
+    uses_none: Tensor,
+) -> Tensor:
+    num_options = int(output.policy_logits.shape[1])
+    num_targets = int(output.target_logits.shape[2])
+    if num_options > 0:
+        opt_clamped = option_idx.clamp(min=0, max=num_options - 1)
+        option_vals = output.policy_logits[step_for_group].gather(1, opt_clamped)
+    else:
+        opt_clamped = option_idx.clamp(min=0)
+        option_vals = output.values.new_full(option_idx.shape, float("-inf"))
+    if num_options > 0 and num_targets > 0:
+        tgt_clamped = target_idx.clamp(min=0, max=num_targets - 1)
+        target_vals = output.target_logits[step_for_group].gather(
+            1,
+            opt_clamped.unsqueeze(-1).expand(-1, -1, num_targets),
+        )
+        target_vals = target_vals.gather(2, tgt_clamped.unsqueeze(-1)).squeeze(-1)
+    else:
+        tgt_clamped = target_idx.clamp(min=0)
+        target_vals = option_vals
+    logits = torch.where(target_idx >= 0, target_vals, option_vals)
+    opt_in_range = (option_idx >= 0) & (option_idx < num_options)
+    tgt_in_range = (target_idx >= 0) & (target_idx < num_targets)
+    neg_inf = output.values.new_tensor(float("-inf"))
+    logits = torch.where(opt_in_range, logits, neg_inf)
+    logits = torch.where((target_idx >= 0) & ~tgt_in_range, neg_inf, logits)
+    col0 = torch.arange(option_idx.shape[1], device=option_idx.device).eq(0)
+    none_mask = uses_none[:, None] & col0[None, :]
+    return torch.where(none_mask, none_logits[step_for_group, None], logits)
+
+
+def _visible_decision_mask(
+    output: RecurrentTextPolicyOutput,
+    *,
+    step_for_group: Tensor,
+    option_idx: Tensor,
+    target_idx: Tensor,
+    decision_mask: Tensor,
+    uses_none: Tensor,
+) -> Tensor:
+    num_options = int(output.option_mask.shape[1])
+    num_targets = int(output.target_mask.shape[2]) if output.target_mask.dim() == 3 else 0
+    opt_in_range = (option_idx >= 0) & (option_idx < num_options)
+    tgt_in_range = (target_idx >= 0) & (target_idx < num_targets)
+    if num_options > 0:
+        opt_clamped = option_idx.clamp(min=0, max=num_options - 1)
+        opt_visible = output.option_mask[step_for_group].gather(1, opt_clamped) & opt_in_range
+    else:
+        opt_clamped = option_idx.clamp(min=0)
+        opt_visible = torch.zeros_like(option_idx, dtype=torch.bool)
+    if num_options > 0 and num_targets > 0:
+        tgt_clamped = target_idx.clamp(min=0, max=num_targets - 1)
+        target_for_groups = output.target_mask[step_for_group].gather(
+            1,
+            opt_clamped.unsqueeze(-1).expand(-1, -1, num_targets),
+        )
+        tgt_visible = target_for_groups.gather(2, tgt_clamped.unsqueeze(-1)).squeeze(-1)
+        tgt_visible = tgt_visible & tgt_in_range
+    else:
+        tgt_visible = torch.zeros_like(option_idx, dtype=torch.bool)
+    target_required = target_idx >= 0
+    visible = opt_visible & (~target_required | tgt_visible)
+    col0 = torch.arange(option_idx.shape[1], device=option_idx.device).eq(0)
+    visible = visible | (uses_none[:, None] & col0[None, :])
+    return decision_mask & visible
+
+
+def _dense_from_packed_batch(
+    batch: PackedTextBatch,
+    *,
+    max_tokens: int,
+    pad_id: int,
+) -> TextEncodedBatch:
+    b = int(batch.seq_lengths.shape[0])
+    token_ids = torch.full(
+        (b, max_tokens),
+        int(pad_id),
+        dtype=batch.token_ids.dtype,
+        device=batch.token_ids.device,
+    )
+    attention_mask = torch.zeros((b, max_tokens), dtype=torch.bool, device=batch.token_ids.device)
+    in_range = batch.pos_in_seq < max_tokens
+    seq_id = batch.seq_id[in_range].to(torch.long)
+    pos = batch.pos_in_seq[in_range].to(torch.long)
+    token_ids[seq_id, pos] = batch.token_ids[in_range]
+    attention_mask[seq_id, pos] = True
+    base = batch.state_positions
+
+    def rebase(pos_tensor: Tensor, view_shape: tuple[int, ...]) -> Tensor:
+        valid = pos_tensor >= 0
+        shifted = pos_tensor - base.view(view_shape)
+        return torch.where(valid, shifted, pos_tensor)
+
+    return TextEncodedBatch(
+        token_ids=token_ids,
+        attention_mask=attention_mask,
+        card_ref_positions=rebase(batch.card_ref_positions, (b, 1)),
+        option_positions=rebase(batch.option_positions, (b, 1)),
+        option_mask=batch.option_mask,
+        target_positions=rebase(batch.target_positions, (b, 1, 1)),
+        target_mask=batch.target_mask,
+        seq_lengths=batch.seq_lengths,
     )
 
 
