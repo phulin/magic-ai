@@ -631,7 +631,7 @@ def neurd_loss_per_choice(
     beta: float,
     clip: float,
     lr: float = 0.0,
-) -> tuple[Tensor, int, int]:
+) -> tuple[Tensor, Tensor, Tensor]:
     """NeuRD loss over a flattened, ragged set of per-choice logits.
 
     Returns ``(sum_loss, num_active_entries, num_clipped_entries)``. The
@@ -652,7 +652,14 @@ def neurd_loss_per_choice(
         raise ValueError("flat_active_mask must match flat_logits shape")
     q_pre = flat_q.detach()
     q_clipped = q_pre.clamp(-clip, clip)
-    n_clipped = int((q_pre.abs() > clip).sum().item()) if flat_logits.numel() > 0 else 0
+    # ``n_clipped`` / ``n_active`` were previously ``.item()``-collapsed here,
+    # which forced a GPU sync per call (×4 policies / ×3 chunks per update on
+    # the rnad hot path). Keeping them as 0-d Long tensors lets the trainer
+    # accumulate across chunks and sync once at the end of ``run_rnad_update``.
+    if flat_logits.numel() > 0:
+        n_clipped = (q_pre.abs() > clip).sum().to(dtype=torch.long)
+    else:
+        n_clipped = flat_logits.new_zeros((), dtype=torch.long)
     with torch.no_grad():
         # Paper §189 post-update logit predicate; see :func:`neurd_loss`.
         post_update = flat_logits + lr * q_clipped
@@ -664,7 +671,10 @@ def neurd_loss_per_choice(
     )
     per_entry = -flat_logits * q_clipped * in_range.to(dtype=flat_logits.dtype) * active_f
     sum_loss = per_entry.sum()
-    n_active = int(active_f.sum().item()) if flat_logits.numel() > 0 else 0
+    if flat_logits.numel() > 0:
+        n_active = active_f.sum().to(dtype=torch.long)
+    else:
+        n_active = flat_logits.new_zeros((), dtype=torch.long)
     return sum_loss, n_active, n_clipped
 
 
@@ -678,7 +688,7 @@ def critic_loss(
     v_theta: Tensor,
     v_hat: Tensor,
     perspective_is_player_i: Tensor,
-) -> tuple[Tensor, int]:
+) -> tuple[Tensor, Tensor]:
     """L1 regression of the online value head against the v-trace target.
 
     Only own-turn steps contribute (paper §186). Returns ``(sum_loss, count)``
@@ -692,10 +702,11 @@ def critic_loss(
         raise ValueError("v_theta and perspective mask must share shape")
 
     mask = perspective_is_player_i.to(dtype=torch.bool)
-    if not mask.any():
-        return v_theta.new_zeros(()), 0
+    count = mask.sum().to(dtype=torch.long)
+    # Always run the masked sum: ``mask.any()`` would force a sync, and
+    # ``diff[all-False].sum()`` already returns a 0-tensor of the right dtype.
     diff = (v_theta - v_hat.detach()).abs()
-    return diff[mask].sum(), int(mask.sum().item())
+    return diff[mask].sum(), count
 
 
 # ---------------------------------------------------------------------------
@@ -777,7 +788,7 @@ def may_neurd_loss(
     beta: float,
     clip: float,
     lr: float = 0.0,
-) -> tuple[Tensor, int]:
+) -> tuple[Tensor, Tensor]:
     """True two-action NeuRD loss for the Bernoulli ``may`` head.
 
     Models accept/decline as a 2-action softmax with logits ``(l, 0)`` (the
@@ -803,8 +814,7 @@ def may_neurd_loss(
     if may_logits.shape != q_decline.shape:
         raise ValueError("may_logits and q_decline must share shape")
     mask = own_turn_may_mask.to(dtype=torch.bool)
-    if not mask.any():
-        return may_logits.new_zeros(()), 0
+    count = mask.sum().to(dtype=torch.long)
     p_accept = torch.sigmoid(may_logits)
     q_accept_c = q_accept.clamp(-clip, clip).detach()
     q_decline_c = q_decline.clamp(-clip, clip).detach()
@@ -820,8 +830,9 @@ def may_neurd_loss(
         post_update = may_logits + lr * grad_l
         in_range = post_update.abs() <= beta
     per_step = -surrogate * in_range.to(dtype=may_logits.dtype)
+    # Always run the masked sum; the empty-mask case yields a 0-tensor without
+    # forcing a sync via ``mask.any()``.
     sum_loss = per_step[mask].sum()
-    count = int(mask.sum().item())
     return sum_loss, count
 
 
@@ -973,10 +984,16 @@ class _TrajLossPieces:
     """
 
     cl_sum: Tensor
-    cl_count: int
+    # Counters were ints (forcing per-call ``.item()`` syncs in the loss
+    # helpers); they're now 0-d ``torch.long`` tensors so the trainer can
+    # accumulate across chunks and force a single sync at the end of the
+    # update. ``int + tensor`` and ``tensor == int`` both work transparently
+    # so verify-mode and ``q_clip_fraction`` callers need no changes beyond
+    # the final ``float(...)``-coerce in ``run_rnad_update``.
+    cl_count: Tensor
     pl_sum: Tensor
-    pl_count: int
-    n_q_clipped: int
+    pl_count: Tensor
+    n_q_clipped: Tensor
     v_hat_mean: float
     transformed_mean: float
     # Diagnostics (issue: within-inner-loop policy degradation). All are sums
@@ -990,7 +1007,7 @@ class _TrajLossPieces:
     is_bias_down_sum: float = 0.0
     is_bias_down_count: int = 0
     v_target_reg_share_sum: float = 0.0
-    v_target_reg_share_count: int = 0
+    v_target_reg_share_count: Tensor | None = None
 
 
 def _maybe_recompute_lstm(policy: Any, replay_rows: list[int]) -> tuple[Tensor, Tensor] | None:
@@ -1299,9 +1316,9 @@ def _trajectory_loss_from_forwards(
 
     cl_sum = v_online.new_zeros(())
     pl_sum = v_online.new_zeros(())
-    cl_count_total = 0
-    pl_count_total = 0
-    n_q_clipped_total = 0
+    cl_count_total = torch.zeros((), dtype=torch.long, device=device)
+    pl_count_total = torch.zeros((), dtype=torch.long, device=device)
+    n_q_clipped_total = torch.zeros((), dtype=torch.long, device=device)
     v_hat_means: list[float] = []
     transformed_means: list[float] = []
 
@@ -1328,7 +1345,7 @@ def _trajectory_loss_from_forwards(
             is_bias_down_sum_t = 0.0
 
     v_target_reg_share_sum_t = 0.0
-    v_target_reg_share_count_t = 0
+    v_target_reg_share_count_t = torch.zeros((), dtype=torch.long, device=device)
 
     # ---- Perspective-independent setup (hoisted out of the (0, 1) loop) ----
     # Everything below is a function only of the per-policy forwards and
@@ -1422,7 +1439,7 @@ def _trajectory_loss_from_forwards(
                     v_term_part = v_out_term.v_hat[is_own].abs()
                     share = v_reg_part / (v_term_part + v_reg_part + 1e-8)
                     v_target_reg_share_sum_t += float(share.sum())
-                    v_target_reg_share_count_t += int(is_own.sum().item())
+                    v_target_reg_share_count_t += is_own.sum().to(dtype=torch.long)
 
         cl_part_sum, cl_part_count = critic_loss(
             v_theta=v_online,
@@ -1699,13 +1716,18 @@ def _batched_trajectory_loss_from_forwards(
 
     cl_sum = v_online.new_zeros(())
     pl_sum = v_online.new_zeros(())
-    cl_count_total = 0
-    pl_count_total = 0
-    n_q_clipped_total = 0
+    # Counters are 0-d ``torch.long`` tensors: ``critic_loss`` /
+    # ``may_neurd_loss`` / ``neurd_loss_per_choice`` now return per-call
+    # counts as tensors, and accumulating into a tensor zero avoids the
+    # implicit ``.item()`` sync that the previous int initialization
+    # triggered on the first ``+=``.
+    cl_count_total = torch.zeros((), dtype=torch.long, device=device)
+    pl_count_total = torch.zeros((), dtype=torch.long, device=device)
+    n_q_clipped_total = torch.zeros((), dtype=torch.long, device=device)
     v_hat_sum = torch.zeros((), dtype=dtype, device=device)
     transformed_sum = torch.zeros((), dtype=dtype, device=device)
     v_target_reg_share_sum_t = torch.zeros((), dtype=dtype, device=device)
-    v_target_reg_share_count_t = 0
+    v_target_reg_share_count_t = torch.zeros((), dtype=torch.long, device=device)
 
     for rewards_p, is_own_p in ((rewards_p0, is_own_p0), (rewards_p1, is_own_p1)):
         transformed = transform_rewards(
@@ -1745,7 +1767,7 @@ def _batched_trajectory_loss_from_forwards(
                     v_term_part = v_out_term.v_hat[is_own_p].abs()
                     share = v_reg_part / (v_term_part + v_reg_part + 1e-8)
                     v_target_reg_share_sum_t = v_target_reg_share_sum_t + share.sum()
-                    v_target_reg_share_count_t += int(is_own_p.sum().item())
+                    v_target_reg_share_count_t += is_own_p.sum().to(dtype=torch.long)
 
         cl_part_sum, cl_part_count = critic_loss(
             v_theta=v_online,

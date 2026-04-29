@@ -307,9 +307,9 @@ class CriticLossTests(unittest.TestCase):
         v_hat = torch.tensor([0.0, 0.0, 0.0, 0.0])
         mask = torch.tensor([True, False, True, False])
         loss_sum, count = critic_loss(v_theta=v_theta, v_hat=v_hat, perspective_is_player_i=mask)
-        self.assertEqual(count, 2)
+        self.assertEqual(int(count), 2)
         # sum |1-0| + |2-0| = 3; mean = 1.5.
-        self.assertAlmostEqual(float(loss_sum) / count, 1.5)
+        self.assertAlmostEqual(float(loss_sum) / int(count), 1.5)
 
     def test_stops_gradient_on_target(self) -> None:
         v_theta = torch.tensor([0.5], requires_grad=True)
@@ -326,7 +326,7 @@ class CriticLossTests(unittest.TestCase):
         v_hat = torch.zeros(3)
         mask = torch.zeros(3, dtype=torch.bool)
         loss_sum, count = critic_loss(v_theta=v_theta, v_hat=v_hat, perspective_is_player_i=mask)
-        self.assertEqual(count, 0)
+        self.assertEqual(int(count), 0)
         self.assertEqual(float(loss_sum), 0.0)
 
 
