@@ -416,14 +416,20 @@ class NativeBatchEncoder:
             raise NativeEncodingError("NativeBatchEncoder is missing shape metadata")
         if self.option_scalar_dim is None or self.target_scalar_dim is None:
             raise NativeEncodingError("NativeBatchEncoder is missing scalar metadata")
+        # Pin the per-decision layout buffers (and assembler render-plan
+        # outputs) so the policy's ``.to(device, non_blocking=True)`` over
+        # slices of these tensors actually runs asynchronously.
+        pin = torch.cuda.is_available()
         render_plan = None
         render_plan_lengths = None
         render_plan_overflow = None
         if self.emit_render_plan:
             if self.render_plan_capacity <= 0:
                 raise NativeEncodingError("render_plan_capacity must be positive")
-            render_plan = torch.empty((batch_size, self.render_plan_capacity), dtype=torch.int32)
-            render_plan_lengths = torch.empty((batch_size,), dtype=torch.int64)
+            render_plan = torch.empty(
+                (batch_size, self.render_plan_capacity), dtype=torch.int32, pin_memory=pin
+            )
+            render_plan_lengths = torch.empty((batch_size,), dtype=torch.int64, pin_memory=pin)
             render_plan_overflow = torch.empty((batch_size,), dtype=torch.int64)
         return _BufferSet(
             trace_kind_id=torch.empty((batch_size,), dtype=torch.int64),
@@ -466,18 +472,24 @@ class NativeBatchEncoder:
                 (batch_size, self.max_options, self.max_targets_per_option), dtype=torch.uint8
             ),
             may_mask_u8=torch.empty((batch_size,), dtype=torch.uint8),
-            decision_start=torch.empty((batch_size,), dtype=torch.int64),
-            decision_count=torch.empty((batch_size,), dtype=torch.int64),
+            decision_start=torch.empty((batch_size,), dtype=torch.int64, pin_memory=pin),
+            decision_count=torch.empty((batch_size,), dtype=torch.int64, pin_memory=pin),
             decision_option_idx=torch.empty(
-                (decision_capacity, self.max_cached_choices), dtype=torch.int64
+                (decision_capacity, self.max_cached_choices),
+                dtype=torch.int64,
+                pin_memory=pin,
             ),
             decision_target_idx=torch.empty(
-                (decision_capacity, self.max_cached_choices), dtype=torch.int64
+                (decision_capacity, self.max_cached_choices),
+                dtype=torch.int64,
+                pin_memory=pin,
             ),
             decision_mask_u8=torch.empty(
-                (decision_capacity, self.max_cached_choices), dtype=torch.uint8
+                (decision_capacity, self.max_cached_choices),
+                dtype=torch.uint8,
+                pin_memory=pin,
             ),
-            uses_none_head_u8=torch.empty((decision_capacity,), dtype=torch.uint8),
+            uses_none_head_u8=torch.empty((decision_capacity,), dtype=torch.uint8, pin_memory=pin),
             render_plan=render_plan,
             render_plan_lengths=render_plan_lengths,
             render_plan_overflow=render_plan_overflow,

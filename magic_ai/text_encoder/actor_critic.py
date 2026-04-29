@@ -240,10 +240,15 @@ class TextActorCritic(nn.Module):
             else:
                 log_prob = output.values.new_zeros(())
                 entropy = output.values.new_zeros(())
-                option_idx_dev = layout.decision_option_idx.to(self.device)
-                target_idx_dev = layout.decision_target_idx.to(self.device)
-                mask_dev = layout.decision_mask.to(device=self.device, dtype=torch.bool)
-                uses_none_flags = layout.uses_none_head.to(torch.bool).tolist()
+                nb = self.device.type == "cuda"
+                option_idx_dev = layout.decision_option_idx.to(self.device, non_blocking=nb)
+                target_idx_dev = layout.decision_target_idx.to(self.device, non_blocking=nb)
+                mask_dev = layout.decision_mask.to(self.device, non_blocking=nb)
+                if mask_dev.dtype != torch.bool:
+                    mask_dev = mask_dev.to(dtype=torch.bool)
+                # ``layout.uses_none_head`` is already CPU; just materialize
+                # to a Python list without going through the device.
+                uses_none_flags = layout.uses_none_head.bool().tolist()
                 num_groups = int(layout.decision_option_idx.shape[0])
                 # Vectorize visibility across ALL groups for this step instead
                 # of computing per-group inside the loop.
@@ -251,15 +256,29 @@ class TextActorCritic(nn.Module):
                 tgt_visibility = output.target_mask[step_idx]
                 num_opts_view = int(opt_visibility.shape[0])
                 num_tgts_view = int(tgt_visibility.shape[1])
-                opt_clamped_all = option_idx_dev.clamp(min=0)
-                tgt_clamped_all = target_idx_dev.clamp(min=0)
+                # ``decision_option_idx`` / ``decision_target_idx`` carry the
+                # engine's option/target indices in the encoder's full
+                # ``max_options`` / ``max_targets_per_option`` space.
+                # ``to_text_encoded_batch`` trims those dims to the per-batch
+                # active extent, so naked ``opt_visibility[opt_clamped_all]``
+                # OOBs when an engine index lands past the trimmed extent
+                # (the option_position simply wasn't emitted as a token).
+                # Treat any out-of-range index as invisible.
+                opt_in_range = (option_idx_dev >= 0) & (option_idx_dev < num_opts_view)
+                tgt_in_range = (target_idx_dev >= 0) & (target_idx_dev < num_tgts_view)
                 if num_opts_view > 0:
-                    opt_visible_all = opt_visibility[opt_clamped_all] & (option_idx_dev >= 0)
+                    opt_clamped_all = option_idx_dev.clamp(min=0, max=num_opts_view - 1)
+                    opt_visible_all = opt_visibility[opt_clamped_all] & opt_in_range
                 else:
+                    opt_clamped_all = option_idx_dev.clamp(min=0)
                     opt_visible_all = torch.zeros_like(option_idx_dev, dtype=torch.bool)
                 if num_opts_view > 0 and num_tgts_view > 0:
-                    tgt_visible_all = tgt_visibility[opt_clamped_all, tgt_clamped_all]
+                    tgt_clamped_all = target_idx_dev.clamp(min=0, max=num_tgts_view - 1)
+                    tgt_visible_all = (
+                        tgt_visibility[opt_clamped_all, tgt_clamped_all] & tgt_in_range
+                    )
                 else:
+                    tgt_clamped_all = target_idx_dev.clamp(min=0)
                     tgt_visible_all = torch.zeros_like(target_idx_dev, dtype=torch.bool)
                 target_required_all = target_idx_dev >= 0
                 visible_all = opt_visible_all & (~target_required_all | tgt_visible_all)
@@ -287,6 +306,43 @@ class TextActorCritic(nn.Module):
                         uses_none=uses_none_flags[group_idx],
                     )
                     valid_cols = mask.nonzero(as_tuple=False).squeeze(-1)
+                    if valid_cols.numel() == 0:
+                        # The model's option-visibility view disagrees with
+                        # the engine: this row has engine-valid choices but
+                        # the rendered text didn't emit <option> tokens for
+                        # them, so ``policy_logits`` at those positions is
+                        # all -inf (the policy head masks invalid options).
+                        # Happens for trace_kinds whose decision options
+                        # aren't priority options (notably ``choice_ids``).
+                        # Fall back to uniform sampling over engine-valid
+                        # columns; the policy can't score these meaningfully
+                        # but we keep the rollout alive.
+                        engine_cols = mask_dev[group_idx].nonzero(as_tuple=False).squeeze(-1)
+                        if engine_cols.numel() == 0:
+                            # Fully empty engine mask — nothing to choose.
+                            # Append a sentinel col 0 so the layout stays
+                            # consistent and let the engine reject if it
+                            # cares.
+                            selected_tensors.append(
+                                torch.zeros((), device=self.device, dtype=torch.long)
+                            )
+                            continue
+                        n_valid = engine_cols.numel()
+                        if deterministic:
+                            sel_in_valid = torch.zeros((), device=self.device, dtype=torch.long)
+                        else:
+                            sel_in_valid = torch.randint(
+                                low=0, high=n_valid, size=(), device=self.device
+                            )
+                        chosen = engine_cols[sel_in_valid]
+                        # Uniform log-prob over the n_valid engine choices,
+                        # zero entropy contribution (model has no view).
+                        uniform_log_prob = output.values.new_tensor(
+                            -float(torch.log(torch.tensor(float(n_valid))))
+                        )
+                        log_prob = log_prob + uniform_log_prob
+                        selected_tensors.append(chosen)
+                        continue
                     valid_logits = logits[valid_cols]
                     dist = Categorical(logits=valid_logits)
                     if deterministic:
@@ -609,36 +665,79 @@ class TextActorCritic(nn.Module):
         decision_group_id_parts: list[Tensor] = []
         step_for_decision_groups: list[int] = []
         decision_group_id = 0
+        # Hoist the per-step / per-group ``.item()`` syncs into three batched
+        # ``.tolist()`` materializations; the inner loop then runs entirely
+        # off CPU-side Python ints. Previously this function spent ~6s of
+        # 120s in ``Tensor.item`` on shandalar.
+        decision_count_cpu = decision_count.tolist()
+        selected_indices_cpu = batch.selected_indices.tolist()
+        mask_any_cpu = batch.decision_mask.any(dim=-1).tolist()
+        # Vectorized prelude: instead of calling
+        # ``_direct_decision_logits`` once per (step, group) — which on
+        # shandalar fired ~22k times and was the dominant gather/clamp
+        # cost — gather all active (step, group) pairs into flat tensors
+        # and call ``direct_decision_logits_from_forward`` exactly once.
+        device = forward.values.device
+        flat_step_positions: list[int] = []
+        flat_step_groups: list[tuple[int, int]] = []
         for step_idx in range(n):
-            group_count = int(decision_count[step_idx].item())
+            group_count = int(decision_count_cpu[step_idx])
+            for group_idx in range(group_count):
+                flat_step_positions.append(step_idx)
+                flat_step_groups.append((step_idx, group_idx))
+        if flat_step_groups:
+            steps_t = torch.tensor(
+                [sg[0] for sg in flat_step_groups], dtype=torch.long, device=device
+            )
+            groups_t = torch.tensor(
+                [sg[1] for sg in flat_step_groups], dtype=torch.long, device=device
+            )
+            flat_option_idx = batch.decision_option_idx[steps_t, groups_t]
+            flat_target_idx = batch.decision_target_idx[steps_t, groups_t]
+            flat_masks = batch.decision_mask[steps_t, groups_t]
+            flat_uses_none = batch.uses_none_head[steps_t, groups_t]
+            step_positions_t = torch.tensor(flat_step_positions, dtype=torch.long, device=device)
+            all_logits = direct_decision_logits_from_forward(
+                forward,
+                step_positions=step_positions_t,
+                option_idx=flat_option_idx,
+                target_idx=flat_target_idx,
+                masks=flat_masks,
+                uses_none=flat_uses_none,
+            )
+        else:
+            all_logits = output.values.new_zeros(0, batch.decision_mask.shape[-1])
+        flat_idx = 0
+        for step_idx in range(n):
+            group_count = int(decision_count_cpu[step_idx])
             for group_idx in range(group_count):
                 mask = batch.decision_mask[step_idx, group_idx]
-                if not bool(mask.any()):
+                if not mask_any_cpu[step_idx][group_idx]:
                     raise ValueError("decision group must include at least one valid choice")
-                logits = self._direct_decision_logits(
-                    forward,
-                    step_idx=step_idx,
-                    group_idx=group_idx,
-                    batch=batch,
-                )
+                logits = all_logits[flat_idx]
+                flat_idx += 1
                 valid_logits = logits[mask]
                 valid_cols = mask.nonzero(as_tuple=False).squeeze(-1)
-                selected = int(batch.selected_indices[step_idx, group_idx].item())
-                selected_pos = (valid_cols == selected).nonzero(as_tuple=False)
-                if selected_pos.numel() == 0:
-                    raise ValueError("selected decision column is not valid for replay group")
+                selected = int(selected_indices_cpu[step_idx][group_idx])
+                # Index of the selected column inside ``valid_cols``.
+                # ``argmax`` of the bool→int8 cast is sync-free (the
+                # equivalent ``nonzero`` allocates based on the count, which
+                # forces a GPU sync). ``valid_cols`` is sorted ascending so
+                # there is at most one match; argmax returns the first.
+                # An invalid ``selected`` would silently give 0, so guard
+                # via a single batched check after the loop.
+                is_sel = valid_cols == selected
+                selected_pos = is_sel.to(torch.int8).argmax()
                 group_log_probs = torch.log_softmax(valid_logits, dim=0)
                 probs = group_log_probs.exp()
-                log_probs[step_idx] = (
-                    log_probs[step_idx] + group_log_probs[int(selected_pos[0, 0].item())]
-                )
+                log_probs[step_idx] = log_probs[step_idx] + group_log_probs[selected_pos]
                 entropies[step_idx] = entropies[step_idx] - (probs * group_log_probs).sum()
                 if return_per_choice:
                     flat_logits_parts.append(valid_logits)
                     flat_log_prob_parts.append(group_log_probs)
                     group_idx_parts.append(torch.full_like(valid_cols, step_idx))
                     choice_col_parts.append(valid_cols)
-                    is_sampled_parts.append(valid_cols == selected)
+                    is_sampled_parts.append(is_sel)
                     decision_group_id_parts.append(torch.full_like(valid_cols, decision_group_id))
                     step_for_decision_groups.append(step_idx)
                 decision_group_id += 1
@@ -730,8 +829,14 @@ class TextActorCritic(nn.Module):
         # the values get masked away by ``torch.where``.
         num_options = int(output.policy_logits.shape[1])
         num_targets = int(output.target_logits.shape[2])
-        opt_clamped = option_idx.clamp(min=0)
-        tgt_clamped = target_idx.clamp(min=0)
+        # ``option_idx`` / ``target_idx`` use the engine's full-width
+        # ``max_options`` / ``max_targets_per_option`` ranges; the model's
+        # logits axes are trimmed to the per-batch active extent. Clamp to
+        # the trimmed extent and mask out-of-range positions with -inf.
+        opt_in_range = (option_idx >= 0) & (option_idx < num_options)
+        tgt_in_range = (target_idx >= 0) & (target_idx < num_targets)
+        opt_clamped = option_idx.clamp(min=0, max=max(num_options - 1, 0))
+        tgt_clamped = target_idx.clamp(min=0, max=max(num_targets - 1, 0))
         if num_options > 0:
             option_vals = output.policy_logits[step_idx, opt_clamped]
         else:
@@ -742,7 +847,8 @@ class TextActorCritic(nn.Module):
             target_vals = option_vals
         logits = torch.where(target_idx >= 0, target_vals, option_vals)
         neg_inf = output.values.new_tensor(float("-inf"))
-        logits = torch.where(option_idx >= 0, logits, neg_inf)
+        logits = torch.where(opt_in_range, logits, neg_inf)
+        logits = torch.where((target_idx >= 0) & ~tgt_in_range, neg_inf, logits)
         if uses_none:
             logits = logits.clone()
             logits[0] = none_logits[step_idx]
@@ -987,15 +1093,27 @@ def _decode_text_action(
 
 
 def _move_text_batch(batch: TextEncodedBatch, device: torch.device) -> TextEncodedBatch:
+    # ``non_blocking=True`` only takes effect when the source is pinned;
+    # the native assembler allocates its outputs in pinned memory when CUDA
+    # is available. Bool conversion runs on the device after the copy so
+    # the H2D transfer happens on the actual storage (uint8) rather than
+    # an unpinned bool intermediate.
+    nb = device.type == "cuda"
+    option_mask = batch.option_mask.to(device, non_blocking=nb)
+    target_mask = batch.target_mask.to(device, non_blocking=nb)
+    if option_mask.dtype != torch.bool:
+        option_mask = option_mask.to(dtype=torch.bool)
+    if target_mask.dtype != torch.bool:
+        target_mask = target_mask.to(dtype=torch.bool)
     return TextEncodedBatch(
-        token_ids=batch.token_ids.to(device),
-        attention_mask=batch.attention_mask.to(device),
-        card_ref_positions=batch.card_ref_positions.to(device),
-        option_positions=batch.option_positions.to(device),
-        option_mask=batch.option_mask.to(device),
-        target_positions=batch.target_positions.to(device),
-        target_mask=batch.target_mask.to(device),
-        seq_lengths=batch.seq_lengths.to(device),
+        token_ids=batch.token_ids.to(device, non_blocking=nb),
+        attention_mask=batch.attention_mask.to(device, non_blocking=nb),
+        card_ref_positions=batch.card_ref_positions.to(device, non_blocking=nb),
+        option_positions=batch.option_positions.to(device, non_blocking=nb),
+        option_mask=option_mask,
+        target_positions=batch.target_positions.to(device, non_blocking=nb),
+        target_mask=target_mask,
+        seq_lengths=batch.seq_lengths.to(device, non_blocking=nb),
     )
 
 

@@ -51,16 +51,23 @@ class NativeAssemblerOutputs:
     _tok_cfg_cffi: Any = None
 
     def to_text_encoded_batch(self) -> TextEncodedBatch:
-        """Slice/widen the dense outputs into a ``TextEncodedBatch`` matching
-        what the Python assembler produces."""
+        """Slice the dense outputs into a ``TextEncodedBatch`` matching the
+        Python assembler's per-batch dimensions.
+
+        Reductions here are all on CPU tensors (no device sync) and the
+        slices are views, so this is cheap. Mask bool conversion is
+        deferred to ``_move_text_batch`` so the underlying pinned uint8
+        storage stays intact for the non-blocking H2D copy.
+        """
 
         max_seq = int(self.seq_lengths.max().item()) if self.seq_lengths.numel() else 0
-        opt_mask_b = self.option_mask.to(dtype=torch.bool)
-        tgt_mask_b = self.target_mask.to(dtype=torch.bool)
-        max_opts = int(opt_mask_b.any(dim=0).sum().item()) if opt_mask_b.numel() else 0
-        # Compress max_targets to actual extent, like the Python assembler.
-        max_tgts = int(tgt_mask_b.any(dim=0).any(dim=0).sum().item()) if tgt_mask_b.numel() else 0
-
+        opt_any = self.option_mask.any(dim=0)
+        max_opts = int(opt_any.sum().item()) if opt_any.numel() else 0
+        if max_opts > 0:
+            tgt_any = self.target_mask[:, :max_opts].any(dim=0).any(dim=0)
+            max_tgts = int(tgt_any.sum().item()) if tgt_any.numel() else 0
+        else:
+            max_tgts = 0
         token_ids = self.token_ids[:, :max_seq] if max_seq > 0 else self.token_ids[:, :0]
         attention_mask = (
             self.attention_mask[:, :max_seq] if max_seq > 0 else self.attention_mask[:, :0]
@@ -68,9 +75,9 @@ class NativeAssemblerOutputs:
         option_positions = (
             self.option_positions[:, :max_opts] if max_opts > 0 else self.option_positions[:, :0]
         )
-        option_mask = opt_mask_b[:, :max_opts] if max_opts > 0 else opt_mask_b[:, :0]
+        option_mask = self.option_mask[:, :max_opts] if max_opts > 0 else self.option_mask[:, :0]
         target_positions = self.target_positions[:, :max_opts, :max_tgts]
-        target_mask = tgt_mask_b[:, :max_opts, :max_tgts]
+        target_mask = self.target_mask[:, :max_opts, :max_tgts]
         return TextEncodedBatch(
             token_ids=token_ids,
             attention_mask=attention_mask,
@@ -94,17 +101,31 @@ def allocate_outputs(
     max_targets: int,
     max_card_refs: int,
 ) -> NativeAssemblerOutputs:
-    """Pre-allocate output tensors for one MageEncodeTokens call."""
+    """Pre-allocate output tensors for one MageEncodeTokens call.
 
+    Tensors that get shipped H2D every step are allocated in pinned
+    memory so the policy's ``.to(device, non_blocking=True)`` actually
+    runs asynchronously. Pinning is skipped when CUDA is unavailable.
+    """
+
+    pin = torch.cuda.is_available()
     return NativeAssemblerOutputs(
-        token_ids=torch.empty((batch_size, max_tokens), dtype=torch.int64),
-        attention_mask=torch.empty((batch_size, max_tokens), dtype=torch.int64),
-        seq_lengths=torch.empty((batch_size,), dtype=torch.int64),
-        option_positions=torch.full((batch_size, max_options), -1, dtype=torch.int64),
-        option_mask=torch.zeros((batch_size, max_options), dtype=torch.uint8),
-        target_positions=torch.full((batch_size, max_options, max_targets), -1, dtype=torch.int64),
-        target_mask=torch.zeros((batch_size, max_options, max_targets), dtype=torch.uint8),
-        card_ref_positions=torch.full((batch_size, max_card_refs), -1, dtype=torch.int64),
+        token_ids=torch.empty((batch_size, max_tokens), dtype=torch.int64, pin_memory=pin),
+        attention_mask=torch.empty((batch_size, max_tokens), dtype=torch.int64, pin_memory=pin),
+        seq_lengths=torch.empty((batch_size,), dtype=torch.int64, pin_memory=pin),
+        option_positions=torch.full(
+            (batch_size, max_options), -1, dtype=torch.int64, pin_memory=pin
+        ),
+        option_mask=torch.zeros((batch_size, max_options), dtype=torch.uint8, pin_memory=pin),
+        target_positions=torch.full(
+            (batch_size, max_options, max_targets), -1, dtype=torch.int64, pin_memory=pin
+        ),
+        target_mask=torch.zeros(
+            (batch_size, max_options, max_targets), dtype=torch.uint8, pin_memory=pin
+        ),
+        card_ref_positions=torch.full(
+            (batch_size, max_card_refs), -1, dtype=torch.int64, pin_memory=pin
+        ),
         token_overflow=torch.zeros((batch_size,), dtype=torch.int32),
     )
 

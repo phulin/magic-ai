@@ -1105,7 +1105,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ORACLE_DB_PATH,
         help="Scryfall oracle-cards.json bulk dump for text encoder oracle text",
     )
-    parser.add_argument("--text-max-tokens", type=int, default=2048)
+    parser.add_argument("--text-max-tokens", type=int, default=4096)
     parser.add_argument("--text-d-model", type=int, default=128)
     parser.add_argument("--text-layers", type=int, default=2)
     parser.add_argument("--text-heads", type=int, default=4)
@@ -2284,9 +2284,11 @@ def sample_native_text_policy_batch(
             assembler_tokens=backend.assembler_tokens,
         )
 
+    # The native encoder writes these directly into pinned CPU scratch — no
+    # device transfer needed, no detach (we're already under no_grad).
     layouts: list[Any] = []
-    starts = native_batch.decision_start.detach().cpu().tolist()
-    counts = native_batch.decision_count.detach().cpu().tolist()
+    starts = native_batch.decision_start.tolist()
+    counts = native_batch.decision_count.tolist()
     for row_idx, trace_kind_raw in enumerate(native_batch.trace_kinds):
         trace_kind = cast(Any, trace_kind_raw)
         start = int(starts[row_idx])
@@ -2296,10 +2298,10 @@ def sample_native_text_policy_batch(
         layouts.append(
             TextDecisionLayout(
                 trace_kind=trace_kind,
-                decision_option_idx=native_batch.decision_option_idx[start:end].detach().cpu(),
-                decision_target_idx=native_batch.decision_target_idx[start:end].detach().cpu(),
-                decision_mask=native_batch.decision_mask[start:end].detach().cpu().bool(),
-                uses_none_head=native_batch.uses_none_head[start:end].detach().cpu().bool(),
+                decision_option_idx=native_batch.decision_option_idx[start:end],
+                decision_target_idx=native_batch.decision_target_idx[start:end],
+                decision_mask=native_batch.decision_mask[start:end],
+                uses_none_head=native_batch.uses_none_head[start:end],
                 pending=pending,
             )
         )
@@ -2597,15 +2599,25 @@ def train_text_native_batched_envs(
             starts: list[int] = list(itertools.accumulate(counts, initial=0))[:-1]
             selected_cols: list[int] = [c for s in policy_steps for c in s.selected_choice_cols]
             may_selected = [s.may_selected for s in policy_steps]
-            for env, player_idx, policy_step in zip(
-                ready_envs, ready_players, policy_steps, strict=True
+            # Batch the per-step D2H of log_prob/value into one stack+.tolist()
+            # so we incur 2 GPU syncs total instead of 2*N.
+            if policy_steps:
+                log_probs_cpu = (
+                    torch.stack([s.log_prob for s in policy_steps]).detach().cpu().tolist()
+                )
+                values_cpu = torch.stack([s.value for s in policy_steps]).detach().cpu().tolist()
+            else:
+                log_probs_cpu = []
+                values_cpu = []
+            for step_idx, (env, player_idx, policy_step) in enumerate(
+                zip(ready_envs, ready_players, policy_steps, strict=True)
             ):
                 env.action_count += 1
                 env.episode_steps.append(
                     RolloutStep(
                         perspective_player_idx=int(player_idx),
-                        old_log_prob=float(policy_step.log_prob.detach().cpu()),
-                        value=float(policy_step.value.detach().cpu()),
+                        old_log_prob=float(log_probs_cpu[step_idx]),
+                        value=float(values_cpu[step_idx]),
                         replay_idx=policy_step.replay_idx,
                     )
                 )

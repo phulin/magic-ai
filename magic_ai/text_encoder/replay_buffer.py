@@ -268,9 +268,16 @@ class TextReplayBuffer:
         batch_index: int,
     ) -> None:
         self._validate_batch_index(encoded, batch_index)
-        seq_len = int(encoded.seq_lengths[batch_index].item())
-        if seq_len > self.max_tokens:
-            raise ValueError("encoded row length exceeds buffer max_tokens")
+        # Encoded tensors carry their per-batch dense shape; ``token_ids``
+        # has shape (B, T_b) where T_b <= self.max_tokens. Copying the
+        # whole row uses the static tensor shape (a Python int, no GPU
+        # sync) instead of materializing the per-row ``seq_lengths`` value
+        # via ``.item()``. The buffer is zeroed past T_b, which matches
+        # the prior behavior (encoded tensors are pad-id padded past
+        # seq_lengths anyway, so the trailing slots either way are
+        # ignored at training time via ``attention_mask``).
+        token_width = int(encoded.token_ids.shape[1])
+        attention_width = int(encoded.attention_mask.shape[1])
         self.token_ids[row].zero_()
         self.attention_mask[row].zero_()
         self.card_ref_positions[row].fill_(-1)
@@ -278,11 +285,11 @@ class TextReplayBuffer:
         self.option_mask[row].zero_()
         self.target_positions[row].fill_(-1)
         self.target_mask[row].zero_()
-        self.token_ids[row, :seq_len].copy_(
-            encoded.token_ids[batch_index, :seq_len].to(device=self.device, dtype=torch.long)
+        self.token_ids[row, :token_width].copy_(
+            encoded.token_ids[batch_index].to(device=self.device, dtype=torch.long)
         )
-        self.attention_mask[row, :seq_len].copy_(
-            encoded.attention_mask[batch_index, :seq_len].to(device=self.device, dtype=torch.long)
+        self.attention_mask[row, :attention_width].copy_(
+            encoded.attention_mask[batch_index].to(device=self.device, dtype=torch.long)
         )
         self.card_ref_positions[row].copy_(
             encoded.card_ref_positions[batch_index].to(device=self.device, dtype=torch.long)
@@ -305,7 +312,8 @@ class TextReplayBuffer:
         self.target_mask[row, :option_width, :target_width].copy_(
             encoded.target_mask[batch_index, :option_width, :target_width].to(device=self.device)
         )
-        self.seq_lengths[row] = seq_len
+        # Device-side copy: no .item() sync, just a 0-d tensor write.
+        self.seq_lengths[row] = encoded.seq_lengths[batch_index]
 
     def _write_recurrent_state(
         self,
