@@ -20,7 +20,7 @@ from typing import Any
 import mage
 import torch
 
-from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 
 
 @dataclass
@@ -296,8 +296,260 @@ def encode_tokens(
     return native_batch, outputs
 
 
+@dataclass
+class NativePackedAssemblerOutputs:
+    """Pre-allocated buffers for one ``MageEncodeTokensPacked`` call.
+
+    Token-shaped buffers are sized at the worst case ``B * max_tokens``
+    so a single allocation can accept any live-token total. The Go side
+    writes ``cu_seqlens[B]`` to indicate the live region; trailing
+    storage is unspecified.
+    """
+
+    token_ids: torch.Tensor  # (B*max_tokens,) int64
+    seq_id: torch.Tensor  # (B*max_tokens,) int64
+    pos_in_seq: torch.Tensor  # (B*max_tokens,) int64
+    cu_seqlens: torch.Tensor  # (B+1,) int64
+    seq_lengths: torch.Tensor  # (B,) int64
+    state_positions: torch.Tensor  # (B,) int64
+    option_positions: torch.Tensor  # (B, max_options) int64 (-1 absent)
+    option_mask: torch.Tensor  # (B, max_options) uint8
+    target_positions: torch.Tensor  # (B, max_options, max_targets) int64
+    target_mask: torch.Tensor  # (B, max_options, max_targets) uint8
+    card_ref_positions: torch.Tensor  # (B, max_card_refs) int64
+    token_overflow: torch.Tensor  # (B,) int32
+    _packed_out_cffi: Any = None
+    _tok_cfg_cffi: Any = None
+
+    def to_packed_text_batch(self) -> PackedTextBatch:
+        """Slice the live region into a :class:`PackedTextBatch`.
+
+        Trims anchor tensors to per-batch maxima so the result matches
+        ``pack_batch(NativeAssemblerOutputs.to_text_encoded_batch())``
+        shape-for-shape, rather than the full pre-allocated capacity.
+        """
+
+        total = int(self.cu_seqlens[-1].item()) if self.cu_seqlens.numel() else 0
+        token_ids = self.token_ids[:total]
+        seq_id = self.seq_id[:total]
+        pos_in_seq = self.pos_in_seq[:total]
+
+        opt_any = self.option_mask.any(dim=0)
+        max_opts = int(opt_any.sum().item()) if opt_any.numel() else 0
+        if max_opts > 0:
+            tgt_any = self.target_mask[:, :max_opts].any(dim=0).any(dim=0)
+            max_tgts = int(tgt_any.sum().item()) if tgt_any.numel() else 0
+        else:
+            max_tgts = 0
+        option_positions = (
+            self.option_positions[:, :max_opts] if max_opts > 0 else self.option_positions[:, :0]
+        )
+        option_mask = self.option_mask[:, :max_opts] if max_opts > 0 else self.option_mask[:, :0]
+        target_positions = self.target_positions[:, :max_opts, :max_tgts]
+        target_mask = self.target_mask[:, :max_opts, :max_tgts]
+
+        return PackedTextBatch(
+            token_ids=token_ids,
+            seq_id=seq_id,
+            pos_in_seq=pos_in_seq,
+            cu_seqlens=self.cu_seqlens,
+            seq_lengths=self.seq_lengths,
+            state_positions=self.state_positions,
+            card_ref_positions=self.card_ref_positions,
+            option_positions=option_positions,
+            option_mask=option_mask.bool(),
+            target_positions=target_positions,
+            target_mask=target_mask.bool(),
+        )
+
+
+def allocate_packed_outputs(
+    batch_size: int,
+    *,
+    max_tokens: int,
+    max_options: int,
+    max_targets: int,
+    max_card_refs: int,
+) -> NativePackedAssemblerOutputs:
+    pin = torch.cuda.is_available()
+    cap = batch_size * max_tokens
+    return NativePackedAssemblerOutputs(
+        token_ids=torch.empty((cap,), dtype=torch.int64, pin_memory=pin),
+        seq_id=torch.empty((cap,), dtype=torch.int64, pin_memory=pin),
+        pos_in_seq=torch.empty((cap,), dtype=torch.int64, pin_memory=pin),
+        cu_seqlens=torch.zeros((batch_size + 1,), dtype=torch.int64, pin_memory=pin),
+        seq_lengths=torch.zeros((batch_size,), dtype=torch.int64, pin_memory=pin),
+        state_positions=torch.zeros((batch_size,), dtype=torch.int64, pin_memory=pin),
+        option_positions=torch.full(
+            (batch_size, max_options), -1, dtype=torch.int64, pin_memory=pin
+        ),
+        option_mask=torch.zeros((batch_size, max_options), dtype=torch.uint8, pin_memory=pin),
+        target_positions=torch.full(
+            (batch_size, max_options, max_targets), -1, dtype=torch.int64, pin_memory=pin
+        ),
+        target_mask=torch.zeros(
+            (batch_size, max_options, max_targets), dtype=torch.uint8, pin_memory=pin
+        ),
+        card_ref_positions=torch.full(
+            (batch_size, max_card_refs), -1, dtype=torch.int64, pin_memory=pin
+        ),
+        token_overflow=torch.zeros((batch_size,), dtype=torch.int32),
+    )
+
+
+def encode_tokens_packed(
+    encoder: Any,
+    games: list[Any],
+    *,
+    perspective_player_indices: list[int],
+    max_tokens: int,
+    max_options: int,
+    max_targets: int,
+    max_card_refs: int,
+    outputs: NativePackedAssemblerOutputs | None = None,
+) -> tuple[Any, NativePackedAssemblerOutputs]:
+    """Run ``MageEncodeTokensPacked`` for a batch of games.
+
+    Mirrors :func:`encode_tokens` but writes into a packed (varlen)
+    output buffer. Anchors come back as absolute offsets into
+    ``token_ids``; ``cu_seqlens[-1]`` is the live token count.
+    """
+
+    mage._ensure_loaded()
+    ffi = mage._ffi
+    lib = mage._lib
+
+    batch_size = len(games)
+    if batch_size == 0:
+        raise ValueError("encode_tokens_packed requires at least one game")
+    if len(perspective_player_indices) != batch_size:
+        raise ValueError("perspective_player_indices length mismatch")
+
+    if outputs is None:
+        outputs = allocate_packed_outputs(
+            batch_size,
+            max_tokens=max_tokens,
+            max_options=max_options,
+            max_targets=max_targets,
+            max_card_refs=max_card_refs,
+        )
+
+    decision_capacity = max(1, batch_size * encoder.max_options)
+    encoder._scratch_buffers(batch_size, decision_capacity)
+    scratch = encoder._scratch
+    if scratch.req_cffi is None or scratch.cfg_cffi is None or scratch.enc_out_cffi is None:
+        encoder.rebuild_cffi_structs(ffi, decision_capacity)
+    req = scratch.req_cffi
+    cfg = scratch.cfg_cffi
+    enc_out = scratch.enc_out_cffi
+    req.n = batch_size
+    cfg.decision_capacity = decision_capacity
+
+    handles_np = scratch.handles_np
+    for i, g in enumerate(games):
+        handles_np[i] = getattr(g, "_id", None) or g.handle
+    scratch.perspectives_np[:batch_size] = perspective_player_indices
+
+    if outputs._tok_cfg_cffi is None:
+        outputs._tok_cfg_cffi = ffi.new(
+            "MageTokenAssemblerConfig *",
+            {
+                "max_tokens": max_tokens,
+                "max_options": max_options,
+                "max_targets": max_targets,
+                "max_card_refs": max_card_refs,
+            },
+        )
+    if outputs._packed_out_cffi is None:
+        outputs._packed_out_cffi = ffi.new(
+            "MagePackedTokenAssemblerOutputs *",
+            {
+                "token_ids": ffi.cast("int64_t *", outputs.token_ids.data_ptr()),
+                "seq_id": ffi.cast("int64_t *", outputs.seq_id.data_ptr()),
+                "pos_in_seq": ffi.cast("int64_t *", outputs.pos_in_seq.data_ptr()),
+                "cu_seqlens": ffi.cast("int64_t *", outputs.cu_seqlens.data_ptr()),
+                "seq_lengths": ffi.cast("int64_t *", outputs.seq_lengths.data_ptr()),
+                "state_positions": ffi.cast("int64_t *", outputs.state_positions.data_ptr()),
+                "option_positions": ffi.cast("int64_t *", outputs.option_positions.data_ptr()),
+                "option_mask": ffi.cast("uint8_t *", outputs.option_mask.data_ptr()),
+                "target_positions": ffi.cast("int64_t *", outputs.target_positions.data_ptr()),
+                "target_mask": ffi.cast("uint8_t *", outputs.target_mask.data_ptr()),
+                "card_ref_positions": ffi.cast("int64_t *", outputs.card_ref_positions.data_ptr()),
+                "token_overflow": ffi.cast("int32_t *", outputs.token_overflow.data_ptr()),
+            },
+        )
+    tok_cfg = outputs._tok_cfg_cffi
+    packed_out = outputs._packed_out_cffi
+
+    buffers = scratch.buffers
+    assert buffers is not None
+    result = lib.MageEncodeTokensPacked(req, cfg, enc_out, tok_cfg, packed_out)
+    if result.error_code != 0:
+        message = "MageEncodeTokensPacked failed"
+        if result.error_message != ffi.NULL:
+            try:
+                message = ffi.string(result.error_message).decode("utf-8")
+            finally:
+                lib.MageFreeString(result.error_message)
+        from magic_ai.native_encoder import NativeEncodingError
+
+        raise NativeEncodingError(message)
+
+    decision_rows_written = int(result.decision_rows_written)
+    batch = encoder._slice_batch_buffers(buffers, batch_size)
+    from magic_ai.native_encoder import (
+        TRACE_KIND_VALUES,
+        NativeEncodedBatch,
+    )
+
+    trace_kind_id = batch["trace_kind_id"]
+    trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
+    decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
+    decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
+    decision_mask = buffers.decision_mask_u8[:decision_rows_written]
+    uses_none_head = buffers.uses_none_head_u8[:decision_rows_written]
+    native_batch = NativeEncodedBatch(
+        trace_kind_id=trace_kind_id,
+        slot_card_rows=batch["slot_card_rows"],
+        slot_occupied=batch["slot_occupied"],
+        slot_tapped=batch["slot_tapped"],
+        game_info=batch["game_info"],
+        pending_kind_id=batch["pending_kind_id"],
+        num_present_options=batch["num_present_options"],
+        option_kind_ids=batch["option_kind_ids"],
+        option_scalars=batch["option_scalars"],
+        option_mask=batch["option_mask"],
+        option_ref_slot_idx=batch["option_ref_slot_idx"],
+        option_ref_card_row=batch["option_ref_card_row"],
+        target_mask=batch["target_mask"],
+        target_type_ids=batch["target_type_ids"],
+        target_scalars=batch["target_scalars"],
+        target_overflow=batch["target_overflow"],
+        target_ref_slot_idx=batch["target_ref_slot_idx"],
+        target_ref_is_player=batch["target_ref_is_player"],
+        target_ref_is_self=batch["target_ref_is_self"],
+        may_mask=batch["may_mask"],
+        decision_start=batch["decision_start"],
+        decision_count=batch["decision_count"],
+        decision_option_idx=decision_option_idx,
+        decision_target_idx=decision_target_idx,
+        decision_mask=decision_mask,
+        uses_none_head=uses_none_head,
+        decision_rows_written=decision_rows_written,
+        pendings=[],
+        trace_kinds=trace_kinds,
+        render_plan=batch.get("render_plan"),
+        render_plan_lengths=batch.get("render_plan_lengths"),
+        render_plan_overflow=batch.get("render_plan_overflow"),
+    )
+    return native_batch, outputs
+
+
 __all__ = [
     "NativeAssemblerOutputs",
+    "NativePackedAssemblerOutputs",
     "allocate_outputs",
+    "allocate_packed_outputs",
     "encode_tokens",
+    "encode_tokens_packed",
 ]
