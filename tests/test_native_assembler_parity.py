@@ -58,7 +58,11 @@ class NativeAssemblerParityTests(unittest.TestCase):
             build_card_cache,
             load_card_cache,
         )
+        from magic_ai.text_encoder.native_token_tables import (
+            register_native_token_tables,
+        )
         from magic_ai.text_encoder.render import load_oracle_text
+        from magic_ai.text_encoder.token_tables import build_token_tables
         from magic_ai.text_encoder.tokenizer import load_tokenizer
 
         mage.load()
@@ -76,6 +80,15 @@ class NativeAssemblerParityTests(unittest.TestCase):
             )
 
         cls.assembler_tokens = build_assembler_tokens(cls.tokenizer)
+
+        # Phase 4: register the closed-vocabulary token tables with the
+        # native side so MageEncodeTokens can dispatch through them.
+        cls.token_tables_py = build_token_tables(cls.tokenizer, cls.cache)
+        register_native_token_tables(cls.token_tables_py)
+        cls.max_tokens_native = 2048
+        cls.max_options_native = 32
+        cls.max_targets_native = 8
+        cls.max_card_refs_native = 256
 
         # Engine shape constants live in mage-go/cmd/pylib/encoder.go; the
         # encoder validates these on every call. We don't need a policy to
@@ -213,17 +226,37 @@ class NativeAssemblerParityTests(unittest.TestCase):
             assembler_tokens=self.assembler_tokens,
         )
 
-    def _assemble_native(self, native_batch: Any) -> Any | None:
-        """Run the native assembler path. Returns None until Phase 4 lands.
+    def _encode_native(self, game: Any, perspective: int) -> tuple[Any, Any]:
+        """Run the native MageEncodeTokens path on a single game handle.
 
-        Phase 4 will:
-          1. Allocate the (B, max_tokens) output tensors.
-          2. Call ``MageEncodeTokens`` with the same handle list.
-          3. Wrap the outputs in a ``TextEncodedBatch``.
-        Drop the implementation in here; the parity assertions below pick
-        up automatically once it returns non-None.
+        Returns the native (NativeEncodedBatch, NativeAssemblerOutputs) pair
+        for downstream comparison against the Python path.
         """
 
+        from magic_ai.text_encoder.native_assembler import encode_tokens
+
+        return encode_tokens(
+            self.encoder,
+            [game],
+            perspective_player_indices=[perspective],
+            max_tokens=self.max_tokens_native,
+            max_options=self.max_options_native,
+            max_targets=self.max_targets_native,
+            max_card_refs=self.max_card_refs_native,
+        )
+
+    def _assemble_native(self, native_batch: Any) -> Any | None:
+        """Convert a native-output bundle to a TextEncodedBatch for parity.
+
+        ``native_batch`` here may either be the legacy ``NativeEncodedBatch``
+        (in which case there's no native assembler output to surface and we
+        return None) or a ``(legacy, NativeAssemblerOutputs)`` tuple
+        produced by ``_encode_native``.
+        """
+
+        if isinstance(native_batch, tuple):
+            _legacy, outputs = native_batch
+            return outputs.to_text_encoded_batch()
         return None
 
     # -- assertions on the Python path (always live) --------------------
@@ -305,24 +338,104 @@ class NativeAssemblerParityTests(unittest.TestCase):
             encoded = self._assemble_python(native_batch)
             self._assert_python_well_formed(encoded, native_batch)
 
-    def test_byte_equal_when_native_path_available(self) -> None:
-        """Once Phase 4 ships, this is the main parity gate.
+    def _drive_and_capture_dual(
+        self,
+        *,
+        seed: int,
+        max_captures: int = 8,
+        max_steps: int = 400,
+    ) -> list[tuple[Any, Any]]:
+        """Like ``_drive_and_capture`` but at each priority pending also
+        runs the native MageEncodeTokens path and returns both bundles.
 
-        Today ``_assemble_native`` returns None and the test silently
-        passes. After Phase 4, every captured state must produce
-        byte-equal token tensors across both paths.
+        Each entry is ``(NativeEncodedBatch_python_path,
+        (NativeEncodedBatch_native_path, NativeAssemblerOutputs))``.
         """
 
-        captures = self._drive_and_capture(seed=3, max_captures=8)
-        for native_batch, _snapshot in captures:
-            py = self._assemble_python(native_batch)
-            nat = self._assemble_native(native_batch)
-            if nat is None:
-                # Phase 4 not yet wired in — skip the byte-equal assertion
-                # but still assert the Python path is sound.
-                self._assert_python_well_formed(py, native_batch)
+        from magic_ai.text_encoder.rollout import (
+            _default_action_for,
+            _translate_action,
+        )
+
+        captures: list[tuple[Any, Any]] = []
+        game = self.mage.new_game(
+            self.deck_a,
+            self.deck_b,
+            seed=seed,
+            shuffle=True,
+            hand_size=7,
+        )
+        steps = 0
+        while steps < max_steps and len(captures) < max_captures:
+            steps += 1
+            game.refresh_state()
+            if game.is_over:
+                break
+            pending = cast(dict[str, Any] | None, game.pending or game.legal())
+            if pending is None:
+                try:
+                    game.step({"kind": "pass"})
+                except Exception:
+                    break
                 continue
-            self._assert_byte_equal(py, nat)
+
+            kind = pending.get("kind", "") or ""
+            options = list(pending.get("options", []) or [])
+            player_idx = int(pending.get("player_idx", 0) or 0)
+            if player_idx not in (0, 1):
+                player_idx = 0
+
+            if kind == "priority" and options:
+                try:
+                    # NativeBatchEncoder shares its scratch buffers across
+                    # calls. The NativeEncodedBatch returned here holds
+                    # views into that scratch, so we MUST assemble + clone
+                    # before the next capture overwrites the buffers.
+                    py_native_batch = self.encoder.encode_handles(
+                        [game],
+                        perspective_player_indices=[player_idx],
+                    )
+                    py_assembled = self._assemble_python(py_native_batch)
+                    py_assembled = type(py_assembled)(
+                        token_ids=py_assembled.token_ids.clone(),
+                        attention_mask=py_assembled.attention_mask.clone(),
+                        card_ref_positions=py_assembled.card_ref_positions.clone(),
+                        option_positions=py_assembled.option_positions.clone(),
+                        option_mask=py_assembled.option_mask.clone(),
+                        target_positions=py_assembled.target_positions.clone(),
+                        target_mask=py_assembled.target_mask.clone(),
+                        seq_lengths=py_assembled.seq_lengths.clone(),
+                    )
+                    # Native outputs already live in their own per-call
+                    # tensors; safe to keep as-is.
+                    nat_pair = self._encode_native(game, player_idx)
+                    captures.append((py_assembled, nat_pair))
+                except Exception:
+                    pass
+
+            if not options:
+                action = _default_action_for(cast(Any, pending))
+            elif kind == "priority":
+                action = _translate_action(cast(Any, pending), 0, None)
+            else:
+                action = _default_action_for(cast(Any, pending))
+            try:
+                game.step(dict(action))
+            except Exception:
+                break
+
+        return captures
+
+    def test_byte_equal_native_vs_python(self) -> None:
+        """Phase 4 parity gate: native and Python assemblers produce
+        byte-equal token tensors at every captured priority pending."""
+
+        dual = self._drive_and_capture_dual(seed=3, max_captures=8)
+        self.assertGreater(len(dual), 0, "harness collected zero dual-path captures")
+        for py_assembled, nat_pair in dual:
+            nat = self._assemble_native(nat_pair)
+            self.assertIsNotNone(nat)
+            self._assert_byte_equal(py_assembled, nat)
 
     def test_drive_is_deterministic_for_fixed_seed(self) -> None:
         """Two drives with the same seed produce identical encoded batches."""
