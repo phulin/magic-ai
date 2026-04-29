@@ -33,10 +33,12 @@ from magic_ai.replay_decisions import (
     score_may_decisions_from_forward,
 )
 from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.policy import EncodedSnapshots
 from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
     RecurrentTextPolicyConfig,
     RecurrentTextPolicyOutput,
+    _cast_encoded,
 )
 from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 
@@ -46,6 +48,22 @@ class TextActorCriticStep:
     output: RecurrentTextPolicyOutput
     h_out: Tensor
     c_out: Tensor
+
+
+@dataclass(frozen=True)
+class CachedReplayForward:
+    """Per-policy cache of a single replay-batch forward.
+
+    Produced by :meth:`TextActorCritic.precompute_replay_forward` and consumed
+    by :meth:`TextActorCritic.evaluate_replay_batch_per_choice` so R-NaD's
+    LSTM-recompute and per-choice scoring share one encoder forward instead of
+    running it twice on the same flat batch.
+    """
+
+    flat_rows: tuple[int, ...]
+    batch: TextReplayBatch
+    encoded: EncodedSnapshots
+    h_concat: Tensor
 
 
 @dataclass(frozen=True)
@@ -501,27 +519,34 @@ class TextActorCritic(nn.Module):
         *,
         lstm_state_override: tuple[Tensor, Tensor] | None = None,
         hidden_override: Tensor | None = None,
+        cached: CachedReplayForward | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice]:
-        if self.rollout_buffer is None:
-            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
-        batch = self.rollout_buffer.gather(replay_rows)
-        if hidden_override is not None:
-            output, _state = self.policy(
-                batch.encoded,
-                state_hidden_override=hidden_override.to(self.device),
-            )
-        elif lstm_state_override is not None:
-            output, _state = self.policy(
-                batch.encoded,
-                h_in=lstm_state_override[0],
-                c_in=lstm_state_override[1],
-            )
-        elif batch.lstm_h_in is None or batch.lstm_c_in is None:
-            output, _state = self.policy(batch.encoded)
+        if cached is not None:
+            if tuple(int(r) for r in replay_rows) != cached.flat_rows:
+                raise ValueError("cached.flat_rows must match replay_rows")
+            batch = cached.batch
+            output = self.policy.forward_from_encoded(cached.encoded, cached.h_concat)
         else:
-            h_in = batch.lstm_h_in.permute(1, 0, 2).contiguous()
-            c_in = batch.lstm_c_in.permute(1, 0, 2).contiguous()
-            output, _state = self.policy(batch.encoded, h_in=h_in, c_in=c_in)
+            if self.rollout_buffer is None:
+                raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+            batch = self.rollout_buffer.gather(replay_rows)
+            if hidden_override is not None:
+                output, _state = self.policy(
+                    batch.encoded,
+                    state_hidden_override=hidden_override.to(self.device),
+                )
+            elif lstm_state_override is not None:
+                output, _state = self.policy(
+                    batch.encoded,
+                    h_in=lstm_state_override[0],
+                    c_in=lstm_state_override[1],
+                )
+            elif batch.lstm_h_in is None or batch.lstm_c_in is None:
+                output, _state = self.policy(batch.encoded)
+            else:
+                h_in = batch.lstm_h_in.permute(1, 0, 2).contiguous()
+                c_in = batch.lstm_c_in.permute(1, 0, 2).contiguous()
+                output, _state = self.policy(batch.encoded, h_in=h_in, c_in=c_in)
 
         n = int(batch.trace_kind_id.shape[0])
         log_probs = output.values.new_zeros(n)
@@ -595,6 +620,69 @@ class TextActorCritic(nn.Module):
         if any(len(ep) == 0 for ep in episodes):
             raise ValueError("each episode must contain at least one row")
         return [self._recompute_lstm_outputs_for_rows(ep) for ep in episodes]
+
+    def precompute_replay_forward(
+        self,
+        episodes_replay_rows: Sequence[Sequence[int]],
+    ) -> CachedReplayForward:
+        """Run encoder once on the flat replay batch + per-episode LSTM scan.
+
+        R-NaD's batched-trajectory loss runs an LSTM recompute and a per-choice
+        scoring forward against the same replay rows under the same parameters.
+        Both used to call :meth:`TextPolicy.encode_only` independently, paying
+        the encoder cost twice. This helper consolidates them: the encoder runs
+        once on the concatenated flat batch (under the same bf16 autocast as
+        the live forward path), and the cached :class:`CachedReplayForward` is
+        consumed by ``evaluate_replay_batch_per_choice(cached=...)`` to skip
+        the second forward.
+        """
+
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+        if not episodes_replay_rows:
+            raise ValueError("episodes_replay_rows must be non-empty")
+        flat_rows: list[int] = []
+        ep_lens: list[int] = []
+        for ep in episodes_replay_rows:
+            ep_list = [int(r) for r in ep]
+            if not ep_list:
+                raise ValueError("each episode must contain at least one row")
+            flat_rows.extend(ep_list)
+            ep_lens.append(len(ep_list))
+        batch = self.rollout_buffer.gather(flat_rows)
+
+        device_type = batch.encoded.token_ids.device.type
+        autocast_enabled = device_type == "cuda"
+        with torch.autocast(
+            device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+        ):
+            encoded = self.policy.text_policy.encode_only(batch.encoded)
+        target_dtype = self.policy.in_proj.weight.dtype
+        encoded = _cast_encoded(encoded, target_dtype)
+
+        # cuDNN's fused LSTM doesn't expose intermediate cell states for a
+        # multi-episode batched call without padding-and-masking, and the
+        # episodes here have ragged lengths. The per-episode LSTM scan stays;
+        # what we save is the encoder forward, which is the dominant cost.
+        state = self.policy.in_proj(encoded.state_vector)
+        device = state.device
+        h_chunks: list[Tensor] = []
+        cursor = 0
+        for n_ep in ep_lens:
+            x = state[cursor : cursor + n_ep].unsqueeze(0)
+            h0 = torch.zeros(self.lstm_layers, 1, self.lstm_hidden, device=device)
+            c0 = torch.zeros_like(h0)
+            out, _ = self.policy.lstm(x, (h0, c0))
+            h_chunks.append(out.squeeze(0).contiguous())
+            cursor += n_ep
+        h_concat = torch.cat(h_chunks, dim=0)
+
+        return CachedReplayForward(
+            flat_rows=tuple(flat_rows),
+            batch=batch,
+            encoded=encoded,
+            h_concat=h_concat,
+        )
 
     def scatter_lstm_env_states(
         self,

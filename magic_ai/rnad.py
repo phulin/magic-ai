@@ -1918,6 +1918,22 @@ def _slice_per_choice(
     )
 
 
+def _maybe_precompute_replay_forward(policy: Any, episodes: Sequence[Sequence[int]]) -> Any | None:
+    """Return ``policy.precompute_replay_forward(...)`` when available.
+
+    The text-encoder policy fuses the encoder forward with the per-episode
+    LSTM scan so the cached encoder outputs can be reused by the per-choice
+    scoring forward (avoiding a second encoder pass over the same batch).
+    Policies without the helper (legacy slot encoder, test stubs) return
+    ``None``; the caller falls back to the legacy h_out + hidden_override path.
+    """
+
+    fn = getattr(policy, "precompute_replay_forward", None)
+    if fn is None:
+        return None
+    return fn([list(ep) for ep in episodes])
+
+
 def _maybe_recompute_lstm_h_out_episodes(
     policy: Any, episodes: Sequence[Sequence[int]]
 ) -> list[Tensor] | None:
@@ -1990,34 +2006,63 @@ def rnad_batched_trajectory_loss(
 
     device = next(iter(online.parameters())).device
 
-    # 1) Single fused LSTM recompute per policy.
-    online_h_list = _maybe_recompute_lstm_h_out_episodes(online, episodes_replay_rows)
+    # 1) Single fused encoder + LSTM recompute per policy. When the policy
+    #    exposes ``precompute_replay_forward`` (text encoder), the encoder
+    #    runs once on the flat batch and is reused by the per-choice forward
+    #    below via ``cached=...``; otherwise we fall back to the legacy
+    #    ``recompute_lstm_outputs_for_episodes`` + ``hidden_override`` path.
+    online_cache = _maybe_precompute_replay_forward(online, episodes_replay_rows)
     with torch.no_grad():
-        target_h_list = _maybe_recompute_lstm_h_out_episodes(target, episodes_replay_rows)
-        reg_cur_h_list = _maybe_recompute_lstm_h_out_episodes(reg_cur, episodes_replay_rows)
-        reg_prev_h_list = _maybe_recompute_lstm_h_out_episodes(reg_prev, episodes_replay_rows)
+        target_cache = _maybe_precompute_replay_forward(target, episodes_replay_rows)
+        reg_cur_cache = _maybe_precompute_replay_forward(reg_cur, episodes_replay_rows)
+        reg_prev_cache = _maybe_precompute_replay_forward(reg_prev, episodes_replay_rows)
 
-    online_h_concat = torch.cat(online_h_list, dim=0) if online_h_list is not None else None
-    target_h_concat = torch.cat(target_h_list, dim=0) if target_h_list is not None else None
-    reg_cur_h_concat = torch.cat(reg_cur_h_list, dim=0) if reg_cur_h_list is not None else None
-    reg_prev_h_concat = torch.cat(reg_prev_h_list, dim=0) if reg_prev_h_list is not None else None
+    if online_cache is not None:
+        online_h_concat: Tensor | None = online_cache.h_concat
+    else:
+        online_h_list = _maybe_recompute_lstm_h_out_episodes(online, episodes_replay_rows)
+        online_h_concat = torch.cat(online_h_list, dim=0) if online_h_list is not None else None
+    if target_cache is None:
+        with torch.no_grad():
+            target_h_list = _maybe_recompute_lstm_h_out_episodes(target, episodes_replay_rows)
+        target_h_concat = torch.cat(target_h_list, dim=0) if target_h_list is not None else None
+    else:
+        target_h_concat = target_cache.h_concat
+    if reg_cur_cache is None:
+        with torch.no_grad():
+            reg_cur_h_list = _maybe_recompute_lstm_h_out_episodes(reg_cur, episodes_replay_rows)
+        reg_cur_h_concat = torch.cat(reg_cur_h_list, dim=0) if reg_cur_h_list is not None else None
+    else:
+        reg_cur_h_concat = reg_cur_cache.h_concat
+    if reg_prev_cache is None:
+        with torch.no_grad():
+            reg_prev_h_list = _maybe_recompute_lstm_h_out_episodes(reg_prev, episodes_replay_rows)
+        reg_prev_h_concat = (
+            torch.cat(reg_prev_h_list, dim=0) if reg_prev_h_list is not None else None
+        )
+    else:
+        reg_prev_h_concat = reg_prev_cache.h_concat
 
     online_per_choice = getattr(online, "evaluate_replay_batch_per_choice")  # noqa: B009
     target_per_choice = getattr(target, "evaluate_replay_batch_per_choice")  # noqa: B009
     reg_cur_per_choice = getattr(reg_cur, "evaluate_replay_batch_per_choice")  # noqa: B009
     reg_prev_per_choice = getattr(reg_prev, "evaluate_replay_batch_per_choice")  # noqa: B009
 
-    def _forward(per_choice: Any, h_concat: Tensor | None) -> Any:
+    def _forward(per_choice: Any, h_concat: Tensor | None, cache: Any) -> Any:
+        if cache is not None:
+            return per_choice(list(flat_rows), cached=cache)
         if h_concat is not None:
             return per_choice(list(flat_rows), hidden_override=h_concat)
         return per_choice(list(flat_rows))
 
     # 2) Single per-choice forward per policy across the full batch.
-    lp_online_b, _, v_online_b, pc_online_b = _forward(online_per_choice, online_h_concat)
+    lp_online_b, _, v_online_b, pc_online_b = _forward(
+        online_per_choice, online_h_concat, online_cache
+    )
     with torch.no_grad():
-        lp_tgt_b, _, v_tgt_b, pc_tgt_b = _forward(target_per_choice, target_h_concat)
-        _, _, _, pc_reg_cur_b = _forward(reg_cur_per_choice, reg_cur_h_concat)
-        _, _, _, pc_reg_prev_b = _forward(reg_prev_per_choice, reg_prev_h_concat)
+        lp_tgt_b, _, v_tgt_b, pc_tgt_b = _forward(target_per_choice, target_h_concat, target_cache)
+        _, _, _, pc_reg_cur_b = _forward(reg_cur_per_choice, reg_cur_h_concat, reg_cur_cache)
+        _, _, _, pc_reg_prev_b = _forward(reg_prev_per_choice, reg_prev_h_concat, reg_prev_cache)
 
     # 3) Single batched loss assembly across the whole flat batch.
     perspective_flat = torch.tensor(

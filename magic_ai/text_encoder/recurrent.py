@@ -170,6 +170,38 @@ class RecurrentTextPolicy(nn.Module):
         )
         return out, (h_out, c_out)
 
+    def forward_from_encoded(
+        self,
+        encoded: EncodedSnapshots,
+        state_hidden: Tensor,
+    ) -> RecurrentTextPolicyOutput:
+        """Run only the heads given precomputed encoder outputs and LSTM hidden.
+
+        Used by R-NaD's batched-trajectory path: the encoder forward and the
+        per-episode LSTM scan are run once per policy via
+        ``TextActorCritic.precompute_replay_forward``; the resulting ``encoded``
+        and ``state_hidden`` are then fed here directly so the per-choice scoring
+        forward does not re-run the encoder. Caller is responsible for casting
+        ``encoded`` to the head-parameter dtype.
+        """
+
+        state_for_heads = self.out_proj(state_hidden)
+        policy_logits, target_logits, values = self.text_policy.run_heads(
+            encoded, state_vec=state_for_heads
+        )
+        return RecurrentTextPolicyOutput(
+            policy_logits=policy_logits,
+            target_logits=target_logits,
+            values=values,
+            state_hidden=state_hidden,
+            option_vectors=encoded.option_vectors,
+            option_mask=encoded.option_mask,
+            target_vectors=encoded.target_vectors,
+            target_mask=encoded.target_mask,
+            card_vectors=encoded.card_vectors,
+            card_mask=encoded.card_mask,
+        )
+
 
 __all__ = [
     "RecurrentTextPolicy",
