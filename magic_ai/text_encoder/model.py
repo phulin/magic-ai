@@ -9,7 +9,7 @@ position-anchored gather pools, and (b) policy / target / value head logits.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -26,7 +26,10 @@ from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 # (332ms/call vs 281ms/call in profiling), so we keep the per-op compile and
 # accept the multiple dispatch boundaries.
 _flex_attention = torch.compile(flex_attention, dynamic=True)
-_create_block_mask = torch.compile(create_block_mask, dynamic=True)
+
+
+def _create_block_mask(*args: Any, **kwargs: Any) -> BlockMask:
+    return create_block_mask(*args, _compile=True, **kwargs)
 
 
 @dataclass
@@ -124,6 +127,7 @@ class MultiHeadSelfAttention(nn.Module):
         attn_bias: Tensor,
         cos: Tensor,
         sin: Tensor,
+        cu_seqlens: Tensor | None = None,
     ) -> Tensor:
         b, t, _ = x.shape
         qkv = self.qkv(x).view(b, t, 3, self.n_heads, self.head_dim)
@@ -133,12 +137,29 @@ class MultiHeadSelfAttention(nn.Module):
         v = v.transpose(1, 2)
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
-        # flex_attention compiles the key-padding ``block_mask`` into a flash-
-        # attention-style kernel — O(B·H·T·d) memory instead of the O(B·H·T²)
-        # score matrix the SDPA math fallback was materializing. flex_attention
-        # has no CPU backward kernel as of torch 2.11, so we keep the old
-        # additive-mask SDPA path for CPU (used by the test suite). dropout is
-        # config-defaulted to 0 and unused, so no score_mod plumbing here.
+        # Three attention paths:
+        #   (1) packed varlen on CUDA via NJT + SDPA → FlashAttention varlen
+        #       kernel, no flex_attention compile.
+        #   (2) padded CUDA via flex_attention's BlockMask (compiled).
+        #   (3) CPU additive-bias SDPA (flex_attention has no CPU backward
+        #       in torch 2.11).
+        if cu_seqlens is not None:
+            # q/k/v are [1, H, T_packed, Dh]; strip the B=1, wrap as NJT
+            # over the doc-length offsets, run SDPA on [B_docs, H, j, Dh],
+            # then unwrap back to packed [T_packed, H*Dh].
+            q_p = q.squeeze(0).transpose(0, 1).contiguous()  # [T, H, Dh]
+            k_p = k.squeeze(0).transpose(0, 1).contiguous()
+            v_p = v.squeeze(0).transpose(0, 1).contiguous()
+            offsets = cu_seqlens.to(torch.int64)
+            q_nt = torch.nested.nested_tensor_from_jagged(q_p, offsets).transpose(1, 2)
+            k_nt = torch.nested.nested_tensor_from_jagged(k_p, offsets).transpose(1, 2)
+            v_nt = torch.nested.nested_tensor_from_jagged(v_p, offsets).transpose(1, 2)
+            out_nt = F.scaled_dot_product_attention(
+                q_nt, k_nt, v_nt, dropout_p=self.dropout if self.training else 0.0
+            )
+            out_p = out_nt.transpose(1, 2).values()  # [T, H, Dh]
+            out = out_p.reshape(1, t, self.n_heads * self.head_dim)
+            return self.proj(out)
         if x.device.type == "cuda":
             result = _flex_attention(q, k, v, block_mask=block_mask)
             out = result if isinstance(result, Tensor) else result[0]
@@ -177,8 +198,9 @@ class EncoderBlock(nn.Module):
         attn_bias: Tensor,
         cos: Tensor,
         sin: Tensor,
+        cu_seqlens: Tensor | None = None,
     ) -> Tensor:
-        x = x + self.attn(self.norm1(x), block_mask, attn_bias, cos, sin)
+        x = x + self.attn(self.norm1(x), block_mask, attn_bias, cos, sin, cu_seqlens)
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -275,24 +297,22 @@ class TextStateEncoder(nn.Module):
         cos = cos_full.index_select(0, pos)
         sin = sin_full.index_select(0, pos)
 
+        # Packed varlen attention via NJT + SDPA on CUDA (FlashAttention
+        # varlen) — avoids the flex_attention create_block_mask compile.
+        # CPU keeps the additive-mask SDPA fallback used by the tests.
         if x.device.type == "cuda":
-            block_mask = _create_block_mask(
-                _document_mask_mod(seq_id),
-                B=1,
-                H=None,
-                Q_LEN=t,
-                KV_LEN=t,
-                device=x.device,
-            )
+            block_mask = cast(BlockMask, None)
             attn_bias = x.new_zeros(())
+            cu_seqlens: Tensor | None = batch.cu_seqlens.to(device=x.device, dtype=torch.int64)
         else:
             block_mask = cast(BlockMask, None)
             same = seq_id[:, None] == seq_id[None, :]  # [T, T] bool
             attn_bias = torch.zeros(1, 1, t, t, device=x.device, dtype=x.dtype)
             attn_bias = attn_bias.masked_fill(~same[None, None, :, :], float("-inf"))
+            cu_seqlens = None
 
         for block in self.blocks:
-            x = block(x, block_mask, attn_bias, cos, sin)
+            x = block(x, block_mask, attn_bias, cos, sin, cu_seqlens)
         x = self.final_norm(x)
         return x.squeeze(0)  # [T, D]
 
