@@ -180,6 +180,17 @@ class TokenTables:
     dict_close_id: int = 0
     card_open_id: int = 0
 
+    # Per-player + shared-zone single-id specials (Go-parity additions).
+    # ``self_id`` / ``opp_id`` are emitted inside ``<target>`` blocks when
+    # an option targets a player. ``stack_*`` / ``command_*`` open and close
+    # the shared (non-per-player) stack and command zones once per snapshot.
+    self_id: int = 0
+    opp_id: int = 0
+    stack_open_id: int = 0
+    stack_close_id: int = 0
+    command_open_id: int = 0
+    command_close_id: int = 0
+
     structural: dict[Frag, list[int]] = field(default_factory=dict)
     zone_open: dict[tuple[int, int], list[int]] = field(default_factory=dict)
     zone_close: dict[tuple[int, int], list[int]] = field(default_factory=dict)
@@ -258,6 +269,12 @@ def build_token_tables(
         dict_open_id=_single(tokenizer, "<dict>"),
         dict_close_id=_single(tokenizer, "</dict>"),
         card_open_id=_single(tokenizer, "<card>"),
+        self_id=_single(tokenizer, "<self>"),
+        opp_id=_single(tokenizer, "<opp>"),
+        stack_open_id=_single(tokenizer, "<stack>"),
+        stack_close_id=_single(tokenizer, "</stack>"),
+        command_open_id=_single(tokenizer, "<command>"),
+        command_close_id=_single(tokenizer, "</command>"),
     )
 
     # Static structural fragments.

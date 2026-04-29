@@ -31,6 +31,9 @@ from magic_ai.text_encoder.render_plan import (
     OP_CLOSE_RAW_CARD,
     OP_CLOSE_STATE,
     OP_CLOSE_ZONE,
+    OP_COMMAND_CLOSE,
+    OP_COMMAND_OPEN,
+    OP_COUNT,
     OP_COUNTER,
     OP_DICT_ENTRY,
     OP_END_CARD,
@@ -46,6 +49,8 @@ from magic_ai.text_encoder.render_plan import (
     OP_OPTION,
     OP_PLACE_CARD,
     OP_PLACE_CARD_REF,
+    OP_STACK_CLOSE,
+    OP_STACK_OPEN,
     OP_TARGET,
     OP_TURN,
     OPCODE_ARITY,
@@ -133,6 +138,12 @@ class AssemblerTokens:
     dict_close_id: int = 0
     dict_entry_ids: list[int] = field(default_factory=list)
     card_open_id: int = 0
+    stack_open_id: int = 0
+    stack_close_id: int = 0
+    command_open_id: int = 0
+    command_close_id: int = 0
+    self_id: int = 0
+    opp_id: int = 0
     # ref_id -> K reverse map for the literal-tokens walker, which would
     # otherwise scan card_ref_ids per token.
     card_ref_id_to_k: dict[int, int] = field(default_factory=dict)
@@ -193,6 +204,12 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
             _single_id(tokenizer, f"<dict-entry:{r}>") for r in range(MAX_DICT_ENTRIES)
         ],
         card_open_id=_single_id(tokenizer, "<card>"),
+        stack_open_id=_single_id(tokenizer, "<stack>"),
+        stack_close_id=_single_id(tokenizer, "</stack>"),
+        command_open_id=_single_id(tokenizer, "<command>"),
+        command_close_id=_single_id(tokenizer, "</command>"),
+        self_id=_single_id(tokenizer, "<self>"),
+        opp_id=_single_id(tokenizer, "<opp>"),
     )
     toks.card_ref_id_to_k = {ref_id: k for k, ref_id in enumerate(toks.card_ref_ids)}
     toks._tokenizer = tokenizer
@@ -544,7 +561,6 @@ def _assemble_one(
                 # ability suffix, matching the legacy "verb in (pass, choice,
                 # unknown)" guard.
                 if kind_known and kind_id not in (0, 6):
-                    out.extend(frag_table[Frag.SPACE])
                     if not emit_card_ref(source_uuid_idx) and (0 <= source_row < len(name_lists)):
                         out.extend(name_lists[source_row])
                 if ability_idx >= 0 and kind_id == 3:
@@ -561,20 +577,54 @@ def _assemble_one(
             if op == OP_TARGET:
                 target_row = plan_list[i + 1]
                 target_uuid_idx = plan_list[i + 2]
+                target_kind = plan_list[i + 3]
                 pos = len(out)
                 out.append(toks.target_open_id)
                 if cur_target_bucket is not None:
                     cur_target_bucket.append(pos)
-                out.extend(frag_table[Frag.SPACE])
-                if not emit_card_ref(target_uuid_idx):
+                # target_kind 0 = player target. target_row is the owner index
+                # (0=self, 1=opp). Other kinds resolve to a card-ref or a
+                # cached display-name span.
+                if target_kind == 0:
+                    out.append(toks.self_id if target_row == 0 else toks.opp_id)
+                elif not emit_card_ref(target_uuid_idx):
                     if 0 <= target_row < len(name_lists):
                         out.extend(name_lists[target_row])
                     else:
                         out.extend(frag_table[Frag.TARGET_FALLBACK])
-                out.extend(frag_table[Frag.SPACE])
                 out.append(toks.target_close_id)
                 i += 1 + arity
                 continue
+
+        if op == OP_COUNT:
+            n_val = plan_list[i + 1]
+            count_table = toks.tables.count if toks.tables is not None else None
+            span = count_table.get(n_val) if count_table is not None else None
+            if span is None:
+                raise ValueError(f"OP_COUNT out of bounds: amount={n_val}")
+            out.extend(span)
+            i += 1 + arity
+            continue
+
+        if op == OP_STACK_OPEN:
+            out.append(toks.stack_open_id)
+            i += 1
+            continue
+
+        if op == OP_STACK_CLOSE:
+            out.append(toks.stack_close_id)
+            i += 1
+            continue
+
+        if op == OP_COMMAND_OPEN:
+            out.append(toks.command_open_id)
+            i += 1
+            continue
+
+        if op == OP_COMMAND_CLOSE:
+            out.append(toks.command_close_id)
+            i += 1
+            continue
 
         if op == OP_OPEN_DICT:
             out.append(toks.dict_open_id)

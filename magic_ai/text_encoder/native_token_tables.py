@@ -297,6 +297,12 @@ def register_native_token_tables(tables: TokenTables) -> None:
             "dict_close_id": tables.dict_close_id,
             "card_open_id": tables.card_open_id,
             "dict_entry_ids": _i32_ptr(ffi, dict_entry_ids),
+            "self_id": tables.self_id,
+            "opp_id": tables.opp_id,
+            "stack_open_id": tables.stack_open_id,
+            "stack_close_id": tables.stack_close_id,
+            "command_open_id": tables.command_open_id,
+            "command_close_id": tables.command_close_id,
         },
     )
     packed.struct = struct

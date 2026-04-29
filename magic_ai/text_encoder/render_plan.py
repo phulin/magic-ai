@@ -107,6 +107,13 @@ OP_OPEN_DICT: Final = 21
 OP_CLOSE_DICT: Final = 22
 OP_DICT_ENTRY: Final = 23
 OP_PLACE_CARD_REF: Final = 24
+# Go-parity additions — emit a count, or open/close the shared stack/command
+# zones whose content is not per-player.
+OP_COUNT: Final = 25
+OP_STACK_OPEN: Final = 26
+OP_STACK_CLOSE: Final = 27
+OP_COMMAND_OPEN: Final = 28
+OP_COMMAND_CLOSE: Final = 29
 
 # Fixed arity per opcode (number of int32 payload slots after the opcode
 # header). ``-1`` marks a variable-length opcode whose first payload word is
@@ -136,6 +143,11 @@ OPCODE_ARITY: Final[dict[int, int]] = {
     OP_CLOSE_DICT: 0,
     OP_DICT_ENTRY: 1,
     OP_PLACE_CARD_REF: 4,
+    OP_COUNT: 1,
+    OP_STACK_OPEN: 0,
+    OP_STACK_CLOSE: 0,
+    OP_COMMAND_OPEN: 0,
+    OP_COMMAND_CLOSE: 0,
 }
 
 # ---------------------------------------------------------------------------
@@ -221,6 +233,10 @@ class RenderPlanWriter:
 
     def emit_close_actions(self) -> None:
         self._buf.append(OP_CLOSE_ACTIONS)
+
+    def write(self, *words: int) -> None:
+        """Generic opcode + payload write — mirrors the Go ``writer.write`` API."""
+        self._buf.extend(int(w) for w in words)
 
     # -- card / option / target -------------------------------------------
 
@@ -546,14 +562,19 @@ def emit_render_plan(
         opp_lib = int(opp_player.get("LibraryCount", 0) or 0)
         w.emit_literal_tokens(tokenize(f"<opp><library>{opp_lib}</library></opp>"))
 
-    # Stack
-    w.emit_literal_tokens(tokenize("<stack>"))
+    # Stack (shared).
+    w.write(OP_STACK_OPEN)
     for stack_obj in snapshot.get("stack") or []:
         _emit_stack_object(w, stack_obj, refs, tokenize)
-    w.emit_literal_tokens(tokenize("</stack>"))
+    w.write(OP_STACK_CLOSE)
 
-    # Command zone.
-    w.emit_literal_tokens(tokenize("<command></command>"))
+    # Command zone (shared) — only emit when non-empty. The snapshot's command
+    # zone is keyed per-player; treat it as empty when no commanders are
+    # listed for either side.
+    has_command = any((p or {}).get("Command") for p in (self_player, opp_player) if p is not None)
+    if has_command:
+        w.write(OP_COMMAND_OPEN)
+        w.write(OP_COMMAND_CLOSE)
 
     # Actions.
     if actions is None:
