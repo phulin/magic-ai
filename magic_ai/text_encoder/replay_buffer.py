@@ -74,15 +74,21 @@ class TextReplayBuffer:
         self.max_card_refs = int(max_card_refs)
         self.device = torch.device(device)
 
+        # Storage dtypes are sized to the value ranges they hold, then cast to
+        # int64 at the few consumption sites that actually require Long
+        # (nn.Embedding, torch.gather indices). The buffer is the dominant GPU
+        # consumer at training scale, so the dtype cuts compound.
         self.token_ids = torch.zeros(
-            self.capacity, self.max_tokens, dtype=torch.long, device=self.device
+            self.capacity, self.max_tokens, dtype=torch.int32, device=self.device
         )
-        self.attention_mask = torch.zeros_like(self.token_ids)
+        self.attention_mask = torch.zeros(
+            self.capacity, self.max_tokens, dtype=torch.bool, device=self.device
+        )
         self.card_ref_positions = torch.full(
-            (self.capacity, self.max_card_refs), -1, dtype=torch.long, device=self.device
+            (self.capacity, self.max_card_refs), -1, dtype=torch.int32, device=self.device
         )
         self.option_positions = torch.full(
-            (self.capacity, self.max_options), -1, dtype=torch.long, device=self.device
+            (self.capacity, self.max_options), -1, dtype=torch.int32, device=self.device
         )
         self.option_mask = torch.zeros(
             self.capacity, self.max_options, dtype=torch.bool, device=self.device
@@ -94,7 +100,7 @@ class TextReplayBuffer:
                 self.max_targets_per_option,
             ),
             -1,
-            dtype=torch.long,
+            dtype=torch.int32,
             device=self.device,
         )
         self.target_mask = torch.zeros(
@@ -104,12 +110,12 @@ class TextReplayBuffer:
             dtype=torch.bool,
             device=self.device,
         )
-        self.seq_lengths = torch.zeros(self.capacity, dtype=torch.long, device=self.device)
-        self.trace_kind_id = torch.zeros(self.capacity, dtype=torch.long, device=self.device)
+        self.seq_lengths = torch.zeros(self.capacity, dtype=torch.int32, device=self.device)
+        self.trace_kind_id = torch.zeros(self.capacity, dtype=torch.int8, device=self.device)
         self.decision_option_idx = torch.full(
             (self.capacity, self.max_decision_groups, self.max_cached_choices),
             -1,
-            dtype=torch.long,
+            dtype=torch.int16,
             device=self.device,
         )
         self.decision_target_idx = torch.full_like(self.decision_option_idx, -1)
@@ -123,15 +129,15 @@ class TextReplayBuffer:
         self.uses_none_head = torch.zeros(
             self.capacity, self.max_decision_groups, dtype=torch.bool, device=self.device
         )
-        self.decision_count = torch.zeros(self.capacity, dtype=torch.long, device=self.device)
+        self.decision_count = torch.zeros(self.capacity, dtype=torch.int16, device=self.device)
         self.selected_indices = torch.full(
-            (self.capacity, self.max_decision_groups), -1, dtype=torch.long, device=self.device
+            (self.capacity, self.max_decision_groups), -1, dtype=torch.int16, device=self.device
         )
         self.may_selected = torch.zeros(self.capacity, dtype=torch.float32, device=self.device)
         self.old_log_prob = torch.zeros(self.capacity, dtype=torch.float32, device=self.device)
         self.value = torch.zeros(self.capacity, dtype=torch.float32, device=self.device)
         self.perspective_player_idx = torch.zeros(
-            self.capacity, dtype=torch.long, device=self.device
+            self.capacity, dtype=torch.int8, device=self.device
         )
         self.lstm_h_in: Tensor | None = None
         self.lstm_c_in: Tensor | None = None
@@ -286,19 +292,19 @@ class TextReplayBuffer:
         self.target_positions[row].fill_(-1)
         self.target_mask[row].zero_()
         self.token_ids[row, :token_width].copy_(
-            encoded.token_ids[batch_index].to(device=self.device, dtype=torch.long)
+            encoded.token_ids[batch_index].to(device=self.device, dtype=torch.int32)
         )
         self.attention_mask[row, :attention_width].copy_(
-            encoded.attention_mask[batch_index].to(device=self.device, dtype=torch.long)
+            encoded.attention_mask[batch_index].to(device=self.device, dtype=torch.bool)
         )
         self.card_ref_positions[row].copy_(
-            encoded.card_ref_positions[batch_index].to(device=self.device, dtype=torch.long)
+            encoded.card_ref_positions[batch_index].to(device=self.device, dtype=torch.int32)
         )
         option_width = min(encoded.option_positions.shape[1], self.max_options)
         target_width = min(encoded.target_positions.shape[2], self.max_targets_per_option)
         self.option_positions[row, :option_width].copy_(
             encoded.option_positions[batch_index, :option_width].to(
-                device=self.device, dtype=torch.long
+                device=self.device, dtype=torch.int32
             )
         )
         self.option_mask[row, :option_width].copy_(
@@ -306,7 +312,7 @@ class TextReplayBuffer:
         )
         self.target_positions[row, :option_width, :target_width].copy_(
             encoded.target_positions[batch_index, :option_width, :target_width].to(
-                device=self.device, dtype=torch.long
+                device=self.device, dtype=torch.int32
             )
         )
         self.target_mask[row, :option_width, :target_width].copy_(

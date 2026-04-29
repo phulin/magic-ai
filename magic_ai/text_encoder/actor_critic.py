@@ -778,8 +778,11 @@ class TextActorCritic(nn.Module):
         group_starts = torch.cumsum(decision_count_long, dim=0) - decision_count_long
         groups_t = torch.arange(g_total, device=device) - group_starts[steps_t]
 
-        flat_option_idx = batch.decision_option_idx[steps_t, groups_t]
-        flat_target_idx = batch.decision_target_idx[steps_t, groups_t]
+        # The replay buffer stores ``decision_*_idx`` as int16 to shrink the
+        # ``(capacity, max_decision_groups, max_cached_choices)`` tensors;
+        # cast to Long here since downstream ``torch.gather`` requires it.
+        flat_option_idx = batch.decision_option_idx[steps_t, groups_t].to(torch.long)
+        flat_target_idx = batch.decision_target_idx[steps_t, groups_t].to(torch.long)
         flat_masks = batch.decision_mask[steps_t, groups_t]
         flat_uses_none = batch.uses_none_head[steps_t, groups_t]
         flat_selected = batch.selected_indices[steps_t, groups_t].to(dtype=torch.long)
@@ -864,8 +867,8 @@ class TextActorCritic(nn.Module):
         return direct_decision_logits_from_forward(
             forward,
             step_positions=torch.tensor([step_idx], dtype=torch.long, device=device),
-            option_idx=batch.decision_option_idx[step_idx, group_idx].unsqueeze(0),
-            target_idx=batch.decision_target_idx[step_idx, group_idx].unsqueeze(0),
+            option_idx=batch.decision_option_idx[step_idx, group_idx].unsqueeze(0).to(torch.long),
+            target_idx=batch.decision_target_idx[step_idx, group_idx].unsqueeze(0).to(torch.long),
             masks=batch.decision_mask[step_idx, group_idx].unsqueeze(0),
             uses_none=batch.uses_none_head[step_idx, group_idx].unsqueeze(0),
         )[0]

@@ -73,16 +73,31 @@ class TextReplayBufferTests(unittest.TestCase):
         )
         gathered = buffer.gather([row])
 
-        torch.testing.assert_close(gathered.encoded.token_ids[0], encoded.token_ids[0])
-        torch.testing.assert_close(gathered.encoded.attention_mask[0], encoded.attention_mask[0])
+        # The buffer stores narrower dtypes than the encoder produces (e.g.
+        # int32 token_ids, bool attention_mask, int16 decision indices); the
+        # round-trip preserves values, not dtype.
         torch.testing.assert_close(
-            gathered.encoded.card_ref_positions[0], encoded.card_ref_positions[0]
+            gathered.encoded.token_ids[0], encoded.token_ids[0], check_dtype=False
         )
-        torch.testing.assert_close(gathered.decision_option_idx[0, :2], decision_option_idx)
-        torch.testing.assert_close(gathered.decision_target_idx[0, :2], decision_target_idx)
+        torch.testing.assert_close(
+            gathered.encoded.attention_mask[0], encoded.attention_mask[0], check_dtype=False
+        )
+        torch.testing.assert_close(
+            gathered.encoded.card_ref_positions[0],
+            encoded.card_ref_positions[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered.decision_option_idx[0, :2], decision_option_idx, check_dtype=False
+        )
+        torch.testing.assert_close(
+            gathered.decision_target_idx[0, :2], decision_target_idx, check_dtype=False
+        )
         torch.testing.assert_close(gathered.decision_mask[0, :2], decision_mask)
         torch.testing.assert_close(gathered.uses_none_head[0, :2], uses_none_head)
-        torch.testing.assert_close(gathered.selected_indices[0, :2], selected_indices)
+        torch.testing.assert_close(
+            gathered.selected_indices[0, :2], selected_indices, check_dtype=False
+        )
         self.assertEqual(int(gathered.trace_kind_id[0]), 3)
         self.assertEqual(int(gathered.decision_count[0]), 2)
         self.assertAlmostEqual(float(gathered.old_log_prob[0]), -1.25)

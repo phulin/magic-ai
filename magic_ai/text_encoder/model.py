@@ -197,8 +197,11 @@ class TextStateEncoder(nn.Module):
         token_ids = batch.token_ids
         attention_mask = batch.attention_mask
         b, t = token_ids.shape
-        x = self.tok_emb(token_ids)
-        key_pad = attention_mask == 0
+        # nn.Embedding requires Long; the replay buffer stores int32 to halve
+        # token-storage memory and the live assembler may emit int32 too.
+        # ``.to(torch.long)`` is a no-op when the tensor is already Long.
+        x = self.tok_emb(token_ids.to(torch.long))
+        key_pad = ~attention_mask.bool()
         # Guard rows whose entire key axis is masked: softmax over an empty
         # set is NaN, which would poison the whole batch. Such rows produce
         # meaningless hidden states either way; un-mask them here so
@@ -243,7 +246,9 @@ def _gather_at(hidden: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
     mask = positions >= 0
     safe = positions.clamp(min=0)
     flat = safe.reshape(b, -1)  # [B, K]
-    idx = flat.unsqueeze(-1).expand(-1, -1, d)  # [B, K, D]
+    # ``torch.gather`` requires Long indices; the replay buffer stores
+    # positions as int32 to halve their footprint.
+    idx = flat.unsqueeze(-1).expand(-1, -1, d).to(torch.long)  # [B, K, D]
     gathered = torch.gather(hidden, 1, idx)  # [B, K, D]
     gathered = gathered.reshape(*positions.shape, d)
     gathered = gathered * mask.unsqueeze(-1).to(gathered.dtype)

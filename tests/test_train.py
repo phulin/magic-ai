@@ -498,6 +498,8 @@ class TrainPPOTests(unittest.TestCase):
             max_steps_per_game=4,
             max_options=3,
             max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
         )
 
         with (
@@ -508,7 +510,9 @@ class TrainPPOTests(unittest.TestCase):
                 return_value=["Mountain"],
             ),
             patch("scripts.train.build_card_cache", return_value=cache) as build_cache,
+            patch("scripts.train.build_assembler_tokens", return_value=object()),
         ):
+            args.text_native_assembler = False
             backend = build_text_backend(args, torch.device("cpu"))
 
         self.assertEqual(backend.cache, cache)
@@ -567,6 +571,8 @@ class TrainPPOTests(unittest.TestCase):
             max_steps_per_game=4,
             max_options=2,
             max_targets_per_option=1,
+            max_decision_groups=2,
+            max_cached_choices=2,
             native_render_plan=False,
         )
         snapshot = cast(
@@ -597,7 +603,9 @@ class TrainPPOTests(unittest.TestCase):
             patch("scripts.train.build_card_cache", return_value=cache),
             patch("scripts.train.emit_render_plan", return_value=object()) as emit,
             patch("scripts.train.assemble_batch", return_value=encoded_batch()) as assemble,
+            patch("scripts.train.build_assembler_tokens", return_value=object()),
         ):
+            args.text_native_assembler = False
             backend = build_text_backend(args, torch.device("cpu"))
             steps = sample_text_policy_batch(
                 args,

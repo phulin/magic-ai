@@ -373,8 +373,8 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         max_tokens=args.text_max_tokens,
         max_options=args.max_options,
         max_targets_per_option=args.max_targets_per_option,
-        max_decision_groups=args.max_options,
-        max_cached_choices=max(args.max_options, args.max_options * args.max_targets_per_option),
+        max_decision_groups=args.max_decision_groups,
+        max_cached_choices=args.max_cached_choices,
         recurrent_layers=args.hidden_layers,
         recurrent_hidden_dim=args.text_d_model,
         device=device,
@@ -1145,6 +1145,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-options", type=int, default=64)
     parser.add_argument("--max-targets-per-option", type=int, default=4)
     parser.add_argument(
+        "--max-decision-groups",
+        type=int,
+        default=16,
+        help="Cap on per-step decision groups in the replay buffer. Combat "
+        "steps (attackers/blockers) emit one group per creature; rows that "
+        "would exceed this cap raise at append time.",
+    )
+    parser.add_argument(
+        "--max-cached-choices",
+        type=int,
+        default=None,
+        help="Cap on per-group cached choices in the replay buffer. Priority "
+        "candidates beyond this width are truncated when building the "
+        "decision layout. The native encoder requires this to be at least "
+        "max(max_options, max_targets_per_option + 1); when unset, it "
+        "defaults to that floor.",
+    )
+    parser.add_argument(
         "--learning-rate",
         type=float,
         default=None,
@@ -1255,6 +1273,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--text-d-ff must be at least 1")
     if getattr(args, "render_plan_capacity", 1) < 1:
         raise ValueError("--render-plan-capacity must be at least 1")
+    if getattr(args, "max_decision_groups", 1) < 1:
+        raise ValueError("--max-decision-groups must be at least 1")
+    max_options = getattr(args, "max_options", 1)
+    max_targets = getattr(args, "max_targets_per_option", 1)
+    cached_floor = max(max_options, max_targets + 1)
+    cached = getattr(args, "max_cached_choices", None)
+    if cached is None:
+        args.max_cached_choices = cached_floor
+    elif cached < cached_floor:
+        raise ValueError(
+            f"--max-cached-choices ({cached}) must be >= "
+            f"max(max_options={max_options}, "
+            f"max_targets_per_option+1={max_targets + 1}); "
+            "raise it or lower --max-options / --max-targets-per-option."
+        )
     if getattr(args, "encoder", "slots") == "text":
         if args.trainer == "rnad" and not getattr(args, "native_render_plan", False):
             raise ValueError("--encoder text --trainer rnad requires --native-render-plan")
