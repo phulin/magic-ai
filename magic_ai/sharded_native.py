@@ -115,6 +115,8 @@ class ShardedNativeBatchEncoder:
         self._encoders = encoders
         self._pool = pool
         self.is_available = encoders[0].is_available
+        self._packed_token_outputs: Any | None = None
+        self._packed_token_outputs_spec: tuple[int, int, int, int, int] | None = None
 
     @classmethod
     def for_policy(
@@ -266,7 +268,37 @@ class ShardedNativeBatchEncoder:
     ) -> tuple[NativeEncodedBatch, Any]:
         """Run the native packed text-encoder assembler."""
 
-        from magic_ai.text_encoder.native_assembler import encode_tokens_packed
+        from magic_ai.text_encoder.native_assembler import (
+            allocate_packed_outputs,
+            encode_tokens_packed,
+        )
+
+        batch_size = len(games)
+        spec = (batch_size, max_tokens, max_options, max_targets, max_card_refs)
+        if (
+            self._packed_token_outputs is None
+            or self._packed_token_outputs_spec is None
+            or self._packed_token_outputs_spec[0] < batch_size
+            or self._packed_token_outputs_spec[1:] != spec[1:]
+        ):
+            capacity = max(
+                batch_size,
+                self._packed_token_outputs_spec[0] * 2 if self._packed_token_outputs_spec else 0,
+            )
+            self._packed_token_outputs = allocate_packed_outputs(
+                capacity,
+                max_tokens=max_tokens,
+                max_options=max_options,
+                max_targets=max_targets,
+                max_card_refs=max_card_refs,
+            )
+            self._packed_token_outputs_spec = (
+                capacity,
+                max_tokens,
+                max_options,
+                max_targets,
+                max_card_refs,
+            )
 
         return encode_tokens_packed(
             self._encoders[0],
@@ -276,6 +308,8 @@ class ShardedNativeBatchEncoder:
             max_options=max_options,
             max_targets=max_targets,
             max_card_refs=max_card_refs,
+            outputs=self._packed_token_outputs,
+            include_trace_kinds=False,
         )
 
     def encode_handles(

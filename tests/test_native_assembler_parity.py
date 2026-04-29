@@ -450,6 +450,22 @@ class NativeAssemblerParityTests(unittest.TestCase):
             max_card_refs=self.max_card_refs_native,
         )
 
+    def _encode_native_packed_reuse(
+        self, game: Any, perspective: int, outputs: Any
+    ) -> tuple[Any, Any]:
+        from magic_ai.text_encoder.native_assembler import encode_tokens_packed
+
+        return encode_tokens_packed(
+            self.encoder,
+            [game],
+            perspective_player_indices=[perspective],
+            max_tokens=self.max_tokens_native,
+            max_options=self.max_options_native,
+            max_targets=self.max_targets_native,
+            max_card_refs=self.max_card_refs_native,
+            outputs=outputs,
+        )
+
     def test_packed_native_matches_pack_batch_of_dense(self) -> None:
         """Go's MageEncodeTokensPacked must produce the same result as
         running the dense path and then ``pack_batch`` in Python."""
@@ -525,6 +541,101 @@ class NativeAssemblerParityTests(unittest.TestCase):
             self.assertTrue(torch.equal(packed.target_positions, expected.target_positions))
             self.assertTrue(torch.equal(packed.target_mask, expected.target_mask))
             self.assertTrue(torch.equal(packed.card_ref_positions, expected.card_ref_positions))
+
+    def test_packed_native_output_reuse_matches_pack_batch_of_dense(self) -> None:
+        """Reusing packed output buffers must not leak stale slots."""
+
+        from magic_ai.text_encoder.batch import pack_batch
+        from magic_ai.text_encoder.native_assembler import allocate_packed_outputs
+
+        outputs = allocate_packed_outputs(
+            1,
+            max_tokens=self.max_tokens_native,
+            max_options=self.max_options_native,
+            max_targets=self.max_targets_native,
+            max_card_refs=self.max_card_refs_native,
+        )
+        captures: list[tuple[Any, Any]] = []
+        game = self.mage.new_game(self.deck_a, self.deck_b, seed=5, shuffle=True, hand_size=7)
+        from magic_ai.text_encoder.rollout import (
+            _default_action_for,
+            _translate_action,
+        )
+
+        steps = 0
+        while steps < 400 and len(captures) < 4:
+            steps += 1
+            game.refresh_state()
+            if game.is_over:
+                break
+            pending = cast(dict[str, Any] | None, game.pending or game.legal())
+            if pending is None:
+                try:
+                    game.step({"kind": "pass"})
+                except Exception:
+                    break
+                continue
+            kind = pending.get("kind", "") or ""
+            options = list(pending.get("options", []) or [])
+            player_idx = int(pending.get("player_idx", 0) or 0)
+            if player_idx not in (0, 1):
+                player_idx = 0
+            if kind == "priority" and options:
+                _, dense_outputs = self._encode_native(game, player_idx)
+                expected = pack_batch(dense_outputs.to_text_encoded_batch())
+                _, outputs = self._encode_native_packed_reuse(game, player_idx, outputs)
+                packed = outputs.to_packed_text_batch()
+                captures.append(
+                    (
+                        type(expected)(
+                            token_ids=expected.token_ids.clone(),
+                            seq_id=expected.seq_id.clone(),
+                            pos_in_seq=expected.pos_in_seq.clone(),
+                            cu_seqlens=expected.cu_seqlens.clone(),
+                            seq_lengths=expected.seq_lengths.clone(),
+                            state_positions=expected.state_positions.clone(),
+                            card_ref_positions=expected.card_ref_positions.clone(),
+                            option_positions=expected.option_positions.clone(),
+                            option_mask=expected.option_mask.clone(),
+                            target_positions=expected.target_positions.clone(),
+                            target_mask=expected.target_mask.clone(),
+                        ),
+                        type(packed)(
+                            token_ids=packed.token_ids.clone(),
+                            seq_id=packed.seq_id.clone(),
+                            pos_in_seq=packed.pos_in_seq.clone(),
+                            cu_seqlens=packed.cu_seqlens.clone(),
+                            seq_lengths=packed.seq_lengths.clone(),
+                            state_positions=packed.state_positions.clone(),
+                            card_ref_positions=packed.card_ref_positions.clone(),
+                            option_positions=packed.option_positions.clone(),
+                            option_mask=packed.option_mask.clone(),
+                            target_positions=packed.target_positions.clone(),
+                            target_mask=packed.target_mask.clone(),
+                        ),
+                    )
+                )
+            if not options:
+                action = _default_action_for(cast(Any, pending))
+            elif kind == "priority":
+                action = _translate_action(cast(Any, pending), 0, None)
+            else:
+                action = _default_action_for(cast(Any, pending))
+            try:
+                game.step(dict(action))
+            except Exception:
+                break
+
+        self.assertGreater(len(captures), 0, "no packed reuse captures collected")
+        for expected, packed in captures:
+            self.assertTrue(torch.equal(packed.token_ids, expected.token_ids))
+            self.assertTrue(torch.equal(packed.seq_id, expected.seq_id))
+            self.assertTrue(torch.equal(packed.pos_in_seq, expected.pos_in_seq))
+            self.assertTrue(torch.equal(packed.cu_seqlens, expected.cu_seqlens))
+            self.assertTrue(torch.equal(packed.option_positions, expected.option_positions))
+            self.assertTrue(torch.equal(packed.option_mask, expected.option_mask))
+            self.assertTrue(torch.equal(packed.target_positions, expected.target_positions))
+            self.assertTrue(torch.equal(packed.target_mask, expected.target_mask))
 
     def test_drive_is_deterministic_for_fixed_seed(self) -> None:
         """Two drives with the same seed produce identical encoded batches."""

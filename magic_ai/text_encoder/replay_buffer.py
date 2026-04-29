@@ -329,13 +329,17 @@ class TextReplayBuffer:
 
         token_width = int(encoded.token_ids.shape[1])
         attention_width = int(encoded.attention_mask.shape[1])
-        self.token_ids[rows].zero_()
-        self.attention_mask[rows].zero_()
-        self.card_ref_positions[rows].fill_(-1)
-        self.option_positions[rows].fill_(-1)
-        self.option_mask[rows].zero_()
-        self.target_positions[rows].fill_(-1)
-        self.target_mask[rows].zero_()
+        # ``self.X[rows].zero_()`` would zero a *copy* of the rows (advanced
+        # indexing with a 1-D tensor returns a copy, not a view), leaving
+        # stale data from previous occupants in trailing columns. Use
+        # ``index_fill_`` so the write lands on the buffer storage.
+        self.token_ids.index_fill_(0, rows, 0)
+        self.attention_mask.index_fill_(0, rows, 0)
+        self.card_ref_positions.index_fill_(0, rows, -1)
+        self.option_positions.index_fill_(0, rows, -1)
+        self.option_mask.index_fill_(0, rows, 0)
+        self.target_positions.index_fill_(0, rows, -1)
+        self.target_mask.index_fill_(0, rows, 0)
         self.token_ids[rows[:, None], torch.arange(token_width, device=self.device)] = (
             encoded.token_ids.to(device=self.device, dtype=torch.int32)
         )
@@ -373,11 +377,11 @@ class TextReplayBuffer:
 
         decision_count_dev = decision_count.to(device=self.device, dtype=torch.long)
         stored_count = decision_count_dev.clamp(max=self.max_decision_groups)
-        self.decision_option_idx[rows].fill_(-1)
-        self.decision_target_idx[rows].fill_(-1)
-        self.decision_mask[rows].zero_()
-        self.uses_none_head[rows].zero_()
-        self.selected_indices[rows].fill_(-1)
+        self.decision_option_idx.index_fill_(0, rows, -1)
+        self.decision_target_idx.index_fill_(0, rows, -1)
+        self.decision_mask.index_fill_(0, rows, 0)
+        self.uses_none_head.index_fill_(0, rows, 0)
+        self.selected_indices.index_fill_(0, rows, -1)
         g_total = int(decision_option_idx.shape[0])
         if g_total > 0:
             step_for_group = torch.repeat_interleave(

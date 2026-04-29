@@ -318,10 +318,29 @@ class NativePackedAssemblerOutputs:
     target_mask: torch.Tensor  # (B, max_options, max_targets) uint8
     card_ref_positions: torch.Tensor  # (B, max_card_refs) int64
     token_overflow: torch.Tensor  # (B,) int32
+    active_batch_size: int = 0
     _packed_out_cffi: Any = None
     _tok_cfg_cffi: Any = None
 
-    def to_packed_text_batch(self) -> PackedTextBatch:
+    def reset_active(self, batch_size: int) -> None:
+        """Clear fixed-shape active rows before reusing this output slab.
+
+        MageEncodeTokensPacked writes variable-length token data but does not
+        currently clear every fixed-shape anchor/mask slot on reuse. Keep the
+        reset vectorized here until that clearing moves into Go.
+        """
+
+        self.cu_seqlens[: batch_size + 1].zero_()
+        self.seq_lengths[:batch_size].zero_()
+        self.state_positions[:batch_size].zero_()
+        self.option_positions[:batch_size].fill_(-1)
+        self.option_mask[:batch_size].zero_()
+        self.target_positions[:batch_size].fill_(-1)
+        self.target_mask[:batch_size].zero_()
+        self.card_ref_positions[:batch_size].fill_(-1)
+        self.token_overflow[:batch_size].zero_()
+
+    def to_packed_text_batch(self, *, trim: bool = True) -> PackedTextBatch:
         """Slice the live region into a :class:`PackedTextBatch`.
 
         Trims anchor tensors to per-batch maxima so the result matches
@@ -329,33 +348,53 @@ class NativePackedAssemblerOutputs:
         shape-for-shape, rather than the full pre-allocated capacity.
         """
 
-        total = int(self.cu_seqlens[-1].item()) if self.cu_seqlens.numel() else 0
+        active_n = self.active_batch_size or int(self.seq_lengths.shape[0])
+        cu_seqlens = self.cu_seqlens[: active_n + 1]
+        seq_lengths = self.seq_lengths[:active_n]
+        state_positions = self.state_positions[:active_n]
+        card_ref_positions = self.card_ref_positions[:active_n]
+        option_positions_full = self.option_positions[:active_n]
+        option_mask_full = self.option_mask[:active_n]
+        target_positions_full = self.target_positions[:active_n]
+        target_mask_full = self.target_mask[:active_n]
+
+        total = int(cu_seqlens[-1].item()) if cu_seqlens.numel() else 0
         token_ids = self.token_ids[:total]
         seq_id = self.seq_id[:total]
         pos_in_seq = self.pos_in_seq[:total]
 
-        opt_any = self.option_mask.any(dim=0)
-        max_opts = int(opt_any.sum().item()) if opt_any.numel() else 0
-        if max_opts > 0:
-            tgt_any = self.target_mask[:, :max_opts].any(dim=0).any(dim=0)
-            max_tgts = int(tgt_any.sum().item()) if tgt_any.numel() else 0
+        if trim:
+            opt_any = option_mask_full.any(dim=0)
+            max_opts = int(opt_any.sum().item()) if opt_any.numel() else 0
+            if max_opts > 0:
+                tgt_any = target_mask_full[:, :max_opts].any(dim=0).any(dim=0)
+                max_tgts = int(tgt_any.sum().item()) if tgt_any.numel() else 0
+            else:
+                max_tgts = 0
+            option_positions = (
+                option_positions_full[:, :max_opts]
+                if max_opts > 0
+                else option_positions_full[:, :0]
+            )
+            option_mask = (
+                option_mask_full[:, :max_opts] if max_opts > 0 else option_mask_full[:, :0]
+            )
+            target_positions = target_positions_full[:, :max_opts, :max_tgts]
+            target_mask = target_mask_full[:, :max_opts, :max_tgts]
         else:
-            max_tgts = 0
-        option_positions = (
-            self.option_positions[:, :max_opts] if max_opts > 0 else self.option_positions[:, :0]
-        )
-        option_mask = self.option_mask[:, :max_opts] if max_opts > 0 else self.option_mask[:, :0]
-        target_positions = self.target_positions[:, :max_opts, :max_tgts]
-        target_mask = self.target_mask[:, :max_opts, :max_tgts]
+            option_positions = option_positions_full
+            option_mask = option_mask_full
+            target_positions = target_positions_full
+            target_mask = target_mask_full
 
         return PackedTextBatch(
             token_ids=token_ids,
             seq_id=seq_id,
             pos_in_seq=pos_in_seq,
-            cu_seqlens=self.cu_seqlens,
-            seq_lengths=self.seq_lengths,
-            state_positions=self.state_positions,
-            card_ref_positions=self.card_ref_positions,
+            cu_seqlens=cu_seqlens,
+            seq_lengths=seq_lengths,
+            state_positions=state_positions,
+            card_ref_positions=card_ref_positions,
             option_positions=option_positions,
             option_mask=option_mask.bool(),
             target_positions=target_positions,
@@ -407,6 +446,7 @@ def encode_tokens_packed(
     max_targets: int,
     max_card_refs: int,
     outputs: NativePackedAssemblerOutputs | None = None,
+    include_trace_kinds: bool = True,
 ) -> tuple[Any, NativePackedAssemblerOutputs]:
     """Run ``MageEncodeTokensPacked`` for a batch of games.
 
@@ -433,6 +473,8 @@ def encode_tokens_packed(
             max_targets=max_targets,
             max_card_refs=max_card_refs,
         )
+    outputs.active_batch_size = batch_size
+    outputs.reset_active(batch_size)
 
     decision_capacity = max(1, batch_size * encoder.max_options)
     encoder._scratch_buffers(batch_size, decision_capacity)
@@ -503,7 +545,11 @@ def encode_tokens_packed(
     )
 
     trace_kind_id = batch["trace_kind_id"]
-    trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
+    trace_kinds = (
+        [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
+        if include_trace_kinds
+        else []
+    )
     decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
     decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
     decision_mask = buffers.decision_mask_u8[:decision_rows_written]
