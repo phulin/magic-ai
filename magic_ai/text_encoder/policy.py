@@ -25,6 +25,7 @@ from magic_ai.game_state import GameStateSnapshot, PendingOptionState
 from magic_ai.text_encoder.batch import (
     TextEncodedBatch,
     collate,
+    pack_batch,
     tokenize_snapshot,
 )
 from magic_ai.text_encoder.model import (
@@ -33,10 +34,10 @@ from magic_ai.text_encoder.model import (
     TextEncoderConfig,
     TextStateEncoder,
     ValueHead,
-    gather_card_vectors,
-    gather_option_vectors,
-    gather_state_vector,
-    gather_target_vectors,
+    gather_card_vectors_packed,
+    gather_option_vectors_packed,
+    gather_state_vector_packed,
+    gather_target_vectors_packed,
 )
 from magic_ai.text_encoder.render import OracleEntry, render_snapshot
 
@@ -110,11 +111,17 @@ class TextPolicy(nn.Module):
         running the heads.
         """
 
-        hidden = self.encoder(batch)
-        card_vecs, card_mask = gather_card_vectors(hidden, batch)
-        option_vecs, option_mask = gather_option_vectors(hidden, batch)
-        target_vecs, target_mask = gather_target_vectors(hidden, batch)
-        state_vec = gather_state_vector(hidden, batch)
+        # Internally we run the packed (varlen) forward path: pack the
+        # padded batch, run forward_packed, gather at the rebased anchor
+        # positions. Output shapes match the dense path 1:1, so callers
+        # don't change. Wins scale with how skewed the per-row sequence
+        # lengths are; equal-length batches are no slower.
+        packed = pack_batch(batch)
+        hidden = self.encoder.forward_packed(packed)
+        card_vecs, card_mask = gather_card_vectors_packed(hidden, packed)
+        option_vecs, option_mask = gather_option_vectors_packed(hidden, packed)
+        target_vecs, target_mask = gather_target_vectors_packed(hidden, packed)
+        state_vec = gather_state_vector_packed(hidden, packed)
         return EncodedSnapshots(
             card_vectors=card_vecs,
             card_mask=card_mask,
