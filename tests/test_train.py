@@ -25,9 +25,11 @@ from scripts.train import (
     TrainingResumeState,
     _current_transcript_snapshot,
     _restore_opponent_pool,
+    append_sample_game_log,
     build_slot_backend,
     build_text_backend,
     checkpoint_encoder_kind,
+    initialize_game_log,
     load_deck_dir,
     load_training_checkpoint,
     log_args_to_wandb_summary,
@@ -145,6 +147,47 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(game.refresh_calls, 1)
         self.assertEqual(state["step"], "Declare Attackers")
         self.assertEqual(pending["player_idx"], 1)
+
+    def test_game_log_is_rewritten_and_appended(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "game_logs.txt"
+            path.write_text("stale")
+
+            initialize_game_log(path)
+            append_sample_game_log(
+                path,
+                [
+                    train_mod.TranscriptAction(
+                        state=cast(
+                            GameStateSnapshot,
+                            {
+                                "players": [
+                                    {"ID": "A", "Name": "A", "Life": 20},
+                                    {"ID": "B", "Name": "B", "Life": 20},
+                                ],
+                                "active_player": "A",
+                                "turn": 1,
+                                "step": "Precombat Main",
+                            },
+                        ),
+                        pending=cast(
+                            PendingState,
+                            {"kind": "priority", "player_idx": 0, "options": []},
+                        ),
+                        action={"kind": "pass"},
+                    )
+                ],
+                episode_idx=7,
+                winner_idx=0,
+                max_actions=80,
+                encoder="text",
+            )
+
+            text = path.read_text()
+
+        self.assertNotIn("stale", text)
+        self.assertIn("encoder=text episode=7 winner=0", text)
+        self.assertIn("pass", text)
 
     def test_gae_returns_flips_bootstrap_sign_for_opponent_steps(self) -> None:
         steps = [
@@ -693,64 +736,71 @@ class TrainPPOTests(unittest.TestCase):
             def new_game(self, *_args: object, **_kwargs: object) -> FakeGame:
                 return self.game
 
-        args = Namespace(
-            episodes=1,
-            max_steps_per_game=1,
-            seed=3,
-            name_a="A",
-            name_b="B",
-            no_shuffle=True,
-            hand_size=7,
-            deterministic_rollout=True,
-            rollout_steps=1,
-            ppo_epochs=1,
-            minibatch_size=1,
-            clip_epsilon=0.2,
-            value_coef=0.5,
-            entropy_coef=0.01,
-            max_grad_norm=0.5,
-            spr=False,
-            spr_coef=0.0,
-            gamma=1.0,
-            gae_lambda=1.0,
-            draw_penalty=1.0,
-            save_every=0,
-            output=Path("unused.pt"),
-        )
-        policy = FakePolicy()
-        backend = Namespace(policy=policy, replay_buffer=FakeReplayBuffer())
-        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
-        policy_step = PolicyStep(
-            action={"kind": "pass"},
-            trace=ActionTrace("priority", indices=(0,)),
-            log_prob=torch.tensor(-0.5),
-            value=torch.tensor(0.1),
-            entropy=torch.tensor(0.0),
-            replay_idx=0,
-            selected_choice_cols=(0,),
-        )
-
-        with (
-            patch("scripts.train.sample_text_policy_batch", return_value=[policy_step]) as sample,
-            patch(
-                "scripts.train.ppo_update",
-                return_value=PPOStats(
-                    loss=1.0,
-                    policy_loss=0.5,
-                    value_loss=0.25,
-                    entropy=0.0,
-                    approx_kl=0.0,
-                    clip_fraction=0.0,
-                ),
-            ) as update,
-        ):
-            resume, rnad_state = train_text_envs(
-                args,
-                FakeMage(),
-                [{"cards": []}],
-                cast(Any, backend),
-                optimizer,
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                episodes=1,
+                max_steps_per_game=1,
+                seed=3,
+                name_a="A",
+                name_b="B",
+                no_shuffle=True,
+                hand_size=7,
+                deterministic_rollout=True,
+                rollout_steps=1,
+                ppo_epochs=1,
+                minibatch_size=1,
+                clip_epsilon=0.2,
+                value_coef=0.5,
+                entropy_coef=0.01,
+                max_grad_norm=0.5,
+                spr=False,
+                spr_coef=0.0,
+                gamma=1.0,
+                gae_lambda=1.0,
+                draw_penalty=1.0,
+                save_every=0,
+                output=Path(tmpdir) / "unused.pt",
+                sample_actions=80,
+                game_log_path=Path(tmpdir) / "game_logs.txt",
             )
+            initialize_game_log(args.game_log_path)
+            policy = FakePolicy()
+            backend = Namespace(policy=policy, replay_buffer=FakeReplayBuffer())
+            optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+            policy_step = PolicyStep(
+                action={"kind": "pass"},
+                trace=ActionTrace("priority", indices=(0,)),
+                log_prob=torch.tensor(-0.5),
+                value=torch.tensor(0.1),
+                entropy=torch.tensor(0.0),
+                replay_idx=0,
+                selected_choice_cols=(0,),
+            )
+
+            with (
+                patch(
+                    "scripts.train.sample_text_policy_batch", return_value=[policy_step]
+                ) as sample,
+                patch(
+                    "scripts.train.ppo_update",
+                    return_value=PPOStats(
+                        loss=1.0,
+                        policy_loss=0.5,
+                        value_loss=0.25,
+                        entropy=0.0,
+                        approx_kl=0.0,
+                        clip_fraction=0.0,
+                    ),
+                ) as update,
+            ):
+                resume, rnad_state = train_text_envs(
+                    args,
+                    FakeMage(),
+                    [{"cards": []}],
+                    cast(Any, backend),
+                    optimizer,
+                )
+            game_log_text = args.game_log_path.read_text()
 
         self.assertIsNone(rnad_state)
         self.assertEqual(resume.completed_games, 1)
@@ -761,6 +811,7 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(policy.reset_indices, [[0]])
         sample.assert_called_once()
         update.assert_called_once()
+        self.assertIn("encoder=text episode=0 winner=draw", game_log_text)
 
     def test_train_selected_backend_native_text_dispatches_to_native_loop(self) -> None:
         args = Namespace(

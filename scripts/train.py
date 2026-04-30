@@ -31,7 +31,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from magic_ai.actions import (  # noqa: E402
     OPTION_SCALAR_DIM,
     TARGET_SCALAR_DIM,
+    TRACE_KIND_VALUES,
     ActionRequest,
+    action_from_choice_accepted,
 )
 from magic_ai.game_state import (  # noqa: E402
     GAME_INFO_DIM,
@@ -78,6 +80,7 @@ from magic_ai.slot_encoder.sharded_native import (  # noqa: E402
 from magic_ai.text_encoder.actor_critic import (  # noqa: E402
     TextActorCritic,  # noqa: E402
     TextDecisionLayout,
+    _decode_text_action,
     build_text_decision_layout,
     infer_text_trace_kind,
 )
@@ -113,6 +116,8 @@ DEFAULT_DECK = {
         {"name": "Lightning Bolt", "count": 36},
     ],
 }
+
+DEFAULT_GAME_LOG_PATH = Path("/tmp/game_logs.txt")
 
 
 # Optional subphase profiling hook. The profile script binds this to a
@@ -895,6 +900,7 @@ def _build_opponent_schedules(
 def main() -> None:
     args = parse_args()
     validate_args(args)
+    initialize_game_log(game_log_path(args))
     if args.learning_rate is None:
         args.learning_rate = 5e-5 if args.trainer == "rnad" else 3e-4
     deck_pool = load_deck_pool(args.deck_json, args.deck_dir)
@@ -1246,6 +1252,12 @@ def parse_args() -> argparse.Namespace:
         default=80,
         help="maximum actions to print from a sample rollout game at each PPO update",
     )
+    parser.add_argument(
+        "--game-log-path",
+        type=Path,
+        default=DEFAULT_GAME_LOG_PATH,
+        help="path for sampled game transcripts; rewritten at the start of training",
+    )
     parser.add_argument("--wandb-project", default="magic-ai")
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
@@ -1510,6 +1522,38 @@ def log_retrospective_table(
         log_fn(payload)
 
 
+def initialize_game_log(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")
+
+
+def game_log_path(args: argparse.Namespace) -> Path:
+    return Path(getattr(args, "game_log_path", DEFAULT_GAME_LOG_PATH))
+
+
+def append_sample_game_log(
+    path: Path,
+    transcript: list[TranscriptAction],
+    *,
+    episode_idx: int,
+    winner_idx: int,
+    max_actions: int,
+    encoder: str,
+) -> None:
+    lines = sample_game_lines(
+        transcript,
+        winner_idx=winner_idx,
+        max_actions=max_actions,
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"encoder={encoder} episode={episode_idx} "
+            f"winner={winner_idx if winner_idx >= 0 else 'draw'}\n"
+        )
+        handle.write("\n".join(lines))
+        handle.write("\n\n")
+
+
 def rollout_value_metrics(
     steps: list[RolloutStep],
     returns: torch.Tensor,
@@ -1723,6 +1767,14 @@ def train_native_batched_envs(
                     )
                 total_generated_rollout_steps += len(env.episode_steps)
             if env.slot_idx == 0:
+                append_sample_game_log(
+                    game_log_path(args),
+                    env.transcript,
+                    episode_idx=env.episode_idx,
+                    winner_idx=winner_idx,
+                    max_actions=args.sample_actions,
+                    encoder="slots",
+                )
                 print_sample_game(
                     env.transcript,
                     winner_idx=winner_idx,
@@ -2228,6 +2280,7 @@ def train_text_envs(
             hand_size=args.hand_size,
         )
         episode_steps: list[RolloutStep] = []
+        transcript: list[TranscriptAction] = []
         winner_idx = -1
         try:
             for _action_idx in range(args.max_steps_per_game):
@@ -2256,6 +2309,13 @@ def train_text_envs(
                     game.step({"kind": "pass"})
                     continue
                 policy_step = policy_steps[0]
+                transcript.append(
+                    TranscriptAction(
+                        state=copy.deepcopy(snapshot),
+                        pending=copy.deepcopy(pending),
+                        action=copy.deepcopy(policy_step.action),
+                    )
+                )
                 game.step(dict(policy_step.action))
                 episode_steps.append(
                     RolloutStep(
@@ -2274,6 +2334,14 @@ def train_text_envs(
             except Exception:
                 pass
 
+        append_sample_game_log(
+            game_log_path(args),
+            transcript,
+            episode_idx=episode_idx,
+            winner_idx=winner_idx,
+            max_actions=args.sample_actions,
+            encoder="text",
+        )
         completed_games += 1
         if winner_idx == 0:
             win_stats.p1_wins += 1
@@ -2516,6 +2584,7 @@ def train_text_native_batched_envs(
     live_games: list[LiveGame] = []
     free_slots = list(range(args.num_envs - 1, -1, -1))
     last_step_time = time.monotonic()
+    transcript_warning_emitted = False
 
     def cli_step_prefix() -> str:
         return f"step={total_wandb_logs}"
@@ -2526,6 +2595,17 @@ def train_text_native_batched_envs(
         if wandb.run is None:
             return
         wandb.log(payload)
+
+    def disable_transcript(env: LiveGame, reason: str) -> None:
+        nonlocal transcript_warning_emitted
+        env.transcript_enabled = False
+        if not transcript_warning_emitted:
+            print(
+                cli_step_prefix(),
+                f"warning: disabling text sample transcript capture: {reason}",
+                flush=True,
+            )
+            transcript_warning_emitted = True
 
     def start_game(slot_idx: int, episode_idx: int) -> LiveGame:
         backend.policy.reset_lstm_env_states([slot_idx])
@@ -2547,6 +2627,7 @@ def train_text_native_batched_envs(
             episode_idx=episode_idx,
             episode_steps=[],
             transcript=[],
+            transcript_enabled=slot_idx == 0,
         )
 
     def maybe_start_games() -> None:
@@ -2564,6 +2645,15 @@ def train_text_native_batched_envs(
                 env.game.close()
             except Exception:
                 pass
+            if env.slot_idx == 0:
+                append_sample_game_log(
+                    game_log_path(args),
+                    env.transcript,
+                    episode_idx=env.episode_idx,
+                    winner_idx=winner_idx,
+                    max_actions=args.sample_actions,
+                    encoder="text",
+                )
             if env.episode_steps:
                 pending_steps.extend(env.episode_steps)
                 pending_returns.append(
@@ -2858,10 +2948,44 @@ def train_text_native_batched_envs(
             log_probs_cpu = policy_batch.old_log_prob
             values_cpu = policy_batch.value
             replay_rows_cpu = policy_batch.replay_rows
+            trace_kind_ids = native_batch.trace_kind_id.tolist()
+            selected_cursor = 0
             for step_idx, (env, player_idx, replay_idx) in enumerate(
                 zip(ready_envs, ready_players, replay_rows_cpu, strict=True)
             ):
                 env.action_count += 1
+                selected_for_step = selected_cols[
+                    selected_cursor : selected_cursor + counts[step_idx]
+                ]
+                selected_cursor += counts[step_idx]
+                if env.transcript_enabled:
+                    try:
+                        transcript_state, transcript_pending = _current_transcript_snapshot(
+                            env.game
+                        )
+                        trace_kind = TRACE_KIND_VALUES[int(trace_kind_ids[step_idx])]
+                        if trace_kind == "may":
+                            transcript_action = action_from_choice_accepted(
+                                bool(may_selected[step_idx])
+                            )
+                        else:
+                            _trace, transcript_action = _decode_text_action(
+                                trace_kind,
+                                transcript_pending,
+                                list(selected_for_step),
+                            )
+                        env.transcript.append(
+                            TranscriptAction(
+                                state=transcript_state,
+                                pending=transcript_pending,
+                                action=copy.deepcopy(transcript_action),
+                            )
+                        )
+                    except Exception as exc:
+                        disable_transcript(
+                            env,
+                            f"{exc} while snapshotting live game for native text action",
+                        )
                 env.episode_steps.append(
                     RolloutStep(
                         perspective_player_idx=int(player_idx),
@@ -3247,8 +3371,24 @@ def print_sample_game(
     max_actions: int,
 ) -> None:
     print()
+    for line in sample_game_lines(
+        transcript,
+        winner_idx=winner_idx,
+        max_actions=max_actions,
+    ):
+        print(line)
+    print()
+
+
+def sample_game_lines(
+    transcript: list[TranscriptAction],
+    *,
+    winner_idx: int,
+    max_actions: int,
+) -> list[str]:
+    lines: list[str] = []
     if not transcript:
-        print("(no actions)")
+        lines.append("(no actions)")
     else:
         condensed = condense_transcript_lines(transcript, max_actions=max_actions)
         if condensed:
@@ -3257,7 +3397,7 @@ def print_sample_game(
             player_width = max(len(line["player"]) for line in condensed)
             life_width = max(len(line["life"]) for line in condensed)
             for line in condensed:
-                print(
+                lines.append(
                     f"{line['turn']:<{turn_width}}  "
                     f"{line['step']:<{step_width}}  "
                     f"{line['player']:<{player_width}}  "
@@ -3266,12 +3406,12 @@ def print_sample_game(
                 )
         remaining = len(transcript) - max_actions
         if remaining > 0:
-            print(f"... {remaining} more actions")
+            lines.append(f"... {remaining} more actions")
     if winner_idx >= 0:
-        print(f"== PLAYER {winner_idx + 1} WINS ==")
+        lines.append(f"== PLAYER {winner_idx + 1} WINS ==")
     else:
-        print("== DRAW ==")
-    print()
+        lines.append("== DRAW ==")
+    return lines
 
 
 def condense_transcript_lines(
