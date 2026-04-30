@@ -20,10 +20,8 @@ from magic_ai.actions import (
     build_priority_candidates,
     selected_priority_candidate_index,
 )
-from magic_ai.buffer import NativeTrajectoryBuffer, RolloutBuffer
 from magic_ai.game_state import (
     GameCardState,
-    GameStateEncoder,
     GameStateSnapshot,
     ManaPoolState,
     ParsedGameState,
@@ -31,15 +29,21 @@ from magic_ai.game_state import (
     PendingState,
     PlayerState,
 )
-from magic_ai.model import (
-    PPOPolicy,
-)
-from magic_ai.native_encoder import NativeBatchEncoder, NativeEncodedBatch, NativeEncodingError
 from magic_ai.ppo import (
     PPOStats,
     RolloutStep,
     gae_returns,
     ppo_update,
+)
+from magic_ai.slot_encoder.buffer import NativeTrajectoryBuffer, RolloutBuffer
+from magic_ai.slot_encoder.game_state import GameStateEncoder
+from magic_ai.slot_encoder.model import (
+    PPOPolicy,
+)
+from magic_ai.slot_encoder.native_encoder import (
+    NativeBatchEncoder,
+    NativeEncodedBatch,
+    NativeEncodingError,
 )
 
 __all__ = [

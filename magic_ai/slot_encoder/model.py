@@ -43,7 +43,6 @@ from magic_ai.actions import (
 from magic_ai.game_state import (
     GAME_INFO_DIM,
     ZONE_SLOT_COUNT,
-    GameStateEncoder,
     GameStateSnapshot,
     ParsedGameStateBatch,
 )
@@ -63,6 +62,7 @@ from magic_ai.replay_decisions import (
     validate_flat_scored_indices,
 )
 from magic_ai.slot_encoder.buffer import NativeTrajectoryBuffer, RolloutBuffer
+from magic_ai.slot_encoder.game_state import GameStateEncoder
 from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
 
 # TraceKind, TRACE_KIND_VALUES, TRACE_KIND_TO_ID, ActionTrace, PolicyStep,

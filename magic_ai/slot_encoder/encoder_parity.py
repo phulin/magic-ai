@@ -20,13 +20,13 @@ from magic_ai.game_state import (
     GAME_INFO_DIM,
     ZONE_SLOT_COUNT,
     GameCardState,
-    GameStateEncoder,
     GameStateSnapshot,
     ManaPoolState,
     ParsedGameState,
     ParsedGameStateBatch,
     PlayerState,
 )
+from magic_ai.slot_encoder.game_state import GameStateEncoder
 
 
 @dataclass(frozen=True)

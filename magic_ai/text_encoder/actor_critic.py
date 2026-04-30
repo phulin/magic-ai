@@ -29,13 +29,13 @@ from magic_ai.actions import (
     selected_option_id,
 )
 from magic_ai.game_state import PendingState
-from magic_ai.model import _clone_detaching_buffer
 from magic_ai.replay_decisions import (
     ReplayPerChoice,
     ReplayScoringForward,
     direct_decision_logits_from_forward,
     score_may_decisions_from_forward,
 )
+from magic_ai.slot_encoder.model import _clone_detaching_buffer
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 from magic_ai.text_encoder.policy import EncodedSnapshots
 from magic_ai.text_encoder.recurrent import (

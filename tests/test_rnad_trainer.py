@@ -8,8 +8,6 @@ from pathlib import Path
 from typing import cast
 
 import torch
-from magic_ai.game_state import GameStateEncoder
-from magic_ai.model import PPOPolicy
 from magic_ai.rnad import RNaDConfig
 from magic_ai.rnad_trainer import (
     _advance_outer_iteration,
@@ -18,6 +16,8 @@ from magic_ai.rnad_trainer import (
     build_trainer_state,
     resume_from_snapshot_dir,
 )
+from magic_ai.slot_encoder.game_state import GameStateEncoder
+from magic_ai.slot_encoder.model import PPOPolicy
 from torch import nn
 
 

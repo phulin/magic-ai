@@ -1,7 +1,6 @@
 import unittest
 
 import torch
-from magic_ai.model import PPOPolicy
 from magic_ai.replay_decisions import (
     ReplayScoringForward,
     decision_logits_reference,
@@ -12,6 +11,7 @@ from magic_ai.replay_decisions import (
     score_may_decisions_from_forward,
     validate_flat_scored_indices,
 )
+from magic_ai.slot_encoder.model import PPOPolicy
 
 
 class ReplayDecisionHelpersTests(unittest.TestCase):

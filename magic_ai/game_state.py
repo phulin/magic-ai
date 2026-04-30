@@ -1,9 +1,9 @@
 """Typed game-state format and shared constants for the Magic AI package.
 
-The ``GameStateEncoder`` class and its slot-encoding helpers live in
-``magic_ai.slot_encoder.game_state``. This module keeps only the shared
-TypedDicts, constants, and ``ParsedGameState``/``ParsedGameStateBatch``
-dataclasses that are used by both the slot and text encoder backends.
+Shared TypedDicts, constants, and ``ParsedGameState``/``ParsedGameStateBatch``
+dataclasses used by both the slot and text encoder backends.
+``GameStateEncoder`` and its private helpers live in
+``magic_ai.slot_encoder.game_state``.
 """
 
 from __future__ import annotations
@@ -141,7 +141,7 @@ class ParsedGameState:
 
     Fields are Python lists of integer/float indices — no tensors are allocated
     here. ``RolloutBuffer.ingest_batch`` does the bulk CPU→GPU copy into
-    preallocated buffers; ``GameStateEncoder.embed_slot_vectors`` then consumes
+    preallocated buffers; ``slot_encoder.GameStateEncoder.embed_slot_vectors`` then consumes
     the gathered tensors on-device.
     """
 
@@ -163,17 +163,6 @@ class ParsedGameStateBatch:
     card_id_to_slots: list[dict[str, int]]
 
 
-# ---------------------------------------------------------------------------
-# Re-export GameStateEncoder from its new home for backward compatibility.
-# External code that imports ``GameStateEncoder`` from ``magic_ai.game_state``
-# continues to work; only the definition has moved.
-# ---------------------------------------------------------------------------
-from magic_ai.slot_encoder.game_state import (  # noqa: E402
-    GameStateEncoder,
-    _card_key,
-    _fill_game_info,
-)
-
 __all__ = [
     "GAME_INFO_DIM",
     "MANA_COLORS",
@@ -189,7 +178,6 @@ __all__ = [
     "ZONE_SPECS",
     "CardEmbeddingInput",
     "GameCardState",
-    "GameStateEncoder",
     "GameStateSnapshot",
     "ManaPoolState",
     "ParsedGameState",
@@ -202,6 +190,4 @@ __all__ = [
     "ZoneName",
     "ZoneOwner",
     "ZoneSpec",
-    "_card_key",
-    "_fill_game_info",
 ]

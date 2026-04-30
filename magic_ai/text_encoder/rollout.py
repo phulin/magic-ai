@@ -46,7 +46,7 @@ from magic_ai.game_state import (
     PendingOptionState,
     PendingState,
 )
-from magic_ai.native_encoder import NativeBatchEncoder, NativeEncodingError
+from magic_ai.slot_encoder.native_encoder import NativeBatchEncoder, NativeEncodingError
 from magic_ai.text_encoder.assembler import assemble_batch
 from magic_ai.text_encoder.card_cache import CardTokenCache
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy

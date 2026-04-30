@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from magic_ai.encoder_parity import (
+from magic_ai.slot_encoder.encoder_parity import (
     build_sample_encoders,
     build_sample_parity_cases,
     compare_batch_outputs,
@@ -71,7 +71,7 @@ class EncoderParityTests(unittest.TestCase):
         self.assertEqual(tuple(outputs.parsed_state.game_info.shape), shapes["game_info"])
 
     def test_loader_resolves_builtin_batch_encoder(self) -> None:
-        candidate = load_batch_encoder("magic_ai.encoder_parity:encode_python_batch")
+        candidate = load_batch_encoder("magic_ai.slot_encoder.encoder_parity:encode_python_batch")
         self.assertIs(candidate, encode_python_batch)
 
 

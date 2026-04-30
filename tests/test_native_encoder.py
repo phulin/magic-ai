@@ -4,10 +4,12 @@ import unittest
 from typing import cast
 
 import torch
-from magic_ai.buffer import NativeTrajectoryBuffer
-from magic_ai.game_state import GameStateEncoder, GameStateSnapshot, PendingState
-from magic_ai.model import ParsedBatch, PPOPolicy
-from magic_ai.native_encoder import (
+from magic_ai.actions import ParsedBatch
+from magic_ai.game_state import GameStateSnapshot, PendingState
+from magic_ai.slot_encoder.buffer import NativeTrajectoryBuffer
+from magic_ai.slot_encoder.game_state import GameStateEncoder
+from magic_ai.slot_encoder.model import PPOPolicy
+from magic_ai.slot_encoder.native_encoder import (
     NativeBatchEncoder,
     NativeEncodedBatch,
     NativeEncodingError,

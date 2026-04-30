@@ -10,13 +10,13 @@ import torch
 from torch import Tensor, nn
 
 from magic_ai.game_state import (
-    GameStateEncoder,
     GameStateSnapshot,
     ParsedGameState,
     ParsedGameStateBatch,
     PendingOptionState,
     PendingState,
 )
+from magic_ai.slot_encoder.game_state import GameStateEncoder
 
 DEFAULT_MAX_OPTIONS = 64
 DEFAULT_MAX_TARGETS_PER_OPTION = 4
@@ -736,7 +736,7 @@ def _resolve_option_reference(
 
     card_name = option.get("card_name")
     if card_name:
-        from magic_ai.game_state import _card_key as _ck
+        from magic_ai.slot_encoder.game_state import _card_key as _ck
 
         row = name_to_row.get(_ck(card_name), 0)
         return None, row

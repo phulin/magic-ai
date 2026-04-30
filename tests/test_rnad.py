@@ -1044,7 +1044,7 @@ class PerPolicyLSTMRecomputeTests(unittest.TestCase):
         # the method under test. Full PPOPolicy construction is too heavy
         # for a unit test — the empty-rows guard is part of the contract
         # exercised even on the stub.
-        from magic_ai.model import PPOPolicy
+        from magic_ai.slot_encoder.model import PPOPolicy
 
         # Pull the unbound method off the class and call its empty-input
         # validation; the path raises before touching any of the heavy

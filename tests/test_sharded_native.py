@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
-from magic_ai.native_encoder import NativeEncodedBatch
-from magic_ai.native_rollout import NativeRolloutDriver
-from magic_ai.sharded_native import (
+from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
+from magic_ai.slot_encoder.native_rollout import NativeRolloutDriver
+from magic_ai.slot_encoder.sharded_native import (
     ShardedNativeRolloutDriver,
     _concat_encoded_batches,
     _shard_ranges,

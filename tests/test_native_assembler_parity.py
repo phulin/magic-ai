@@ -52,7 +52,7 @@ class NativeAssemblerParityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         import mage
-        from magic_ai.native_encoder import NativeBatchEncoder
+        from magic_ai.slot_encoder.native_encoder import NativeBatchEncoder
         from magic_ai.text_encoder.assembler import build_assembler_tokens
         from magic_ai.text_encoder.card_cache import (
             build_card_cache,

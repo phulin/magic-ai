@@ -12,8 +12,11 @@ from typing import Any, cast
 import torch
 import trueskill
 
-from magic_ai.model import PPOPolicy
-from magic_ai.sharded_native import ShardedNativeBatchEncoder, ShardedNativeRolloutDriver
+from magic_ai.slot_encoder.model import PPOPolicy
+from magic_ai.slot_encoder.sharded_native import (
+    ShardedNativeBatchEncoder,
+    ShardedNativeRolloutDriver,
+)
 
 
 @dataclass
