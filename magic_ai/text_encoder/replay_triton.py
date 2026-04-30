@@ -26,7 +26,6 @@ _write_rebased_fields_kernel: Any = None
 _clear_decision_rows_kernel: Any = None
 _write_decision_rows_kernel: Any = None
 _gather_packed_tokens_kernel: Any = None
-_gather_sequence_layout_kernel: Any = None
 _gather_rebased_positions_kernel: Any = None
 _gather_metadata_kernel: Any = None
 _gather_recurrent_kernel: Any = None
@@ -232,6 +231,7 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
     @triton.jit
     def _write_decision_rows_kernel(
         rows,
+        group_starts,
         decision_count_in,
         decision_option_idx_in,
         decision_target_idx_in,
@@ -254,19 +254,14 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
         old_log_prob_out,
         value_out,
         perspective_player_idx_out,
-        batch_size: tl.constexpr,
         max_decision_groups: tl.constexpr,
         max_cached_choices: tl.constexpr,
         slots_per_row: tl.constexpr,
         choice_block: tl.constexpr,
-        prefix_block: tl.constexpr,
     ):
         b = tl.program_id(0)
         row = tl.load(rows + b)
-        prefix_offsets = tl.arange(0, prefix_block)
-        prefix_mask = prefix_offsets < b
-        prefix_counts = tl.load(decision_count_in + prefix_offsets, mask=prefix_mask, other=0)
-        group_start = tl.sum(prefix_counts, axis=0)
+        group_start = tl.load(group_starts + b)
         raw_count = tl.load(decision_count_in + b)
         stored_count = tl.minimum(raw_count, max_decision_groups)
         tl.store(decision_count_out + row, stored_count)
@@ -342,24 +337,6 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
         )
 
     @triton.jit
-    def _gather_sequence_layout_kernel(
-        rows,
-        row_token_length,
-        seq_lengths_out,
-        cu_seqlens_out,
-        batch_size: tl.constexpr,
-        block: tl.constexpr,
-    ):
-        offsets = tl.arange(0, block)
-        mask = offsets < batch_size
-        row = tl.load(rows + offsets, mask=mask, other=0)
-        lengths = tl.load(row_token_length + row, mask=mask, other=0).to(tl.int64)
-        prefix = tl.cumsum(lengths, axis=0)
-        tl.store(seq_lengths_out + offsets, lengths, mask=mask)
-        tl.store(cu_seqlens_out, 0)
-        tl.store(cu_seqlens_out + offsets + 1, prefix, mask=mask)
-
-    @triton.jit
     def _gather_packed_tokens_kernel(
         rows,
         row_token_start,
@@ -369,20 +346,21 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
         dst_token_ids,
         dst_seq_id,
         dst_pos_in_seq,
-        block: tl.constexpr,
+        chunk: tl.constexpr,
     ):
         b = tl.program_id(0)
         row = tl.load(rows + b)
         row_start = tl.load(row_token_start + row)
         length = tl.load(seq_lengths + b)
         out_start = tl.load(cu_seqlens + b)
-        offsets = tl.arange(0, block)
-        mask = offsets < length
-        values = tl.load(src_token_ids + row_start + offsets, mask=mask, other=0)
-        out_offsets = out_start + offsets
-        tl.store(dst_token_ids + out_offsets, values, mask=mask)
-        tl.store(dst_seq_id + out_offsets, b, mask=mask)
-        tl.store(dst_pos_in_seq + out_offsets, offsets, mask=mask)
+        for start in range(0, length, chunk):
+            offsets = start + tl.arange(0, chunk)
+            mask = offsets < length
+            values = tl.load(src_token_ids + row_start + offsets, mask=mask, other=0)
+            out_offsets = out_start + offsets
+            tl.store(dst_token_ids + out_offsets, values, mask=mask)
+            tl.store(dst_seq_id + out_offsets, b, mask=mask)
+            tl.store(dst_pos_in_seq + out_offsets, offsets, mask=mask)
 
     @triton.jit(
         do_not_specialize=[
@@ -828,13 +806,17 @@ def write_append_decisions_triton(
     max_cached_choices = int(dst_decision_option_idx.shape[2])
     slots_per_row = max_decision_groups * max_cached_choices
     choice_block = _next_power_of_2(max(slots_per_row, max_decision_groups))
-    prefix_block = _next_power_of_2(batch_size)
-    if choice_block > 1024 or prefix_block > 1024:
+    if choice_block > 1024:
         return False
+    stored_counts = decision_count.clamp(max=max_decision_groups)
+    group_starts_excl = torch.zeros(batch_size, dtype=torch.int64, device=rows.device)
+    if batch_size > 1:
+        torch.cumsum(stored_counts[:-1], dim=0, out=group_starts_excl[1:])
     _launch(
         _write_decision_rows_kernel,
         (batch_size,),
         rows,
+        group_starts_excl,
         decision_count,
         decision_option_idx,
         decision_target_idx,
@@ -857,12 +839,10 @@ def write_append_decisions_triton(
         dst_old_log_prob,
         dst_value,
         dst_perspective_player_idx,
-        batch_size,
         max_decision_groups,
         max_cached_choices,
         slots_per_row,
         choice_block,
-        prefix_block,
     )
     return True
 
@@ -872,35 +852,18 @@ def gather_sequence_layout_triton(
     rows: Tensor,
     row_token_length: Tensor,
 ) -> tuple[Tensor, Tensor] | None:
-    """Gather sequence lengths and build compact packed offsets with Triton."""
+    """Gather sequence lengths and build compact packed offsets on GPU."""
 
-    if not TRITON_AVAILABLE or not rows.is_cuda:
-        return None
-    if (
-        not rows.is_contiguous()
-        or not row_token_length.is_cuda
-        or not row_token_length.is_contiguous()
-    ):
+    if not rows.is_cuda or not row_token_length.is_cuda:
         return None
 
     batch_size = int(rows.shape[0])
     if batch_size == 0:
         return None
-    block = _next_power_of_2(batch_size)
-    if block > 1024:
-        return None
-    seq_lengths = torch.empty(batch_size, dtype=torch.int64, device=rows.device)
-    cu_seqlens = torch.empty(batch_size + 1, dtype=torch.int64, device=rows.device)
-    _launch(
-        _gather_sequence_layout_kernel,
-        (1,),
-        rows,
-        row_token_length,
-        seq_lengths,
-        cu_seqlens,
-        batch_size,
-        block,
-    )
+
+    seq_lengths = row_token_length[rows].to(torch.int64)
+    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int64, device=rows.device)
+    torch.cumsum(seq_lengths, dim=0, out=cu_seqlens[1:])
     return seq_lengths, cu_seqlens
 
 
@@ -943,9 +906,6 @@ def gather_encoded_triton(
     if batch_size == 0:
         return None
     total_tokens = int(cu_seqlens[-1].item())
-    token_block = _next_power_of_2(max(1, max_seq_length))
-    if token_block > 131_072:
-        return None
 
     token_ids = torch.empty(total_tokens, dtype=packed_token_ids.dtype, device=rows.device)
     seq_id = torch.empty(total_tokens, dtype=torch.int64, device=rows.device)
@@ -961,7 +921,7 @@ def gather_encoded_triton(
         token_ids,
         seq_id,
         pos_in_seq,
-        token_block,
+        512,
     )
 
     card_ref_positions_out = torch.empty(
@@ -1005,7 +965,7 @@ def gather_encoded_triton(
     total_target = batch_size * option_width * target_width
     max_total = max(total_card, total_option, total_target)
     if max_total > 0:
-        block = 64
+        block = 256
         _launch(
             _gather_rebased_positions_kernel,
             (_cdiv(max_total, block),),
@@ -1135,7 +1095,7 @@ def gather_metadata_triton(
         device=rows.device,
     )
 
-    block = 64
+    block = 256
     _launch(
         _gather_metadata_kernel,
         (_cdiv(max_total, block),),
