@@ -11,6 +11,10 @@ from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 from magic_ai.text_encoder.replay_triton import (
     append_batch_encoded_triton,
     clear_append_decisions_triton,
+    gather_encoded_triton,
+    gather_metadata_triton,
+    gather_recurrent_triton,
+    gather_sequence_layout_triton,
     write_append_decisions_triton,
 )
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
@@ -52,6 +56,7 @@ class TextReplayBuffer:
         device: torch.device | str = "cpu",
         validate: bool = True,
         use_triton_append: bool = True,
+        use_triton_gather: bool = True,
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be at least 1")
@@ -82,6 +87,7 @@ class TextReplayBuffer:
         self.device = torch.device(device)
         self.validate = bool(validate)
         self.use_triton_append = bool(use_triton_append)
+        self.use_triton_gather = bool(use_triton_gather)
 
         # Storage dtypes are sized to the value ranges they hold, then cast to
         # int64 at the few consumption sites that actually require Long
@@ -552,6 +558,7 @@ class TextReplayBuffer:
             if not replay_rows:
                 raise ValueError("replay_rows must not be empty")
             idx = torch.tensor(replay_rows, dtype=torch.long, device=self.device)
+        batch_size = int(idx.numel())
         if self.validate:
             in_range = (idx >= 0) & (idx < self.capacity)
             if not bool(in_range.all().item()):
@@ -561,37 +568,75 @@ class TextReplayBuffer:
             if not bool(occupied.all().item()):
                 bad = int(idx[~occupied][0].item())
                 raise ValueError(f"replay row {bad} is not occupied")
-        seq_lengths = self.seq_lengths[idx].to(torch.long)
-        batch_size = int(seq_lengths.numel())
-        token_starts = self.row_token_start[idx]
-        if self.validate and bool((token_starts < 0).any().item()):
-            bad = int(idx[token_starts < 0][0].item())
-            raise ValueError(f"replay row {bad} has no packed token span")
-        cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
-        cu_seqlens[1:] = seq_lengths.cumsum(0)
+        gathered_layout = None
+        if self.use_triton_gather:
+            gathered_layout = gather_sequence_layout_triton(
+                rows=idx,
+                row_token_length=self.row_token_length,
+            )
+        if gathered_layout is None:
+            seq_lengths = self.seq_lengths[idx].to(torch.long)
+            cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
+            cu_seqlens[1:] = seq_lengths.cumsum(0)
+        else:
+            seq_lengths, cu_seqlens = gathered_layout
+        if self.validate:
+            token_starts = self.row_token_start[idx]
+            if bool((token_starts < 0).any().item()):
+                bad = int(idx[token_starts < 0][0].item())
+                raise ValueError(f"replay row {bad} has no packed token span")
         state_positions = cu_seqlens[:-1]
-        seq_id = torch.repeat_interleave(
-            torch.arange(batch_size, dtype=torch.long, device=self.device),
-            seq_lengths,
-        )
         total_tokens = int(cu_seqlens[-1].item())
-        pos_in_seq = torch.arange(
-            total_tokens, dtype=torch.long, device=self.device
-        ) - torch.repeat_interleave(
-            state_positions,
-            seq_lengths,
-        )
-        token_offsets = token_starts[seq_id] + pos_in_seq
-        token_ids = self.packed_token_ids[token_offsets]
+        gathered_encoded = None
+        if self.use_triton_gather:
+            gathered_encoded = gather_encoded_triton(
+                rows=idx,
+                seq_lengths=seq_lengths,
+                cu_seqlens=cu_seqlens,
+                state_positions=state_positions,
+                packed_token_ids=self.packed_token_ids,
+                row_token_start=self.row_token_start,
+                card_ref_positions=self.card_ref_positions,
+                option_positions=self.option_positions,
+                option_mask=self.option_mask,
+                target_positions=self.target_positions,
+                target_mask=self.target_mask,
+                max_seq_length=self.max_tokens,
+            )
+        if gathered_encoded is None:
+            token_starts = self.row_token_start[idx]
+            seq_id = torch.repeat_interleave(
+                torch.arange(batch_size, dtype=torch.long, device=self.device),
+                seq_lengths,
+            )
+            pos_in_seq = torch.arange(
+                total_tokens, dtype=torch.long, device=self.device
+            ) - torch.repeat_interleave(
+                state_positions,
+                seq_lengths,
+            )
+            token_offsets = token_starts[seq_id] + pos_in_seq
+            token_ids = self.packed_token_ids[token_offsets]
 
-        def pack_positions(pos: Tensor, view_shape: tuple[int, ...]) -> Tensor:
-            valid = pos >= 0
-            shifted = pos.to(torch.long) + state_positions.view(view_shape)
-            return torch.where(valid, shifted, pos.to(torch.long))
+            def pack_positions(pos: Tensor, view_shape: tuple[int, ...]) -> Tensor:
+                valid = pos >= 0
+                shifted = pos.to(torch.long) + state_positions.view(view_shape)
+                return torch.where(valid, shifted, pos.to(torch.long))
 
-        card_ref_positions = pack_positions(self.card_ref_positions[idx], (batch_size, 1))
-        option_positions = pack_positions(self.option_positions[idx], (batch_size, 1))
-        target_positions = pack_positions(self.target_positions[idx], (batch_size, 1, 1))
+            card_ref_positions = pack_positions(self.card_ref_positions[idx], (batch_size, 1))
+            option_positions = pack_positions(self.option_positions[idx], (batch_size, 1))
+            target_positions = pack_positions(self.target_positions[idx], (batch_size, 1, 1))
+        else:
+            (
+                token_ids,
+                seq_id,
+                pos_in_seq,
+                card_ref_positions,
+                option_positions,
+                option_mask,
+                target_positions,
+                target_mask,
+            ) = gathered_encoded
         encoded = PackedTextBatch(
             token_ids=token_ids,
             seq_id=seq_id,
@@ -601,25 +646,81 @@ class TextReplayBuffer:
             state_positions=state_positions,
             card_ref_positions=card_ref_positions,
             option_positions=option_positions,
-            option_mask=self.option_mask[idx],
+            option_mask=option_mask if gathered_encoded is not None else self.option_mask[idx],
             target_positions=target_positions,
-            target_mask=self.target_mask[idx],
+            target_mask=target_mask if gathered_encoded is not None else self.target_mask[idx],
         )
-        h_in = self.lstm_h_in[idx] if self.lstm_h_in is not None else None
-        c_in = self.lstm_c_in[idx] if self.lstm_c_in is not None else None
+        gathered_metadata = None
+        if self.use_triton_gather:
+            gathered_metadata = gather_metadata_triton(
+                rows=idx,
+                trace_kind_id=self.trace_kind_id,
+                decision_option_idx=self.decision_option_idx,
+                decision_target_idx=self.decision_target_idx,
+                decision_mask=self.decision_mask,
+                uses_none_head=self.uses_none_head,
+                decision_count=self.decision_count,
+                selected_indices=self.selected_indices,
+                may_selected=self.may_selected,
+                old_log_prob=self.old_log_prob,
+                value=self.value,
+                perspective_player_idx=self.perspective_player_idx,
+            )
+        if gathered_metadata is None:
+            trace_kind_id = self.trace_kind_id[idx]
+            decision_option_idx = self.decision_option_idx[idx]
+            decision_target_idx = self.decision_target_idx[idx]
+            decision_mask = self.decision_mask[idx]
+            uses_none_head = self.uses_none_head[idx]
+            decision_count = self.decision_count[idx]
+            selected_indices = self.selected_indices[idx]
+            may_selected = self.may_selected[idx]
+            old_log_prob = self.old_log_prob[idx]
+            value = self.value[idx]
+            perspective_player_idx = self.perspective_player_idx[idx]
+        else:
+            (
+                trace_kind_id,
+                decision_option_idx,
+                decision_target_idx,
+                decision_mask,
+                uses_none_head,
+                decision_count,
+                selected_indices,
+                may_selected,
+                old_log_prob,
+                value,
+                perspective_player_idx,
+            ) = gathered_metadata
+
+        h_in = None
+        c_in = None
+        if self.lstm_h_in is not None and self.lstm_c_in is not None:
+            gathered_recurrent = None
+            if self.use_triton_gather:
+                gathered_recurrent = gather_recurrent_triton(
+                    rows=idx,
+                    lstm_h_in=self.lstm_h_in,
+                    lstm_c_in=self.lstm_c_in,
+                )
+            if gathered_recurrent is None:
+                h_in = self.lstm_h_in[idx]
+                c_in = self.lstm_c_in[idx]
+            else:
+                h_in, c_in = gathered_recurrent
         return TextReplayBatch(
             encoded=encoded,
-            trace_kind_id=self.trace_kind_id[idx],
-            decision_option_idx=self.decision_option_idx[idx],
-            decision_target_idx=self.decision_target_idx[idx],
-            decision_mask=self.decision_mask[idx],
-            uses_none_head=self.uses_none_head[idx],
-            decision_count=self.decision_count[idx],
-            selected_indices=self.selected_indices[idx],
-            may_selected=self.may_selected[idx],
-            old_log_prob=self.old_log_prob[idx],
-            value=self.value[idx],
-            perspective_player_idx=self.perspective_player_idx[idx],
+            trace_kind_id=trace_kind_id,
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            decision_count=decision_count,
+            selected_indices=selected_indices,
+            may_selected=may_selected,
+            old_log_prob=old_log_prob,
+            value=value,
+            perspective_player_idx=perspective_player_idx,
             lstm_h_in=h_in,
             lstm_c_in=c_in,
         )

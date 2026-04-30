@@ -1,4 +1,4 @@
-"""Benchmark text replay-buffer append_batch with and without Triton."""
+"""Benchmark text replay-buffer append/gather with and without Triton."""
 
 from __future__ import annotations
 
@@ -165,6 +165,46 @@ def _run(
     return time.perf_counter() - start
 
 
+def _run_gather(
+    *,
+    use_triton: bool,
+    encoded: PackedTextBatch,
+    meta: dict[str, torch.Tensor],
+    iterations: int,
+    max_tokens: int,
+    max_options: int,
+    max_targets_per_option: int,
+    max_decision_groups: int,
+    max_cached_choices: int,
+    device: torch.device,
+    profile_range: bool = False,
+) -> float:
+    batch_size = int(encoded.seq_lengths.shape[0])
+    buffer = TextReplayBuffer(
+        capacity=batch_size,
+        max_tokens=max_tokens,
+        max_options=max_options,
+        max_targets_per_option=max_targets_per_option,
+        max_decision_groups=max_decision_groups,
+        max_cached_choices=max_cached_choices,
+        device=device,
+        validate=False,
+        use_triton_append=True,
+        use_triton_gather=use_triton,
+    )
+    rows = buffer.append_batch(encoded=encoded, **meta)
+    _sync(device)
+    if profile_range and device.type == "cuda":
+        torch.cuda.cudart().cudaProfilerStart()
+    start = time.perf_counter()
+    for _ in range(iterations):
+        buffer.gather(rows)
+    _sync(device)
+    if profile_range and device.type == "cuda":
+        torch.cuda.cudart().cudaProfilerStop()
+    return time.perf_counter() - start
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="auto")
@@ -179,6 +219,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--mode", choices=("both", "torch", "triton"), default="both")
+    parser.add_argument("--op", choices=("append", "gather"), default="append")
     parser.add_argument("--cuda-profiler-range", action="store_true")
     args = parser.parse_args()
 
@@ -208,7 +249,8 @@ def main() -> None:
     for use_triton in modes:
         if use_triton and (device.type != "cuda" or not TRITON_AVAILABLE):
             continue
-        _run(
+        run_fn = _run_gather if args.op == "gather" else _run
+        run_fn(
             use_triton=use_triton,
             encoded=encoded,
             meta=meta,
@@ -223,7 +265,8 @@ def main() -> None:
 
     torch_seconds = None
     if args.mode in ("both", "torch"):
-        torch_seconds = _run(
+        run_fn = _run_gather if args.op == "gather" else _run
+        torch_seconds = run_fn(
             use_triton=False,
             encoded=encoded,
             meta=meta,
@@ -237,8 +280,8 @@ def main() -> None:
             profile_range=args.cuda_profiler_range and args.mode == "torch",
         )
         print(
-            "torch append_batch: "
-            f"{torch_seconds * 1_000 / args.iterations:.3f} ms/append "
+            f"torch {args.op}: "
+            f"{torch_seconds * 1_000 / args.iterations:.3f} ms/{args.op} "
             f"({args.batch_size} rows)"
         )
     if args.mode == "torch":
@@ -247,7 +290,8 @@ def main() -> None:
         print("triton append_batch: skipped (requires CUDA and Triton)")
         return
 
-    triton_seconds = _run(
+    run_fn = _run_gather if args.op == "gather" else _run
+    triton_seconds = run_fn(
         use_triton=True,
         encoded=encoded,
         meta=meta,
@@ -262,7 +306,7 @@ def main() -> None:
     )
     speed = f"{torch_seconds / triton_seconds:.2f}x torch" if torch_seconds is not None else "only"
     print(
-        f"triton append_batch: {triton_seconds * 1_000 / args.iterations:.3f} ms/append ({speed})"
+        f"triton {args.op}: {triton_seconds * 1_000 / args.iterations:.3f} ms/{args.op} ({speed})"
     )
 
 

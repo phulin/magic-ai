@@ -570,6 +570,7 @@ class TextReplayBufferTests(unittest.TestCase):
             recurrent_hidden_dim=6,
             device=device,
             use_triton_append=False,
+            use_triton_gather=False,
         )
 
         rows_triton = triton_buffer.append_batch(**kwargs)
@@ -645,6 +646,7 @@ class TextReplayBufferTests(unittest.TestCase):
             max_cached_choices=4,
             device=device,
             use_triton_append=False,
+            use_triton_gather=False,
         )
 
         rows_triton = triton_buffer.append_batch(**kwargs)
@@ -653,6 +655,67 @@ class TextReplayBufferTests(unittest.TestCase):
             self,
             triton_buffer.gather(rows_triton),
             torch_buffer.gather(rows_torch),
+        )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and TRITON_AVAILABLE,
+        "requires CUDA and Triton",
+    )
+    def test_gather_triton_matches_torch_path(self) -> None:
+        device = torch.device("cuda")
+        encoded = _packed_to_device(pack_batch(_encoded_batch()), device)
+        kwargs: dict[str, Any] = dict(
+            encoded=encoded,
+            trace_kind_id=torch.tensor([1, 2], device=device),
+            decision_count=torch.tensor([1, 1], device=device),
+            decision_option_idx=torch.tensor(
+                [[0, 1, -1, -1], [2, -1, -1, -1]],
+                device=device,
+            ),
+            decision_target_idx=torch.tensor(
+                [[-1, 0, -1, -1], [1, -1, -1, -1]],
+                device=device,
+            ),
+            decision_mask=torch.tensor(
+                [[True, True, False, False], [True, False, False, False]],
+                device=device,
+            ),
+            uses_none_head=torch.tensor([False, True], device=device),
+            selected_indices=torch.tensor([1, 0], device=device),
+            may_selected=torch.tensor([0.0, 1.0], device=device),
+            old_log_prob=torch.tensor([-0.25, -0.5], device=device),
+            value=torch.tensor([0.75, -0.125], device=device),
+            perspective_player_idx=torch.tensor([0, 1], device=device),
+        )
+        triton_buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            device=device,
+            use_triton_append=False,
+            use_triton_gather=True,
+        )
+        torch_buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            device=device,
+            use_triton_append=False,
+            use_triton_gather=False,
+        )
+
+        rows_triton = triton_buffer.append_batch(**kwargs)
+        rows_torch = torch_buffer.append_batch(**kwargs)
+        _assert_replay_batch_close(
+            self,
+            triton_buffer.gather(rows_triton.flip(0)),
+            torch_buffer.gather(rows_torch.flip(0)),
         )
 
 
