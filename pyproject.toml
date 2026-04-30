@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu128torch2.11-cp314-cp314-linux_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "mage-go",
     "orjson>=3.11",
     "python-dotenv>=1.2.2",
