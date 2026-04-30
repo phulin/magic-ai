@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, TypedDict, cast
+from typing import Any, Literal, NamedTuple, TypedDict, cast
 
 import torch
 from torch import Tensor, nn
@@ -12,6 +12,8 @@ from torch import Tensor, nn
 from magic_ai.game_state import (
     GameStateEncoder,
     GameStateSnapshot,
+    ParsedGameState,
+    ParsedGameStateBatch,
     PendingOptionState,
     PendingState,
 )
@@ -892,6 +894,93 @@ def _clip_norm(value: int | float | None, maximum: float) -> float:
     return max(0.0, min(float(value), maximum)) / maximum
 
 
+def build_decision_layout_rows(
+    trace_kind: TraceKind,
+    *,
+    max_cached_choices: int,
+    option_count: int,
+    priority_candidates: list[LegalActionCandidate],
+    target_counts_per_option: list[int],
+) -> tuple[list[list[int]], list[list[int]], list[list[bool]], list[bool]]:
+    """Return (option_rows, target_rows, mask_rows, uses_none) for a decision group.
+
+    ``target_counts_per_option`` is only used for the ``blockers`` trace kind.
+    """
+
+    choices = max_cached_choices
+
+    if trace_kind == "may":
+        return [], [], [], []
+
+    if trace_kind == "priority":
+        candidates = priority_candidates[:choices]
+        if not candidates:
+            return [], [], [], []
+        option_row = [-1] * choices
+        target_row = [-1] * choices
+        mask_row = [False] * choices
+        for col, cand in enumerate(candidates):
+            option_row[col] = cand.option_index
+            if cand.target_index is not None:
+                target_row[col] = cand.target_index
+            mask_row[col] = True
+        return [option_row], [target_row], [mask_row], [False]
+
+    if trace_kind == "attackers":
+        if option_count == 0:
+            return [], [], [], []
+        option_idx_l: list[list[int]] = []
+        target_idx_l: list[list[int]] = []
+        mask_l: list[list[bool]] = []
+        for i in range(option_count):
+            option_row = [-1] * choices
+            target_row = [-1] * choices
+            mask_row = [False] * choices
+            if choices > 0:
+                mask_row[0] = True
+            if choices > 1:
+                option_row[1] = i
+                mask_row[1] = True
+            option_idx_l.append(option_row)
+            target_idx_l.append(target_row)
+            mask_l.append(mask_row)
+        return option_idx_l, target_idx_l, mask_l, [True] * option_count
+
+    if trace_kind == "blockers":
+        if option_count == 0:
+            return [], [], [], []
+        option_idx_l = []
+        target_idx_l = []
+        mask_l = []
+        for i, target_count in enumerate(target_counts_per_option):
+            option_row = [-1] * choices
+            target_row = [-1] * choices
+            mask_row = [False] * choices
+            if choices > 0:
+                mask_row[0] = True
+            for t in range(int(target_count)):
+                col = t + 1
+                if col < choices:
+                    option_row[col] = i
+                    target_row[col] = t
+                    mask_row[col] = True
+            option_idx_l.append(option_row)
+            target_idx_l.append(target_row)
+            mask_l.append(mask_row)
+        return option_idx_l, target_idx_l, mask_l, [True] * option_count
+
+    # choice_index / choice_ids / choice_color
+    if option_count == 0:
+        return [], [], [], []
+    option_row = [-1] * choices
+    target_row = [-1] * choices
+    mask_row = [False] * choices
+    for i in range(option_count):
+        option_row[i] = i
+        mask_row[i] = True
+    return [option_row], [target_row], [mask_row], [False]
+
+
 def _copy_action_request(action: ActionRequest) -> ActionRequest:
     copied: dict[str, Any] = {}
     for key, value in action.items():
@@ -900,3 +989,90 @@ def _copy_action_request(action: ActionRequest) -> ActionRequest:
         else:
             copied[key] = value
     return cast(ActionRequest, copied)
+
+
+# ---------------------------------------------------------------------------
+# Shared game-general types (used by both slot and text encoders)
+# ---------------------------------------------------------------------------
+
+TraceKind = Literal[
+    "priority",
+    "attackers",
+    "blockers",
+    "choice_index",
+    "choice_ids",
+    "choice_color",
+    "may",
+]
+
+TRACE_KIND_VALUES: tuple[TraceKind, ...] = (
+    "priority",
+    "attackers",
+    "blockers",
+    "choice_index",
+    "choice_ids",
+    "choice_color",
+    "may",
+)
+TRACE_KIND_TO_ID: dict[TraceKind, int] = {
+    trace_kind: idx for idx, trace_kind in enumerate(TRACE_KIND_VALUES)
+}
+
+
+@dataclass(frozen=True)
+class ActionTrace:
+    """Enough information to recompute a sampled action's log-probability."""
+
+    kind: TraceKind
+    indices: tuple[int, ...] = ()
+    binary: tuple[float, ...] = ()
+
+
+class PolicyStep(NamedTuple):
+    # NamedTuple instead of @dataclass: ~3-5x faster to construct, which
+    # matters because the rollout sampling path builds ~80 of these per
+    # poll (~5k per profiled iter).
+    action: ActionRequest
+    trace: ActionTrace
+    log_prob: Tensor
+    value: Tensor
+    entropy: Tensor
+    replay_idx: int | None = None
+    selected_choice_cols: tuple[int, ...] = ()
+    may_selected: int = 0
+
+
+@dataclass(frozen=True)
+class ParsedStep:
+    """Pure-Python parsed policy inputs for one step.
+
+    Holds the parsed game-state / action-options plus the decision-row layout.
+    No tensors; ``RolloutBuffer.ingest_batch`` does the bulk CPU→GPU copy.
+    """
+
+    parsed_state: ParsedGameState
+    parsed_action: ParsedActionInputs
+    trace_kind: TraceKind
+    trace_kind_id: int
+    decision_option_idx: list[list[int]]  # [G, C]
+    decision_target_idx: list[list[int]]  # [G, C]
+    decision_mask: list[list[bool]]  # [G, C]
+    uses_none_head: list[bool]  # [G]
+    pending: PendingState
+
+
+@dataclass(frozen=True)
+class ParsedBatch:
+    """Batched parsed policy inputs for one actor forward."""
+
+    parsed_state: ParsedGameStateBatch
+    parsed_action: ParsedActionBatch
+    trace_kinds: list[TraceKind]
+    trace_kind_ids: Tensor  # [N]
+    pendings: list[PendingState]
+    decision_option_idx: Tensor  # [total_groups, max_cached_choices]
+    decision_target_idx: Tensor  # [total_groups, max_cached_choices]
+    decision_mask: Tensor  # [total_groups, max_cached_choices]
+    uses_none_head: Tensor  # [total_groups]
+    decision_starts: list[int]
+    decision_counts: list[int]

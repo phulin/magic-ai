@@ -1,0 +1,1073 @@
+from __future__ import annotations
+
+import ctypes
+import importlib
+import json
+import threading
+from dataclasses import dataclass
+from typing import Any, cast
+
+import torch
+from torch import Tensor
+
+from magic_ai.game_state import PendingState
+
+
+class NativeEncodingError(RuntimeError):
+    pass
+
+
+# Parallel ctypes handle for MageEncodeBatch. The mage package's cffi (ABI
+# mode) loader holds the GIL across foreign calls; ctypes releases it. We
+# open the same shared library a second time via ctypes so encoder shards
+# launched on a thread pool can actually run in parallel.
+_encode_lib_lock = threading.Lock()
+_encode_lib: ctypes.CDLL | None = None
+
+
+def _load_encode_ctypes_lib() -> ctypes.CDLL | None:
+    global _encode_lib
+    with _encode_lib_lock:
+        if _encode_lib is not None:
+            return _encode_lib
+        try:
+            mage = importlib.import_module("mage")
+        except ImportError:
+            return None
+        path = getattr(mage, "_lib_path_used", None)
+        if not path:
+            try:
+                cast(Any, mage).load()
+            except Exception:
+                return None
+            path = getattr(mage, "_lib_path_used", None)
+        if not path:
+            return None
+        try:
+            lib = ctypes.CDLL(path)
+        except OSError:
+            return None
+        _encode_lib = lib
+        return lib
+
+
+@dataclass(frozen=True)
+class NativeEncodedBatch:
+    trace_kind_id: Tensor
+    slot_card_rows: Tensor
+    slot_occupied: Tensor
+    slot_tapped: Tensor
+    game_info: Tensor
+    pending_kind_id: Tensor
+    num_present_options: Tensor
+    option_kind_ids: Tensor
+    option_scalars: Tensor
+    option_mask: Tensor
+    option_ref_slot_idx: Tensor
+    option_ref_card_row: Tensor
+    target_mask: Tensor
+    target_type_ids: Tensor
+    target_scalars: Tensor
+    target_overflow: Tensor
+    target_ref_slot_idx: Tensor
+    target_ref_is_player: Tensor
+    target_ref_is_self: Tensor
+    may_mask: Tensor
+    decision_start: Tensor
+    decision_count: Tensor
+    decision_option_idx: Tensor
+    decision_target_idx: Tensor
+    decision_mask: Tensor
+    uses_none_head: Tensor
+    decision_rows_written: int
+    pendings: list[PendingState]
+    trace_kinds: list[str]
+    render_plan: Tensor | None = None
+    render_plan_lengths: Tensor | None = None
+    render_plan_overflow: Tensor | None = None
+
+
+class _MageBatchRequest(ctypes.Structure):
+    _fields_ = [
+        ("n", ctypes.c_int64),
+        ("handles", ctypes.POINTER(ctypes.c_int64)),
+        ("perspective_player_idx", ctypes.POINTER(ctypes.c_int64)),
+    ]
+
+
+class _MageEncodeConfig(ctypes.Structure):
+    _fields_ = [
+        ("max_options", ctypes.c_int64),
+        ("max_targets_per_option", ctypes.c_int64),
+        ("max_cached_choices", ctypes.c_int64),
+        ("zone_slot_count", ctypes.c_int64),
+        ("game_info_dim", ctypes.c_int64),
+        ("option_scalar_dim", ctypes.c_int64),
+        ("target_scalar_dim", ctypes.c_int64),
+        ("decision_capacity", ctypes.c_int64),
+        ("emit_render_plan", ctypes.c_int64),
+        ("render_plan_capacity", ctypes.c_int64),
+        ("dedup_card_bodies", ctypes.c_int64),
+    ]
+
+
+class _MageEncodeOutputs(ctypes.Structure):
+    _fields_ = [
+        ("trace_kind_id", ctypes.POINTER(ctypes.c_int64)),
+        ("slot_card_rows", ctypes.POINTER(ctypes.c_int64)),
+        ("slot_occupied", ctypes.POINTER(ctypes.c_float)),
+        ("slot_tapped", ctypes.POINTER(ctypes.c_float)),
+        ("game_info", ctypes.POINTER(ctypes.c_float)),
+        ("pending_kind_id", ctypes.POINTER(ctypes.c_int64)),
+        ("num_present_options", ctypes.POINTER(ctypes.c_int64)),
+        ("option_kind_ids", ctypes.POINTER(ctypes.c_int64)),
+        ("option_scalars", ctypes.POINTER(ctypes.c_float)),
+        ("option_mask", ctypes.POINTER(ctypes.c_float)),
+        ("option_ref_slot_idx", ctypes.POINTER(ctypes.c_int64)),
+        ("option_ref_card_row", ctypes.POINTER(ctypes.c_int64)),
+        ("target_mask", ctypes.POINTER(ctypes.c_float)),
+        ("target_type_ids", ctypes.POINTER(ctypes.c_int64)),
+        ("target_scalars", ctypes.POINTER(ctypes.c_float)),
+        ("target_overflow", ctypes.POINTER(ctypes.c_float)),
+        ("target_ref_slot_idx", ctypes.POINTER(ctypes.c_int64)),
+        ("target_ref_is_player", ctypes.POINTER(ctypes.c_uint8)),
+        ("target_ref_is_self", ctypes.POINTER(ctypes.c_uint8)),
+        ("may_mask", ctypes.POINTER(ctypes.c_uint8)),
+        ("decision_start", ctypes.POINTER(ctypes.c_int64)),
+        ("decision_count", ctypes.POINTER(ctypes.c_int64)),
+        ("decision_option_idx", ctypes.POINTER(ctypes.c_int64)),
+        ("decision_target_idx", ctypes.POINTER(ctypes.c_int64)),
+        ("decision_mask", ctypes.POINTER(ctypes.c_uint8)),
+        ("uses_none_head", ctypes.POINTER(ctypes.c_uint8)),
+        ("render_plan", ctypes.POINTER(ctypes.c_int32)),
+        ("render_plan_lengths", ctypes.POINTER(ctypes.c_int64)),
+        ("render_plan_overflow", ctypes.POINTER(ctypes.c_int64)),
+    ]
+
+
+class _MageEncodeResult(ctypes.Structure):
+    _fields_ = [
+        ("decision_rows_written", ctypes.c_int64),
+        ("error_code", ctypes.c_int64),
+        ("error_message", ctypes.c_void_p),
+    ]
+
+
+TRACE_KIND_VALUES = (
+    "priority",
+    "attackers",
+    "blockers",
+    "choice_index",
+    "choice_ids",
+    "choice_color",
+    "may",
+)
+
+
+@dataclass
+class _BufferSet:
+    trace_kind_id: Tensor
+    slot_card_rows: Tensor
+    slot_occupied: Tensor
+    slot_tapped: Tensor
+    game_info: Tensor
+    pending_kind_id: Tensor
+    num_present_options: Tensor
+    option_kind_ids: Tensor
+    option_scalars: Tensor
+    option_mask: Tensor
+    option_ref_slot_idx: Tensor
+    option_ref_card_row: Tensor
+    target_mask: Tensor
+    target_type_ids: Tensor
+    target_scalars: Tensor
+    target_overflow: Tensor
+    target_ref_slot_idx: Tensor
+    target_ref_is_player_u8: Tensor
+    target_ref_is_self_u8: Tensor
+    may_mask_u8: Tensor
+    decision_start: Tensor
+    decision_count: Tensor
+    decision_option_idx: Tensor
+    decision_target_idx: Tensor
+    decision_mask_u8: Tensor
+    uses_none_head_u8: Tensor
+    render_plan: Tensor | None = None
+    render_plan_lengths: Tensor | None = None
+    render_plan_overflow: Tensor | None = None
+
+
+@dataclass
+class _EncoderScratch:
+    batch_size: int = 0
+    decision_capacity: int = 0
+    buffers: _BufferSet | None = None
+    handles_t: Tensor | None = None
+    perspectives_t: Tensor | None = None
+    handles_np: Any = None
+    perspectives_np: Any = None
+    # Cached request/config/output structs for the ctypes path; rebuilt
+    # only when buffers are reallocated. Per-call work is just updating
+    # `n` and `decision_capacity`.
+    req_c: _MageBatchRequest | None = None
+    cfg_c: _MageEncodeConfig | None = None
+    out_c: _MageEncodeOutputs | None = None
+    # cffi mirrors of the same structs, used by the native_assembler.encode_tokens
+    # path. cffi struct construction was the dominant Python-side cost on
+    # the rollout hot path before this cache (~1 ms/call building 50+
+    # ``ffi.cast(..., tensor.data_ptr())`` fields). Rebuilt on
+    # reallocation; per-call work is just updating ``n`` and
+    # ``decision_capacity``.
+    req_cffi: Any = None
+    cfg_cffi: Any = None
+    enc_out_cffi: Any = None
+
+
+def _ptr(tensor: Tensor, ctype: Any) -> Any:
+    return ctypes.cast(tensor.data_ptr(), ctypes.POINTER(ctype))
+
+
+def _validate_decision_layout(
+    *,
+    decision_option_idx: Tensor,
+    decision_target_idx: Tensor,
+    decision_mask: Tensor,
+    uses_none_head: Tensor,
+    max_options: int,
+    max_targets_per_option: int,
+) -> None:
+    valid = decision_mask.nonzero(as_tuple=False)
+    if valid.numel() == 0:
+        return
+
+    rows = valid[:, 0]
+    cols = valid[:, 1]
+    none_choices = uses_none_head[rows].bool() & cols.eq(0)
+    scored = ~none_choices
+    if not scored.any():
+        return
+
+    scored_options = decision_option_idx[rows[scored], cols[scored]]
+    bad_options = (scored_options < 0) | (scored_options >= max_options)
+    if bad_options.any():
+        bad = scored_options[bad_options][0].item()
+        raise NativeEncodingError(
+            f"native encoder produced decision option index {bad}, outside [0, {max_options})"
+        )
+
+    scored_targets = decision_target_idx[rows[scored], cols[scored]]
+    bad_targets = scored_targets >= max_targets_per_option
+    if bad_targets.any():
+        bad = scored_targets[bad_targets][0].item()
+        raise NativeEncodingError(
+            f"native encoder produced decision target index {bad}, "
+            f"outside [0, {max_targets_per_option})"
+        )
+
+
+class NativeBatchEncoder:
+    def __init__(
+        self,
+        *,
+        max_options: int,
+        max_targets_per_option: int,
+        max_cached_choices: int,
+        zone_slot_count: int | None = None,
+        game_info_dim: int | None = None,
+        option_scalar_dim: int | None = None,
+        target_scalar_dim: int | None = None,
+        lib: Any | None = None,
+        ffi: Any | None = None,
+        card_name_to_row: dict[str, int] | None = None,
+        validate: bool = True,
+        emit_render_plan: bool = False,
+        render_plan_capacity: int = 4096,
+        dedup_card_bodies: bool = False,
+    ) -> None:
+        self.max_options = max_options
+        self.max_targets_per_option = max_targets_per_option
+        self.max_cached_choices = max_cached_choices
+        self.zone_slot_count = zone_slot_count
+        self.game_info_dim = game_info_dim
+        self.option_scalar_dim = option_scalar_dim
+        self.target_scalar_dim = target_scalar_dim
+        self.lib = lib
+        self.ffi = ffi
+        self.validate = validate
+        self.emit_render_plan = bool(emit_render_plan)
+        self.render_plan_capacity = int(render_plan_capacity)
+        self.dedup_card_bodies = bool(dedup_card_bodies)
+        self.is_available = False
+        if self.lib is None:
+            return
+        if not self._has_required_symbols():
+            return
+        if self.ffi is None:
+            self._configure_ctypes()
+        self._ctypes_lib: ctypes.CDLL | None = None
+        if self.ffi is not None:
+            # cffi is the primary path, but cffi (ABI mode) holds the GIL
+            # across the C call. Load the same .so via ctypes so the hot
+            # MageEncodeBatch invocation can release the GIL and let
+            # encoder shards in ShardedNativeBatchEncoder run in parallel.
+            ctypes_lib = _load_encode_ctypes_lib()
+            if ctypes_lib is not None:
+                try:
+                    ctypes_lib.MageEncodeBatch.argtypes = [
+                        ctypes.POINTER(_MageBatchRequest),
+                        ctypes.POINTER(_MageEncodeConfig),
+                        ctypes.POINTER(_MageEncodeOutputs),
+                    ]
+                    ctypes_lib.MageEncodeBatch.restype = _MageEncodeResult
+                    ctypes_lib.MageFreeString.argtypes = [ctypes.c_void_p]
+                    ctypes_lib.MageFreeString.restype = None
+                    self._ctypes_lib = ctypes_lib
+                except AttributeError:
+                    self._ctypes_lib = None
+        self.is_available = True
+        self._scratch = _EncoderScratch()
+        if card_name_to_row is not None:
+            self.register_card_rows(card_name_to_row)
+
+    def _has_required_symbols(self) -> bool:
+        return all(
+            self._has_symbol(name)
+            for name in ("MageEncodeBatch", "MageSetCardNameRows", "MageFreeString")
+        )
+
+    def _has_symbol(self, name: str) -> bool:
+        try:
+            getattr(self.lib, name)
+        except AttributeError:
+            return False
+        return True
+
+    @classmethod
+    def for_policy(cls, policy: Any) -> NativeBatchEncoder:
+        try:
+            mage = importlib.import_module("mage")
+            mage_any = cast(Any, mage)
+            if mage_any._lib is None or mage_any._ffi is None:
+                mage_any.load()
+            lib = mage_any._lib
+            ffi = mage_any._ffi
+        except Exception:
+            return cls(
+                max_options=policy.max_options,
+                max_targets_per_option=policy.max_targets_per_option,
+                max_cached_choices=policy.max_cached_choices,
+            )
+        return cls(
+            max_options=policy.max_options,
+            max_targets_per_option=policy.max_targets_per_option,
+            max_cached_choices=policy.max_cached_choices,
+            zone_slot_count=int(policy.rollout_buffer.slot_card_rows.shape[1]),
+            game_info_dim=int(policy.rollout_buffer.game_info.shape[1]),
+            option_scalar_dim=int(policy.action_encoder.option_scalar_projection.in_features),
+            target_scalar_dim=int(policy.action_encoder.target_scalar_projection.in_features),
+            lib=lib,
+            ffi=ffi,
+            card_name_to_row=policy.game_state_encoder._card_name_to_row,
+            validate=policy.validate,
+        )
+
+    def _configure_ctypes(self) -> None:
+        lib = cast(Any, self.lib)
+        lib.MageSetCardNameRows.argtypes = [ctypes.c_char_p]
+        lib.MageSetCardNameRows.restype = ctypes.c_void_p
+        lib.MageEncodeBatch.argtypes = [
+            ctypes.POINTER(_MageBatchRequest),
+            ctypes.POINTER(_MageEncodeConfig),
+            ctypes.POINTER(_MageEncodeOutputs),
+        ]
+        lib.MageEncodeBatch.restype = _MageEncodeResult
+        lib.MageFreeString.argtypes = [ctypes.c_void_p]
+        lib.MageFreeString.restype = None
+
+    def register_card_rows(self, card_name_to_row: dict[str, int]) -> None:
+        if not self.is_available:
+            raise NativeEncodingError("MageEncodeBatch is unavailable")
+        payload = json.dumps(card_name_to_row).encode("utf-8")
+        if self.ffi is not None:
+            lib = cast(Any, self.lib)
+            raw = lib.MageSetCardNameRows(self.ffi.new("char[]", payload))
+            if raw == self.ffi.NULL:
+                raise NativeEncodingError("MageSetCardNameRows returned null")
+            try:
+                response = json.loads(self.ffi.string(raw).decode("utf-8"))
+            finally:
+                lib.MageFreeString(raw)
+            if not response.get("ok", False):
+                raise NativeEncodingError(response.get("error", "failed to register card rows"))
+            return
+        lib = cast(Any, self.lib)
+        raw = lib.MageSetCardNameRows(ctypes.c_char_p(payload))
+        if not raw:
+            raise NativeEncodingError("MageSetCardNameRows returned null")
+        try:
+            raw_value = ctypes.cast(raw, ctypes.c_char_p).value
+            if raw_value is None:
+                raise NativeEncodingError("MageSetCardNameRows returned null payload")
+            response = json.loads(raw_value.decode("utf-8"))
+        finally:
+            lib.MageFreeString(raw)
+        if not response.get("ok", False):
+            raise NativeEncodingError(response.get("error", "failed to register card rows"))
+
+    def _alloc(self, batch_size: int, decision_capacity: int) -> _BufferSet:
+        if self.zone_slot_count is None or self.game_info_dim is None:
+            raise NativeEncodingError("NativeBatchEncoder is missing shape metadata")
+        if self.option_scalar_dim is None or self.target_scalar_dim is None:
+            raise NativeEncodingError("NativeBatchEncoder is missing scalar metadata")
+        # Pin the per-decision layout buffers (and assembler render-plan
+        # outputs) so the policy's ``.to(device, non_blocking=True)`` over
+        # slices of these tensors actually runs asynchronously.
+        pin = torch.cuda.is_available()
+        render_plan = None
+        render_plan_lengths = None
+        render_plan_overflow = None
+        if self.emit_render_plan:
+            if self.render_plan_capacity <= 0:
+                raise NativeEncodingError("render_plan_capacity must be positive")
+            render_plan = torch.empty(
+                (batch_size, self.render_plan_capacity), dtype=torch.int32, pin_memory=pin
+            )
+            render_plan_lengths = torch.empty((batch_size,), dtype=torch.int64, pin_memory=pin)
+            render_plan_overflow = torch.empty((batch_size,), dtype=torch.int64)
+        return _BufferSet(
+            trace_kind_id=torch.empty((batch_size,), dtype=torch.int64),
+            slot_card_rows=torch.empty((batch_size, self.zone_slot_count), dtype=torch.int64),
+            slot_occupied=torch.empty((batch_size, self.zone_slot_count), dtype=torch.float32),
+            slot_tapped=torch.empty((batch_size, self.zone_slot_count), dtype=torch.float32),
+            game_info=torch.empty((batch_size, self.game_info_dim), dtype=torch.float32),
+            pending_kind_id=torch.empty((batch_size,), dtype=torch.int64),
+            num_present_options=torch.empty((batch_size,), dtype=torch.int64),
+            option_kind_ids=torch.empty((batch_size, self.max_options), dtype=torch.int64),
+            option_scalars=torch.empty(
+                (batch_size, self.max_options, self.option_scalar_dim), dtype=torch.float32
+            ),
+            option_mask=torch.empty((batch_size, self.max_options), dtype=torch.float32),
+            option_ref_slot_idx=torch.empty((batch_size, self.max_options), dtype=torch.int64),
+            option_ref_card_row=torch.empty((batch_size, self.max_options), dtype=torch.int64),
+            target_mask=torch.empty(
+                (batch_size, self.max_options, self.max_targets_per_option), dtype=torch.float32
+            ),
+            target_type_ids=torch.empty(
+                (batch_size, self.max_options, self.max_targets_per_option), dtype=torch.int64
+            ),
+            target_scalars=torch.empty(
+                (
+                    batch_size,
+                    self.max_options,
+                    self.max_targets_per_option,
+                    self.target_scalar_dim,
+                ),
+                dtype=torch.float32,
+            ),
+            target_overflow=torch.empty((batch_size, self.max_options), dtype=torch.float32),
+            target_ref_slot_idx=torch.empty(
+                (batch_size, self.max_options, self.max_targets_per_option), dtype=torch.int64
+            ),
+            target_ref_is_player_u8=torch.empty(
+                (batch_size, self.max_options, self.max_targets_per_option), dtype=torch.uint8
+            ),
+            target_ref_is_self_u8=torch.empty(
+                (batch_size, self.max_options, self.max_targets_per_option), dtype=torch.uint8
+            ),
+            may_mask_u8=torch.empty((batch_size,), dtype=torch.uint8),
+            decision_start=torch.empty((batch_size,), dtype=torch.int64, pin_memory=pin),
+            decision_count=torch.empty((batch_size,), dtype=torch.int64, pin_memory=pin),
+            decision_option_idx=torch.empty(
+                (decision_capacity, self.max_cached_choices),
+                dtype=torch.int64,
+                pin_memory=pin,
+            ),
+            decision_target_idx=torch.empty(
+                (decision_capacity, self.max_cached_choices),
+                dtype=torch.int64,
+                pin_memory=pin,
+            ),
+            decision_mask_u8=torch.empty(
+                (decision_capacity, self.max_cached_choices),
+                dtype=torch.uint8,
+                pin_memory=pin,
+            ),
+            uses_none_head_u8=torch.empty((decision_capacity,), dtype=torch.uint8, pin_memory=pin),
+            render_plan=render_plan,
+            render_plan_lengths=render_plan_lengths,
+            render_plan_overflow=render_plan_overflow,
+        )
+
+    def _scratch_buffers(self, batch_size: int, decision_capacity: int) -> _BufferSet:
+        scratch = self._scratch
+        if (
+            scratch.buffers is None
+            or batch_size > scratch.batch_size
+            or decision_capacity > scratch.decision_capacity
+            or (self.emit_render_plan and scratch.buffers.render_plan is None)
+        ):
+            scratch.batch_size = max(batch_size, scratch.batch_size * 2 or 64)
+            scratch.decision_capacity = max(decision_capacity, scratch.decision_capacity * 2 or 64)
+            scratch.buffers = self._alloc(scratch.batch_size, scratch.decision_capacity)
+            scratch.handles_t = torch.empty((scratch.batch_size,), dtype=torch.int64)
+            scratch.perspectives_t = torch.empty((scratch.batch_size,), dtype=torch.int64)
+            scratch.handles_np = scratch.handles_t.numpy()
+            scratch.perspectives_np = scratch.perspectives_t.numpy()
+            if self._ctypes_lib is not None:
+                self._rebuild_encode_structs()
+            # Drop cached cffi structs — pointers into the just-realloced
+            # scratch are stale. Rebuilt lazily on next encode_tokens call.
+            scratch.req_cffi = None
+            scratch.cfg_cffi = None
+            scratch.enc_out_cffi = None
+        assert scratch.buffers is not None
+        return scratch.buffers
+
+    def rebuild_cffi_structs(self, ffi: Any, decision_capacity: int) -> None:
+        """Build (or rebuild) cached cffi structs over the current scratch.
+
+        Called by ``native_assembler.encode_tokens`` when its cached
+        structs are stale (first call, or scratch was reallocated since
+        the last call). Per-call hot-path work is then just mutating
+        ``req_cffi.n`` and ``cfg_cffi.decision_capacity``.
+        """
+        scratch = self._scratch
+        buffers = scratch.buffers
+        handles_t = scratch.handles_t
+        perspectives_t = scratch.perspectives_t
+        assert buffers is not None and handles_t is not None and perspectives_t is not None
+
+        scratch.req_cffi = ffi.new(
+            "MageBatchRequest *",
+            {
+                "n": 0,
+                "handles": ffi.cast("int64_t *", handles_t.data_ptr()),
+                "perspective_player_idx": ffi.cast("int64_t *", perspectives_t.data_ptr()),
+            },
+        )
+        cfg_fields: dict[str, Any] = {
+            "max_options": self.max_options,
+            "max_targets_per_option": self.max_targets_per_option,
+            "max_cached_choices": self.max_cached_choices,
+            "zone_slot_count": cast(int, self.zone_slot_count),
+            "game_info_dim": cast(int, self.game_info_dim),
+            "option_scalar_dim": cast(int, self.option_scalar_dim),
+            "target_scalar_dim": cast(int, self.target_scalar_dim),
+            "decision_capacity": decision_capacity,
+            "emit_render_plan": 1 if self.emit_render_plan else 0,
+            "render_plan_capacity": self.render_plan_capacity if self.emit_render_plan else 0,
+            "dedup_card_bodies": 1 if self.dedup_card_bodies else 0,
+        }
+        scratch.cfg_cffi = ffi.new("MageEncodeConfig *", cfg_fields)
+
+        out_fields: dict[str, Any] = {
+            "trace_kind_id": ffi.cast("int64_t *", buffers.trace_kind_id.data_ptr()),
+            "slot_card_rows": ffi.cast("int64_t *", buffers.slot_card_rows.data_ptr()),
+            "slot_occupied": ffi.cast("float *", buffers.slot_occupied.data_ptr()),
+            "slot_tapped": ffi.cast("float *", buffers.slot_tapped.data_ptr()),
+            "game_info": ffi.cast("float *", buffers.game_info.data_ptr()),
+            "pending_kind_id": ffi.cast("int64_t *", buffers.pending_kind_id.data_ptr()),
+            "num_present_options": ffi.cast("int64_t *", buffers.num_present_options.data_ptr()),
+            "option_kind_ids": ffi.cast("int64_t *", buffers.option_kind_ids.data_ptr()),
+            "option_scalars": ffi.cast("float *", buffers.option_scalars.data_ptr()),
+            "option_mask": ffi.cast("float *", buffers.option_mask.data_ptr()),
+            "option_ref_slot_idx": ffi.cast("int64_t *", buffers.option_ref_slot_idx.data_ptr()),
+            "option_ref_card_row": ffi.cast("int64_t *", buffers.option_ref_card_row.data_ptr()),
+            "target_mask": ffi.cast("float *", buffers.target_mask.data_ptr()),
+            "target_type_ids": ffi.cast("int64_t *", buffers.target_type_ids.data_ptr()),
+            "target_scalars": ffi.cast("float *", buffers.target_scalars.data_ptr()),
+            "target_overflow": ffi.cast("float *", buffers.target_overflow.data_ptr()),
+            "target_ref_slot_idx": ffi.cast("int64_t *", buffers.target_ref_slot_idx.data_ptr()),
+            "target_ref_is_player": ffi.cast(
+                "uint8_t *", buffers.target_ref_is_player_u8.data_ptr()
+            ),
+            "target_ref_is_self": ffi.cast("uint8_t *", buffers.target_ref_is_self_u8.data_ptr()),
+            "may_mask": ffi.cast("uint8_t *", buffers.may_mask_u8.data_ptr()),
+            "decision_start": ffi.cast("int64_t *", buffers.decision_start.data_ptr()),
+            "decision_count": ffi.cast("int64_t *", buffers.decision_count.data_ptr()),
+            "decision_option_idx": ffi.cast("int64_t *", buffers.decision_option_idx.data_ptr()),
+            "decision_target_idx": ffi.cast("int64_t *", buffers.decision_target_idx.data_ptr()),
+            "decision_mask": ffi.cast("uint8_t *", buffers.decision_mask_u8.data_ptr()),
+            "uses_none_head": ffi.cast("uint8_t *", buffers.uses_none_head_u8.data_ptr()),
+        }
+        if buffers.render_plan is not None:
+            out_fields["render_plan"] = ffi.cast("int32_t *", buffers.render_plan.data_ptr())
+        if buffers.render_plan_lengths is not None:
+            out_fields["render_plan_lengths"] = ffi.cast(
+                "int64_t *", buffers.render_plan_lengths.data_ptr()
+            )
+        if buffers.render_plan_overflow is not None:
+            out_fields["render_plan_overflow"] = ffi.cast(
+                "int64_t *", buffers.render_plan_overflow.data_ptr()
+            )
+        scratch.enc_out_cffi = ffi.new("MageEncodeOutputs *", out_fields)
+
+    def _rebuild_encode_structs(self) -> None:
+        scratch = self._scratch
+        buffers = scratch.buffers
+        handles_t = scratch.handles_t
+        perspectives_t = scratch.perspectives_t
+        assert buffers is not None and handles_t is not None and perspectives_t is not None
+        scratch.req_c = _MageBatchRequest(
+            n=0,
+            handles=_ptr(handles_t, ctypes.c_int64),
+            perspective_player_idx=_ptr(perspectives_t, ctypes.c_int64),
+        )
+        scratch.cfg_c = _MageEncodeConfig(
+            max_options=self.max_options,
+            max_targets_per_option=self.max_targets_per_option,
+            max_cached_choices=self.max_cached_choices,
+            zone_slot_count=cast(int, self.zone_slot_count),
+            game_info_dim=cast(int, self.game_info_dim),
+            option_scalar_dim=cast(int, self.option_scalar_dim),
+            target_scalar_dim=cast(int, self.target_scalar_dim),
+            decision_capacity=0,
+            emit_render_plan=1 if self.emit_render_plan else 0,
+            render_plan_capacity=self.render_plan_capacity if self.emit_render_plan else 0,
+            dedup_card_bodies=1 if self.dedup_card_bodies else 0,
+        )
+        scratch.out_c = _MageEncodeOutputs(
+            trace_kind_id=_ptr(buffers.trace_kind_id, ctypes.c_int64),
+            slot_card_rows=_ptr(buffers.slot_card_rows, ctypes.c_int64),
+            slot_occupied=_ptr(buffers.slot_occupied, ctypes.c_float),
+            slot_tapped=_ptr(buffers.slot_tapped, ctypes.c_float),
+            game_info=_ptr(buffers.game_info, ctypes.c_float),
+            pending_kind_id=_ptr(buffers.pending_kind_id, ctypes.c_int64),
+            num_present_options=_ptr(buffers.num_present_options, ctypes.c_int64),
+            option_kind_ids=_ptr(buffers.option_kind_ids, ctypes.c_int64),
+            option_scalars=_ptr(buffers.option_scalars, ctypes.c_float),
+            option_mask=_ptr(buffers.option_mask, ctypes.c_float),
+            option_ref_slot_idx=_ptr(buffers.option_ref_slot_idx, ctypes.c_int64),
+            option_ref_card_row=_ptr(buffers.option_ref_card_row, ctypes.c_int64),
+            target_mask=_ptr(buffers.target_mask, ctypes.c_float),
+            target_type_ids=_ptr(buffers.target_type_ids, ctypes.c_int64),
+            target_scalars=_ptr(buffers.target_scalars, ctypes.c_float),
+            target_overflow=_ptr(buffers.target_overflow, ctypes.c_float),
+            target_ref_slot_idx=_ptr(buffers.target_ref_slot_idx, ctypes.c_int64),
+            target_ref_is_player=_ptr(buffers.target_ref_is_player_u8, ctypes.c_uint8),
+            target_ref_is_self=_ptr(buffers.target_ref_is_self_u8, ctypes.c_uint8),
+            may_mask=_ptr(buffers.may_mask_u8, ctypes.c_uint8),
+            decision_start=_ptr(buffers.decision_start, ctypes.c_int64),
+            decision_count=_ptr(buffers.decision_count, ctypes.c_int64),
+            decision_option_idx=_ptr(buffers.decision_option_idx, ctypes.c_int64),
+            decision_target_idx=_ptr(buffers.decision_target_idx, ctypes.c_int64),
+            decision_mask=_ptr(buffers.decision_mask_u8, ctypes.c_uint8),
+            uses_none_head=_ptr(buffers.uses_none_head_u8, ctypes.c_uint8),
+            render_plan=(
+                _ptr(buffers.render_plan, ctypes.c_int32)
+                if buffers.render_plan is not None
+                else None
+            ),
+            render_plan_lengths=(
+                _ptr(buffers.render_plan_lengths, ctypes.c_int64)
+                if buffers.render_plan_lengths is not None
+                else None
+            ),
+            render_plan_overflow=(
+                _ptr(buffers.render_plan_overflow, ctypes.c_int64)
+                if buffers.render_plan_overflow is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _slice_batch_buffers(buffers: _BufferSet, batch_size: int) -> dict[str, Tensor]:
+        out = {
+            "trace_kind_id": buffers.trace_kind_id[:batch_size],
+            "slot_card_rows": buffers.slot_card_rows[:batch_size],
+            "slot_occupied": buffers.slot_occupied[:batch_size],
+            "slot_tapped": buffers.slot_tapped[:batch_size],
+            "game_info": buffers.game_info[:batch_size],
+            "pending_kind_id": buffers.pending_kind_id[:batch_size],
+            "num_present_options": buffers.num_present_options[:batch_size],
+            "option_kind_ids": buffers.option_kind_ids[:batch_size],
+            "option_scalars": buffers.option_scalars[:batch_size],
+            "option_mask": buffers.option_mask[:batch_size],
+            "option_ref_slot_idx": buffers.option_ref_slot_idx[:batch_size],
+            "option_ref_card_row": buffers.option_ref_card_row[:batch_size],
+            "target_mask": buffers.target_mask[:batch_size],
+            "target_type_ids": buffers.target_type_ids[:batch_size],
+            "target_scalars": buffers.target_scalars[:batch_size],
+            "target_overflow": buffers.target_overflow[:batch_size],
+            "target_ref_slot_idx": buffers.target_ref_slot_idx[:batch_size],
+            "target_ref_is_player": buffers.target_ref_is_player_u8[:batch_size],
+            "target_ref_is_self": buffers.target_ref_is_self_u8[:batch_size],
+            "may_mask": buffers.may_mask_u8[:batch_size],
+            "decision_start": buffers.decision_start[:batch_size],
+            "decision_count": buffers.decision_count[:batch_size],
+        }
+        if buffers.render_plan is not None:
+            assert buffers.render_plan_lengths is not None
+            assert buffers.render_plan_overflow is not None
+            out["render_plan"] = buffers.render_plan[:batch_size]
+            out["render_plan_lengths"] = buffers.render_plan_lengths[:batch_size]
+            out["render_plan_overflow"] = buffers.render_plan_overflow[:batch_size]
+        return out
+
+    def encode_batch(
+        self,
+        games: list[Any],
+        pendings: list[PendingState],
+        *,
+        perspective_player_indices: list[int],
+    ) -> NativeEncodedBatch:
+        if not self.is_available:
+            raise NativeEncodingError("MageEncodeBatch is unavailable")
+        batch_size = len(games)
+        if batch_size == 0:
+            raise NativeEncodingError("empty batch")
+        if batch_size != len(pendings) or batch_size != len(perspective_player_indices):
+            raise NativeEncodingError("games, pendings, and perspective_player_indices must match")
+        return self._encode_games(
+            games,
+            pendings,
+            perspective_player_indices=perspective_player_indices,
+        )
+
+    def encode_handles(
+        self,
+        games: list[Any],
+        *,
+        perspective_player_indices: list[int],
+    ) -> NativeEncodedBatch:
+        if not self.is_available:
+            raise NativeEncodingError("MageEncodeBatch is unavailable")
+        if len(games) != len(perspective_player_indices):
+            raise NativeEncodingError("games and perspective_player_indices must match")
+        return self._encode_games(
+            games,
+            [],
+            perspective_player_indices=perspective_player_indices,
+        )
+
+    def _encode_games(
+        self,
+        games: list[Any],
+        pendings: list[PendingState],
+        *,
+        perspective_player_indices: list[int],
+    ) -> NativeEncodedBatch:
+        batch_size = len(games)
+        if batch_size == 0:
+            raise NativeEncodingError("empty batch")
+        decision_capacity = max(1, batch_size * self.max_options)
+        buffers = self._scratch_buffers(batch_size, decision_capacity)
+        if self.ffi is not None:
+            return self._encode_batch_cffi(
+                buffers,
+                games,
+                pendings,
+                perspective_player_indices=perspective_player_indices,
+                decision_capacity=decision_capacity,
+            )
+        scratch = self._scratch
+        assert scratch.handles_t is not None and scratch.perspectives_t is not None
+        handles_t = scratch.handles_t[:batch_size]
+        perspectives_t = scratch.perspectives_t[:batch_size]
+        handles_t.copy_(torch.tensor([int(game.handle) for game in games], dtype=torch.int64))
+        perspectives_t.copy_(torch.tensor(perspective_player_indices, dtype=torch.int64))
+        request = _MageBatchRequest(
+            n=batch_size,
+            handles=_ptr(handles_t, ctypes.c_int64),
+            perspective_player_idx=_ptr(perspectives_t, ctypes.c_int64),
+        )
+        config = _MageEncodeConfig(
+            max_options=self.max_options,
+            max_targets_per_option=self.max_targets_per_option,
+            max_cached_choices=self.max_cached_choices,
+            zone_slot_count=cast(int, self.zone_slot_count),
+            game_info_dim=cast(int, self.game_info_dim),
+            option_scalar_dim=cast(int, self.option_scalar_dim),
+            target_scalar_dim=cast(int, self.target_scalar_dim),
+            decision_capacity=decision_capacity,
+            emit_render_plan=1 if self.emit_render_plan else 0,
+            render_plan_capacity=self.render_plan_capacity if self.emit_render_plan else 0,
+            dedup_card_bodies=1 if self.dedup_card_bodies else 0,
+        )
+        outputs = _MageEncodeOutputs(
+            trace_kind_id=_ptr(buffers.trace_kind_id, ctypes.c_int64),
+            slot_card_rows=_ptr(buffers.slot_card_rows, ctypes.c_int64),
+            slot_occupied=_ptr(buffers.slot_occupied, ctypes.c_float),
+            slot_tapped=_ptr(buffers.slot_tapped, ctypes.c_float),
+            game_info=_ptr(buffers.game_info, ctypes.c_float),
+            pending_kind_id=_ptr(buffers.pending_kind_id, ctypes.c_int64),
+            num_present_options=_ptr(buffers.num_present_options, ctypes.c_int64),
+            option_kind_ids=_ptr(buffers.option_kind_ids, ctypes.c_int64),
+            option_scalars=_ptr(buffers.option_scalars, ctypes.c_float),
+            option_mask=_ptr(buffers.option_mask, ctypes.c_float),
+            option_ref_slot_idx=_ptr(buffers.option_ref_slot_idx, ctypes.c_int64),
+            option_ref_card_row=_ptr(buffers.option_ref_card_row, ctypes.c_int64),
+            target_mask=_ptr(buffers.target_mask, ctypes.c_float),
+            target_type_ids=_ptr(buffers.target_type_ids, ctypes.c_int64),
+            target_scalars=_ptr(buffers.target_scalars, ctypes.c_float),
+            target_overflow=_ptr(buffers.target_overflow, ctypes.c_float),
+            target_ref_slot_idx=_ptr(buffers.target_ref_slot_idx, ctypes.c_int64),
+            target_ref_is_player=_ptr(buffers.target_ref_is_player_u8, ctypes.c_uint8),
+            target_ref_is_self=_ptr(buffers.target_ref_is_self_u8, ctypes.c_uint8),
+            may_mask=_ptr(buffers.may_mask_u8, ctypes.c_uint8),
+            decision_start=_ptr(buffers.decision_start, ctypes.c_int64),
+            decision_count=_ptr(buffers.decision_count, ctypes.c_int64),
+            decision_option_idx=_ptr(buffers.decision_option_idx, ctypes.c_int64),
+            decision_target_idx=_ptr(buffers.decision_target_idx, ctypes.c_int64),
+            decision_mask=_ptr(buffers.decision_mask_u8, ctypes.c_uint8),
+            uses_none_head=_ptr(buffers.uses_none_head_u8, ctypes.c_uint8),
+            render_plan=(
+                _ptr(buffers.render_plan, ctypes.c_int32)
+                if buffers.render_plan is not None
+                else None
+            ),
+            render_plan_lengths=(
+                _ptr(buffers.render_plan_lengths, ctypes.c_int64)
+                if buffers.render_plan_lengths is not None
+                else None
+            ),
+            render_plan_overflow=(
+                _ptr(buffers.render_plan_overflow, ctypes.c_int64)
+                if buffers.render_plan_overflow is not None
+                else None
+            ),
+        )
+        lib = cast(Any, self.lib)
+        result = lib.MageEncodeBatch(
+            ctypes.byref(request),
+            ctypes.byref(config),
+            ctypes.byref(outputs),
+        )
+        if result.error_code != 0:
+            message = "native encoder failed"
+            if result.error_message:
+                try:
+                    raw_value = ctypes.cast(result.error_message, ctypes.c_char_p).value
+                    if raw_value is not None:
+                        message = raw_value.decode("utf-8")
+                finally:
+                    lib.MageFreeString(result.error_message)
+            raise NativeEncodingError(message)
+        decision_rows_written = int(result.decision_rows_written)
+        batch = self._slice_batch_buffers(buffers, batch_size)
+        trace_kind_id = batch["trace_kind_id"]
+        trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
+        decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
+        decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
+        decision_mask = buffers.decision_mask_u8[:decision_rows_written]
+        uses_none_head = buffers.uses_none_head_u8[:decision_rows_written]
+        if self.validate:
+            _validate_decision_layout(
+                decision_option_idx=decision_option_idx,
+                decision_target_idx=decision_target_idx,
+                decision_mask=decision_mask,
+                uses_none_head=uses_none_head,
+                max_options=self.max_options,
+                max_targets_per_option=self.max_targets_per_option,
+            )
+        return NativeEncodedBatch(
+            trace_kind_id=trace_kind_id,
+            slot_card_rows=batch["slot_card_rows"],
+            slot_occupied=batch["slot_occupied"],
+            slot_tapped=batch["slot_tapped"],
+            game_info=batch["game_info"],
+            pending_kind_id=batch["pending_kind_id"],
+            num_present_options=batch["num_present_options"],
+            option_kind_ids=batch["option_kind_ids"],
+            option_scalars=batch["option_scalars"],
+            option_mask=batch["option_mask"],
+            option_ref_slot_idx=batch["option_ref_slot_idx"],
+            option_ref_card_row=batch["option_ref_card_row"],
+            target_mask=batch["target_mask"],
+            target_type_ids=batch["target_type_ids"],
+            target_scalars=batch["target_scalars"],
+            target_overflow=batch["target_overflow"],
+            target_ref_slot_idx=batch["target_ref_slot_idx"],
+            target_ref_is_player=batch["target_ref_is_player"],
+            target_ref_is_self=batch["target_ref_is_self"],
+            may_mask=batch["may_mask"],
+            decision_start=batch["decision_start"],
+            decision_count=batch["decision_count"],
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            decision_rows_written=decision_rows_written,
+            pendings=pendings,
+            trace_kinds=trace_kinds,
+            render_plan=batch.get("render_plan"),
+            render_plan_lengths=batch.get("render_plan_lengths"),
+            render_plan_overflow=batch.get("render_plan_overflow"),
+        )
+
+    def _encode_batch_cffi(
+        self,
+        buffers: _BufferSet,
+        games: list[Any],
+        pendings: list[PendingState],
+        *,
+        perspective_player_indices: list[int],
+        decision_capacity: int,
+    ) -> NativeEncodedBatch:
+        ffi = self.ffi
+        assert ffi is not None
+        lib = cast(Any, self.lib)
+        batch_size = len(games)
+        scratch = self._scratch
+        assert scratch.handles_t is not None and scratch.perspectives_t is not None
+        # Fill scratch via numpy view rather than torch.tensor(list, ...) +
+        # .copy_(); the latter is the dominant python self-time on this path.
+        handles_np = scratch.handles_np
+        for i, g in enumerate(games):
+            handles_np[i] = getattr(g, "_id", None) or g.handle
+        scratch.perspectives_np[:batch_size] = perspective_player_indices
+        handles_t = scratch.handles_t[:batch_size]
+        perspectives_t = scratch.perspectives_t[:batch_size]
+        req = ffi.new(
+            "MageBatchRequest *",
+            {
+                "n": len(games),
+                "handles": ffi.cast("int64_t *", handles_t.data_ptr()),
+                "perspective_player_idx": ffi.cast("int64_t *", perspectives_t.data_ptr()),
+            },
+        )
+        cfg_fields = {
+            "max_options": self.max_options,
+            "max_targets_per_option": self.max_targets_per_option,
+            "max_cached_choices": self.max_cached_choices,
+            "zone_slot_count": cast(int, self.zone_slot_count),
+            "game_info_dim": cast(int, self.game_info_dim),
+            "option_scalar_dim": cast(int, self.option_scalar_dim),
+            "target_scalar_dim": cast(int, self.target_scalar_dim),
+            "decision_capacity": decision_capacity,
+        }
+        if self.emit_render_plan:
+            cfg_fields["emit_render_plan"] = 1
+            cfg_fields["render_plan_capacity"] = self.render_plan_capacity
+        if self.dedup_card_bodies:
+            cfg_fields["dedup_card_bodies"] = 1
+        cfg = ffi.new("MageEncodeConfig *", cfg_fields)
+
+        out_fields = {
+            "trace_kind_id": ffi.cast("int64_t *", buffers.trace_kind_id.data_ptr()),
+            "slot_card_rows": ffi.cast("int64_t *", buffers.slot_card_rows.data_ptr()),
+            "slot_occupied": ffi.cast("float *", buffers.slot_occupied.data_ptr()),
+            "slot_tapped": ffi.cast("float *", buffers.slot_tapped.data_ptr()),
+            "game_info": ffi.cast("float *", buffers.game_info.data_ptr()),
+            "pending_kind_id": ffi.cast("int64_t *", buffers.pending_kind_id.data_ptr()),
+            "num_present_options": ffi.cast("int64_t *", buffers.num_present_options.data_ptr()),
+            "option_kind_ids": ffi.cast("int64_t *", buffers.option_kind_ids.data_ptr()),
+            "option_scalars": ffi.cast("float *", buffers.option_scalars.data_ptr()),
+            "option_mask": ffi.cast("float *", buffers.option_mask.data_ptr()),
+            "option_ref_slot_idx": ffi.cast("int64_t *", buffers.option_ref_slot_idx.data_ptr()),
+            "option_ref_card_row": ffi.cast("int64_t *", buffers.option_ref_card_row.data_ptr()),
+            "target_mask": ffi.cast("float *", buffers.target_mask.data_ptr()),
+            "target_type_ids": ffi.cast("int64_t *", buffers.target_type_ids.data_ptr()),
+            "target_scalars": ffi.cast("float *", buffers.target_scalars.data_ptr()),
+            "target_overflow": ffi.cast("float *", buffers.target_overflow.data_ptr()),
+            "target_ref_slot_idx": ffi.cast("int64_t *", buffers.target_ref_slot_idx.data_ptr()),
+            "target_ref_is_player": ffi.cast(
+                "uint8_t *", buffers.target_ref_is_player_u8.data_ptr()
+            ),
+            "target_ref_is_self": ffi.cast("uint8_t *", buffers.target_ref_is_self_u8.data_ptr()),
+            "may_mask": ffi.cast("uint8_t *", buffers.may_mask_u8.data_ptr()),
+            "decision_start": ffi.cast("int64_t *", buffers.decision_start.data_ptr()),
+            "decision_count": ffi.cast("int64_t *", buffers.decision_count.data_ptr()),
+            "decision_option_idx": ffi.cast("int64_t *", buffers.decision_option_idx.data_ptr()),
+            "decision_target_idx": ffi.cast("int64_t *", buffers.decision_target_idx.data_ptr()),
+            "decision_mask": ffi.cast("uint8_t *", buffers.decision_mask_u8.data_ptr()),
+            "uses_none_head": ffi.cast("uint8_t *", buffers.uses_none_head_u8.data_ptr()),
+        }
+        if self.emit_render_plan:
+            assert buffers.render_plan is not None
+            assert buffers.render_plan_lengths is not None
+            assert buffers.render_plan_overflow is not None
+            out_fields["render_plan"] = ffi.cast("int32_t *", buffers.render_plan.data_ptr())
+            out_fields["render_plan_lengths"] = ffi.cast(
+                "int64_t *", buffers.render_plan_lengths.data_ptr()
+            )
+            out_fields["render_plan_overflow"] = ffi.cast(
+                "int64_t *", buffers.render_plan_overflow.data_ptr()
+            )
+        out = ffi.new("MageEncodeOutputs *", out_fields)
+        ctypes_lib = self._ctypes_lib
+        if ctypes_lib is not None:
+            # Reuse the cached ctypes structs (pointers into scratch are
+            # stable across calls until scratch is reallocated). Per-call
+            # work is just updating n / decision_capacity.
+            req_c = scratch.req_c
+            cfg_c = scratch.cfg_c
+            out_c = scratch.out_c
+            assert req_c is not None and cfg_c is not None and out_c is not None
+            req_c.n = batch_size
+            cfg_c.decision_capacity = decision_capacity
+            result_c = ctypes_lib.MageEncodeBatch(
+                ctypes.byref(req_c), ctypes.byref(cfg_c), ctypes.byref(out_c)
+            )
+            if result_c.error_code != 0:
+                message = "native encoder failed"
+                if result_c.error_message:
+                    try:
+                        raw = ctypes.cast(result_c.error_message, ctypes.c_char_p).value
+                        if raw is not None:
+                            message = raw.decode("utf-8")
+                    finally:
+                        ctypes_lib.MageFreeString(result_c.error_message)
+                raise NativeEncodingError(message)
+            decision_rows_written = int(result_c.decision_rows_written)
+        else:
+            result = lib.MageEncodeBatch(req, cfg, out)
+            if result.error_code != 0:
+                message = "native encoder failed"
+                if result.error_message != ffi.NULL:
+                    try:
+                        message = ffi.string(result.error_message).decode("utf-8")
+                    finally:
+                        lib.MageFreeString(result.error_message)
+                raise NativeEncodingError(message)
+            decision_rows_written = int(result.decision_rows_written)
+        batch = self._slice_batch_buffers(buffers, batch_size)
+        trace_kind_id = batch["trace_kind_id"]
+        trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
+        decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
+        decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
+        decision_mask = buffers.decision_mask_u8[:decision_rows_written]
+        uses_none_head = buffers.uses_none_head_u8[:decision_rows_written]
+        if self.validate:
+            _validate_decision_layout(
+                decision_option_idx=decision_option_idx,
+                decision_target_idx=decision_target_idx,
+                decision_mask=decision_mask,
+                uses_none_head=uses_none_head,
+                max_options=self.max_options,
+                max_targets_per_option=self.max_targets_per_option,
+            )
+        return NativeEncodedBatch(
+            trace_kind_id=trace_kind_id,
+            slot_card_rows=batch["slot_card_rows"],
+            slot_occupied=batch["slot_occupied"],
+            slot_tapped=batch["slot_tapped"],
+            game_info=batch["game_info"],
+            pending_kind_id=batch["pending_kind_id"],
+            num_present_options=batch["num_present_options"],
+            option_kind_ids=batch["option_kind_ids"],
+            option_scalars=batch["option_scalars"],
+            option_mask=batch["option_mask"],
+            option_ref_slot_idx=batch["option_ref_slot_idx"],
+            option_ref_card_row=batch["option_ref_card_row"],
+            target_mask=batch["target_mask"],
+            target_type_ids=batch["target_type_ids"],
+            target_scalars=batch["target_scalars"],
+            target_overflow=batch["target_overflow"],
+            target_ref_slot_idx=batch["target_ref_slot_idx"],
+            target_ref_is_player=batch["target_ref_is_player"],
+            target_ref_is_self=batch["target_ref_is_self"],
+            may_mask=batch["may_mask"],
+            decision_start=batch["decision_start"],
+            decision_count=batch["decision_count"],
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            decision_rows_written=decision_rows_written,
+            pendings=pendings,
+            trace_kinds=trace_kinds,
+            render_plan=batch.get("render_plan"),
+            render_plan_lengths=batch.get("render_plan_lengths"),
+            render_plan_overflow=batch.get("render_plan_overflow"),
+        )

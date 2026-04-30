@@ -11,8 +11,9 @@ from unittest.mock import patch
 
 import scripts.train as train_mod
 import torch
+from magic_ai.actions import ActionTrace, PolicyStep
 from magic_ai.game_state import GameStateEncoder, GameStateSnapshot, PendingState
-from magic_ai.model import ActionTrace, PolicyStep, PPOPolicy
+from magic_ai.model import PPOPolicy
 from magic_ai.opponent_pool import OpponentPool, SnapshotSchedule
 from magic_ai.ppo import PPOStats, RolloutStep, gae_returns
 from magic_ai.text_encoder.batch import TextEncodedBatch

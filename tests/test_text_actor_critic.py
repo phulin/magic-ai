@@ -526,7 +526,7 @@ class TextActorCriticTests(unittest.TestCase):
             lstm_h_in=torch.zeros(1, 8),
             lstm_c_in=torch.zeros(1, 8),
         )
-        from magic_ai.model import TRACE_KIND_TO_ID
+        from magic_ai.actions import TRACE_KIND_TO_ID
 
         row_may = replay.append(
             encoded=_batch(batch_size=1),

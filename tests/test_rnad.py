@@ -516,7 +516,7 @@ class _StubPolicy(nn.Module):
     ):  # type: ignore[no-untyped-def]
         del lstm_state_override
         del hidden_override
-        from magic_ai.model import ReplayPerChoice
+        from magic_ai.replay_decisions import ReplayPerChoice
 
         idx = torch.tensor(replay_rows, dtype=torch.long)
         n = int(idx.numel())
@@ -706,7 +706,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
     def test_full_neurd_trains_may_head_on_may_steps(self) -> None:
         """Full-NeuRD must not drop the may head from policy training on
         steps whose action came from the Bernoulli may branch."""
-        from magic_ai.model import ReplayPerChoice
+        from magic_ai.replay_decisions import ReplayPerChoice
 
         class MayStub(nn.Module):
             def __init__(self, t_len: int) -> None:
@@ -840,7 +840,7 @@ class MayTwoActionNeuRDTests(unittest.TestCase):
     """Issue 5/8: two-action may NeuRD must move BOTH branches' regularization."""
 
     def test_unsampled_may_branch_receives_reg_gradient(self) -> None:
-        from magic_ai.model import ReplayPerChoice
+        from magic_ai.replay_decisions import ReplayPerChoice
         from magic_ai.rnad import rnad_trajectory_loss
 
         class MayStub(nn.Module):
@@ -937,7 +937,7 @@ class FactoredAutoregressiveTests(unittest.TestCase):
     the per-group form does not."""
 
     def test_per_group_correction_does_not_compound_with_group_count(self) -> None:
-        from magic_ai.model import ReplayPerChoice
+        from magic_ai.replay_decisions import ReplayPerChoice
 
         class MultiGroupStub(nn.Module):
             def __init__(self, t_len: int, num_groups_per_step: int) -> None:

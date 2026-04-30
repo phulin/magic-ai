@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
@@ -13,7 +12,11 @@ from torch.distributions import Bernoulli, Categorical
 
 from magic_ai.actions import (
     COLORS,
+    TRACE_KIND_TO_ID,
     ActionRequest,
+    ActionTrace,
+    PolicyStep,
+    TraceKind,
     action_from_attackers,
     action_from_blockers,
     action_from_choice_accepted,
@@ -21,11 +24,12 @@ from magic_ai.actions import (
     action_from_choice_ids,
     action_from_choice_index,
     action_from_priority_candidate,
+    build_decision_layout_rows,
     build_priority_candidates,
     selected_option_id,
 )
 from magic_ai.game_state import PendingState
-from magic_ai.model import TRACE_KIND_TO_ID, ActionTrace, PolicyStep, TraceKind
+from magic_ai.model import _clone_detaching_buffer
 from magic_ai.replay_decisions import (
     ReplayPerChoice,
     ReplayScoringForward,
@@ -120,19 +124,18 @@ class TextActorCritic(nn.Module):
         target/reg policies never sample from a live env.
         """
 
-        original_buffer = self.rollout_buffer
-        self.rollout_buffer = None
-        try:
-            clone = copy.deepcopy(self)
-        finally:
-            self.rollout_buffer = original_buffer
-        clone.rollout_buffer = original_buffer
-        clone._num_envs = 0
-        clone._players_per_env = self._players_per_env
-        clone.live_lstm_h = torch.zeros(
-            self.lstm_layers, 0, self.lstm_hidden, dtype=torch.float32, device=clone.device
+        _clone = _clone_detaching_buffer(self, "rollout_buffer")
+        clone = cast(TextActorCritic, _clone)
+        clone._num_envs = 0  # type: ignore[attr-defined]
+        clone._players_per_env = self._players_per_env  # type: ignore[attr-defined]
+        clone.live_lstm_h = torch.zeros(  # type: ignore[attr-defined]
+            int(self.lstm_layers),
+            0,
+            int(self.lstm_hidden),
+            dtype=torch.float32,
+            device=clone.device,  # type: ignore[attr-defined]
         )
-        clone.live_lstm_c = torch.zeros_like(clone.live_lstm_h)
+        clone.live_lstm_c = torch.zeros_like(clone.live_lstm_h)  # type: ignore[attr-defined]
         return clone
 
     def count_active_replay_steps(
@@ -916,7 +919,14 @@ class TextActorCritic(nn.Module):
         self.live_lstm_h[:, slots] = h_out.detach()
         self.live_lstm_c[:, slots] = c_out.detach()
 
-    def _recompute_lstm_states_for_rows(self, replay_rows: list[int]) -> tuple[Tensor, Tensor]:
+    def _run_lstm_scan(self, replay_rows: list[int]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Run the LSTM scan from scratch for the given replay rows.
+
+        Returns (projected [T, lstm_hidden], h_in_seq [layers, T, hidden],
+        c_in_seq [layers, T, hidden], out_seq [T, hidden]) where h_in_seq and
+        c_in_seq are the per-step hidden inputs and out_seq is the per-step
+        top-layer output.
+        """
         if self.rollout_buffer is None:
             raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
         batch = self.rollout_buffer.gather(replay_rows)
@@ -926,27 +936,29 @@ class TextActorCritic(nn.Module):
         c = torch.zeros_like(h)
         h_list: list[Tensor] = []
         c_list: list[Tensor] = []
+        out_list: list[Tensor] = []
         for t in range(projected.shape[0]):
             h_list.append(h)
             c_list.append(c)
-            _out, (h_t, c_t) = self.policy.lstm(
+            out_t, (h_t, c_t) = self.policy.lstm(
                 projected[t : t + 1].unsqueeze(0),
                 (h.contiguous(), c.contiguous()),
             )
+            out_list.append(out_t.squeeze(0).squeeze(0))
             h = h_t
             c = c_t
-        return torch.cat(h_list, dim=1).contiguous(), torch.cat(c_list, dim=1).contiguous()
+        h_seq = torch.cat(h_list, dim=1).contiguous()  # (layers, T, hidden)
+        c_seq = torch.cat(c_list, dim=1).contiguous()  # (layers, T, hidden)
+        out_seq = torch.stack(out_list, dim=0).contiguous()  # (T, hidden)
+        return projected, h_seq, c_seq, out_seq
+
+    def _recompute_lstm_states_for_rows(self, replay_rows: list[int]) -> tuple[Tensor, Tensor]:
+        _projected, h_seq, c_seq, _out_seq = self._run_lstm_scan(replay_rows)
+        return h_seq, c_seq
 
     def _recompute_lstm_outputs_for_rows(self, replay_rows: list[int]) -> Tensor:
-        if self.rollout_buffer is None:
-            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
-        batch = self.rollout_buffer.gather(replay_rows)
-        encoded = self.policy.text_policy.encode_only(batch.encoded)
-        projected = self.policy.in_proj(encoded.state_vector).unsqueeze(0)
-        h = torch.zeros(self.lstm_layers, 1, self.lstm_hidden, device=projected.device)
-        c = torch.zeros_like(h)
-        output, _state = self.policy.lstm(projected, (h, c))
-        return output.squeeze(0).contiguous()
+        _projected, _h_seq, _c_seq, out_seq = self._run_lstm_scan(replay_rows)
+        return out_seq
 
     def _evaluate_decision_groups(
         self,
@@ -1221,111 +1233,35 @@ def build_text_decision_layout(
     max_targets_per_option: int,
     max_cached_choices: int,
 ) -> TextDecisionLayout:
-    if trace_kind == "may":
-        return _layout(trace_kind, pending, [], [], [], [], max_cached_choices)
-
+    options = pending.get("options", [])[:max_options]
+    option_count = len(options)
     if trace_kind == "priority":
-        candidates = build_priority_candidates(
+        priority_candidates = build_priority_candidates(
             pending,
             max_targets_per_option=max_targets_per_option,
-        )[:max_cached_choices]
-        if not candidates:
-            return _layout(trace_kind, pending, [], [], [], [], max_cached_choices)
-        option_row = [-1] * max_cached_choices
-        target_row = [-1] * max_cached_choices
-        mask_row = [False] * max_cached_choices
-        for col, cand in enumerate(candidates):
-            option_row[col] = cand.option_index
-            if cand.target_index is not None:
-                target_row[col] = cand.target_index
-            mask_row[col] = True
-        return _layout(
-            trace_kind,
-            pending,
-            [option_row],
-            [target_row],
-            [mask_row],
-            [False],
-            max_cached_choices,
         )
-
-    options = pending.get("options", [])[:max_options]
-    if not options:
-        return _layout(trace_kind, pending, [], [], [], [], max_cached_choices)
-
-    if trace_kind == "attackers":
-        option_rows = []
-        target_rows = []
-        mask_rows = []
-        for i, _option in enumerate(options):
-            option_row = [-1] * max_cached_choices
-            target_row = [-1] * max_cached_choices
-            mask_row = [False] * max_cached_choices
-            if max_cached_choices > 0:
-                mask_row[0] = True
-            if max_cached_choices > 1:
-                option_row[1] = i
-                mask_row[1] = True
-            option_rows.append(option_row)
-            target_rows.append(target_row)
-            mask_rows.append(mask_row)
-        return _layout(
-            trace_kind,
-            pending,
-            option_rows,
-            target_rows,
-            mask_rows,
-            [True] * len(option_rows),
-            max_cached_choices,
-        )
-
+    else:
+        priority_candidates = []
     if trace_kind == "blockers":
-        option_rows = []
-        target_rows = []
-        mask_rows = []
-        for i, option in enumerate(options):
-            option_row = [-1] * max_cached_choices
-            target_row = [-1] * max_cached_choices
-            mask_row = [False] * max_cached_choices
-            if max_cached_choices > 0:
-                mask_row[0] = True
-            target_count = min(
+        target_counts_per_option = [
+            min(
                 len(option.get("valid_targets", [])),
                 max_targets_per_option,
                 max_cached_choices - 1,
             )
-            for target_idx in range(target_count):
-                col = target_idx + 1
-                option_row[col] = i
-                target_row[col] = target_idx
-                mask_row[col] = True
-            option_rows.append(option_row)
-            target_rows.append(target_row)
-            mask_rows.append(mask_row)
-        return _layout(
-            trace_kind,
-            pending,
-            option_rows,
-            target_rows,
-            mask_rows,
-            [True] * len(option_rows),
-            max_cached_choices,
-        )
-
-    option_row = [-1] * max_cached_choices
-    target_row = [-1] * max_cached_choices
-    mask_row = [False] * max_cached_choices
-    for i in range(min(len(options), max_cached_choices)):
-        option_row[i] = i
-        mask_row[i] = True
-    return _layout(
+            for option in options
+        ]
+    else:
+        target_counts_per_option = []
+    option_rows, target_rows, mask_rows, uses_none = build_decision_layout_rows(
         trace_kind,
-        pending,
-        [option_row],
-        [target_row],
-        [mask_row],
-        [False],
-        max_cached_choices,
+        max_cached_choices=max_cached_choices,
+        option_count=option_count,
+        priority_candidates=priority_candidates,
+        target_counts_per_option=target_counts_per_option,
+    )
+    return _layout(
+        trace_kind, pending, option_rows, target_rows, mask_rows, uses_none, max_cached_choices
     )
 
 

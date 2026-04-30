@@ -3,9 +3,12 @@
 from magic_ai.actions import (
     ActionOptionsEncoder,
     ActionRequest,
+    ActionTrace,
     EncodedSelectedAction,
     LegalActionCandidate,
     ParsedActionInputs,
+    ParsedStep,
+    PolicyStep,
     SelectedActionEncoder,
     action_from_attackers,
     action_from_blockers,
@@ -29,9 +32,6 @@ from magic_ai.game_state import (
     PlayerState,
 )
 from magic_ai.model import (
-    ActionTrace,
-    ParsedStep,
-    PolicyStep,
     PPOPolicy,
 )
 from magic_ai.native_encoder import NativeBatchEncoder, NativeEncodedBatch, NativeEncodingError
