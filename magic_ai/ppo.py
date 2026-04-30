@@ -76,15 +76,16 @@ def ppo_update(
             unbiased=False,
         ).clamp_min(1e-8)
 
-    sums = {
-        "loss": 0.0,
-        "policy_loss": 0.0,
-        "value_loss": 0.0,
-        "entropy": 0.0,
-        "approx_kl": 0.0,
-        "clip_fraction": 0.0,
-        "spr_loss": 0.0,
-    }
+    stat_names = (
+        "loss",
+        "policy_loss",
+        "value_loss",
+        "entropy",
+        "approx_kl",
+        "clip_fraction",
+        "spr_loss",
+    )
+    sums_t = torch.zeros(len(stat_names), dtype=torch.float32, device=device)
     num_minibatches = 0
     indices = list(range(len(steps)))
     for _ in range(epochs):
@@ -108,12 +109,12 @@ def ppo_update(
             entropy = batch_entropies.mean()
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
 
-            spr_loss_val = 0.0
+            spr_loss_stat = loss.new_zeros(())
             if spr_active:
                 assert extras is not None
                 spr_loss = policy.compute_spr_loss(extras.step_indices, extras=extras)
                 loss = loss + spr_coef * spr_loss
-                spr_loss_val = float(spr_loss.detach().cpu())
+                spr_loss_stat = spr_loss.detach()
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -123,27 +124,32 @@ def ppo_update(
             with torch.no_grad():
                 approx_kl = (batch_old_log_probs - batch_log_probs).mean()
                 clip_fraction = ((ratio - 1.0).abs() > clip_epsilon).float().mean()
-            sums["loss"] += float(loss.detach().cpu())
-            sums["policy_loss"] += float(policy_loss.detach().cpu())
-            sums["value_loss"] += float(value_loss.detach().cpu())
-            sums["entropy"] += float(entropy.detach().cpu())
-            sums["approx_kl"] += float(approx_kl.detach().cpu())
-            sums["clip_fraction"] += float(clip_fraction.detach().cpu())
-            sums["spr_loss"] += spr_loss_val
+            sums_t += torch.stack(
+                (
+                    loss.detach(),
+                    policy_loss.detach(),
+                    value_loss.detach(),
+                    entropy.detach(),
+                    approx_kl.detach(),
+                    clip_fraction.detach(),
+                    spr_loss_stat,
+                )
+            )
             num_minibatches += 1
 
     if num_minibatches == 0:
         raise RuntimeError("PPO update did not run any minibatches")
     if spr_coef > 0.0 and policy.spr_enabled:
         policy.update_spr_target()
+    sums = dict(zip(stat_names, (sums_t / num_minibatches).cpu().tolist(), strict=True))
     return PPOStats(
-        loss=sums["loss"] / num_minibatches,
-        policy_loss=sums["policy_loss"] / num_minibatches,
-        value_loss=sums["value_loss"] / num_minibatches,
-        entropy=sums["entropy"] / num_minibatches,
-        approx_kl=sums["approx_kl"] / num_minibatches,
-        clip_fraction=sums["clip_fraction"] / num_minibatches,
-        spr_loss=sums["spr_loss"] / num_minibatches,
+        loss=sums["loss"],
+        policy_loss=sums["policy_loss"],
+        value_loss=sums["value_loss"],
+        entropy=sums["entropy"],
+        approx_kl=sums["approx_kl"],
+        clip_fraction=sums["clip_fraction"],
+        spr_loss=sums["spr_loss"],
     )
 
 
@@ -167,8 +173,11 @@ def gae_returns(
 
     num_steps = len(steps)
     values_t = torch.tensor([step.value for step in steps], dtype=torch.float32)
+    players_t = torch.tensor(
+        [step.perspective_player_idx for step in steps],
+        dtype=torch.int8,
+    )
     rewards_t = torch.zeros(num_steps, dtype=torch.float32)
-    advantages_t = torch.zeros(num_steps, dtype=torch.float32)
 
     last_step = steps[-1]
     if winner_idx < 0:
@@ -178,18 +187,28 @@ def gae_returns(
     else:
         rewards_t[-1] = -1.0
 
-    next_advantage = 0.0
-    for idx in range(num_steps - 1, -1, -1):
-        if idx == num_steps - 1:
-            delta = rewards_t[idx] - values_t[idx]
-            next_advantage = float(delta.item())
-        else:
-            next_same_player = (
-                steps[idx + 1].perspective_player_idx == steps[idx].perspective_player_idx
+    if num_steps == 1:
+        return rewards_t
+
+    signs_t = torch.where(
+        players_t[1:] == players_t[:-1],
+        torch.ones(num_steps - 1, dtype=torch.float32),
+        torch.full((num_steps - 1,), -1.0, dtype=torch.float32),
+    )
+    deltas_t = rewards_t - values_t
+    deltas_t[:-1] += gamma * signs_t * values_t[1:]
+
+    if gamma == 0.0 or gae_lambda == 0.0:
+        advantages_t = deltas_t
+    else:
+        coeffs_rev = (gamma * gae_lambda * signs_t).flip(0)
+        deltas_rev = deltas_t.flip(0)
+        scan_coeffs = torch.cat(
+            (
+                torch.ones(1, dtype=torch.float32),
+                coeffs_rev.cumprod(0),
             )
-            sign = 1.0 if next_same_player else -1.0
-            delta = rewards_t[idx] + gamma * sign * values_t[idx + 1] - values_t[idx]
-            next_advantage = float(delta.item()) + gamma * gae_lambda * sign * next_advantage
-        advantages_t[idx] = next_advantage
+        )
+        advantages_t = (scan_coeffs * torch.cumsum(deltas_rev / scan_coeffs, dim=0)).flip(0)
 
     return advantages_t + values_t
