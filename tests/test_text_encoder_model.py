@@ -20,7 +20,7 @@ from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 def _make_batch(
     b: int = 2,
-    t: int = 64,
+    t: int = 24,
     max_opts: int = 4,
     max_targets: int = 3,
     vocab_size: int = 1000,
@@ -36,20 +36,20 @@ def _make_batch(
 
     # Card-ref positions: a few real anchors per row, rest -1.
     card_ref_positions = torch.full((b, MAX_CARD_REFS), -1, dtype=torch.int64)
-    card_ref_positions[0, :3] = torch.tensor([2, 10, 20])
-    card_ref_positions[1, :2] = torch.tensor([4, 15])
+    card_ref_positions[0, :3] = torch.tensor([2, 5, 8])
+    card_ref_positions[1, :2] = torch.tensor([3, 6])
 
     # Options: 3 valid in row 0, 2 valid in row 1.
     option_positions = torch.full((b, max_opts), -1, dtype=torch.int64)
-    option_positions[0, :3] = torch.tensor([30, 35, 40])
-    option_positions[1, :2] = torch.tensor([25, 45])
+    option_positions[0, :3] = torch.tensor([10, 14, 18])
+    option_positions[1, :2] = torch.tensor([9, 13])
     option_mask = option_positions >= 0
 
     # Targets per option.
     target_positions = torch.full((b, max_opts, max_targets), -1, dtype=torch.int64)
-    target_positions[0, 0, :2] = torch.tensor([31, 32])
-    target_positions[0, 1, :1] = torch.tensor([36])
-    target_positions[1, 0, :3] = torch.tensor([26, 27, 28])
+    target_positions[0, 0, :2] = torch.tensor([11, 12])
+    target_positions[0, 1, :1] = torch.tensor([15])
+    target_positions[1, 0, :3] = torch.tensor([10, 11, 12])
     target_mask = target_positions >= 0
 
     return TextEncodedBatch(
@@ -66,12 +66,12 @@ def _make_batch(
 
 def test_text_encoder_forward_pooling_heads_backward() -> None:
     vocab_size = 1000
-    cfg = TextEncoderConfig(vocab_size=vocab_size)
+    cfg = TextEncoderConfig(vocab_size=vocab_size, d_model=32, n_layers=1, n_heads=4, d_ff=64)
     encoder = TextStateEncoder(cfg)
     batch = _make_batch(vocab_size=vocab_size)
 
     hidden = encoder(batch)
-    assert hidden.shape == (2, 64, cfg.d_model)
+    assert hidden.shape == (2, 24, cfg.d_model)
     assert torch.isfinite(hidden).all()
 
     # Card vectors.

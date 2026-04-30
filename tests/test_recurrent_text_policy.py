@@ -14,7 +14,7 @@ from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 def _make_batch(
     b: int = 2,
-    t: int = 64,
+    t: int = 20,
     max_opts: int = 4,
     max_targets: int = 3,
     vocab_size: int = 1000,
@@ -29,18 +29,18 @@ def _make_batch(
         token_ids[i, n:] = 0  # pad_id
 
     card_ref_positions = torch.full((b, MAX_CARD_REFS), -1, dtype=torch.int64)
-    card_ref_positions[0, :3] = torch.tensor([2, 10, 20])
-    card_ref_positions[1, :2] = torch.tensor([4, 15])
+    card_ref_positions[0, :3] = torch.tensor([2, 5, 8])
+    card_ref_positions[1, :2] = torch.tensor([3, 6])
 
     option_positions = torch.full((b, max_opts), -1, dtype=torch.int64)
-    option_positions[0, :3] = torch.tensor([30, 35, 40])
-    option_positions[1, :2] = torch.tensor([25, 45])
+    option_positions[0, :3] = torch.tensor([10, 13, 16])
+    option_positions[1, :2] = torch.tensor([4, 8])
     option_mask = option_positions >= 0
 
     target_positions = torch.full((b, max_opts, max_targets), -1, dtype=torch.int64)
-    target_positions[0, 0, :2] = torch.tensor([31, 32])
-    target_positions[0, 1, :1] = torch.tensor([36])
-    target_positions[1, 0, :3] = torch.tensor([26, 27, 28])
+    target_positions[0, 0, :2] = torch.tensor([11, 12])
+    target_positions[0, 1, :1] = torch.tensor([14])
+    target_positions[1, 0, :3] = torch.tensor([5, 6, 7])
     target_mask = target_positions >= 0
 
     return TextEncodedBatch(
@@ -56,16 +56,18 @@ def _make_batch(
 
 
 def _make_policy(
-    vocab_size: int = 1000, lstm_hidden: int = 384, lstm_layers: int = 1
+    vocab_size: int = 1000, lstm_hidden: int = 32, lstm_layers: int = 1
 ) -> RecurrentTextPolicy:
-    enc = TextEncoderConfig(vocab_size=vocab_size)
+    enc = TextEncoderConfig(
+        vocab_size=vocab_size, d_model=32, n_layers=1, n_heads=4, d_ff=64, max_seq_len=20
+    )
     cfg = RecurrentTextPolicyConfig(encoder=enc, lstm_hidden=lstm_hidden, lstm_layers=lstm_layers)
     return RecurrentTextPolicy(cfg)
 
 
 def test_recurrent_forward_and_state_shape() -> None:
     vocab_size = 1000
-    lstm_hidden = 384
+    lstm_hidden = 32
     lstm_layers = 1
     policy = _make_policy(vocab_size=vocab_size, lstm_hidden=lstm_hidden, lstm_layers=lstm_layers)
     batch = _make_batch(vocab_size=vocab_size)

@@ -46,6 +46,7 @@ class RecurrentTextPolicyConfig:
     encoder: TextEncoderConfig
     lstm_hidden: int = 384  # match d_model by default
     lstm_layers: int = 1
+    compile_forward: bool = False
 
 
 @dataclass
@@ -92,6 +93,13 @@ class RecurrentTextPolicy(nn.Module):
             num_layers=cfg.lstm_layers,
             batch_first=True,
         )
+
+        if cfg.compile_forward:
+            # Only compile the packed (rollout-only) path. The non-packed
+            # forward runs during PPO training with .backward(), and AOT
+            # autograd currently mismatches NJT subclass metadata on the
+            # backward pass when compiled.
+            self.forward_packed = torch.compile(self.forward_packed, dynamic=True)  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]
 
     def init_state(self, batch_size: int, device: torch.device) -> tuple[Tensor, Tensor]:
         shape = (self.lstm_layers, batch_size, self.lstm_hidden)

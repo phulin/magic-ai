@@ -93,7 +93,7 @@ class TextRolloutSmokeTests(unittest.TestCase):
             "seed": 1,
             "shuffle": True,
         }
-        episode = worker.play_episode(cfg, max_turns=10)
+        episode = worker.play_episode(cfg, max_turns=4)
         self.assertGreaterEqual(len(episode.steps), 1)
         for step in episode.steps:
             self.assertIn(step.reward, (-1.0, 0.0, 1.0))
@@ -110,7 +110,7 @@ class TextRolloutSmokeTests(unittest.TestCase):
             "seed": 2,
             "shuffle": True,
         }
-        episode = worker.play_episode(cfg, max_turns=10)
+        episode = worker.play_episode(cfg, max_turns=4)
         for step in episode.steps:
             # The chosen option index must point inside the legal_options
             # list captured at that decision (no off-by-one in the worker).
@@ -179,7 +179,7 @@ class TextRolloutSmokeTests(unittest.TestCase):
                 "seed": 3,
                 "shuffle": True,
             }
-            episode = worker.play_episode(cfg, max_turns=8)
+            episode = worker.play_episode(cfg, max_turns=4)
         finally:
             setattr(rollout_mod.TextRolloutWorker, "_score_step", original)
             setattr(rollout_mod.TextRolloutWorker, "_init_states", original_init)

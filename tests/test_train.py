@@ -506,6 +506,7 @@ class TrainPPOTests(unittest.TestCase):
             max_targets_per_option=2,
             max_decision_groups=3,
             max_cached_choices=4,
+            torch_compile=False,
         )
 
         with (
@@ -580,6 +581,7 @@ class TrainPPOTests(unittest.TestCase):
             max_decision_groups=2,
             max_cached_choices=2,
             native_render_plan=False,
+            torch_compile=False,
         )
         snapshot = cast(
             dict[str, object],

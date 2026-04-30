@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import torch
@@ -173,12 +173,24 @@ def _snapshot_simple(names: list[str]) -> GameStateSnapshot:
 # ---------------------------------------------------------------------------
 
 
+def _small_cfg(tokenizer: Any) -> TextEncoderConfig:
+    """Tiny encoder config for smoke tests: real vocab but small model."""
+    return TextEncoderConfig(
+        vocab_size=len(tokenizer),
+        pad_id=int(tokenizer.pad_token_id),
+        d_model=32,
+        n_layers=1,
+        n_heads=4,
+        d_ff=64,
+    )
+
+
 def test_text_policy_end_to_end(
     tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
 ) -> None:
     snapshots = [_snapshot_with_action(real_card_names), _snapshot_simple(real_card_names)]
 
-    policy = build_text_policy(tokenizer)
+    policy = build_text_policy(tokenizer, _small_cfg(tokenizer))
     cfg = policy.cfg
 
     batch = TextPolicy.encode_snapshots(
@@ -234,7 +246,7 @@ def test_text_policy_backward(
     tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
 ) -> None:
     snapshots = [_snapshot_with_action(real_card_names), _snapshot_simple(real_card_names)]
-    policy = build_text_policy(tokenizer)
+    policy = build_text_policy(tokenizer, _small_cfg(tokenizer))
     batch = TextPolicy.encode_snapshots(snapshots, None, oracle, tokenizer)
 
     out = policy(batch)

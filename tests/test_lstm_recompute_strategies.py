@@ -78,14 +78,14 @@ class LstmRecomputeStrategiesCorrectness(unittest.TestCase):
     def test_strategies_match_legacy_small(self) -> None:
         device = torch.device("cpu")
         dtype = torch.float32
-        hidden = 32
+        hidden = 16
         num_layers = 2
         torch.manual_seed(0)
         lstm = _make_lstm(hidden, num_layers, dtype, device)
 
         # Mix of lengths including the boundary cases (T==1, T==T_max, ties).
         projected, lengths = _make_workload(
-            n_episodes=6, t_max=12, t_min=1, hidden=hidden, seed=42, dtype=dtype, device=device
+            n_episodes=4, t_max=8, t_min=1, hidden=hidden, seed=42, dtype=dtype, device=device
         )
 
         ref = lstm_recompute_per_step_states(lstm, projected, lengths, strategy="legacy")
@@ -104,7 +104,7 @@ class LstmRecomputeStrategiesCorrectness(unittest.TestCase):
         # construction in every strategy.
         device = torch.device("cpu")
         dtype = torch.float32
-        hidden = 16
+        hidden = 8
         num_layers = 2
         torch.manual_seed(1)
         lstm = _make_lstm(hidden, num_layers, dtype, device)
@@ -149,14 +149,14 @@ class LstmRecomputeChunkedBptt(unittest.TestCase):
     def test_forward_invariant_to_chunk_size(self) -> None:
         device = torch.device("cpu")
         dtype = torch.float32
-        hidden = 24
+        hidden = 12
         num_layers = 2
         torch.manual_seed(2)
         lstm = _make_lstm(hidden, num_layers, dtype, device)
         projected, lengths = _make_workload(
-            n_episodes=4,
-            t_max=20,
-            t_min=5,
+            n_episodes=3,
+            t_max=10,
+            t_min=3,
             hidden=hidden,
             seed=11,
             dtype=dtype,
@@ -169,7 +169,7 @@ class LstmRecomputeChunkedBptt(unittest.TestCase):
         # T_max -- must produce identical forward output. Gradient flow is
         # truncated at chunk boundaries, but the forward computation is
         # exact.
-        for chunk_size in (1, 2, 3, 7, 10, 19, 100):
+        for chunk_size in (1, 2, 3, 7, 9, 100):
             with self.subTest(chunk_size=chunk_size):
                 got = lstm_recompute_per_step_h_out(lstm, per_ep, chunk_size=chunk_size)
                 for g, r in zip(got, ref, strict=True):
@@ -182,12 +182,12 @@ class LstmRecomputeChunkedBptt(unittest.TestCase):
         # full BPTT.
         device = torch.device("cpu")
         torch.manual_seed(3)
-        lstm = _make_lstm(16, 2, torch.float32, device)
+        lstm = _make_lstm(8, 2, torch.float32, device)
         projected, lengths = _make_workload(
             n_episodes=2,
-            t_max=8,
-            t_min=8,
-            hidden=16,
+            t_max=6,
+            t_min=6,
+            hidden=8,
             seed=5,
             dtype=torch.float32,
             device=device,

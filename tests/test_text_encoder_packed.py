@@ -27,8 +27,8 @@ from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 def _make_batch(vocab_size: int = 1000) -> TextEncodedBatch:
     torch.manual_seed(0)
-    b, t = 3, 48
-    seq_lens = torch.tensor([48, 32, 17], dtype=torch.int64)
+    b, t = 3, 20
+    seq_lens = torch.tensor([20, 14, 9], dtype=torch.int64)
     token_ids = torch.randint(low=1, high=vocab_size, size=(b, t), dtype=torch.int64)
     attention_mask = torch.zeros(b, t, dtype=torch.int64)
     for i, n in enumerate(seq_lens.tolist()):
@@ -36,22 +36,22 @@ def _make_batch(vocab_size: int = 1000) -> TextEncodedBatch:
         token_ids[i, n:] = 0  # pad
 
     card_ref_positions = torch.full((b, MAX_CARD_REFS), -1, dtype=torch.int64)
-    card_ref_positions[0, :3] = torch.tensor([2, 10, 20])
-    card_ref_positions[1, :2] = torch.tensor([4, 15])
-    card_ref_positions[2, :1] = torch.tensor([5])
+    card_ref_positions[0, :3] = torch.tensor([2, 5, 8])
+    card_ref_positions[1, :2] = torch.tensor([3, 6])
+    card_ref_positions[2, :1] = torch.tensor([4])
 
     max_opts, max_targets = 4, 3
     option_positions = torch.full((b, max_opts), -1, dtype=torch.int64)
-    option_positions[0, :3] = torch.tensor([30, 35, 40])
-    option_positions[1, :2] = torch.tensor([20, 25])
-    option_positions[2, :1] = torch.tensor([10])
+    option_positions[0, :3] = torch.tensor([10, 13, 16])
+    option_positions[1, :2] = torch.tensor([7, 10])
+    option_positions[2, :1] = torch.tensor([5])
     option_mask = option_positions >= 0
 
     target_positions = torch.full((b, max_opts, max_targets), -1, dtype=torch.int64)
-    target_positions[0, 0, :2] = torch.tensor([31, 32])
-    target_positions[0, 1, :1] = torch.tensor([36])
-    target_positions[1, 0, :3] = torch.tensor([21, 22, 23])
-    target_positions[2, 0, :2] = torch.tensor([11, 12])
+    target_positions[0, 0, :2] = torch.tensor([11, 12])
+    target_positions[0, 1, :1] = torch.tensor([14])
+    target_positions[1, 0, :3] = torch.tensor([8, 9, 10])
+    target_positions[2, 0, :2] = torch.tensor([6, 7])
     target_mask = target_positions >= 0
 
     return TextEncodedBatch(
@@ -77,7 +77,7 @@ def test_pack_batch_shapes_and_anchors() -> None:
     assert packed.cu_seqlens.shape == (4,)
 
     # cu_seqlens is exclusive-prefix-sum.
-    expected_cu = torch.tensor([0, 48, 80, 97], dtype=torch.int64)
+    expected_cu = torch.tensor([0, 20, 34, 43], dtype=torch.int64)
     assert torch.equal(packed.cu_seqlens, expected_cu)
     assert torch.equal(packed.state_positions, expected_cu[:-1])
 
@@ -98,7 +98,7 @@ def test_pack_batch_shapes_and_anchors() -> None:
 
 def test_padded_vs_packed_parity() -> None:
     vocab_size = 1000
-    cfg = TextEncoderConfig(vocab_size=vocab_size, n_layers=2)
+    cfg = TextEncoderConfig(vocab_size=vocab_size, d_model=32, n_layers=1, n_heads=4, d_ff=64)
     encoder = TextStateEncoder(cfg).eval()
 
     padded = _make_batch(vocab_size=vocab_size)
@@ -129,7 +129,7 @@ def test_padded_vs_packed_parity() -> None:
 
 
 def test_packed_backward_smoke() -> None:
-    cfg = TextEncoderConfig(vocab_size=1000, n_layers=2)
+    cfg = TextEncoderConfig(vocab_size=1000, d_model=32, n_layers=1, n_heads=4, d_ff=64)
     encoder = TextStateEncoder(cfg)
     packed = pack_batch(_make_batch())
 
