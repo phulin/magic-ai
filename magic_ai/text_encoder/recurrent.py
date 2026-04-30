@@ -14,7 +14,9 @@ This module is self-contained: no edits to ``PPOPolicy`` / ``model.py`` /
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -94,12 +96,25 @@ class RecurrentTextPolicy(nn.Module):
             batch_first=True,
         )
 
+        self._compiled_forward_packed: (
+            Callable[
+                [PackedTextBatch, Tensor | None, Tensor | None, Tensor | None],
+                tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]],
+            ]
+            | None
+        ) = None
         if cfg.compile_forward:
             # Only compile the packed (rollout-only) path. The non-packed
             # forward runs during PPO training with .backward(), and AOT
             # autograd currently mismatches NJT subclass metadata on the
             # backward pass when compiled.
-            self.forward_packed = torch.compile(self.forward_packed, dynamic=True)  # type: ignore[method-assign]  # ty: ignore[invalid-assignment]
+            self._compiled_forward_packed = cast(
+                Callable[
+                    [PackedTextBatch, Tensor | None, Tensor | None, Tensor | None],
+                    tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]],
+                ],
+                torch.compile(self._forward_packed_impl, dynamic=True),
+            )
 
     def init_state(self, batch_size: int, device: torch.device) -> tuple[Tensor, Tensor]:
         shape = (self.lstm_layers, batch_size, self.lstm_hidden)
@@ -145,6 +160,17 @@ class RecurrentTextPolicy(nn.Module):
         h_in: Tensor | None = None,
         c_in: Tensor | None = None,
         *,
+        state_hidden_override: Tensor | None = None,
+    ) -> tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]]:
+        if self._compiled_forward_packed is not None:
+            return self._compiled_forward_packed(batch, h_in, c_in, state_hidden_override)
+        return self._forward_packed_impl(batch, h_in, c_in, state_hidden_override)
+
+    def _forward_packed_impl(
+        self,
+        batch: PackedTextBatch,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
         state_hidden_override: Tensor | None = None,
     ) -> tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]]:
         device_type = batch.token_ids.device.type

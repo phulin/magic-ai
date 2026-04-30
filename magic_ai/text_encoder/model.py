@@ -129,6 +129,7 @@ class MultiHeadSelfAttention(nn.Module):
         assert cfg.d_model % cfg.n_heads == 0
         self.n_heads = cfg.n_heads
         self.head_dim = cfg.d_model // cfg.n_heads
+        self.max_seq_len = cfg.max_seq_len
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.dropout = cfg.dropout
@@ -143,10 +144,8 @@ class MultiHeadSelfAttention(nn.Module):
         cu_seqlens: Tensor | None = None,
     ) -> Tensor:
         # Two layouts share this module:
-        #   (1) packed varlen [T, D] when cu_seqlens is not None — wraps q/k/v
-        #       once into NJT over doc offsets, dispatches to FlashAttention
-        #       varlen, unwraps to packed [T, H, Dh]. No leading batch dim,
-        #       no extra transposes/contiguous around the wrap.
+        #   (1) packed varlen [T, D] when cu_seqlens is not None — flash_attn varlen
+        #       kernel; q/k/v stay as packed [T, H, Dh], no NJT overhead.
         #   (2) padded [B, T, D] otherwise — flex_attention on CUDA,
         #       additive-bias SDPA on CPU.
         if cu_seqlens is not None:
@@ -155,19 +154,31 @@ class MultiHeadSelfAttention(nn.Module):
 
     def _forward_packed(self, x: Tensor, cu_seqlens: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         # x: [T, D]; cos/sin: [T, Dh/2]
-        t = x.shape[0]
-        qkv = self.qkv(x).view(t, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=1)  # each [T, H, Dh], canonical NJT layout
-        q = _apply_rope_packed(q, cos, sin)
-        k = _apply_rope_packed(k, cos, sin)
-        q_nt = torch.nested.nested_tensor_from_jagged(q, cu_seqlens).transpose(1, 2)
-        k_nt = torch.nested.nested_tensor_from_jagged(k, cu_seqlens).transpose(1, 2)
-        v_nt = torch.nested.nested_tensor_from_jagged(v, cu_seqlens).transpose(1, 2)
-        out_nt = F.scaled_dot_product_attention(
-            q_nt, k_nt, v_nt, dropout_p=self.dropout if self.training else 0.0
-        )
-        out = out_nt.transpose(1, 2).values()  # [T, H, Dh]
-        return self.proj(out.reshape(t, self.n_heads * self.head_dim))
+        # flash_attn_varlen_func takes packed [T, H, Dh] q/k/v directly — no NJT
+        # construction, no Python subclass dispatch, one kernel launch per block.
+        from flash_attn import flash_attn_varlen_func
+
+        q, k, v = self.qkv(x).chunk(3, dim=-1)  # each [T, D]
+        q = _apply_rope_packed(q.unflatten(-1, [self.n_heads, self.head_dim]), cos, sin)
+        k = _apply_rope_packed(k.unflatten(-1, [self.n_heads, self.head_dim]), cos, sin)
+        v = v.unflatten(-1, [self.n_heads, self.head_dim])  # [T, H, Dh]
+        # flash_attn requires fp16/bf16; training runs under autocast (already bf16),
+        # but direct calls (tests, eval) may arrive as fp32.
+        src_dtype = q.dtype
+        if src_dtype == torch.float32:
+            q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
+        cu = cu_seqlens.to(torch.int32)
+        out = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            self.max_seq_len,
+            self.max_seq_len,
+            dropout_p=self.dropout if self.training else 0.0,
+        )  # [T, H, Dh]
+        return self.proj(out.flatten(1).to(src_dtype))
 
     def _forward_dense(
         self,
@@ -317,7 +328,7 @@ class TextStateEncoder(nn.Module):
         """
 
         token_ids = batch.token_ids.to(torch.long)  # [T]
-        t = int(token_ids.shape[0])
+        t = token_ids.shape[0]
         x = self.tok_emb(token_ids)  # [T, D] — packed path stays rank-2
         pos = batch.pos_in_seq.to(device=x.device, dtype=torch.long)
         rope_cos = cast(Tensor, self.rope_cos)
