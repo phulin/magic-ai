@@ -15,8 +15,8 @@ from typing import Any, cast
 
 import torch
 
-from magic_ai.native_encoder import NativeBatchEncoder, NativeEncodedBatch
-from magic_ai.native_rollout import NativeRolloutDriver, NativeRolloutUnavailable
+from magic_ai.slot_encoder.native_encoder import NativeBatchEncoder, NativeEncodedBatch
+from magic_ai.slot_encoder.native_rollout import NativeRolloutDriver, NativeRolloutUnavailable
 
 
 def _shard_ranges(n: int, workers: int) -> list[tuple[int, int]]:

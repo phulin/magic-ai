@@ -17,8 +17,8 @@ import torch
 from torch import Tensor, nn
 
 if TYPE_CHECKING:
-    from magic_ai.model import ParsedBatch, ParsedStep
-    from magic_ai.native_encoder import NativeEncodedBatch
+    from magic_ai.actions import ParsedBatch, ParsedStep
+    from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
 
 
 @dataclass(frozen=True)

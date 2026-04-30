@@ -143,7 +143,7 @@ def encode_tokens(
 ) -> tuple[Any, NativeAssemblerOutputs]:
     """Run ``MageEncodeTokens`` for a batch of games.
 
-    ``encoder`` must be a :class:`magic_ai.native_encoder.NativeBatchEncoder`
+    ``encoder`` must be a :class:`magic_ai.slot_encoder.native_encoder.NativeBatchEncoder`
     constructed with ``emit_render_plan=True``. The native side fills both
     the existing encoder outputs (slot/option/target tensors etc.) and the
     new token outputs in a single FFI call.
@@ -239,7 +239,7 @@ def encode_tokens(
                 message = ffi.string(result.error_message).decode("utf-8")
             finally:
                 lib.MageFreeString(result.error_message)
-        from magic_ai.native_encoder import NativeEncodingError
+        from magic_ai.slot_encoder.native_encoder import NativeEncodingError
 
         raise NativeEncodingError(message)
 
@@ -248,13 +248,11 @@ def encode_tokens(
     # field assembly.
     decision_rows_written = int(result.decision_rows_written)
     batch = encoder._slice_batch_buffers(buffers, batch_size)
-    from magic_ai.native_encoder import (
-        TRACE_KIND_VALUES,
-        NativeEncodedBatch,
-    )
+    from magic_ai.actions import TRACE_KIND_VALUES
+    from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
 
     trace_kind_id = batch["trace_kind_id"]
-    trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
+    trace_kinds: list[str] = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
     decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
     decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
     decision_mask = buffers.decision_mask_u8[:decision_rows_written]
@@ -533,19 +531,17 @@ def encode_tokens_packed(
                 message = ffi.string(result.error_message).decode("utf-8")
             finally:
                 lib.MageFreeString(result.error_message)
-        from magic_ai.native_encoder import NativeEncodingError
+        from magic_ai.slot_encoder.native_encoder import NativeEncodingError
 
         raise NativeEncodingError(message)
 
     decision_rows_written = int(result.decision_rows_written)
     batch = encoder._slice_batch_buffers(buffers, batch_size)
-    from magic_ai.native_encoder import (
-        TRACE_KIND_VALUES,
-        NativeEncodedBatch,
-    )
+    from magic_ai.actions import TRACE_KIND_VALUES
+    from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
 
     trace_kind_id = batch["trace_kind_id"]
-    trace_kinds = (
+    trace_kinds: list[str] = (
         [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
         if include_trace_kinds
         else []

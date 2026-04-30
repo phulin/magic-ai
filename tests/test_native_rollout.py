@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from magic_ai.native_rollout import (
+from magic_ai.slot_encoder.native_rollout import (
     NativeMageStatus,
     NativeRolloutDriver,
     NativeRolloutUnavailable,

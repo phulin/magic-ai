@@ -13,8 +13,11 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import trueskill
 
-from magic_ai.model import PPOPolicy
-from magic_ai.sharded_native import ShardedNativeBatchEncoder, ShardedNativeRolloutDriver
+from magic_ai.slot_encoder.model import PPOPolicy
+from magic_ai.slot_encoder.sharded_native import (
+    ShardedNativeBatchEncoder,
+    ShardedNativeRolloutDriver,
+)
 
 if TYPE_CHECKING:
     from magic_ai.text_encoder.actor_critic import TextActorCritic

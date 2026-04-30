@@ -6,7 +6,7 @@ import copy
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, NamedTuple, cast
+from typing import Any, cast
 
 import torch
 from torch import Tensor, nn
@@ -17,12 +17,19 @@ from magic_ai.actions import (
     COLORS,
     OPTION_SCALAR_DIM,
     TARGET_SCALAR_DIM,
+    TRACE_KIND_TO_ID,
+    TRACE_KIND_VALUES,
     ActionOptionsEncoder,
     ActionRequest,
+    ActionTrace,
     LegalActionCandidate,
     ParsedActionBatch,
     ParsedActionInputs,
+    ParsedBatch,
+    ParsedStep,
     PendingState,
+    PolicyStep,
+    TraceKind,
     action_from_attackers,
     action_from_blockers,
     action_from_choice_accepted,
@@ -30,15 +37,13 @@ from magic_ai.actions import (
     action_from_choice_ids,
     action_from_choice_index,
     action_from_priority_candidate,
+    build_decision_layout_rows,
     selected_option_id,
 )
-from magic_ai.buffer import NativeTrajectoryBuffer, RolloutBuffer
 from magic_ai.game_state import (
     GAME_INFO_DIM,
     ZONE_SLOT_COUNT,
-    GameStateEncoder,
     GameStateSnapshot,
-    ParsedGameState,
     ParsedGameStateBatch,
 )
 from magic_ai.lstm_recompute import (
@@ -46,7 +51,6 @@ from magic_ai.lstm_recompute import (
     lstm_recompute_per_step_h_out,
     lstm_recompute_per_step_states,
 )
-from magic_ai.native_encoder import NativeEncodedBatch
 from magic_ai.replay_decisions import (
     ReplayPerChoice,
     ReplayScoringForward,
@@ -57,88 +61,31 @@ from magic_ai.replay_decisions import (
     validate_decision_indices,
     validate_flat_scored_indices,
 )
+from magic_ai.slot_encoder.buffer import NativeTrajectoryBuffer, RolloutBuffer
+from magic_ai.slot_encoder.game_state import GameStateEncoder
+from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
 
-TraceKind = Literal[
-    "priority",
-    "attackers",
-    "blockers",
-    "choice_index",
-    "choice_ids",
-    "choice_color",
-    "may",
-]
-
-TRACE_KIND_VALUES: tuple[TraceKind, ...] = (
-    "priority",
-    "attackers",
-    "blockers",
-    "choice_index",
-    "choice_ids",
-    "choice_color",
-    "may",
-)
-TRACE_KIND_TO_ID: dict[TraceKind, int] = {
-    trace_kind: idx for idx, trace_kind in enumerate(TRACE_KIND_VALUES)
-}
+# TraceKind, TRACE_KIND_VALUES, TRACE_KIND_TO_ID, ActionTrace, PolicyStep,
+# ParsedStep, and ParsedBatch are now defined in magic_ai.actions and
+# re-imported above.
 
 
-@dataclass(frozen=True)
-class ActionTrace:
-    """Enough information to recompute a sampled action's log-probability."""
+def _clone_detaching_buffer(module: nn.Module, buffer_attr: str) -> nn.Module:
+    """Deep-copy a module while temporarily detaching one nn.Module sub-attribute.
 
-    kind: TraceKind
-    indices: tuple[int, ...] = ()
-    binary: tuple[float, ...] = ()
-
-
-@dataclass(frozen=True)
-class ParsedStep:
-    """Pure-Python parsed policy inputs for one step.
-
-    Holds the parsed game-state / action-options plus the decision-row layout.
-    No tensors; ``RolloutBuffer.ingest_batch`` does the bulk CPU→GPU copy.
+    Used by ``clone_for_rnad`` on both ``PPOPolicy`` and ``TextActorCritic`` to
+    share the replay buffer across the online/target/reg copies without
+    deep-copying gigabytes of ingested trajectory tensors.
     """
 
-    parsed_state: ParsedGameState
-    parsed_action: ParsedActionInputs
-    trace_kind: TraceKind
-    trace_kind_id: int
-    decision_option_idx: list[list[int]]  # [G, C]
-    decision_target_idx: list[list[int]]  # [G, C]
-    decision_mask: list[list[bool]]  # [G, C]
-    uses_none_head: list[bool]  # [G]
-    pending: PendingState
-
-
-@dataclass(frozen=True)
-class ParsedBatch:
-    """Batched parsed policy inputs for one actor forward."""
-
-    parsed_state: ParsedGameStateBatch
-    parsed_action: ParsedActionBatch
-    trace_kinds: list[TraceKind]
-    trace_kind_ids: Tensor  # [N]
-    pendings: list[PendingState]
-    decision_option_idx: Tensor  # [total_groups, max_cached_choices]
-    decision_target_idx: Tensor  # [total_groups, max_cached_choices]
-    decision_mask: Tensor  # [total_groups, max_cached_choices]
-    uses_none_head: Tensor  # [total_groups]
-    decision_starts: list[int]
-    decision_counts: list[int]
-
-
-class PolicyStep(NamedTuple):
-    # NamedTuple instead of @dataclass: ~3-5x faster to construct, which
-    # matters because the rollout sampling path builds ~80 of these per
-    # poll (~5k per profiled iter).
-    action: ActionRequest
-    trace: ActionTrace
-    log_prob: Tensor
-    value: Tensor
-    entropy: Tensor
-    replay_idx: int | None = None
-    selected_choice_cols: tuple[int, ...] = ()
-    may_selected: int = 0
+    original = getattr(module, buffer_attr)
+    setattr(module, buffer_attr, None)
+    try:
+        clone = copy.deepcopy(module)
+    finally:
+        setattr(module, buffer_attr, original)
+    setattr(clone, buffer_attr, original)
+    return clone
 
 
 class PPOPolicy(nn.Module):
@@ -301,27 +248,23 @@ class PPOPolicy(nn.Module):
         the LSTM from a zero initial hidden state per policy.
         """
 
-        import copy
-
-        # Deepcopy everything except the rollout buffer, which we splice
-        # back in. Use normal attribute assignment so nn.Module updates
-        # ``_modules`` in lockstep with ``__dict__``: ``object.__setattr__``
-        # would leave the old buffer registered in ``_modules`` and
-        # silently deep-copy it anyway via ``nn.Module.__deepcopy__``'s
-        # traversal of submodules, defeating the whole point of sharing
-        # the buffer.
-        original_buffer = self.rollout_buffer
-        self.rollout_buffer = None  # ty: ignore[invalid-assignment]
-        try:
-            clone = copy.deepcopy(self)
-        finally:
-            self.rollout_buffer = original_buffer
-        clone.rollout_buffer = original_buffer
+        # Use normal attribute assignment so nn.Module updates ``_modules``
+        # in lockstep with ``__dict__``: ``object.__setattr__`` would leave
+        # the old buffer registered in ``_modules`` and silently deep-copy
+        # it anyway via ``nn.Module.__deepcopy__``'s traversal of submodules,
+        # defeating the whole point of sharing the buffer.
+        _clone = _clone_detaching_buffer(self, "rollout_buffer")
+        clone = cast(PPOPolicy, _clone)
         if getattr(clone, "use_lstm", False):
-            empty_h = torch.zeros(clone.hidden_layers, 0, clone.hidden_dim, dtype=torch.float32)
+            empty_h = torch.zeros(
+                int(clone.hidden_layers),  # type: ignore[attr-defined]
+                0,
+                int(clone.hidden_dim),  # type: ignore[attr-defined]
+                dtype=torch.float32,
+            )
             empty_c = empty_h.clone()
-            clone.live_lstm_h = empty_h.to(clone.live_lstm_h.device)
-            clone.live_lstm_c = empty_c.to(clone.live_lstm_c.device)
+            clone.live_lstm_h = empty_h.to(clone.live_lstm_h.device)  # type: ignore[attr-defined]
+            clone.live_lstm_c = empty_c.to(clone.live_lstm_c.device)  # type: ignore[attr-defined]
         return clone
 
     def count_active_replay_steps(
@@ -556,76 +499,20 @@ class PPOPolicy(nn.Module):
         target_mask: Tensor,
         priority_candidates: list[LegalActionCandidate],
     ) -> tuple[list[list[int]], list[list[int]], list[list[bool]], list[bool]]:
-        choices = self.max_cached_choices
-
-        if trace_kind == "may":
-            return [], [], [], []
-
-        if trace_kind == "priority":
-            candidates = priority_candidates[:choices]
-            if not candidates:
-                return [], [], [], []
-            option_row = [-1] * choices
-            target_row = [-1] * choices
-            mask_row = [False] * choices
-            for col, cand in enumerate(candidates):
-                option_row[col] = cand.option_index
-                if cand.target_index is not None:
-                    target_row[col] = cand.target_index
-                mask_row[col] = True
-            return [option_row], [target_row], [mask_row], [False]
-
         option_count = min(num_present_options, self.max_options)
-
-        if trace_kind == "attackers":
-            if option_count == 0:
-                return [], [], [], []
-            option_idx_l: list[list[int]] = []
-            target_idx_l: list[list[int]] = []
-            mask_l: list[list[bool]] = []
-            for i in range(option_count):
-                option_row = [-1] * choices
-                option_row[1] = i
-                target_row = [-1] * choices
-                mask_row = [False] * choices
-                mask_row[0] = True
-                mask_row[1] = True
-                option_idx_l.append(option_row)
-                target_idx_l.append(target_row)
-                mask_l.append(mask_row)
-            return option_idx_l, target_idx_l, mask_l, [True] * option_count
-
         if trace_kind == "blockers":
-            if option_count == 0:
-                return [], [], [], []
-            option_idx_l = []
-            target_idx_l = []
-            mask_l = []
-            target_counts = target_mask[:option_count].count_nonzero(dim=-1).detach().cpu().tolist()
-            for i, target_count in enumerate(target_counts):
-                option_row = [-1] * choices
-                target_row = [-1] * choices
-                mask_row = [False] * choices
-                mask_row[0] = True
-                for t in range(int(target_count)):
-                    col = t + 1
-                    option_row[col] = i
-                    target_row[col] = t
-                    mask_row[col] = True
-                option_idx_l.append(option_row)
-                target_idx_l.append(target_row)
-                mask_l.append(mask_row)
-            return option_idx_l, target_idx_l, mask_l, [True] * option_count
-
-        if option_count == 0:
-            return [], [], [], []
-        option_row = [-1] * choices
-        target_row = [-1] * choices
-        mask_row = [False] * choices
-        for i in range(option_count):
-            option_row[i] = i
-            mask_row[i] = True
-        return [option_row], [target_row], [mask_row], [False]
+            target_counts_per_option = (
+                target_mask[:option_count].count_nonzero(dim=-1).detach().cpu().tolist()
+            )
+        else:
+            target_counts_per_option = []
+        return build_decision_layout_rows(
+            trace_kind,
+            max_cached_choices=self.max_cached_choices,
+            option_count=option_count,
+            priority_candidates=priority_candidates,
+            target_counts_per_option=target_counts_per_option,
+        )
 
     def act(
         self,
@@ -2534,80 +2421,22 @@ class PPOPolicy(nn.Module):
         decision storage in one torch.tensor call per field.
         """
 
-        choices = self.max_cached_choices
-
-        if trace_kind == "may":
-            return [], [], [], []
-
-        if trace_kind == "priority":
-            candidates = parsed.priority_candidates[:choices]
-            if not candidates:
-                return [], [], [], []
-            option_row = [-1] * choices
-            target_row = [-1] * choices
-            mask_row = [False] * choices
-            for col, cand in enumerate(candidates):
-                option_row[col] = cand.option_index
-                if cand.target_index is not None:
-                    target_row[col] = cand.target_index
-                mask_row[col] = True
-            return [option_row], [target_row], [mask_row], [False]
-
         option_count = min(parsed.num_present_options, self.max_options)
-
-        if trace_kind == "attackers":
-            if option_count == 0:
-                return [], [], [], []
-            option_idx_l: list[list[int]] = []
-            target_idx_l: list[list[int]] = []
-            mask_l: list[list[bool]] = []
-            for i in range(option_count):
-                option_row = [-1] * choices
-                option_row[1] = i
-                target_row = [-1] * choices
-                mask_row = [False] * choices
-                mask_row[0] = True
-                mask_row[1] = True
-                option_idx_l.append(option_row)
-                target_idx_l.append(target_row)
-                mask_l.append(mask_row)
-            return option_idx_l, target_idx_l, mask_l, [True] * option_count
-
         if trace_kind == "blockers":
             options = pending.get("options", [])[: self.max_options]
-            if not options:
-                return [], [], [], []
-            option_idx_l = []
-            target_idx_l = []
-            mask_l = []
-            for i, option in enumerate(options):
-                target_count = min(
-                    len(option.get("valid_targets", [])), self.max_targets_per_option
-                )
-                option_row = [-1] * choices
-                target_row = [-1] * choices
-                mask_row = [False] * choices
-                mask_row[0] = True  # col 0 will use none-blocker head
-                for t in range(target_count):
-                    col = t + 1
-                    option_row[col] = i
-                    target_row[col] = t
-                    mask_row[col] = True
-                option_idx_l.append(option_row)
-                target_idx_l.append(target_row)
-                mask_l.append(mask_row)
-            return option_idx_l, target_idx_l, mask_l, [True] * len(options)
-
-        # choice_index / choice_ids / choice_color
-        if option_count == 0:
-            return [], [], [], []
-        option_row = [-1] * choices
-        target_row = [-1] * choices
-        mask_row = [False] * choices
-        for i in range(option_count):
-            option_row[i] = i
-            mask_row[i] = True
-        return [option_row], [target_row], [mask_row], [False]
+            target_counts_per_option = [
+                min(len(option.get("valid_targets", [])), self.max_targets_per_option)
+                for option in options
+            ]
+        else:
+            target_counts_per_option = []
+        return build_decision_layout_rows(
+            trace_kind,
+            max_cached_choices=self.max_cached_choices,
+            option_count=option_count,
+            priority_candidates=parsed.priority_candidates,
+            target_counts_per_option=target_counts_per_option,
+        )
 
 
 @dataclass(frozen=True)

@@ -33,20 +33,12 @@ from magic_ai.actions import (  # noqa: E402
     TARGET_SCALAR_DIM,
     ActionRequest,
 )
-from magic_ai.buffer import NativeTrajectoryBuffer  # noqa: E402
 from magic_ai.game_state import (  # noqa: E402
     GAME_INFO_DIM,
     ZONE_SLOT_COUNT,
-    GameStateEncoder,
     GameStateSnapshot,
     PendingOptionState,
     PendingState,
-)
-from magic_ai.model import PPOPolicy  # noqa: E402
-from magic_ai.native_encoder import NativeBatchEncoder, NativeEncodingError  # noqa: E402,F401
-from magic_ai.native_rollout import (  # noqa: E402
-    NativeRolloutDriver,  # noqa: F401
-    NativeRolloutUnavailable,
 )
 from magic_ai.opponent_pool import (  # noqa: E402
     OpponentEntry,
@@ -68,7 +60,18 @@ from magic_ai.rnad_trainer import (  # noqa: E402
     build_trainer_state,
     run_rnad_update,
 )
-from magic_ai.sharded_native import (  # noqa: E402
+from magic_ai.slot_encoder.buffer import NativeTrajectoryBuffer  # noqa: E402
+from magic_ai.slot_encoder.game_state import GameStateEncoder  # noqa: E402
+from magic_ai.slot_encoder.model import PPOPolicy  # noqa: E402
+from magic_ai.slot_encoder.native_encoder import (  # noqa: E402,F401
+    NativeBatchEncoder,
+    NativeEncodingError,
+)
+from magic_ai.slot_encoder.native_rollout import (  # noqa: E402
+    NativeRolloutDriver,  # noqa: F401
+    NativeRolloutUnavailable,
+)
+from magic_ai.slot_encoder.sharded_native import (  # noqa: E402
     ShardedNativeBatchEncoder,
     ShardedNativeRolloutDriver,
 )
