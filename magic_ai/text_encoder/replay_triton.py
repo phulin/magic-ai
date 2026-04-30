@@ -36,12 +36,12 @@ def _cdiv(numerator: int, denominator: int) -> int:
 
 if TRITON_AVAILABLE and not TYPE_CHECKING:
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["token_start", "total_tokens"])
     def _copy_packed_tokens_kernel(
         src,
         dst,
         token_start,
-        total_tokens: tl.constexpr,
+        total_tokens,
         block: tl.constexpr,
     ):
         offsets = tl.program_id(0) * block + tl.arange(0, block)
@@ -49,7 +49,16 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
         values = tl.load(src + offsets, mask=mask, other=0)
         tl.store(dst + token_start + offsets, values, mask=mask)
 
-    @triton.jit
+    @triton.jit(
+        do_not_specialize=[
+            "token_start",
+            "batch_size",
+            "total_card",
+            "total_option",
+            "total_target",
+            "max_total",
+        ]
+    )
     def _write_rebased_fields_kernel(
         rows,
         cu_seqlens,
@@ -69,17 +78,17 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
         dst_target_pos,
         dst_target_mask,
         token_start,
-        batch_size: tl.constexpr,
+        batch_size,
         card_width: tl.constexpr,
         dst_card_width: tl.constexpr,
         src_options: tl.constexpr,
         src_targets: tl.constexpr,
         dst_options: tl.constexpr,
         dst_targets: tl.constexpr,
-        total_card: tl.constexpr,
-        total_option: tl.constexpr,
-        total_target: tl.constexpr,
-        max_total: tl.constexpr,
+        total_card,
+        total_option,
+        total_target,
+        max_total,
         block: tl.constexpr,
     ):
         offsets = tl.program_id(0) * block + tl.arange(0, block)
@@ -171,7 +180,14 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
             mask=target_mask_offsets,
         )
 
-    @triton.jit
+    @triton.jit(
+        do_not_specialize=[
+            "batch_size",
+            "total_choice_slots",
+            "total_group_slots",
+            "max_total",
+        ]
+    )
     def _clear_decision_rows_kernel(
         rows,
         decision_option_idx,
@@ -179,12 +195,12 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
         decision_mask,
         uses_none_head,
         selected_indices,
-        batch_size: tl.constexpr,
+        batch_size,
         max_decision_groups: tl.constexpr,
         max_cached_choices: tl.constexpr,
-        total_choice_slots: tl.constexpr,
-        total_group_slots: tl.constexpr,
-        max_total: tl.constexpr,
+        total_choice_slots,
+        total_group_slots,
+        max_total,
         block: tl.constexpr,
     ):
         offsets = tl.program_id(0) * block + tl.arange(0, block)
