@@ -32,6 +32,21 @@ class OpponentEntry:
     cached_policy: dict[str, torch.Tensor] | None = None
 
 
+_OPPONENT_EXCLUDED_STATE_PREFIXES: tuple[str, ...] = (
+    "target_",
+    "spr_",
+    "live_lstm_h",
+    "live_lstm_c",
+    "rollout_buffer.",
+)
+
+
+def _is_opponent_state_key(key: str) -> bool:
+    return not any(
+        key == prefix or key.startswith(prefix) for prefix in _OPPONENT_EXCLUDED_STATE_PREFIXES
+    )
+
+
 @dataclass
 class OpponentPool:
     env: trueskill.TrueSkill = field(default_factory=trueskill.TrueSkill)
@@ -193,14 +208,14 @@ def opponent_policy_state_dict(policy: torch.nn.Module) -> dict[str, torch.Tenso
     return {
         key: value.detach().clone()
         for key, value in state_dict.items()
-        if not key.startswith(("target_", "spr_"))
+        if _is_opponent_state_key(key)
     }
 
 
 def save_snapshot(policy: torch.nn.Module, directory: Path, tag: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"snapshot_{tag}.pt"
-    torch.save({"policy": policy.state_dict()}, path)
+    torch.save({"policy": opponent_policy_state_dict(policy)}, path)
     return path
 
 
@@ -259,7 +274,7 @@ def ensure_opponent_cached(entry: OpponentEntry, device: torch.device) -> None:
     entry.cached_policy = {
         key: value.detach().clone()
         for key, value in state_dict.items()
-        if not key.startswith(("target_", "spr_"))
+        if _is_opponent_state_key(key)
     }
 
 
