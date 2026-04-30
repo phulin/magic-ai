@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import copy
+import itertools
 import math
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import trueskill
 
 from magic_ai.model import PPOPolicy
 from magic_ai.sharded_native import ShardedNativeBatchEncoder, ShardedNativeRolloutDriver
+
+if TYPE_CHECKING:
+    from magic_ai.text_encoder.actor_critic import TextActorCritic
 
 
 @dataclass
@@ -175,7 +179,7 @@ def snapshot_tag(threshold: int, total_episodes: int) -> str:
     return f"g{threshold:06d}_p{pct:05.1f}"
 
 
-def opponent_policy_state_dict(policy: PPOPolicy) -> dict[str, torch.Tensor]:
+def opponent_policy_state_dict(policy: torch.nn.Module) -> dict[str, torch.Tensor]:
     """Return a clone of the policy's weights suitable for opponent use.
 
     Tensors stay on their current device (typically the training GPU) so that
@@ -190,7 +194,7 @@ def opponent_policy_state_dict(policy: PPOPolicy) -> dict[str, torch.Tensor]:
     }
 
 
-def save_snapshot(policy: PPOPolicy, directory: Path, tag: str) -> Path:
+def save_snapshot(policy: torch.nn.Module, directory: Path, tag: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"snapshot_{tag}.pt"
     torch.save({"policy": policy.state_dict()}, path)
@@ -216,6 +220,26 @@ def build_opponent_policy(main_policy: PPOPolicy, device: torch.device) -> PPOPo
     opponent.eval()
     for p in opponent.parameters():
         p.requires_grad_(False)
+    return opponent
+
+
+def build_text_opponent_policy(
+    main_policy: TextActorCritic, device: torch.device
+) -> TextActorCritic:
+    """Inference-only clone of a TextActorCritic that does not share replay state."""
+    original_buffer = main_policy.rollout_buffer
+    main_policy.rollout_buffer = None
+    try:
+        opponent = copy.deepcopy(main_policy)
+    finally:
+        main_policy.rollout_buffer = original_buffer
+    opponent.rollout_buffer = None
+    opponent.spr_enabled = False
+    opponent.to(device)
+    opponent.eval()
+    for p in opponent.parameters():
+        p.requires_grad_(False)
+    opponent._num_envs = 0
     return opponent
 
 
@@ -292,8 +316,8 @@ class _EvalGame:
 
 def run_eval_matches(
     *,
-    main_policy: PPOPolicy,
-    opponent_policy: PPOPolicy,
+    main_policy: Any,
+    opponent_policy: Any,
     game_opponents: list[OpponentEntry],
     pool: OpponentPool,
     current_entry: OpponentEntry,
@@ -311,6 +335,7 @@ def run_eval_matches(
     no_shuffle: bool,
     seed_base: int,
     rng: random.Random,
+    text_max_tokens: int | None = None,
 ) -> dict[str, float]:
     """Play one eval game per entry in ``game_opponents``; update ratings; return metrics."""
     total_games_target = len(game_opponents)
@@ -330,11 +355,13 @@ def run_eval_matches(
 
     saved_main_h: torch.Tensor | None = None
     saved_main_c: torch.Tensor | None = None
-    if main_policy.use_lstm:
+    main_uses_lstm = bool(getattr(main_policy, "use_lstm", True))
+    opp_uses_lstm = bool(getattr(opponent_policy, "use_lstm", True))
+    if main_uses_lstm:
         saved_main_h = main_policy.live_lstm_h.clone()
         saved_main_c = main_policy.live_lstm_c.clone()
         main_policy.init_lstm_env_states(num_envs)
-    if opponent_policy.use_lstm:
+    if opp_uses_lstm:
         opponent_policy.init_lstm_env_states(num_envs)
 
     main_wins = 0
@@ -362,9 +389,9 @@ def run_eval_matches(
         deck_b = deck_rng.choice(deck_pool)
         main_player_idx = rng.randrange(2)
         opponent = game_opponents[game_idx]
-        if main_policy.use_lstm:
+        if main_uses_lstm:
             main_policy.reset_lstm_env_states([slot_idx])
-        if opponent_policy.use_lstm:
+        if opp_uses_lstm:
             opponent_policy.reset_lstm_env_states([slot_idx])
         return _EvalGame(
             game=mage.new_game(
@@ -386,36 +413,64 @@ def run_eval_matches(
         while free_slots and next_game_idx < total_games_target:
             live.append(start_game(free_slots.pop()))
 
+    from magic_ai.text_encoder.actor_critic import TextActorCritic
+
     def run_policy(
-        policy: PPOPolicy,
+        policy: Any,
         envs: list[_EvalGame],
         players: list[int],
     ) -> tuple[list[int], list[int], list[int], list[int]]:
         slot_indices = [env.slot_idx for env in envs]
-        parsed = native_encoder.encode_handles(
-            [env.game for env in envs],
-            perspective_player_indices=players,
-        )
-        with torch.no_grad():
-            steps = policy.sample_native_batch(
-                parsed,
-                env_indices=slot_indices,
-                deterministic=False,
+        games = [env.game for env in envs]
+        if isinstance(policy, TextActorCritic):
+            if text_max_tokens is None:
+                raise ValueError("run_eval_matches: text_max_tokens is required for text policies")
+            native_batch, nat_outputs = native_encoder.encode_tokens_packed(
+                games,
+                perspective_player_indices=players,
+                max_tokens=text_max_tokens,
+                max_options=max_options,
+                max_targets=max_targets_per_option,
+                max_card_refs=256,
             )
-        starts: list[int] = []
-        counts: list[int] = []
-        selected_cols: list[int] = []
-        may_selected: list[int] = []
-        cursor = 0
-        for step in steps:
-            cols = list(step.selected_choice_cols)
-            starts.append(cursor)
-            counts.append(len(cols))
-            selected_cols.extend(cols)
-            may_selected.append(step.may_selected)
-            cursor += len(cols)
+            packed_text_batch = nat_outputs.to_packed_text_batch(trim=False)
+            with torch.no_grad():
+                sample = policy.sample_native_tensor_batch(
+                    native_batch=native_batch,
+                    env_indices=slot_indices,
+                    perspective_player_indices=players,
+                    packed_batch=packed_text_batch,
+                    deterministic=False,
+                )
+            counts = list(sample.decision_counts)
+            selected_cols = list(sample.selected_choice_cols)
+            may_selected = list(sample.may_selected)
+            starts = list(itertools.accumulate(counts, initial=0))[:-1]
+        else:
+            parsed = native_encoder.encode_handles(
+                games,
+                perspective_player_indices=players,
+            )
+            with torch.no_grad():
+                steps = policy.sample_native_batch(
+                    parsed,
+                    env_indices=slot_indices,
+                    deterministic=False,
+                )
+            starts = []
+            counts = []
+            selected_cols = []
+            may_selected = []
+            cursor = 0
+            for step in steps:
+                cols = list(step.selected_choice_cols)
+                starts.append(cursor)
+                counts.append(len(cols))
+                selected_cols.extend(cols)
+                may_selected.append(step.may_selected)
+                cursor += len(cols)
         native_rollout.step_by_choice(
-            [env.game for env in envs],
+            games,
             decision_starts=starts,
             decision_counts=counts,
             selected_choice_cols=selected_cols,

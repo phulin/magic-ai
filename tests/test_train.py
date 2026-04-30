@@ -457,6 +457,12 @@ class TrainPPOTests(unittest.TestCase):
                     return_value=(TrainingResumeState(completed_games=1), None),
                 ) as train_text,
                 patch.object(train_mod, "train_native_batched_envs") as train_native,
+                patch.object(
+                    train_mod,
+                    "_build_opponent_schedules",
+                    return_value=(None, None, None),
+                ),
+                patch.object(train_mod, "build_text_opponent_policy"),
                 patch.object(train_mod, "save_checkpoint") as save,
                 patch.object(train_mod.wandb, "finish") as finish,
             ):
@@ -773,6 +779,12 @@ class TrainPPOTests(unittest.TestCase):
                 return_value=(expected_state, None),
             ) as train_native_text,
             patch.object(train_mod, "train_text_envs") as train_text,
+            patch.object(
+                train_mod,
+                "_build_opponent_schedules",
+                return_value=(None, None, None),
+            ),
+            patch.object(train_mod, "build_text_opponent_policy"),
         ):
             result = train_selected_backend(
                 args,

@@ -53,6 +53,7 @@ from magic_ai.opponent_pool import (  # noqa: E402
     OpponentPool,
     SnapshotSchedule,
     build_opponent_policy,
+    build_text_opponent_policy,
     distribute_games_by_recency,
     opponent_policy_state_dict,
     run_eval_matches,
@@ -763,9 +764,19 @@ def train_selected_backend(
 ) -> TrainingRunResult:
     """Dispatch the selected encoder backend and return checkpoint state."""
 
-    if getattr(args, "encoder", "slots") == "text":
+    encoder_kind = getattr(args, "encoder", "slots")
+
+    if encoder_kind == "text":
         if text_backend is None:
             raise ValueError("text_backend is required when --encoder text")
+
+        opponent_pool, snapshot_schedule, retrospective_schedule = _build_opponent_schedules(
+            args, checkpoint_cpu
+        )
+        opponent_policy: Any = None
+        if opponent_pool is not None:
+            opponent_policy = build_text_opponent_policy(text_backend.policy, device)
+
         if getattr(args, "native_render_plan", False):
             if text_backend.native_encoder is None:
                 raise ValueError("text backend is missing native render-plan encoder")
@@ -783,19 +794,35 @@ def train_selected_backend(
                 optimizer,
                 native_rollout,
                 text_backend.native_encoder,
+                opponent_pool=opponent_pool,
+                snapshot_schedule=snapshot_schedule,
+                retrospective_schedule=retrospective_schedule,
+                opponent_policy=opponent_policy,
                 resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
                 resume_checkpoint=checkpoint_cpu,
             )
         else:
+            # Slow Python text path doesn't require native rollout for training,
+            # but eval does. Skip eval if native_encoder is unavailable.
             resume_state, rnad_state = train_text_envs(
                 args,
                 mage,
                 deck_pool,
                 text_backend,
                 optimizer,
+                opponent_pool=opponent_pool,
+                snapshot_schedule=snapshot_schedule,
+                retrospective_schedule=retrospective_schedule,
+                opponent_policy=opponent_policy,
                 resume_state=_resume_state_from_checkpoint(checkpoint_cpu),
             )
-        return TrainingRunResult(resume_state=resume_state, rnad_state=rnad_state)
+        return TrainingRunResult(
+            resume_state=resume_state,
+            rnad_state=rnad_state,
+            opponent_pool=opponent_pool,
+            snapshot_schedule=snapshot_schedule,
+            retrospective_schedule=retrospective_schedule,
+        )
 
     if slot_backend is None:
         raise ValueError("slot_backend is required when --encoder slots")
@@ -807,23 +834,11 @@ def train_selected_backend(
     except NativeRolloutUnavailable as exc:
         raise SystemExit(f"native rollout is unavailable: {exc}") from exc
 
-    opponent_pool: OpponentPool | None = None
-    snapshot_schedule: SnapshotSchedule | None = None
-    retrospective_schedule: RetrospectiveLogSchedule | None = None
-    opponent_policy: PPOPolicy | None = None
-    if not args.disable_opponent_pool:
-        opponent_pool = _restore_opponent_pool(checkpoint_cpu, args.opponent_pool_dir)
-        snapshot_schedule = SnapshotSchedule.build(args.episodes)
-        retrospective_schedule = RetrospectiveLogSchedule.build(args.episodes)
-        training_state = _training_state_dict(checkpoint_cpu)
-        snapshot_schedule.next_idx = min(
-            int(training_state.get("snapshot_schedule_next_idx", 0)),
-            len(snapshot_schedule.thresholds),
-        )
-        retrospective_schedule.next_idx = min(
-            int(training_state.get("retrospective_schedule_next_idx", 0)),
-            len(retrospective_schedule.thresholds),
-        )
+    opponent_pool, snapshot_schedule, retrospective_schedule = _build_opponent_schedules(
+        args, checkpoint_cpu
+    )
+    opponent_policy = None
+    if opponent_pool is not None:
         opponent_policy = build_opponent_policy(slot_policy, device)
 
     resume_state, rnad_state = train_native_batched_envs(
@@ -849,6 +864,27 @@ def train_selected_backend(
         snapshot_schedule=snapshot_schedule,
         retrospective_schedule=retrospective_schedule,
     )
+
+
+def _build_opponent_schedules(
+    args: argparse.Namespace,
+    checkpoint_cpu: dict[str, Any] | None,
+) -> tuple[OpponentPool | None, SnapshotSchedule | None, RetrospectiveLogSchedule | None]:
+    if getattr(args, "disable_opponent_pool", False):
+        return None, None, None
+    opponent_pool = _restore_opponent_pool(checkpoint_cpu, args.opponent_pool_dir)
+    snapshot_schedule = SnapshotSchedule.build(args.episodes)
+    retrospective_schedule = RetrospectiveLogSchedule.build(args.episodes)
+    training_state = _training_state_dict(checkpoint_cpu)
+    snapshot_schedule.next_idx = min(
+        int(training_state.get("snapshot_schedule_next_idx", 0)),
+        len(snapshot_schedule.thresholds),
+    )
+    retrospective_schedule.next_idx = min(
+        int(training_state.get("retrospective_schedule_next_idx", 0)),
+        len(retrospective_schedule.thresholds),
+    )
+    return opponent_pool, snapshot_schedule, retrospective_schedule
 
 
 def main() -> None:
@@ -2077,6 +2113,12 @@ def train_text_envs(
     backend: TextTrainingBackend,
     optimizer: torch.optim.Optimizer,
     *,
+    native_rollout: ShardedNativeRolloutDriver | None = None,
+    native_encoder: ShardedNativeBatchEncoder | None = None,
+    opponent_pool: OpponentPool | None = None,
+    snapshot_schedule: SnapshotSchedule | None = None,
+    retrospective_schedule: RetrospectiveLogSchedule | None = None,
+    opponent_policy: TextActorCritic | None = None,
     resume_state: TrainingResumeState | None = None,
 ) -> tuple[TrainingResumeState, None]:
     """Slow Python text-encoder PPO loop.
@@ -2086,6 +2128,7 @@ def train_text_envs(
     the single-env Python stepping with native render-plan batching.
     """
 
+    eval_rng = random.Random(args.seed ^ 0x5EED5)
     restored_state = resume_state or TrainingResumeState()
     completed_games = restored_state.completed_games
     last_saved_games = restored_state.last_saved_games
@@ -2259,6 +2302,9 @@ def train_text_envs(
                 backend.policy,
                 optimizer,
                 args,
+                opponent_pool=opponent_pool,
+                snapshot_schedule=snapshot_schedule,
+                retrospective_schedule=retrospective_schedule,
                 resume_state=TrainingResumeState(
                     completed_games=completed_games,
                     last_saved_games=completed_games,
@@ -2268,6 +2314,43 @@ def train_text_envs(
                 ),
             )
             last_saved_games = completed_games
+
+        if (
+            opponent_pool is not None
+            and snapshot_schedule is not None
+            and opponent_policy is not None
+            and native_rollout is not None
+            and native_encoder is not None
+        ):
+            for threshold in snapshot_schedule.fire(completed_games):
+                take_snapshot_and_eval(
+                    args=args,
+                    threshold=threshold,
+                    policy=backend.policy,
+                    opponent_policy=opponent_policy,
+                    opponent_pool=opponent_pool,
+                    native_encoder=native_encoder,
+                    native_rollout=native_rollout,
+                    mage=mage,
+                    deck_pool=deck_pool,
+                    rng=eval_rng,
+                    step_prefix=f"step={total_wandb_logs}",
+                    log_fn=tracked_wandb_log,
+                )
+
+        if opponent_pool is not None and retrospective_schedule is not None:
+            for horizon_pct, horizon_step_count in retrospective_schedule.fire(completed_games):
+                if wandb.run is not None:
+                    log_retrospective_table(
+                        wandb.run,
+                        horizon_pct=horizon_pct,
+                        horizon_step_count=horizon_step_count,
+                        ratings=retrospective_rating_rows(
+                            opponent_pool,
+                            total_episodes=args.episodes,
+                        ),
+                        log_fn=tracked_wandb_log,
+                    )
 
     run_update(final=True)
     return (
@@ -2371,11 +2454,16 @@ def train_text_native_batched_envs(
     native_rollout: ShardedNativeRolloutDriver,
     native_encoder: ShardedNativeBatchEncoder,
     *,
+    opponent_pool: OpponentPool | None = None,
+    snapshot_schedule: SnapshotSchedule | None = None,
+    retrospective_schedule: RetrospectiveLogSchedule | None = None,
+    opponent_policy: TextActorCritic | None = None,
     resume_state: TrainingResumeState | None = None,
     resume_checkpoint: dict[str, Any] | None = None,
 ) -> tuple[TrainingResumeState, RNaDTrainerState | None]:
     if not native_encoder.is_available:
         raise SystemExit("native text rollout requires MageEncodeBatch")
+    eval_rng = random.Random(args.seed ^ 0x5EED5)
 
     restored_state = resume_state or TrainingResumeState()
     completed_games = restored_state.completed_games
@@ -2669,6 +2757,66 @@ def train_text_native_batched_envs(
         live_games = still_live
         finish_games(finished_games)
 
+        if (
+            args.save_every
+            and completed_games > 0
+            and completed_games % args.save_every == 0
+            and completed_games != last_saved_games
+        ):
+            save_checkpoint(
+                args.output,
+                backend.policy,
+                optimizer,
+                args,
+                opponent_pool=opponent_pool,
+                snapshot_schedule=snapshot_schedule,
+                retrospective_schedule=retrospective_schedule,
+                resume_state=TrainingResumeState(
+                    completed_games=completed_games,
+                    last_saved_games=completed_games,
+                    total_rollout_steps=total_rollout_steps,
+                    total_generated_rollout_steps=total_generated_rollout_steps,
+                    total_wandb_logs=total_wandb_logs,
+                ),
+                rnad_state=rnad_state,
+            )
+            last_saved_games = completed_games
+
+        if (
+            opponent_pool is not None
+            and snapshot_schedule is not None
+            and opponent_policy is not None
+        ):
+            for threshold in snapshot_schedule.fire(completed_games):
+                take_snapshot_and_eval(
+                    args=args,
+                    threshold=threshold,
+                    policy=backend.policy,
+                    opponent_policy=opponent_policy,
+                    opponent_pool=opponent_pool,
+                    native_encoder=native_encoder,
+                    native_rollout=native_rollout,
+                    mage=mage,
+                    deck_pool=deck_pool,
+                    rng=eval_rng,
+                    step_prefix=cli_step_prefix(),
+                    log_fn=tracked_wandb_log,
+                )
+
+        if opponent_pool is not None and retrospective_schedule is not None:
+            for horizon_pct, horizon_step_count in retrospective_schedule.fire(completed_games):
+                if wandb.run is not None:
+                    log_retrospective_table(
+                        wandb.run,
+                        horizon_pct=horizon_pct,
+                        horizon_step_count=horizon_step_count,
+                        ratings=retrospective_rating_rows(
+                            opponent_pool,
+                            total_episodes=args.episodes,
+                        ),
+                        log_fn=tracked_wandb_log,
+                    )
+
         if ready_envs:
             ready_env_indices = [env.slot_idx for env in ready_envs]
             ready_games = [env.game for env in ready_envs]
@@ -2757,8 +2905,8 @@ def take_snapshot_and_eval(
     *,
     args: argparse.Namespace,
     threshold: int,
-    policy: PPOPolicy,
-    opponent_policy: PPOPolicy,
+    policy: torch.nn.Module,
+    opponent_policy: torch.nn.Module,
     opponent_pool: OpponentPool,
     native_encoder: ShardedNativeBatchEncoder,
     native_rollout: ShardedNativeRolloutDriver,
@@ -2817,6 +2965,7 @@ def take_snapshot_and_eval(
         args.eval_num_envs if args.eval_num_envs is not None else eval_games_per_snapshot
     )
     seed_base = args.seed + threshold * 1000
+    text_max_tokens = args.text_max_tokens if getattr(args, "encoder", "slots") == "text" else None
     metrics = run_eval_matches(
         main_policy=policy,
         opponent_policy=opponent_policy,
@@ -2837,6 +2986,7 @@ def take_snapshot_and_eval(
         no_shuffle=args.no_shuffle,
         seed_base=seed_base,
         rng=rng,
+        text_max_tokens=text_max_tokens,
     )
     for opponent in unique_opponents:
         games = int(metrics.get(f"eval/opp_{opponent.tag}_games", 0.0))
