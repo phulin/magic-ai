@@ -6,6 +6,8 @@ import copy
 import itertools
 import math
 import random
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -288,6 +290,24 @@ def load_opponent_weights(
     opponent.load_state_dict(entry.cached_policy, strict=False)
 
 
+@contextmanager
+def _disable_text_replay_capture(*policies: Any) -> Iterator[None]:
+    """Temporarily run text policies in inference mode without replay writes."""
+
+    from magic_ai.text_encoder.actor_critic import TextActorCritic
+
+    saved: list[tuple[TextActorCritic, Any]] = []
+    try:
+        for policy in policies:
+            if isinstance(policy, TextActorCritic):
+                saved.append((policy, policy.rollout_buffer))
+                policy.rollout_buffer = None
+        yield
+    finally:
+        for policy, rollout_buffer in saved:
+            policy.rollout_buffer = rollout_buffer
+
+
 def distribute_games_by_recency(
     entries: list[OpponentEntry],
     total_games: int,
@@ -500,57 +520,58 @@ def run_eval_matches(
             env.action_count += 1
         return starts, counts, selected_cols, may_selected
 
-    fill_slots()
-    while live:
-        ready_t, over_t, player_t, winner_t = native_rollout.poll([env.game for env in live])
-        still_live: list[_EvalGame] = []
-        main_envs: list[_EvalGame] = []
-        main_players: list[int] = []
-        opp_groups: dict[Path, tuple[OpponentEntry, list[_EvalGame], list[int]]] = {}
-
-        for idx, env in enumerate(live):
-            over = bool(int(over_t[idx]))
-            hit_cap = env.action_count >= max_steps_per_game
-            if over or hit_cap:
-                env.winner_idx = int(winner_t[idx]) if over else -1
-                env.game.close()
-                if env.winner_idx == env.main_player_idx:
-                    main_wins += 1
-                    per_opp_main_wins[env.opponent.tag] += 1
-                    outcomes.append((env.game_idx, env.opponent, True))
-                elif env.winner_idx == -1:
-                    draws += 1
-                    per_opp_draws[env.opponent.tag] += 1
-                    outcomes.append((env.game_idx, env.opponent, None))
-                else:
-                    opp_wins += 1
-                    per_opp_opp_wins[env.opponent.tag] += 1
-                    outcomes.append((env.game_idx, env.opponent, False))
-                free_slots.append(env.slot_idx)
-                continue
-            still_live.append(env)
-            if not bool(int(ready_t[idx])):
-                continue
-            player = int(player_t[idx])
-            if player == env.main_player_idx:
-                main_envs.append(env)
-                main_players.append(player)
-            else:
-                group = opp_groups.get(env.opponent.path)
-                if group is None:
-                    opp_groups[env.opponent.path] = (env.opponent, [env], [player])
-                else:
-                    group[1].append(env)
-                    group[2].append(player)
-        live = still_live
-
-        if main_envs:
-            run_policy(main_policy, main_envs, main_players)
-        for opponent, opp_envs, opp_players in opp_groups.values():
-            load_opponent_weights(opponent_policy, opponent, main_policy.device)
-            run_policy(opponent_policy, opp_envs, opp_players)
-
+    with _disable_text_replay_capture(main_policy, opponent_policy):
         fill_slots()
+        while live:
+            ready_t, over_t, player_t, winner_t = native_rollout.poll([env.game for env in live])
+            still_live: list[_EvalGame] = []
+            main_envs: list[_EvalGame] = []
+            main_players: list[int] = []
+            opp_groups: dict[Path, tuple[OpponentEntry, list[_EvalGame], list[int]]] = {}
+
+            for idx, env in enumerate(live):
+                over = bool(int(over_t[idx]))
+                hit_cap = env.action_count >= max_steps_per_game
+                if over or hit_cap:
+                    env.winner_idx = int(winner_t[idx]) if over else -1
+                    env.game.close()
+                    if env.winner_idx == env.main_player_idx:
+                        main_wins += 1
+                        per_opp_main_wins[env.opponent.tag] += 1
+                        outcomes.append((env.game_idx, env.opponent, True))
+                    elif env.winner_idx == -1:
+                        draws += 1
+                        per_opp_draws[env.opponent.tag] += 1
+                        outcomes.append((env.game_idx, env.opponent, None))
+                    else:
+                        opp_wins += 1
+                        per_opp_opp_wins[env.opponent.tag] += 1
+                        outcomes.append((env.game_idx, env.opponent, False))
+                    free_slots.append(env.slot_idx)
+                    continue
+                still_live.append(env)
+                if not bool(int(ready_t[idx])):
+                    continue
+                player = int(player_t[idx])
+                if player == env.main_player_idx:
+                    main_envs.append(env)
+                    main_players.append(player)
+                else:
+                    group = opp_groups.get(env.opponent.path)
+                    if group is None:
+                        opp_groups[env.opponent.path] = (env.opponent, [env], [player])
+                    else:
+                        group[1].append(env)
+                        group[2].append(player)
+            live = still_live
+
+            if main_envs:
+                run_policy(main_policy, main_envs, main_players)
+            for opponent, opp_envs, opp_players in opp_groups.values():
+                load_opponent_weights(opponent_policy, opponent, main_policy.device)
+                run_policy(opponent_policy, opp_envs, opp_players)
+
+            fill_slots()
 
     if saved_main_h is not None and saved_main_c is not None:
         main_policy.live_lstm_h = saved_main_h

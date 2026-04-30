@@ -6,10 +6,14 @@ import torch.nn as nn
 import trueskill
 from magic_ai.opponent_pool import (
     OpponentEntry,
+    _disable_text_replay_capture,
     load_opponent_weights,
     opponent_policy_state_dict,
     save_snapshot,
 )
+from magic_ai.text_encoder.actor_critic import TextActorCritic
+from magic_ai.text_encoder.model import TextEncoderConfig
+from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig
 
 
 class _PolicyWithRuntimeBuffers(nn.Module):
@@ -20,6 +24,23 @@ class _PolicyWithRuntimeBuffers(nn.Module):
         self.register_buffer("live_lstm_c", torch.zeros(1, slots, 8))
 
 
+def _text_policy() -> TextActorCritic:
+    cfg = RecurrentTextPolicyConfig(
+        encoder=TextEncoderConfig(
+            vocab_size=16,
+            d_model=8,
+            n_layers=1,
+            n_heads=2,
+            d_ff=16,
+            max_seq_len=8,
+            pad_id=0,
+        ),
+        lstm_hidden=8,
+        lstm_layers=1,
+    )
+    return TextActorCritic(cfg)
+
+
 def test_opponent_state_dict_excludes_runtime_lstm_buffers() -> None:
     policy = _PolicyWithRuntimeBuffers(slots=64)
 
@@ -28,6 +49,31 @@ def test_opponent_state_dict_excludes_runtime_lstm_buffers() -> None:
     assert "linear.weight" in state
     assert "live_lstm_h" not in state
     assert "live_lstm_c" not in state
+
+
+def test_disable_text_replay_capture_restores_buffer_after_eval_context() -> None:
+    policy = _text_policy()
+    rollout_buffer = object()
+    policy.rollout_buffer = cast(Any, rollout_buffer)
+
+    with _disable_text_replay_capture(policy, object()):
+        assert policy.rollout_buffer is None
+
+    assert policy.rollout_buffer is rollout_buffer
+
+
+def test_disable_text_replay_capture_restores_buffer_after_exception() -> None:
+    policy = _text_policy()
+    rollout_buffer = object()
+    policy.rollout_buffer = cast(Any, rollout_buffer)
+
+    try:
+        with _disable_text_replay_capture(policy):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+
+    assert policy.rollout_buffer is rollout_buffer
 
 
 def test_save_snapshot_excludes_runtime_lstm_buffers(tmp_path: Path) -> None:
