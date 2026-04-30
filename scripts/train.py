@@ -1635,10 +1635,10 @@ def train_native_batched_envs(
 
     def tracked_wandb_log(payload: dict[str, Any]) -> None:
         nonlocal total_wandb_logs
+        total_wandb_logs += 1
         if wandb.run is None:
             return
         wandb.log(payload)
-        total_wandb_logs += 1
 
     def disable_transcript(env: LiveGame, reason: str) -> None:
         nonlocal transcript_warning_emitted
@@ -2156,10 +2156,10 @@ def train_text_envs(
 
     def tracked_wandb_log(payload: dict[str, Any]) -> None:
         nonlocal total_wandb_logs
+        total_wandb_logs += 1
         if wandb.run is None:
             return
         wandb.log(payload)
-        total_wandb_logs += 1
 
     def run_update(*, final: bool = False) -> None:
         nonlocal total_rollout_steps, last_step_time
@@ -2522,10 +2522,10 @@ def train_text_native_batched_envs(
 
     def tracked_wandb_log(payload: dict[str, Any]) -> None:
         nonlocal total_wandb_logs
+        total_wandb_logs += 1
         if wandb.run is None:
             return
         wandb.log(payload)
-        total_wandb_logs += 1
 
     def start_game(slot_idx: int, episode_idx: int) -> LiveGame:
         backend.policy.reset_lstm_env_states([slot_idx])
@@ -2934,7 +2934,7 @@ def take_snapshot_and_eval(
     eval_games_per_snapshot = (
         args.eval_games_per_snapshot
         if args.eval_games_per_snapshot is not None
-        else max(100, args.episodes // 2500)
+        else max(400, args.episodes // 625)
     )
 
     # Historical opponents only — exclude the freshly-added snapshot from its
@@ -3008,6 +3008,14 @@ def take_snapshot_and_eval(
             f"rating=mu={opponent_mu:.2f},sigma={opponent_sigma:.2f}",
             flush=True,
         )
+
+    own_mu = float(current_entry.rating.mu)
+    own_sigma = float(current_entry.rating.sigma)
+    print(
+        step_prefix,
+        f"eval: snapshot_tag={tag} own_rating=mu={own_mu:.2f},sigma={own_sigma:.2f}",
+        flush=True,
+    )
 
     log_fn(
         {
