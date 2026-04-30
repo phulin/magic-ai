@@ -1650,7 +1650,7 @@ def train_native_batched_envs(
         if sampling_policy is not policy:
             sampling_policy.reset_lstm_env_states([slot_idx])
         seed = args.seed + episode_idx
-        deck_a, deck_b = sample_decks(deck_pool, seed)
+        deck_a, deck_b = sample_decks(deck_pool, seed, fixed=args.deck_json is not None)
         return LiveGame(
             game=mage.new_game(
                 deck_a,
@@ -2269,7 +2269,7 @@ def train_text_envs(
     for episode_idx in range(completed_games, args.episodes):
         backend.policy.reset_lstm_env_states([0])
         seed = args.seed + episode_idx
-        deck_a, deck_b = sample_decks(deck_pool, seed)
+        deck_a, deck_b = sample_decks(deck_pool, seed, fixed=args.deck_json is not None)
         game = mage.new_game(
             deck_a,
             deck_b,
@@ -2612,7 +2612,7 @@ def train_text_native_batched_envs(
         if sampling_policy is not backend.policy:
             sampling_policy.reset_lstm_env_states([slot_idx])
         seed = args.seed + episode_idx
-        deck_a, deck_b = sample_decks(deck_pool, seed)
+        deck_a, deck_b = sample_decks(deck_pool, seed, fixed=args.deck_json is not None)
         return LiveGame(
             game=mage.new_game(
                 deck_a,
@@ -3176,9 +3176,14 @@ def load_deck_dir(path: Path) -> list[dict[str, Any]]:
 def sample_decks(
     deck_pool: list[dict[str, Any]],
     seed: int,
+    *,
+    fixed: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not deck_pool:
         raise ValueError("deck pool must contain at least one deck")
+    if fixed:
+        # deck_json supplies exactly [player_a, player_b] in order; don't randomize
+        return deck_pool[0], deck_pool[1]
     rng = random.Random(seed)
     return rng.choice(deck_pool), rng.choice(deck_pool)
 
