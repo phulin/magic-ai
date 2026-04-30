@@ -26,9 +26,7 @@ _write_rebased_fields_kernel: Any = None
 _clear_decision_rows_kernel: Any = None
 _write_decision_rows_kernel: Any = None
 _gather_packed_tokens_kernel: Any = None
-_gather_rebased_positions_kernel: Any = None
-_gather_metadata_kernel: Any = None
-_gather_recurrent_kernel: Any = None
+_gather_flat_kernel: Any = None
 
 
 def _launch(kernel: Any, grid: tuple[int, ...], *args: Any) -> None:
@@ -368,11 +366,15 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
             "total_card",
             "total_option",
             "total_target",
+            "total_choice",
+            "total_group",
+            "total_lstm",
             "max_total",
         ]
     )
-    def _gather_rebased_positions_kernel(
+    def _gather_flat_kernel(
         rows,
+        # positions
         state_positions,
         src_card_pos,
         src_option_pos,
@@ -384,80 +386,7 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
         dst_option_mask,
         dst_target_pos,
         dst_target_mask,
-        batch_size,
-        card_width: tl.constexpr,
-        option_width: tl.constexpr,
-        target_width: tl.constexpr,
-        total_card,
-        total_option,
-        total_target,
-        max_total,
-        block: tl.constexpr,
-    ):
-        offsets = tl.program_id(0) * block + tl.arange(0, block)
-
-        card_mask = offsets < total_card
-        card_b = offsets // card_width
-        card_col = offsets - card_b * card_width
-        card_row = tl.load(rows + card_b, mask=card_mask, other=0)
-        card_base = tl.load(state_positions + card_b, mask=card_mask, other=0)
-        card_value = tl.load(
-            src_card_pos + card_row * card_width + card_col,
-            mask=card_mask,
-            other=-1,
-        )
-        card_shifted = tl.where(card_value >= 0, card_value + card_base, card_value)
-        tl.store(dst_card_pos + offsets, card_shifted, mask=card_mask)
-
-        option_mask = offsets < total_option
-        option_b = offsets // option_width
-        option_col = offsets - option_b * option_width
-        option_row = tl.load(rows + option_b, mask=option_mask, other=0)
-        option_base = tl.load(state_positions + option_b, mask=option_mask, other=0)
-        option_value = tl.load(
-            src_option_pos + option_row * option_width + option_col,
-            mask=option_mask,
-            other=-1,
-        )
-        option_mask_value = tl.load(
-            src_option_mask + option_row * option_width + option_col,
-            mask=option_mask,
-            other=0,
-        )
-        option_shifted = tl.where(option_value >= 0, option_value + option_base, option_value)
-        tl.store(dst_option_pos + offsets, option_shifted, mask=option_mask)
-        tl.store(dst_option_mask + offsets, option_mask_value, mask=option_mask)
-
-        target_mask = offsets < total_target
-        target_row_area = option_width * target_width
-        target_b = offsets // target_row_area
-        target_in_row = offsets - target_b * target_row_area
-        target_row = tl.load(rows + target_b, mask=target_mask, other=0)
-        target_base = tl.load(state_positions + target_b, mask=target_mask, other=0)
-        target_value = tl.load(
-            src_target_pos + target_row * target_row_area + target_in_row,
-            mask=target_mask,
-            other=-1,
-        )
-        target_mask_value = tl.load(
-            src_target_mask + target_row * target_row_area + target_in_row,
-            mask=target_mask,
-            other=0,
-        )
-        target_shifted = tl.where(target_value >= 0, target_value + target_base, target_value)
-        tl.store(dst_target_pos + offsets, target_shifted, mask=target_mask)
-        tl.store(dst_target_mask + offsets, target_mask_value, mask=target_mask)
-
-    @triton.jit(
-        do_not_specialize=[
-            "batch_size",
-            "total_choice_slots",
-            "total_group_slots",
-            "max_total",
-        ]
-    )
-    def _gather_metadata_kernel(
-        rows,
+        # metadata
         trace_kind_id,
         decision_option_idx,
         decision_target_idx,
@@ -480,108 +409,156 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
         old_log_prob_out,
         value_out,
         perspective_player_idx_out,
+        # recurrent
+        h_in,
+        c_in,
+        h_out,
+        c_out,
+        # sizes
         batch_size,
+        card_width: tl.constexpr,
+        option_width: tl.constexpr,
+        target_width: tl.constexpr,
         max_decision_groups: tl.constexpr,
         max_cached_choices: tl.constexpr,
-        total_choice_slots,
-        total_group_slots,
+        layer_count: tl.constexpr,
+        hidden_dim: tl.constexpr,
+        total_card,
+        total_option,
+        total_target,
+        total_choice,
+        total_group,
+        total_lstm,
         max_total,
         block: tl.constexpr,
     ):
         offsets = tl.program_id(0) * block + tl.arange(0, block)
 
-        scalar_mask = offsets < batch_size
-        scalar_row = tl.load(rows + offsets, mask=scalar_mask, other=0)
+        # ---- positions ----
+        card_m = offsets < total_card
+        card_b = offsets // card_width
+        card_col = offsets - card_b * card_width
+        card_row = tl.load(rows + card_b, mask=card_m, other=0)
+        card_base = tl.load(state_positions + card_b, mask=card_m, other=0)
+        card_val = tl.load(src_card_pos + card_row * card_width + card_col, mask=card_m, other=-1)
+        tl.store(
+            dst_card_pos + offsets,
+            tl.where(card_val >= 0, card_val + card_base, card_val),
+            mask=card_m,
+        )
+
+        opt_m = offsets < total_option
+        opt_b = offsets // option_width
+        opt_col = offsets - opt_b * option_width
+        opt_row = tl.load(rows + opt_b, mask=opt_m, other=0)
+        opt_base = tl.load(state_positions + opt_b, mask=opt_m, other=0)
+        opt_val = tl.load(src_option_pos + opt_row * option_width + opt_col, mask=opt_m, other=-1)
+        opt_mval = tl.load(src_option_mask + opt_row * option_width + opt_col, mask=opt_m, other=0)
+        tl.store(
+            dst_option_pos + offsets,
+            tl.where(opt_val >= 0, opt_val + opt_base, opt_val),
+            mask=opt_m,
+        )
+        tl.store(dst_option_mask + offsets, opt_mval, mask=opt_m)
+
+        tgt_m = offsets < total_target
+        tgt_row_area = option_width * target_width
+        tgt_b = offsets // tgt_row_area
+        tgt_in_row = offsets - tgt_b * tgt_row_area
+        tgt_row = tl.load(rows + tgt_b, mask=tgt_m, other=0)
+        tgt_base = tl.load(state_positions + tgt_b, mask=tgt_m, other=0)
+        tgt_val = tl.load(
+            src_target_pos + tgt_row * tgt_row_area + tgt_in_row, mask=tgt_m, other=-1
+        )
+        tgt_mval = tl.load(
+            src_target_mask + tgt_row * tgt_row_area + tgt_in_row, mask=tgt_m, other=0
+        )
+        tl.store(
+            dst_target_pos + offsets,
+            tl.where(tgt_val >= 0, tgt_val + tgt_base, tgt_val),
+            mask=tgt_m,
+        )
+        tl.store(dst_target_mask + offsets, tgt_mval, mask=tgt_m)
+
+        # ---- metadata scalars ----
+        sc_m = offsets < batch_size
+        sc_row = tl.load(rows + offsets, mask=sc_m, other=0)
         tl.store(
             trace_kind_id_out + offsets,
-            tl.load(trace_kind_id + scalar_row, mask=scalar_mask, other=0),
-            mask=scalar_mask,
+            tl.load(trace_kind_id + sc_row, mask=sc_m, other=0),
+            mask=sc_m,
         )
         tl.store(
             decision_count_out + offsets,
-            tl.load(decision_count + scalar_row, mask=scalar_mask, other=0),
-            mask=scalar_mask,
+            tl.load(decision_count + sc_row, mask=sc_m, other=0),
+            mask=sc_m,
         )
         tl.store(
             may_selected_out + offsets,
-            tl.load(may_selected + scalar_row, mask=scalar_mask, other=0.0),
-            mask=scalar_mask,
+            tl.load(may_selected + sc_row, mask=sc_m, other=0.0),
+            mask=sc_m,
         )
         tl.store(
             old_log_prob_out + offsets,
-            tl.load(old_log_prob + scalar_row, mask=scalar_mask, other=0.0),
-            mask=scalar_mask,
+            tl.load(old_log_prob + sc_row, mask=sc_m, other=0.0),
+            mask=sc_m,
         )
-        tl.store(
-            value_out + offsets,
-            tl.load(value + scalar_row, mask=scalar_mask, other=0.0),
-            mask=scalar_mask,
-        )
+        tl.store(value_out + offsets, tl.load(value + sc_row, mask=sc_m, other=0.0), mask=sc_m)
         tl.store(
             perspective_player_idx_out + offsets,
-            tl.load(perspective_player_idx + scalar_row, mask=scalar_mask, other=0),
-            mask=scalar_mask,
+            tl.load(perspective_player_idx + sc_row, mask=sc_m, other=0),
+            mask=sc_m,
         )
 
-        choice_mask = offsets < total_choice_slots
+        # ---- metadata choice slots ----
+        ch_m = offsets < total_choice
         slots_per_row = max_decision_groups * max_cached_choices
-        choice_b = offsets // slots_per_row
-        choice_in_row = offsets - choice_b * slots_per_row
-        choice_row = tl.load(rows + choice_b, mask=choice_mask, other=0)
-        choice_src = choice_row * slots_per_row + choice_in_row
+        ch_b = offsets // slots_per_row
+        ch_in_row = offsets - ch_b * slots_per_row
+        ch_row = tl.load(rows + ch_b, mask=ch_m, other=0)
+        ch_src = ch_row * slots_per_row + ch_in_row
         tl.store(
             decision_option_idx_out + offsets,
-            tl.load(decision_option_idx + choice_src, mask=choice_mask, other=-1),
-            mask=choice_mask,
+            tl.load(decision_option_idx + ch_src, mask=ch_m, other=-1),
+            mask=ch_m,
         )
         tl.store(
             decision_target_idx_out + offsets,
-            tl.load(decision_target_idx + choice_src, mask=choice_mask, other=-1),
-            mask=choice_mask,
+            tl.load(decision_target_idx + ch_src, mask=ch_m, other=-1),
+            mask=ch_m,
         )
         tl.store(
             decision_mask_out + offsets,
-            tl.load(decision_mask + choice_src, mask=choice_mask, other=0),
-            mask=choice_mask,
+            tl.load(decision_mask + ch_src, mask=ch_m, other=0),
+            mask=ch_m,
         )
 
-        group_mask = offsets < total_group_slots
-        group_b = offsets // max_decision_groups
-        group_in_row = offsets - group_b * max_decision_groups
-        group_row = tl.load(rows + group_b, mask=group_mask, other=0)
-        group_src = group_row * max_decision_groups + group_in_row
+        # ---- metadata group slots ----
+        gr_m = offsets < total_group
+        gr_b = offsets // max_decision_groups
+        gr_in_row = offsets - gr_b * max_decision_groups
+        gr_row = tl.load(rows + gr_b, mask=gr_m, other=0)
+        gr_src = gr_row * max_decision_groups + gr_in_row
         tl.store(
             uses_none_head_out + offsets,
-            tl.load(uses_none_head + group_src, mask=group_mask, other=0),
-            mask=group_mask,
+            tl.load(uses_none_head + gr_src, mask=gr_m, other=0),
+            mask=gr_m,
         )
         tl.store(
             selected_indices_out + offsets,
-            tl.load(selected_indices + group_src, mask=group_mask, other=-1),
-            mask=group_mask,
+            tl.load(selected_indices + gr_src, mask=gr_m, other=-1),
+            mask=gr_m,
         )
 
-    @triton.jit(do_not_specialize=["total_slots"])
-    def _gather_recurrent_kernel(
-        rows,
-        h_in,
-        c_in,
-        h_out,
-        c_out,
-        layer_count: tl.constexpr,
-        hidden_dim: tl.constexpr,
-        total_slots,
-        block: tl.constexpr,
-    ):
-        offsets = tl.program_id(0) * block + tl.arange(0, block)
-        mask = offsets < total_slots
-        slots_per_row = layer_count * hidden_dim
-        b = offsets // slots_per_row
-        in_row = offsets - b * slots_per_row
-        row = tl.load(rows + b, mask=mask, other=0)
-        src = row * slots_per_row + in_row
-        tl.store(h_out + offsets, tl.load(h_in + src, mask=mask, other=0.0), mask=mask)
-        tl.store(c_out + offsets, tl.load(c_in + src, mask=mask, other=0.0), mask=mask)
+        # ---- recurrent ----
+        lstm_m = offsets < total_lstm
+        lstm_slots_per_row = layer_count * hidden_dim
+        lstm_b = offsets // lstm_slots_per_row
+        lstm_in_row = offsets - lstm_b * lstm_slots_per_row
+        lstm_row = tl.load(rows + lstm_b, mask=lstm_m, other=0)
+        lstm_src = lstm_row * lstm_slots_per_row + lstm_in_row
+        tl.store(h_out + offsets, tl.load(h_in + lstm_src, mask=lstm_m, other=0.0), mask=lstm_m)
+        tl.store(c_out + offsets, tl.load(c_in + lstm_src, mask=lstm_m, other=0.0), mask=lstm_m)
 
 
 def append_batch_encoded_triton(
@@ -872,33 +849,14 @@ def gather_encoded_triton(
     rows: Tensor,
     seq_lengths: Tensor,
     cu_seqlens: Tensor,
-    state_positions: Tensor,
     packed_token_ids: Tensor,
     row_token_start: Tensor,
-    card_ref_positions: Tensor,
-    option_positions: Tensor,
-    option_mask: Tensor,
-    target_positions: Tensor,
-    target_mask: Tensor,
-    max_seq_length: int,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor] | None:
-    """Gather packed replay rows and rebase anchors with Triton."""
+) -> tuple[Tensor, Tensor, Tensor] | None:
+    """Gather packed token sequences with Triton (token copy only)."""
 
     if not TRITON_AVAILABLE or not rows.is_cuda:
         return None
-    tensors = (
-        rows,
-        seq_lengths,
-        cu_seqlens,
-        state_positions,
-        packed_token_ids,
-        row_token_start,
-        card_ref_positions,
-        option_positions,
-        option_mask,
-        target_positions,
-        target_mask,
-    )
+    tensors = (rows, seq_lengths, cu_seqlens, packed_token_ids, row_token_start)
     if not all(t.is_cuda and t.is_contiguous() for t in tensors):
         return None
 
@@ -923,89 +881,18 @@ def gather_encoded_triton(
         pos_in_seq,
         512,
     )
-
-    card_ref_positions_out = torch.empty(
-        (batch_size, int(card_ref_positions.shape[1])),
-        dtype=torch.int64,
-        device=rows.device,
-    )
-    option_positions_out = torch.empty(
-        (batch_size, int(option_positions.shape[1])),
-        dtype=torch.int64,
-        device=rows.device,
-    )
-    target_positions_out = torch.empty(
-        (
-            batch_size,
-            int(target_positions.shape[1]),
-            int(target_positions.shape[2]),
-        ),
-        dtype=torch.int64,
-        device=rows.device,
-    )
-    option_mask_out = torch.empty(
-        (batch_size, int(option_mask.shape[1])),
-        dtype=torch.bool,
-        device=rows.device,
-    )
-    target_mask_out = torch.empty(
-        (
-            batch_size,
-            int(target_mask.shape[1]),
-            int(target_mask.shape[2]),
-        ),
-        dtype=torch.bool,
-        device=rows.device,
-    )
-    card_width = int(card_ref_positions.shape[1])
-    option_width = int(option_positions.shape[1])
-    target_width = int(target_positions.shape[2])
-    total_card = batch_size * card_width
-    total_option = batch_size * option_width
-    total_target = batch_size * option_width * target_width
-    max_total = max(total_card, total_option, total_target)
-    if max_total > 0:
-        block = 256
-        _launch(
-            _gather_rebased_positions_kernel,
-            (_cdiv(max_total, block),),
-            rows,
-            state_positions,
-            card_ref_positions,
-            option_positions,
-            option_mask,
-            target_positions,
-            target_mask,
-            card_ref_positions_out,
-            option_positions_out,
-            option_mask_out,
-            target_positions_out,
-            target_mask_out,
-            batch_size,
-            card_width,
-            option_width,
-            target_width,
-            total_card,
-            total_option,
-            total_target,
-            max_total,
-            block,
-        )
-    return (
-        token_ids,
-        seq_id,
-        pos_in_seq,
-        card_ref_positions_out,
-        option_positions_out,
-        option_mask_out,
-        target_positions_out,
-        target_mask_out,
-    )
+    return token_ids, seq_id, pos_in_seq
 
 
-def gather_metadata_triton(
+def gather_flat_triton(
     *,
     rows: Tensor,
+    state_positions: Tensor,
+    card_ref_positions: Tensor,
+    option_positions: Tensor,
+    option_mask: Tensor,
+    target_positions: Tensor,
+    target_mask: Tensor,
     trace_kind_id: Tensor,
     decision_option_idx: Tensor,
     decision_target_idx: Tensor,
@@ -1017,6 +904,8 @@ def gather_metadata_triton(
     old_log_prob: Tensor,
     value: Tensor,
     perspective_player_idx: Tensor,
+    lstm_h_in: Tensor | None,
+    lstm_c_in: Tensor | None,
 ) -> (
     tuple[
         Tensor,
@@ -1030,15 +919,28 @@ def gather_metadata_triton(
         Tensor,
         Tensor,
         Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor | None,
+        Tensor | None,
     ]
     | None
 ):
-    """Gather fixed-width replay metadata with Triton."""
+    """Gather positions, metadata, and LSTM state in a single fused Triton kernel."""
 
     if not TRITON_AVAILABLE or not rows.is_cuda:
         return None
-    tensors = (
+    tensors: tuple[Tensor, ...] = (
         rows,
+        state_positions,
+        card_ref_positions,
+        option_positions,
+        option_mask,
+        target_positions,
+        target_mask,
         trace_kind_id,
         decision_option_idx,
         decision_target_idx,
@@ -1051,18 +953,69 @@ def gather_metadata_triton(
         value,
         perspective_player_idx,
     )
+    if lstm_h_in is not None and lstm_c_in is not None:
+        tensors = tensors + (lstm_h_in, lstm_c_in)
     if not all(t.is_cuda and t.is_contiguous() for t in tensors):
         return None
 
     batch_size = int(rows.shape[0])
     if batch_size == 0:
         return None
+
+    card_width = int(card_ref_positions.shape[1])
+    option_width = int(option_positions.shape[1])
+    target_width = int(target_positions.shape[2])
     max_decision_groups = int(uses_none_head.shape[1])
     max_cached_choices = int(decision_option_idx.shape[2])
-    total_choice_slots = batch_size * max_decision_groups * max_cached_choices
-    total_group_slots = batch_size * max_decision_groups
-    max_total = max(batch_size, total_choice_slots, total_group_slots)
 
+    total_card = batch_size * card_width
+    total_option = batch_size * option_width
+    total_target = batch_size * option_width * target_width
+    total_choice = batch_size * max_decision_groups * max_cached_choices
+    total_group = batch_size * max_decision_groups
+
+    has_lstm = lstm_h_in is not None and lstm_c_in is not None
+    if has_lstm:
+        assert lstm_h_in is not None and lstm_c_in is not None
+        layer_count = int(lstm_h_in.shape[1])
+        hidden_dim = int(lstm_h_in.shape[2])
+        total_lstm = batch_size * layer_count * hidden_dim
+        _h_in: Tensor = lstm_h_in
+        _c_in: Tensor = lstm_c_in
+    else:
+        layer_count = 1
+        hidden_dim = 1
+        total_lstm = 0
+        _dummy = torch.empty(1, device=rows.device, dtype=torch.float32)
+        _h_in = _dummy
+        _c_in = _dummy
+
+    h_out = (
+        torch.empty(
+            (batch_size, layer_count, hidden_dim),
+            dtype=_h_in.dtype,
+            device=rows.device,
+        )
+        if has_lstm
+        else None
+    )
+    c_out = torch.empty_like(h_out) if h_out is not None else None
+    _h_out = h_out if h_out is not None else torch.empty(1, device=rows.device, dtype=torch.float32)
+    _c_out = c_out if c_out is not None else torch.empty(1, device=rows.device, dtype=torch.float32)
+
+    card_ref_positions_out = torch.empty(
+        (batch_size, card_width), dtype=torch.int64, device=rows.device
+    )
+    option_positions_out = torch.empty(
+        (batch_size, option_width), dtype=torch.int64, device=rows.device
+    )
+    option_mask_out = torch.empty((batch_size, option_width), dtype=torch.bool, device=rows.device)
+    target_positions_out = torch.empty(
+        (batch_size, option_width, target_width), dtype=torch.int64, device=rows.device
+    )
+    target_mask_out = torch.empty(
+        (batch_size, option_width, target_width), dtype=torch.bool, device=rows.device
+    )
     trace_kind_id_out = torch.empty(batch_size, dtype=trace_kind_id.dtype, device=rows.device)
     decision_option_idx_out = torch.empty(
         (batch_size, max_decision_groups, max_cached_choices),
@@ -1076,30 +1029,44 @@ def gather_metadata_triton(
         device=rows.device,
     )
     uses_none_head_out = torch.empty(
-        (batch_size, max_decision_groups),
-        dtype=uses_none_head.dtype,
-        device=rows.device,
+        (batch_size, max_decision_groups), dtype=uses_none_head.dtype, device=rows.device
     )
     decision_count_out = torch.empty(batch_size, dtype=decision_count.dtype, device=rows.device)
     selected_indices_out = torch.empty(
-        (batch_size, max_decision_groups),
-        dtype=selected_indices.dtype,
-        device=rows.device,
+        (batch_size, max_decision_groups), dtype=selected_indices.dtype, device=rows.device
     )
     may_selected_out = torch.empty(batch_size, dtype=may_selected.dtype, device=rows.device)
     old_log_prob_out = torch.empty(batch_size, dtype=old_log_prob.dtype, device=rows.device)
     value_out = torch.empty(batch_size, dtype=value.dtype, device=rows.device)
     perspective_player_idx_out = torch.empty(
-        batch_size,
-        dtype=perspective_player_idx.dtype,
-        device=rows.device,
+        batch_size, dtype=perspective_player_idx.dtype, device=rows.device
     )
 
+    max_total = max(
+        total_card,
+        total_option,
+        total_target,
+        batch_size,
+        total_choice,
+        total_group,
+        total_lstm,
+    )
     block = 256
     _launch(
-        _gather_metadata_kernel,
+        _gather_flat_kernel,
         (_cdiv(max_total, block),),
         rows,
+        state_positions,
+        card_ref_positions,
+        option_positions,
+        option_mask,
+        target_positions,
+        target_mask,
+        card_ref_positions_out,
+        option_positions_out,
+        option_mask_out,
+        target_positions_out,
+        target_mask_out,
         trace_kind_id,
         decision_option_idx,
         decision_target_idx,
@@ -1122,15 +1089,33 @@ def gather_metadata_triton(
         old_log_prob_out,
         value_out,
         perspective_player_idx_out,
+        _h_in,
+        _c_in,
+        _h_out,
+        _c_out,
         batch_size,
+        card_width,
+        option_width,
+        target_width,
         max_decision_groups,
         max_cached_choices,
-        total_choice_slots,
-        total_group_slots,
+        layer_count,
+        hidden_dim,
+        total_card,
+        total_option,
+        total_target,
+        total_choice,
+        total_group,
+        total_lstm,
         max_total,
         block,
     )
     return (
+        card_ref_positions_out,
+        option_positions_out,
+        option_mask_out,
+        target_positions_out,
+        target_mask_out,
         trace_kind_id_out,
         decision_option_idx_out,
         decision_target_idx_out,
@@ -1142,48 +1127,9 @@ def gather_metadata_triton(
         old_log_prob_out,
         value_out,
         perspective_player_idx_out,
-    )
-
-
-def gather_recurrent_triton(
-    *,
-    rows: Tensor,
-    lstm_h_in: Tensor,
-    lstm_c_in: Tensor,
-) -> tuple[Tensor, Tensor] | None:
-    """Gather fixed-width recurrent replay state with Triton."""
-
-    if not TRITON_AVAILABLE or not rows.is_cuda:
-        return None
-    tensors = (rows, lstm_h_in, lstm_c_in)
-    if not all(t.is_cuda and t.is_contiguous() for t in tensors):
-        return None
-
-    batch_size = int(rows.shape[0])
-    layer_count = int(lstm_h_in.shape[1])
-    hidden_dim = int(lstm_h_in.shape[2])
-    total_slots = batch_size * layer_count * hidden_dim
-    h_out = torch.empty(
-        (batch_size, layer_count, hidden_dim), dtype=lstm_h_in.dtype, device=rows.device
-    )
-    c_out = torch.empty_like(h_out)
-    if total_slots == 0:
-        return h_out, c_out
-    block = 256
-    _launch(
-        _gather_recurrent_kernel,
-        (_cdiv(total_slots, block),),
-        rows,
-        lstm_h_in,
-        lstm_c_in,
         h_out,
         c_out,
-        layer_count,
-        hidden_dim,
-        total_slots,
-        block,
     )
-    return h_out, c_out
 
 
 __all__ = [
@@ -1191,8 +1137,7 @@ __all__ = [
     "append_batch_encoded_triton",
     "clear_append_decisions_triton",
     "gather_encoded_triton",
-    "gather_metadata_triton",
-    "gather_recurrent_triton",
+    "gather_flat_triton",
     "gather_sequence_layout_triton",
     "write_append_decisions_triton",
 ]

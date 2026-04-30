@@ -12,8 +12,7 @@ from magic_ai.text_encoder.replay_triton import (
     append_batch_encoded_triton,
     clear_append_decisions_triton,
     gather_encoded_triton,
-    gather_metadata_triton,
-    gather_recurrent_triton,
+    gather_flat_triton,
     gather_sequence_layout_triton,
     write_append_decisions_triton,
 )
@@ -588,22 +587,42 @@ class TextReplayBuffer:
         state_positions = cu_seqlens[:-1]
         total_tokens = int(cu_seqlens[-1].item())
         gathered_encoded = None
+        gathered_flat = None
         if self.use_triton_gather:
             gathered_encoded = gather_encoded_triton(
                 rows=idx,
                 seq_lengths=seq_lengths,
                 cu_seqlens=cu_seqlens,
-                state_positions=state_positions,
                 packed_token_ids=self.packed_token_ids,
                 row_token_start=self.row_token_start,
-                card_ref_positions=self.card_ref_positions,
-                option_positions=self.option_positions,
-                option_mask=self.option_mask,
-                target_positions=self.target_positions,
-                target_mask=self.target_mask,
-                max_seq_length=self.max_tokens,
             )
-        if gathered_encoded is None:
+            if gathered_encoded is not None:
+                gathered_flat = gather_flat_triton(
+                    rows=idx,
+                    state_positions=state_positions,
+                    card_ref_positions=self.card_ref_positions,
+                    option_positions=self.option_positions,
+                    option_mask=self.option_mask,
+                    target_positions=self.target_positions,
+                    target_mask=self.target_mask,
+                    trace_kind_id=self.trace_kind_id,
+                    decision_option_idx=self.decision_option_idx,
+                    decision_target_idx=self.decision_target_idx,
+                    decision_mask=self.decision_mask,
+                    uses_none_head=self.uses_none_head,
+                    decision_count=self.decision_count,
+                    selected_indices=self.selected_indices,
+                    may_selected=self.may_selected,
+                    old_log_prob=self.old_log_prob,
+                    value=self.value,
+                    perspective_player_idx=self.perspective_player_idx,
+                    lstm_h_in=self.lstm_h_in,
+                    lstm_c_in=self.lstm_c_in,
+                )
+                if gathered_flat is None:
+                    gathered_encoded = None
+
+        if gathered_encoded is None or gathered_flat is None:
             token_starts = self.row_token_start[idx]
             seq_id = torch.repeat_interleave(
                 torch.arange(batch_size, dtype=torch.long, device=self.device),
@@ -625,48 +644,9 @@ class TextReplayBuffer:
 
             card_ref_positions = pack_positions(self.card_ref_positions[idx], (batch_size, 1))
             option_positions = pack_positions(self.option_positions[idx], (batch_size, 1))
+            option_mask = self.option_mask[idx]
             target_positions = pack_positions(self.target_positions[idx], (batch_size, 1, 1))
-        else:
-            (
-                token_ids,
-                seq_id,
-                pos_in_seq,
-                card_ref_positions,
-                option_positions,
-                option_mask,
-                target_positions,
-                target_mask,
-            ) = gathered_encoded
-        encoded = PackedTextBatch(
-            token_ids=token_ids,
-            seq_id=seq_id,
-            pos_in_seq=pos_in_seq,
-            cu_seqlens=cu_seqlens,
-            seq_lengths=seq_lengths,
-            state_positions=state_positions,
-            card_ref_positions=card_ref_positions,
-            option_positions=option_positions,
-            option_mask=option_mask if gathered_encoded is not None else self.option_mask[idx],
-            target_positions=target_positions,
-            target_mask=target_mask if gathered_encoded is not None else self.target_mask[idx],
-        )
-        gathered_metadata = None
-        if self.use_triton_gather:
-            gathered_metadata = gather_metadata_triton(
-                rows=idx,
-                trace_kind_id=self.trace_kind_id,
-                decision_option_idx=self.decision_option_idx,
-                decision_target_idx=self.decision_target_idx,
-                decision_mask=self.decision_mask,
-                uses_none_head=self.uses_none_head,
-                decision_count=self.decision_count,
-                selected_indices=self.selected_indices,
-                may_selected=self.may_selected,
-                old_log_prob=self.old_log_prob,
-                value=self.value,
-                perspective_player_idx=self.perspective_player_idx,
-            )
-        if gathered_metadata is None:
+            target_mask = self.target_mask[idx]
             trace_kind_id = self.trace_kind_id[idx]
             decision_option_idx = self.decision_option_idx[idx]
             decision_target_idx = self.decision_target_idx[idx]
@@ -678,8 +658,16 @@ class TextReplayBuffer:
             old_log_prob = self.old_log_prob[idx]
             value = self.value[idx]
             perspective_player_idx = self.perspective_player_idx[idx]
+            h_in = self.lstm_h_in[idx] if self.lstm_h_in is not None else None
+            c_in = self.lstm_c_in[idx] if self.lstm_c_in is not None else None
         else:
+            token_ids, seq_id, pos_in_seq = gathered_encoded
             (
+                card_ref_positions,
+                option_positions,
+                option_mask,
+                target_positions,
+                target_mask,
                 trace_kind_id,
                 decision_option_idx,
                 decision_target_idx,
@@ -691,23 +679,22 @@ class TextReplayBuffer:
                 old_log_prob,
                 value,
                 perspective_player_idx,
-            ) = gathered_metadata
-
-        h_in = None
-        c_in = None
-        if self.lstm_h_in is not None and self.lstm_c_in is not None:
-            gathered_recurrent = None
-            if self.use_triton_gather:
-                gathered_recurrent = gather_recurrent_triton(
-                    rows=idx,
-                    lstm_h_in=self.lstm_h_in,
-                    lstm_c_in=self.lstm_c_in,
-                )
-            if gathered_recurrent is None:
-                h_in = self.lstm_h_in[idx]
-                c_in = self.lstm_c_in[idx]
-            else:
-                h_in, c_in = gathered_recurrent
+                h_in,
+                c_in,
+            ) = gathered_flat
+        encoded = PackedTextBatch(
+            token_ids=token_ids,
+            seq_id=seq_id,
+            pos_in_seq=pos_in_seq,
+            cu_seqlens=cu_seqlens,
+            seq_lengths=seq_lengths,
+            state_positions=state_positions,
+            card_ref_positions=card_ref_positions,
+            option_positions=option_positions,
+            option_mask=option_mask,
+            target_positions=target_positions,
+            target_mask=target_mask,
+        )
         return TextReplayBatch(
             encoded=encoded,
             trace_kind_id=trace_kind_id,
