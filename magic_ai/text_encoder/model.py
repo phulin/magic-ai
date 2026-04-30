@@ -110,6 +110,19 @@ def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((rx1, rx2), dim=-1)
 
 
+def _apply_rope_packed(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    # x: [T, H, D]; cos/sin: [T, D/2]
+    d = x.shape[-1]
+    half = d // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    cos_b = cos[:, None, :]
+    sin_b = sin[:, None, :]
+    rx1 = x1 * cos_b - x2 * sin_b
+    rx2 = x2 * cos_b + x1 * sin_b
+    return torch.cat((rx1, rx2), dim=-1)
+
+
 class MultiHeadSelfAttention(nn.Module):
     def __init__(self, cfg: TextEncoderConfig) -> None:
         super().__init__()
@@ -129,6 +142,41 @@ class MultiHeadSelfAttention(nn.Module):
         sin: Tensor,
         cu_seqlens: Tensor | None = None,
     ) -> Tensor:
+        # Two layouts share this module:
+        #   (1) packed varlen [T, D] when cu_seqlens is not None — wraps q/k/v
+        #       once into NJT over doc offsets, dispatches to FlashAttention
+        #       varlen, unwraps to packed [T, H, Dh]. No leading batch dim,
+        #       no extra transposes/contiguous around the wrap.
+        #   (2) padded [B, T, D] otherwise — flex_attention on CUDA,
+        #       additive-bias SDPA on CPU.
+        if cu_seqlens is not None:
+            return self._forward_packed(x, cu_seqlens, cos, sin)
+        return self._forward_dense(x, block_mask, attn_bias, cos, sin)
+
+    def _forward_packed(self, x: Tensor, cu_seqlens: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        # x: [T, D]; cos/sin: [T, Dh/2]
+        t = x.shape[0]
+        qkv = self.qkv(x).view(t, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=1)  # each [T, H, Dh], canonical NJT layout
+        q = _apply_rope_packed(q, cos, sin)
+        k = _apply_rope_packed(k, cos, sin)
+        q_nt = torch.nested.nested_tensor_from_jagged(q, cu_seqlens).transpose(1, 2)
+        k_nt = torch.nested.nested_tensor_from_jagged(k, cu_seqlens).transpose(1, 2)
+        v_nt = torch.nested.nested_tensor_from_jagged(v, cu_seqlens).transpose(1, 2)
+        out_nt = F.scaled_dot_product_attention(
+            q_nt, k_nt, v_nt, dropout_p=self.dropout if self.training else 0.0
+        )
+        out = out_nt.transpose(1, 2).values()  # [T, H, Dh]
+        return self.proj(out.reshape(t, self.n_heads * self.head_dim))
+
+    def _forward_dense(
+        self,
+        x: Tensor,
+        block_mask: BlockMask,
+        attn_bias: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+    ) -> Tensor:
         b, t, _ = x.shape
         qkv = self.qkv(x).view(b, t, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)  # each [B, T, H, D]
@@ -137,29 +185,6 @@ class MultiHeadSelfAttention(nn.Module):
         v = v.transpose(1, 2)
         q = _apply_rope(q, cos, sin)
         k = _apply_rope(k, cos, sin)
-        # Three attention paths:
-        #   (1) packed varlen on CUDA via NJT + SDPA → FlashAttention varlen
-        #       kernel, no flex_attention compile.
-        #   (2) padded CUDA via flex_attention's BlockMask (compiled).
-        #   (3) CPU additive-bias SDPA (flex_attention has no CPU backward
-        #       in torch 2.11).
-        if cu_seqlens is not None:
-            # q/k/v are [1, H, T_packed, Dh]; strip the B=1, wrap as NJT
-            # over the doc-length offsets, run SDPA on [B_docs, H, j, Dh],
-            # then unwrap back to packed [T_packed, H*Dh].
-            q_p = q.squeeze(0).transpose(0, 1).contiguous()  # [T, H, Dh]
-            k_p = k.squeeze(0).transpose(0, 1).contiguous()
-            v_p = v.squeeze(0).transpose(0, 1).contiguous()
-            offsets = cu_seqlens.to(torch.int64)
-            q_nt = torch.nested.nested_tensor_from_jagged(q_p, offsets).transpose(1, 2)
-            k_nt = torch.nested.nested_tensor_from_jagged(k_p, offsets).transpose(1, 2)
-            v_nt = torch.nested.nested_tensor_from_jagged(v_p, offsets).transpose(1, 2)
-            out_nt = F.scaled_dot_product_attention(
-                q_nt, k_nt, v_nt, dropout_p=self.dropout if self.training else 0.0
-            )
-            out_p = out_nt.transpose(1, 2).values()  # [T, H, Dh]
-            out = out_p.reshape(1, t, self.n_heads * self.head_dim)
-            return self.proj(out)
         if x.device.type == "cuda":
             result = _flex_attention(q, k, v, block_mask=block_mask)
             out = result if isinstance(result, Tensor) else result[0]
@@ -213,6 +238,16 @@ class TextStateEncoder(nn.Module):
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model, padding_idx=cfg.pad_id)
         self.blocks = nn.ModuleList([EncoderBlock(cfg) for _ in range(cfg.n_layers)])
         self.final_norm = RMSNorm(cfg.d_model)
+        # RoPE table is fixed for a given (max_seq_len, head_dim); rebuilding
+        # it every forward showed up in profiling. Stored float32 and cast to
+        # the activation dtype at use, so .to(dtype=...) on the module body
+        # doesn't desync this from the activations.
+        head_dim = cfg.d_model // cfg.n_heads
+        cos_full, sin_full = _build_rope_cache(
+            cfg.max_seq_len, head_dim, torch.device("cpu"), torch.float32
+        )
+        self.register_buffer("rope_cos", cos_full, persistent=False)
+        self.register_buffer("rope_sin", sin_full, persistent=False)
         self.apply(self._init_weights)
 
     @staticmethod
@@ -262,8 +297,10 @@ class TextStateEncoder(nn.Module):
             block_mask = cast(BlockMask, None)
             attn_bias = torch.zeros(b, 1, 1, t, device=x.device, dtype=x.dtype)
             attn_bias = attn_bias.masked_fill(key_pad[:, None, None, :], float("-inf"))
-        head_dim = self.cfg.d_model // self.cfg.n_heads
-        cos, sin = _build_rope_cache(t, head_dim, x.device, x.dtype)
+        rope_cos = cast(Tensor, self.rope_cos)
+        rope_sin = cast(Tensor, self.rope_sin)
+        cos = rope_cos[:t].to(x.dtype)
+        sin = rope_sin[:t].to(x.dtype)
         for block in self.blocks:
             x = block(x, block_mask, attn_bias, cos, sin)
         x = self.final_norm(x)
@@ -273,48 +310,43 @@ class TextStateEncoder(nn.Module):
         """Run the encoder over a packed (varlen) batch.
 
         Returns hidden states of shape ``[T_packed, D]``. Documents are
-        kept independent via a flex_attention mask_mod that compares
-        ``seq_id[q]`` to ``seq_id[kv]``; RoPE positions are reset per
-        document by gathering the precomputed sin/cos table at
-        ``pos_in_seq``. No Python loop over documents.
+        kept independent via the cu_seqlens-aware NJT path on CUDA; the
+        CPU fallback uses an additive block-diagonal mask. RoPE positions
+        are reset per document by gathering the cached sin/cos table at
+        ``pos_in_seq``.
         """
 
         token_ids = batch.token_ids.to(torch.long)  # [T]
         t = int(token_ids.shape[0])
-        x = self.tok_emb(token_ids).unsqueeze(0)  # [1, T, D]
-        seq_id = batch.seq_id.to(device=x.device, dtype=torch.long)
+        x = self.tok_emb(token_ids)  # [T, D] — packed path stays rank-2
         pos = batch.pos_in_seq.to(device=x.device, dtype=torch.long)
+        rope_cos = cast(Tensor, self.rope_cos)
+        rope_sin = cast(Tensor, self.rope_sin)
+        cos = rope_cos.index_select(0, pos).to(x.dtype)  # [T, Dh/2]
+        sin = rope_sin.index_select(0, pos).to(x.dtype)
 
-        head_dim = self.cfg.d_model // self.cfg.n_heads
-        # Cache size has to cover the largest in-doc position; the
-        # configured ``max_seq_len`` is the model's hard upper bound,
-        # and any individual document is ``<= max_seq_len`` by
-        # construction.
-        cache_len = self.cfg.max_seq_len
-        cos_full, sin_full = _build_rope_cache(cache_len, head_dim, x.device, x.dtype)
-        # [T, D/2] — same shape the dense path feeds into ``_apply_rope``,
-        # so the existing rope kernel works unchanged.
-        cos = cos_full.index_select(0, pos)
-        sin = sin_full.index_select(0, pos)
-
-        # Packed varlen attention via NJT + SDPA on CUDA (FlashAttention
-        # varlen) — avoids the flex_attention create_block_mask compile.
-        # CPU keeps the additive-mask SDPA fallback used by the tests.
         if x.device.type == "cuda":
             block_mask = cast(BlockMask, None)
             attn_bias = x.new_zeros(())
             cu_seqlens: Tensor | None = batch.cu_seqlens.to(device=x.device, dtype=torch.int64)
-        else:
-            block_mask = cast(BlockMask, None)
-            same = seq_id[:, None] == seq_id[None, :]  # [T, T] bool
-            attn_bias = torch.zeros(1, 1, t, t, device=x.device, dtype=x.dtype)
-            attn_bias = attn_bias.masked_fill(~same[None, None, :, :], float("-inf"))
-            cu_seqlens = None
+            for block in self.blocks:
+                x = block(x, block_mask, attn_bias, cos, sin, cu_seqlens)
+            x = self.final_norm(x)
+            return x
 
+        # CPU fallback: flex_attention has no CPU backward in current torch,
+        # so run dense SDPA with a block-diagonal additive mask. We add a
+        # leading B=1 here just for the dense attention path's expectations.
+        seq_id = batch.seq_id.to(device=x.device, dtype=torch.long)
+        same = seq_id[:, None] == seq_id[None, :]  # [T, T] bool
+        attn_bias = torch.zeros(1, 1, t, t, device=x.device, dtype=x.dtype)
+        attn_bias = attn_bias.masked_fill(~same[None, None, :, :], float("-inf"))
+        block_mask = cast(BlockMask, None)
+        x_dense = x.unsqueeze(0)  # [1, T, D]
         for block in self.blocks:
-            x = block(x, block_mask, attn_bias, cos, sin, cu_seqlens)
-        x = self.final_norm(x)
-        return x.squeeze(0)  # [T, D]
+            x_dense = block(x_dense, block_mask, attn_bias, cos, sin, None)
+        x_dense = self.final_norm(x_dense)
+        return x_dense.squeeze(0)
 
 
 def _gather_at(hidden: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
