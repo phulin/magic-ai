@@ -5,10 +5,7 @@ Comprehensive test suite covering text encoding (rendering, tokenization, assemb
 ## Files
 
 - `conftest.py` — Pytest configuration and path setup.
-- `test_assembler.py` — Hand-written opcode-decoder tests for `assemble_batch` without coupling to render-plan emission.
-- `test_assembler_dedup.py` — Tests for card-body deduplication opcodes; validates token efficiency gains in v2 plan.
 - `test_card_cache.py` — Card cache build, roundtrip, slice extraction, hash stability, and parity with slow renderer.
-- `test_encoder_parity.py` — Parity between Python batch encoder and single-item reference implementations.
 - `test_lstm_recompute_strategies.py` — Correctness and performance comparison for LSTM recompute strategies (pad/gather/packed/legacy).
 - `test_native_assembler_parity.py` — Infrastructure for parity gate between Python and native (Go) assembler paths.
 - `test_native_encoder.py` — Unit tests for native batch encoder and decision-layout validation.
@@ -33,5 +30,8 @@ Comprehensive test suite covering text encoding (rendering, tokenization, assemb
 - `test_text_render.py` — Tests for game state renderer: determinism, card refs, zones, actions, busy mid-game scenarios.
 - `test_text_replay_buffer.py` — Tests for replay buffer storage and batch packing.
 - `test_text_rollout.py` — Smoke tests for cache/emitter/assembler/policy pipeline against live mage engine.
-- `test_token_tables.py` — Parity test: precomputed token lists match live tokenizer output for each table entry.
+- `test_text_assembler.py` — Hand-written opcode-decoder tests for `assemble_batch` without coupling to render-plan emission.
+- `test_text_assembler_dedup.py` — Tests for card-body deduplication opcodes; validates token efficiency gains in v2 plan.
+- `test_text_encoder_parity.py` — Parity between Python batch encoder and single-item reference implementations.
+- `test_text_token_tables.py` — Parity test: precomputed token lists match live tokenizer output for each table entry.
 - `test_train.py` — Integration tests for training script: slot/text backend setup, checkpoint loading, opponent pool, transcript snapshots.

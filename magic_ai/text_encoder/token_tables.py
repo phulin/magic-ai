@@ -9,7 +9,7 @@ the dispatch loop to native code that just does table lookups + memcpy.
 This module is the **single source of truth** for which (kind, scalar)
 pairs the assembler is allowed to emit. Phase 4 (Go-side native assembler)
 serializes this same table over the FFI; the parity test in
-``tests/test_token_tables.py`` guarantees the table matches what the live
+``tests/test_text_token_tables.py`` guarantees the table matches what the live
 HF tokenizer would produce.
 """
 
