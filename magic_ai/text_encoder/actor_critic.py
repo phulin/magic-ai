@@ -36,7 +36,7 @@ from magic_ai.replay_decisions import (
     score_may_decisions_from_forward,
 )
 from magic_ai.slot_encoder.model import _clone_detaching_buffer
-from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
+from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch, pack_batch
 from magic_ai.text_encoder.policy import EncodedSnapshots
 from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
@@ -506,8 +506,6 @@ class TextActorCritic(nn.Module):
     ) -> NativeTextSampleBatch:
         """Sample a native text batch without Python loops over tensor rows/groups."""
 
-        if self.rollout_buffer is None:
-            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
         if text_batch is None and packed_batch is None:
             raise ValueError("text_batch or packed_batch is required")
         batch_size = (
@@ -527,15 +525,11 @@ class TextActorCritic(nn.Module):
         h_in, c_in = self.lstm_env_state_inputs(env_indices, perspective_player_indices)
         if moved_packed is not None:
             output, (h_out, c_out) = self.policy.forward_packed(moved_packed, h_in=h_in, c_in=c_in)
-            replay_encoded = _dense_from_packed_batch(
-                moved_packed,
-                max_tokens=self.rollout_buffer.max_tokens,
-                pad_id=self.policy.cfg.encoder.pad_id,
-            )
+            replay_encoded = moved_packed if self.rollout_buffer is not None else None
         else:
             moved = cast(TextEncodedBatch, moved_text)
             output, (h_out, c_out) = self.policy(moved, h_in=h_in, c_in=c_in)
-            replay_encoded = moved
+            replay_encoded = pack_batch(moved) if self.rollout_buffer is not None else None
         self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
 
         trace_kind_id = native_batch.trace_kind_id.to(self.device, dtype=torch.long)
@@ -632,25 +626,29 @@ class TextActorCritic(nn.Module):
         step_entropies = step_entropies + may_entropy * may_mask_f
         del step_entropies
 
-        perspective_t = torch.tensor(
-            perspective_player_indices, dtype=torch.long, device=self.device
-        )
-        replay_rows = self.rollout_buffer.append_batch(
-            encoded=replay_encoded,
-            trace_kind_id=trace_kind_id,
-            decision_count=decision_count,
-            decision_option_idx=option_idx,
-            decision_target_idx=target_idx,
-            decision_mask=decision_mask,
-            uses_none_head=uses_none,
-            selected_indices=selected,
-            may_selected=may_selected_t,
-            old_log_prob=step_log_probs.detach(),
-            value=output.values.detach(),
-            perspective_player_idx=perspective_t,
-            lstm_h_in=h_in.detach(),
-            lstm_c_in=c_in.detach(),
-        )
+        if self.rollout_buffer is not None:
+            perspective_t = torch.tensor(
+                perspective_player_indices, dtype=torch.long, device=self.device
+            )
+            assert replay_encoded is not None
+            replay_rows = self.rollout_buffer.append_batch(
+                encoded=replay_encoded,
+                trace_kind_id=trace_kind_id,
+                decision_count=decision_count,
+                decision_option_idx=option_idx,
+                decision_target_idx=target_idx,
+                decision_mask=decision_mask,
+                uses_none_head=uses_none,
+                selected_indices=selected,
+                may_selected=may_selected_t,
+                old_log_prob=step_log_probs.detach(),
+                value=output.values.detach(),
+                perspective_player_idx=perspective_t,
+                lstm_h_in=h_in.detach(),
+                lstm_c_in=c_in.detach(),
+            )
+        else:
+            replay_rows = torch.full((batch_size,), -1, dtype=torch.long, device=device)
 
         host = torch.cat(
             [
@@ -689,11 +687,11 @@ class TextActorCritic(nn.Module):
             raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
         batch = self.rollout_buffer.gather(replay_rows)
         if batch.lstm_h_in is None or batch.lstm_c_in is None:
-            output, _state = self.policy(batch.encoded)
+            output, _state = self.policy.forward_packed(batch.encoded)
         else:
             h_in = batch.lstm_h_in.permute(1, 0, 2).contiguous()
             c_in = batch.lstm_c_in.permute(1, 0, 2).contiguous()
-            output, _state = self.policy(batch.encoded, h_in=h_in, c_in=c_in)
+            output, _state = self.policy.forward_packed(batch.encoded, h_in=h_in, c_in=c_in)
 
         n = int(batch.trace_kind_id.shape[0])
         log_probs = output.values.new_zeros(n)
@@ -749,22 +747,22 @@ class TextActorCritic(nn.Module):
                 raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
             batch = self.rollout_buffer.gather(replay_rows)
             if hidden_override is not None:
-                output, _state = self.policy(
+                output, _state = self.policy.forward_packed(
                     batch.encoded,
                     state_hidden_override=hidden_override.to(self.device),
                 )
             elif lstm_state_override is not None:
-                output, _state = self.policy(
+                output, _state = self.policy.forward_packed(
                     batch.encoded,
                     h_in=lstm_state_override[0],
                     c_in=lstm_state_override[1],
                 )
             elif batch.lstm_h_in is None or batch.lstm_c_in is None:
-                output, _state = self.policy(batch.encoded)
+                output, _state = self.policy.forward_packed(batch.encoded)
             else:
                 h_in = batch.lstm_h_in.permute(1, 0, 2).contiguous()
                 c_in = batch.lstm_c_in.permute(1, 0, 2).contiguous()
-                output, _state = self.policy(batch.encoded, h_in=h_in, c_in=c_in)
+                output, _state = self.policy.forward_packed(batch.encoded, h_in=h_in, c_in=c_in)
 
         n = int(batch.trace_kind_id.shape[0])
         log_probs = output.values.new_zeros(n)
@@ -874,7 +872,7 @@ class TextActorCritic(nn.Module):
         with torch.autocast(
             device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
         ):
-            encoded = self.policy.text_policy.encode_only(batch.encoded)
+            encoded = self.policy.text_policy.encode_packed_only(batch.encoded)
         target_dtype = self.policy.in_proj.weight.dtype
         encoded = _cast_encoded(encoded, target_dtype)
 
@@ -930,7 +928,7 @@ class TextActorCritic(nn.Module):
         if self.rollout_buffer is None:
             raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
         batch = self.rollout_buffer.gather(replay_rows)
-        encoded = self.policy.text_policy.encode_only(batch.encoded)
+        encoded = self.policy.text_policy.encode_packed_only(batch.encoded)
         projected = self.policy.in_proj(encoded.state_vector)
         h = torch.zeros(self.lstm_layers, 1, self.lstm_hidden, device=projected.device)
         c = torch.zeros_like(h)

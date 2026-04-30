@@ -229,8 +229,38 @@ class TextActorCriticTests(unittest.TestCase):
         self.assertEqual(len(out.replay_rows), 2)
         self.assertEqual(replay.size, 2)
         gathered = replay.gather(out.replay_rows)
-        self.assertEqual(tuple(gathered.encoded.token_ids.shape), (2, 4))
+        self.assertEqual(tuple(gathered.encoded.token_ids.shape), (7,))
+        self.assertEqual(tuple(gathered.encoded.seq_lengths.tolist()), (4, 3))
         self.assertTrue(torch.isfinite(gathered.old_log_prob).all())
+
+    def test_sample_native_tensor_batch_without_replay_buffer_for_eval(self) -> None:
+        torch.manual_seed(0)
+        model = _model()
+        model.rollout_buffer = None
+        model.init_lstm_env_states(2)
+        native_batch = SimpleNamespace(
+            trace_kind_id=torch.tensor([0, 0], dtype=torch.long),
+            decision_count=torch.tensor([1, 1], dtype=torch.long),
+            decision_rows_written=2,
+            decision_option_idx=torch.tensor([[0, 1], [0, -1]], dtype=torch.long),
+            decision_target_idx=torch.tensor([[-1, -1], [-1, -1]], dtype=torch.long),
+            decision_mask=torch.tensor([[True, True], [True, False]], dtype=torch.bool),
+            uses_none_head=torch.tensor([False, False], dtype=torch.bool),
+        )
+
+        out = model.sample_native_tensor_batch(
+            native_batch=native_batch,
+            env_indices=[0, 1],
+            perspective_player_indices=[0, 0],
+            text_batch=_batch(batch_size=2),
+            deterministic=True,
+        )
+
+        self.assertEqual(out.decision_counts, [1, 1])
+        self.assertEqual(len(out.selected_choice_cols), 2)
+        self.assertEqual(out.replay_rows, [-1, -1])
+        self.assertFalse(torch.equal(model.live_lstm_h[:, 0], torch.zeros(1, 8)))
+        self.assertFalse(torch.equal(model.live_lstm_h[:, 2], torch.zeros(1, 8)))
 
     def test_sample_text_batch_handles_may_head(self) -> None:
         torch.manual_seed(0)
