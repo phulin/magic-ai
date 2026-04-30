@@ -383,6 +383,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         recurrent_layers=args.hidden_layers,
         recurrent_hidden_dim=args.text_d_model,
         device=device,
+        validate=not getattr(args, "no_validate", False),
     )
     policy.rollout_buffer = replay_buffer
     batch_workers = max(1, getattr(args, "batch_workers", 1))
