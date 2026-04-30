@@ -6,8 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
-from torch.distributions import Bernoulli
 
 
 @dataclass(frozen=True)
@@ -66,22 +66,17 @@ def score_may_decisions(
     """
 
     selected = may_selected.to(dtype=may_logits.dtype, device=may_logits.device)
-    log_probs = may_logits.new_zeros(may_mask.shape[0])
-    entropies = may_logits.new_zeros(may_mask.shape[0])
-    may_logits_per_step = may_logits.new_zeros(may_mask.shape[0])
-    may_selected_per_step = may_logits.new_zeros(may_mask.shape[0])
+    active = may_mask.to(dtype=torch.bool, device=may_logits.device)
+    zeros = may_logits.new_zeros(may_mask.shape[0])
 
-    may_pos = may_mask.nonzero(as_tuple=False).squeeze(-1)
-    active_logits = may_logits[may_pos]
-    active_selected = selected[may_pos]
-    dist = Bernoulli(logits=active_logits)
-    log_probs[may_pos] = dist.log_prob(active_selected)
-    entropies[may_pos] = dist.entropy()
+    dense_log_probs = -F.binary_cross_entropy_with_logits(may_logits, selected, reduction="none")
+    probs = may_logits.sigmoid()
+    dense_entropies = F.binary_cross_entropy_with_logits(may_logits, probs, reduction="none")
 
-    # Assignment into a cloned tensor preserves gradient from active logits.
-    may_logits_per_step = may_logits_per_step.clone()
-    may_logits_per_step[may_pos] = active_logits
-    may_selected_per_step[may_pos] = active_selected
+    log_probs = torch.where(active, dense_log_probs, zeros)
+    entropies = torch.where(active, dense_entropies, zeros)
+    may_logits_per_step = torch.where(active, may_logits, zeros)
+    may_selected_per_step = torch.where(active, selected, zeros)
     return log_probs, entropies, may_logits_per_step, may_selected_per_step
 
 
