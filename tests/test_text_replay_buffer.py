@@ -1,8 +1,10 @@
 import unittest
+from typing import Any
 
 import torch
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch, pack_batch
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
+from magic_ai.text_encoder.replay_triton import TRITON_AVAILABLE
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 
@@ -66,6 +68,59 @@ def _unpack(batch: PackedTextBatch, *, max_tokens: int, pad_id: int = 0) -> Text
         target_mask=batch.target_mask,
         seq_lengths=batch.seq_lengths,
     )
+
+
+def _packed_to_device(batch: PackedTextBatch, device: torch.device) -> PackedTextBatch:
+    return PackedTextBatch(
+        token_ids=batch.token_ids.to(device),
+        seq_id=batch.seq_id.to(device),
+        pos_in_seq=batch.pos_in_seq.to(device),
+        cu_seqlens=batch.cu_seqlens.to(device),
+        seq_lengths=batch.seq_lengths.to(device),
+        state_positions=batch.state_positions.to(device),
+        card_ref_positions=batch.card_ref_positions.to(device),
+        option_positions=batch.option_positions.to(device),
+        option_mask=batch.option_mask.to(device),
+        target_positions=batch.target_positions.to(device),
+        target_mask=batch.target_mask.to(device),
+    )
+
+
+def _assert_replay_batch_close(
+    test: unittest.TestCase,
+    actual,
+    expected,
+) -> None:
+    torch.testing.assert_close(actual.encoded.token_ids, expected.encoded.token_ids)
+    torch.testing.assert_close(actual.encoded.seq_id, expected.encoded.seq_id)
+    torch.testing.assert_close(actual.encoded.pos_in_seq, expected.encoded.pos_in_seq)
+    torch.testing.assert_close(actual.encoded.cu_seqlens, expected.encoded.cu_seqlens)
+    torch.testing.assert_close(actual.encoded.seq_lengths, expected.encoded.seq_lengths)
+    torch.testing.assert_close(actual.encoded.state_positions, expected.encoded.state_positions)
+    torch.testing.assert_close(
+        actual.encoded.card_ref_positions, expected.encoded.card_ref_positions
+    )
+    torch.testing.assert_close(actual.encoded.option_positions, expected.encoded.option_positions)
+    torch.testing.assert_close(actual.encoded.option_mask, expected.encoded.option_mask)
+    torch.testing.assert_close(actual.encoded.target_positions, expected.encoded.target_positions)
+    torch.testing.assert_close(actual.encoded.target_mask, expected.encoded.target_mask)
+    torch.testing.assert_close(actual.trace_kind_id, expected.trace_kind_id)
+    torch.testing.assert_close(actual.decision_option_idx, expected.decision_option_idx)
+    torch.testing.assert_close(actual.decision_target_idx, expected.decision_target_idx)
+    torch.testing.assert_close(actual.decision_mask, expected.decision_mask)
+    torch.testing.assert_close(actual.uses_none_head, expected.uses_none_head)
+    torch.testing.assert_close(actual.decision_count, expected.decision_count)
+    torch.testing.assert_close(actual.selected_indices, expected.selected_indices)
+    torch.testing.assert_close(actual.may_selected, expected.may_selected)
+    torch.testing.assert_close(actual.old_log_prob, expected.old_log_prob)
+    torch.testing.assert_close(actual.value, expected.value)
+    torch.testing.assert_close(actual.perspective_player_idx, expected.perspective_player_idx)
+    test.assertEqual(actual.lstm_h_in is None, expected.lstm_h_in is None)
+    test.assertEqual(actual.lstm_c_in is None, expected.lstm_c_in is None)
+    if actual.lstm_h_in is not None and expected.lstm_h_in is not None:
+        torch.testing.assert_close(actual.lstm_h_in, expected.lstm_h_in)
+    if actual.lstm_c_in is not None and expected.lstm_c_in is not None:
+        torch.testing.assert_close(actual.lstm_c_in, expected.lstm_c_in)
 
 
 class TextReplayBufferTests(unittest.TestCase):
@@ -437,6 +492,168 @@ class TextReplayBufferTests(unittest.TestCase):
                 value=0.0,
                 perspective_player_idx=0,
             )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and TRITON_AVAILABLE,
+        "requires CUDA and Triton",
+    )
+    def test_append_batch_triton_matches_torch_path(self) -> None:
+        device = torch.device("cuda")
+        encoded = _packed_to_device(pack_batch(_encoded_batch()), device)
+
+        kwargs: dict[str, Any] = dict(
+            encoded=encoded,
+            trace_kind_id=torch.tensor([1, 2], device=device),
+            decision_count=torch.tensor([2, 4], device=device),
+            decision_option_idx=torch.tensor(
+                [
+                    [0, 1, -1, -1],
+                    [2, -1, -1, -1],
+                    [1, -1, -1, -1],
+                    [0, 2, -1, -1],
+                    [3, -1, -1, -1],
+                    [2, 1, -1, -1],
+                ],
+                device=device,
+            ),
+            decision_target_idx=torch.tensor(
+                [
+                    [-1, 0, -1, -1],
+                    [1, -1, -1, -1],
+                    [0, -1, -1, -1],
+                    [-1, 1, -1, -1],
+                    [2, -1, -1, -1],
+                    [0, 2, -1, -1],
+                ],
+                device=device,
+            ),
+            decision_mask=torch.tensor(
+                [
+                    [True, True, False, False],
+                    [True, False, False, False],
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [True, False, False, False],
+                    [True, True, False, False],
+                ],
+                device=device,
+            ),
+            uses_none_head=torch.tensor([False, True, True, False, True, False], device=device),
+            selected_indices=torch.tensor([1, 0, 0, 1, 0, 1], device=device),
+            may_selected=torch.tensor([0.0, 1.0], device=device),
+            old_log_prob=torch.tensor([-0.25, -0.5], device=device),
+            value=torch.tensor([0.75, -0.125], device=device),
+            perspective_player_idx=torch.tensor([0, 1], device=device),
+            lstm_h_in=torch.arange(12, dtype=torch.float32, device=device).reshape(1, 2, 6),
+            lstm_c_in=torch.arange(100, 112, dtype=torch.float32, device=device).reshape(1, 2, 6),
+        )
+        triton_buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            recurrent_layers=1,
+            recurrent_hidden_dim=6,
+            device=device,
+            use_triton_append=True,
+        )
+        torch_buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            recurrent_layers=1,
+            recurrent_hidden_dim=6,
+            device=device,
+            use_triton_append=False,
+        )
+
+        rows_triton = triton_buffer.append_batch(**kwargs)
+        rows_torch = torch_buffer.append_batch(**kwargs)
+        torch.testing.assert_close(rows_triton, rows_torch)
+        _assert_replay_batch_close(
+            self,
+            triton_buffer.gather(rows_triton),
+            torch_buffer.gather(rows_torch),
+        )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and TRITON_AVAILABLE,
+        "requires CUDA and Triton",
+    )
+    def test_append_batch_triton_matches_zero_and_truncated_decisions(self) -> None:
+        device = torch.device("cuda")
+        encoded = _packed_to_device(pack_batch(_encoded_batch()), device)
+        kwargs: dict[str, Any] = dict(
+            encoded=encoded,
+            trace_kind_id=torch.tensor([2, 3], device=device),
+            decision_count=torch.tensor([0, 4], device=device),
+            decision_option_idx=torch.tensor(
+                [
+                    [0, -1, -1, -1],
+                    [1, 2, -1, -1],
+                    [3, -1, -1, -1],
+                    [2, 0, -1, -1],
+                ],
+                device=device,
+            ),
+            decision_target_idx=torch.tensor(
+                [
+                    [-1, -1, -1, -1],
+                    [0, 1, -1, -1],
+                    [2, -1, -1, -1],
+                    [1, 0, -1, -1],
+                ],
+                device=device,
+            ),
+            decision_mask=torch.tensor(
+                [
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [True, False, False, False],
+                    [True, True, False, False],
+                ],
+                device=device,
+            ),
+            uses_none_head=torch.tensor([False, True, False, True], device=device),
+            selected_indices=torch.tensor([0, 1, 0, 1], device=device),
+            may_selected=torch.tensor([1.0, 0.0], device=device),
+            old_log_prob=torch.tensor([-0.75, -1.25], device=device),
+            value=torch.tensor([0.125, 0.875], device=device),
+            perspective_player_idx=torch.tensor([1, 0], device=device),
+        )
+        triton_buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            device=device,
+            use_triton_append=True,
+        )
+        torch_buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            device=device,
+            use_triton_append=False,
+        )
+
+        rows_triton = triton_buffer.append_batch(**kwargs)
+        rows_torch = torch_buffer.append_batch(**kwargs)
+        _assert_replay_batch_close(
+            self,
+            triton_buffer.gather(rows_triton),
+            torch_buffer.gather(rows_torch),
+        )
 
 
 if __name__ == "__main__":

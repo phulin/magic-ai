@@ -8,6 +8,11 @@ import torch
 from torch import Tensor
 
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
+from magic_ai.text_encoder.replay_triton import (
+    append_batch_encoded_triton,
+    clear_append_decisions_triton,
+    write_append_decisions_triton,
+)
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 
@@ -46,6 +51,7 @@ class TextReplayBuffer:
         max_card_refs: int = MAX_CARD_REFS,
         device: torch.device | str = "cpu",
         validate: bool = True,
+        use_triton_append: bool = True,
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be at least 1")
@@ -75,6 +81,7 @@ class TextReplayBuffer:
         self.max_card_refs = int(max_card_refs)
         self.device = torch.device(device)
         self.validate = bool(validate)
+        self.use_triton_append = bool(use_triton_append)
 
         # Storage dtypes are sized to the value ranges they hold, then cast to
         # int64 at the few consumption sites that actually require Long
@@ -342,10 +349,11 @@ class TextReplayBuffer:
         rows_list = [self._free_rows.pop() for _ in range(batch_size)]
         rows = torch.tensor(rows_list, dtype=torch.long, device=self.device)
 
-        seq_lengths = encoded.seq_lengths.to(device=self.device, dtype=torch.int32)
-        max_seq_length = int(seq_lengths.max().item()) if batch_size > 0 else 0
-        if max_seq_length > self.max_tokens:
-            raise ValueError("encoded packed row token width exceeds buffer max_tokens")
+        seq_lengths = encoded.seq_lengths.to(device=self.device)
+        if self.validate:
+            max_seq_length = int(seq_lengths.max().item()) if batch_size > 0 else 0
+            if max_seq_length > self.max_tokens:
+                raise ValueError("encoded packed row token width exceeds buffer max_tokens")
         total_tokens = int(encoded.token_ids.numel())
         token_start = self._token_cursor
         token_end = token_start + total_tokens
@@ -353,96 +361,162 @@ class TextReplayBuffer:
             raise RuntimeError("TextReplayBuffer packed token arena is full")
         self._token_cursor = token_end
 
-        self.row_token_start[rows] = -1
-        self.row_token_length[rows] = 0
-        self.card_ref_positions.index_fill_(0, rows, -1)
-        self.option_positions.index_fill_(0, rows, -1)
-        self.option_mask.index_fill_(0, rows, 0)
-        self.target_positions.index_fill_(0, rows, -1)
-        self.target_mask.index_fill_(0, rows, 0)
-        token_ids = encoded.token_ids.to(device=self.device, dtype=torch.int32)
-        if total_tokens > 0:
-            self.packed_token_ids[token_start:token_end] = token_ids
-        self.row_token_start[rows] = token_start + encoded.cu_seqlens[:-1].to(
-            device=self.device, dtype=torch.int64
-        )
-        self.row_token_length[rows] = seq_lengths
-
-        base = encoded.state_positions.to(device=self.device, dtype=torch.int32)
-
-        def rebase_positions(pos: Tensor, view_shape: tuple[int, ...]) -> Tensor:
-            pos_dev = pos.to(device=self.device, dtype=torch.int32)
-            valid = pos_dev >= 0
-            shifted = pos_dev - base.view(view_shape)
-            return torch.where(valid, shifted, pos_dev)
-
-        self.card_ref_positions[rows] = rebase_positions(
-            encoded.card_ref_positions,
-            (batch_size, 1),
-        )
+        wrote_encoded_with_triton = False
+        if self.use_triton_append:
+            wrote_encoded_with_triton = append_batch_encoded_triton(
+                token_ids=encoded.token_ids,
+                cu_seqlens=encoded.cu_seqlens,
+                seq_lengths=seq_lengths,
+                state_positions=encoded.state_positions,
+                card_ref_positions=encoded.card_ref_positions,
+                option_positions=encoded.option_positions,
+                option_mask=encoded.option_mask,
+                target_positions=encoded.target_positions,
+                target_mask=encoded.target_mask,
+                rows=rows,
+                packed_token_ids=self.packed_token_ids,
+                row_token_start=self.row_token_start,
+                row_token_length=self.row_token_length,
+                dst_card_ref_positions=self.card_ref_positions,
+                dst_option_positions=self.option_positions,
+                dst_option_mask=self.option_mask,
+                dst_target_positions=self.target_positions,
+                dst_target_mask=self.target_mask,
+                dst_seq_lengths=self.seq_lengths,
+                token_start=token_start,
+            )
         option_width = min(int(encoded.option_positions.shape[1]), self.max_options)
         target_width = min(int(encoded.target_positions.shape[2]), self.max_targets_per_option)
-        if option_width > 0:
-            self.option_positions[rows, :option_width] = rebase_positions(
-                encoded.option_positions[:, :option_width],
+        if not wrote_encoded_with_triton:
+            self.row_token_start[rows] = -1
+            self.row_token_length[rows] = 0
+            self.card_ref_positions.index_fill_(0, rows, -1)
+            self.option_positions.index_fill_(0, rows, -1)
+            self.option_mask.index_fill_(0, rows, 0)
+            self.target_positions.index_fill_(0, rows, -1)
+            self.target_mask.index_fill_(0, rows, 0)
+            token_ids = encoded.token_ids.to(device=self.device, dtype=torch.int32)
+            if total_tokens > 0:
+                self.packed_token_ids[token_start:token_end] = token_ids
+            self.row_token_start[rows] = token_start + encoded.cu_seqlens[:-1].to(
+                device=self.device, dtype=torch.int64
+            )
+            seq_lengths_i32 = seq_lengths.to(dtype=torch.int32)
+            self.row_token_length[rows] = seq_lengths_i32
+
+            base = encoded.state_positions.to(device=self.device, dtype=torch.int32)
+
+            def rebase_positions(pos: Tensor, view_shape: tuple[int, ...]) -> Tensor:
+                pos_dev = pos.to(device=self.device, dtype=torch.int32)
+                valid = pos_dev >= 0
+                shifted = pos_dev - base.view(view_shape)
+                return torch.where(valid, shifted, pos_dev)
+
+            self.card_ref_positions[rows] = rebase_positions(
+                encoded.card_ref_positions,
                 (batch_size, 1),
             )
-            self.option_mask[rows, :option_width] = encoded.option_mask[:, :option_width].to(
-                device=self.device, dtype=torch.bool
-            )
-        if option_width > 0 and target_width > 0:
-            self.target_positions[rows, :option_width, :target_width] = rebase_positions(
-                encoded.target_positions[:, :option_width, :target_width],
-                (batch_size, 1, 1),
-            )
-            self.target_mask[rows, :option_width, :target_width] = encoded.target_mask[
-                :, :option_width, :target_width
-            ].to(device=self.device, dtype=torch.bool)
-        self.seq_lengths[rows] = seq_lengths
+            if option_width > 0:
+                self.option_positions[rows, :option_width] = rebase_positions(
+                    encoded.option_positions[:, :option_width],
+                    (batch_size, 1),
+                )
+                self.option_mask[rows, :option_width] = encoded.option_mask[:, :option_width].to(
+                    device=self.device, dtype=torch.bool
+                )
+            if option_width > 0 and target_width > 0:
+                self.target_positions[rows, :option_width, :target_width] = rebase_positions(
+                    encoded.target_positions[:, :option_width, :target_width],
+                    (batch_size, 1, 1),
+                )
+                self.target_mask[rows, :option_width, :target_width] = encoded.target_mask[
+                    :, :option_width, :target_width
+                ].to(device=self.device, dtype=torch.bool)
+            self.seq_lengths[rows] = seq_lengths_i32
 
         decision_count_dev = decision_count.to(device=self.device, dtype=torch.long)
-        stored_count = decision_count_dev.clamp(max=self.max_decision_groups)
-        self.decision_option_idx.index_fill_(0, rows, -1)
-        self.decision_target_idx.index_fill_(0, rows, -1)
-        self.decision_mask.index_fill_(0, rows, 0)
-        self.uses_none_head.index_fill_(0, rows, 0)
-        self.selected_indices.index_fill_(0, rows, -1)
-        g_total = int(decision_option_idx.shape[0])
-        if g_total > 0:
-            step_for_group = torch.repeat_interleave(
-                torch.arange(batch_size, device=self.device), decision_count_dev
+        wrote_decisions_with_triton = False
+        if self.use_triton_append:
+            wrote_decisions_with_triton = write_append_decisions_triton(
+                rows=rows,
+                decision_count=decision_count_dev,
+                decision_option_idx=decision_option_idx,
+                decision_target_idx=decision_target_idx,
+                decision_mask=decision_mask,
+                uses_none_head=uses_none_head,
+                selected_indices=selected_indices,
+                trace_kind_id=trace_kind_id,
+                may_selected=may_selected,
+                old_log_prob=old_log_prob,
+                value=value,
+                perspective_player_idx=perspective_player_idx,
+                dst_decision_option_idx=self.decision_option_idx,
+                dst_decision_target_idx=self.decision_target_idx,
+                dst_decision_mask=self.decision_mask,
+                dst_uses_none_head=self.uses_none_head,
+                dst_selected_indices=self.selected_indices,
+                dst_decision_count=self.decision_count,
+                dst_trace_kind_id=self.trace_kind_id,
+                dst_may_selected=self.may_selected,
+                dst_old_log_prob=self.old_log_prob,
+                dst_value=self.value,
+                dst_perspective_player_idx=self.perspective_player_idx,
             )
-            group_starts = torch.cumsum(decision_count_dev, dim=0) - decision_count_dev
-            group_in_step = torch.arange(g_total, device=self.device) - group_starts[step_for_group]
-            keep = group_in_step < self.max_decision_groups
-            kept_steps = step_for_group[keep]
-            kept_groups = group_in_step[keep]
-            flat_keep = keep.nonzero(as_tuple=False).squeeze(-1)
-            replay_rows = rows[kept_steps]
-            self.decision_option_idx[replay_rows, kept_groups] = decision_option_idx[flat_keep].to(
-                device=self.device, dtype=torch.int16
+        if not wrote_decisions_with_triton:
+            stored_count = decision_count_dev.clamp(max=self.max_decision_groups)
+            cleared_decisions_with_triton = False
+            if self.use_triton_append:
+                cleared_decisions_with_triton = clear_append_decisions_triton(
+                    rows=rows,
+                    decision_option_idx=self.decision_option_idx,
+                    decision_target_idx=self.decision_target_idx,
+                    decision_mask=self.decision_mask,
+                    uses_none_head=self.uses_none_head,
+                    selected_indices=self.selected_indices,
+                )
+            if not cleared_decisions_with_triton:
+                self.decision_option_idx.index_fill_(0, rows, -1)
+                self.decision_target_idx.index_fill_(0, rows, -1)
+                self.decision_mask.index_fill_(0, rows, 0)
+                self.uses_none_head.index_fill_(0, rows, 0)
+                self.selected_indices.index_fill_(0, rows, -1)
+            g_total = int(decision_option_idx.shape[0])
+            if g_total > 0:
+                step_for_group = torch.repeat_interleave(
+                    torch.arange(batch_size, device=self.device), decision_count_dev
+                )
+                group_starts = torch.cumsum(decision_count_dev, dim=0) - decision_count_dev
+                group_in_step = (
+                    torch.arange(g_total, device=self.device) - group_starts[step_for_group]
+                )
+                keep = group_in_step < self.max_decision_groups
+                kept_steps = step_for_group[keep]
+                kept_groups = group_in_step[keep]
+                flat_keep = keep.nonzero(as_tuple=False).squeeze(-1)
+                replay_rows = rows[kept_steps]
+                self.decision_option_idx[replay_rows, kept_groups] = decision_option_idx[
+                    flat_keep
+                ].to(device=self.device, dtype=torch.int16)
+                self.decision_target_idx[replay_rows, kept_groups] = decision_target_idx[
+                    flat_keep
+                ].to(device=self.device, dtype=torch.int16)
+                self.decision_mask[replay_rows, kept_groups] = decision_mask[flat_keep].to(
+                    device=self.device, dtype=torch.bool
+                )
+                self.uses_none_head[replay_rows, kept_groups] = uses_none_head[flat_keep].to(
+                    device=self.device, dtype=torch.bool
+                )
+                self.selected_indices[replay_rows, kept_groups] = selected_indices[flat_keep].to(
+                    device=self.device, dtype=torch.int16
+                )
+            self.decision_count[rows] = stored_count.to(dtype=torch.int16)
+            self.trace_kind_id[rows] = trace_kind_id.to(device=self.device, dtype=torch.int8)
+            self.may_selected[rows] = may_selected.to(device=self.device, dtype=torch.float32)
+            self.old_log_prob[rows] = old_log_prob.to(device=self.device, dtype=torch.float32)
+            self.value[rows] = value.to(device=self.device, dtype=torch.float32)
+            self.perspective_player_idx[rows] = perspective_player_idx.to(
+                device=self.device, dtype=torch.int8
             )
-            self.decision_target_idx[replay_rows, kept_groups] = decision_target_idx[flat_keep].to(
-                device=self.device, dtype=torch.int16
-            )
-            self.decision_mask[replay_rows, kept_groups] = decision_mask[flat_keep].to(
-                device=self.device, dtype=torch.bool
-            )
-            self.uses_none_head[replay_rows, kept_groups] = uses_none_head[flat_keep].to(
-                device=self.device, dtype=torch.bool
-            )
-            self.selected_indices[replay_rows, kept_groups] = selected_indices[flat_keep].to(
-                device=self.device, dtype=torch.int16
-            )
-
-        self.trace_kind_id[rows] = trace_kind_id.to(device=self.device, dtype=torch.int8)
-        self.decision_count[rows] = stored_count.to(dtype=torch.int16)
-        self.may_selected[rows] = may_selected.to(device=self.device, dtype=torch.float32)
-        self.old_log_prob[rows] = old_log_prob.to(device=self.device, dtype=torch.float32)
-        self.value[rows] = value.to(device=self.device, dtype=torch.float32)
-        self.perspective_player_idx[rows] = perspective_player_idx.to(
-            device=self.device, dtype=torch.int8
-        )
         if self.lstm_h_in is not None and self.lstm_c_in is not None:
             if lstm_h_in is None or lstm_c_in is None:
                 raise ValueError("h_in and c_in are required for recurrent text replay")
