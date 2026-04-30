@@ -97,7 +97,11 @@ from magic_ai.text_encoder.card_cache import (  # noqa: E402
     load_card_cache,
     load_oracle_db,
 )
-from magic_ai.text_encoder.model import TextEncoderConfig  # noqa: E402
+from magic_ai.text_encoder.model import (  # noqa: E402
+    DEFAULT_HF_ENCODER_MODEL,
+    TextEncoderConfig,
+    text_encoder_config_from_hf,
+)
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig  # noqa: E402
 from magic_ai.text_encoder.render import OracleEntry  # noqa: E402
 from magic_ai.text_encoder.render_plan import emit_render_plan  # noqa: E402
@@ -358,18 +362,29 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         raise ValueError("text tokenizer must define pad_token_id")
-    cfg = TextEncoderConfig(
-        vocab_size=len(tokenizer),
-        pad_id=int(pad_id),
-        d_model=args.text_d_model,
-        n_layers=args.text_layers,
-        n_heads=args.text_heads,
-        d_ff=args.text_d_ff,
-        max_seq_len=args.text_max_tokens,
-    )
+    if args.text_encoder_backend == "hf":
+        cfg = text_encoder_config_from_hf(
+            model_name=args.text_hf_model,
+            revision=args.text_hf_revision,
+            truncate_layers=args.text_hf_layers,
+            vocab_size=len(tokenizer),
+            pad_id=int(pad_id),
+            max_seq_len=args.text_max_tokens,
+            trust_remote_code=args.text_hf_trust_remote_code,
+        )
+    else:
+        cfg = TextEncoderConfig(
+            vocab_size=len(tokenizer),
+            pad_id=int(pad_id),
+            d_model=args.text_d_model,
+            n_layers=args.text_layers,
+            n_heads=args.text_heads,
+            d_ff=args.text_d_ff,
+            max_seq_len=args.text_max_tokens,
+        )
     recurrent_cfg = RecurrentTextPolicyConfig(
         encoder=cfg,
-        lstm_hidden=args.text_d_model,
+        lstm_hidden=cfg.d_model,
         lstm_layers=args.hidden_layers,
         compile_forward=args.torch_compile,
     )
@@ -386,7 +401,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         max_decision_groups=args.max_decision_groups,
         max_cached_choices=args.max_cached_choices,
         recurrent_layers=args.hidden_layers,
-        recurrent_hidden_dim=args.text_d_model,
+        recurrent_hidden_dim=cfg.d_model,
         device=device,
         validate=not getattr(args, "no_validate", False),
     )
@@ -628,16 +643,32 @@ def validate_checkpoint_encoder(
     text_config = metadata.get("text_config")
     if not isinstance(text_config, dict):
         raise ValueError("text checkpoint metadata is missing text_config")
-    for key in (
+    saved_backend = text_config.get("text_encoder_backend", "scratch")
+    requested_backend = getattr(args, "text_encoder_backend", "scratch")
+    if saved_backend != requested_backend:
+        raise ValueError(
+            f"text checkpoint text_encoder_backend={saved_backend!r} is incompatible with "
+            f"--text-encoder-backend {requested_backend!r}"
+        )
+    common_keys = (
         "text_max_tokens",
+        "hidden_layers",
+        "max_options",
+        "max_targets_per_option",
+    )
+    scratch_keys = (
         "text_d_model",
         "text_layers",
         "text_heads",
         "text_d_ff",
-        "hidden_layers",
-        "max_options",
-        "max_targets_per_option",
-    ):
+    )
+    hf_keys = (
+        "text_hf_model",
+        "text_hf_revision",
+        "text_hf_layers",
+    )
+    keys = common_keys + (hf_keys if requested_backend == "hf" else scratch_keys)
+    for key in keys:
         saved = text_config.get(key)
         requested = getattr(args, key, None)
         if saved != requested:
@@ -1159,6 +1190,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-heads", type=int, default=4)
     parser.add_argument("--text-d-ff", type=int, default=512)
     parser.add_argument(
+        "--text-encoder-backend",
+        choices=("scratch", "hf"),
+        default="scratch",
+        help="text encoder trunk source: scratch keeps the local lightweight "
+        "encoder; hf loads --text-hf-model and grows its embedding table",
+    )
+    parser.add_argument(
+        "--text-hf-model",
+        default=DEFAULT_HF_ENCODER_MODEL,
+        help="Hugging Face encoder checkpoint for --text-encoder-backend=hf",
+    )
+    parser.add_argument(
+        "--text-hf-revision",
+        default=None,
+        help="optional Hugging Face revision for --text-hf-model",
+    )
+    parser.add_argument(
+        "--text-hf-layers",
+        type=int,
+        default=None,
+        help="keep only the first N checkpoint layers; default uses all layers",
+    )
+    parser.add_argument(
+        "--text-hf-trust-remote-code",
+        action="store_true",
+        help="pass trust_remote_code=True when loading the HF text encoder",
+    )
+    parser.add_argument(
         "--native-render-plan",
         action="store_true",
         help="use mage-go native render-plan emission for text encoder rollouts",
@@ -1333,6 +1392,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--text-heads must be at least 1")
     if getattr(args, "text_d_ff", 1) < 1:
         raise ValueError("--text-d-ff must be at least 1")
+    if getattr(args, "text_hf_layers", None) is not None and args.text_hf_layers < 1:
+        raise ValueError("--text-hf-layers must be at least 1")
     if getattr(args, "render_plan_capacity", 1) < 1:
         raise ValueError("--render-plan-capacity must be at least 1")
     if getattr(args, "max_decision_groups", 1) < 1:
@@ -3320,12 +3381,21 @@ def save_checkpoint(
     }
     if getattr(args, "encoder", "slots") == "text":
         cache_path = Path(getattr(args, "card_token_cache", ""))
+        actual_text_cfg = getattr(
+            getattr(getattr(policy, "policy", None), "text_policy", None), "cfg", None
+        )
         metadata["text_config"] = {
             "text_max_tokens": getattr(args, "text_max_tokens", None),
-            "text_d_model": getattr(args, "text_d_model", None),
-            "text_layers": getattr(args, "text_layers", None),
-            "text_heads": getattr(args, "text_heads", None),
-            "text_d_ff": getattr(args, "text_d_ff", None),
+            "text_encoder_backend": getattr(args, "text_encoder_backend", "scratch"),
+            "text_hf_model": getattr(args, "text_hf_model", None),
+            "text_hf_revision": getattr(args, "text_hf_revision", None),
+            "text_hf_layers": getattr(args, "text_hf_layers", None),
+            "text_d_model": getattr(
+                actual_text_cfg, "d_model", getattr(args, "text_d_model", None)
+            ),
+            "text_layers": getattr(actual_text_cfg, "n_layers", getattr(args, "text_layers", None)),
+            "text_heads": getattr(actual_text_cfg, "n_heads", getattr(args, "text_heads", None)),
+            "text_d_ff": getattr(actual_text_cfg, "d_ff", getattr(args, "text_d_ff", None)),
             "hidden_layers": getattr(args, "hidden_layers", None),
             "max_options": getattr(args, "max_options", None),
             "max_targets_per_option": getattr(args, "max_targets_per_option", None),

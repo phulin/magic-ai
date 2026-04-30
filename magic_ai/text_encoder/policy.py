@@ -39,6 +39,7 @@ from magic_ai.text_encoder.model import (
     gather_option_vectors_packed,
     gather_state_vector_packed,
     gather_target_vectors_packed,
+    initialize_text_state_encoder_from_hf,
 )
 from magic_ai.text_encoder.render import OracleEntry, render_snapshot
 
@@ -100,6 +101,8 @@ class TextPolicy(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.encoder = TextStateEncoder(cfg)
+        if cfg.hf_model_name is not None:
+            initialize_text_state_encoder_from_hf(self.encoder, cfg)
         self.policy_head = PolicyHead(cfg.d_model)
         self.target_head = TargetHead(cfg.d_model)
         self.value_head = ValueHead(cfg.d_model)

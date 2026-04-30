@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -16,6 +17,8 @@ from magic_ai.game_state import (
     PlayerState,
     TargetState,
 )
+from magic_ai.text_encoder import model as text_model
+from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.policy import (
     TextPolicy,
@@ -272,3 +275,104 @@ def test_build_text_policy_validates_config(tokenizer) -> None:
     bad_pad = TextEncoderConfig(vocab_size=len(tokenizer), pad_id=int(tokenizer.pad_token_id) + 1)
     with pytest.raises(ValueError):
         build_text_policy(tokenizer, bad_pad)
+
+
+def test_hf_text_policy_copies_checkpoint_into_local_encoder(monkeypatch) -> None:
+    class DummyConfig:
+        hidden_size = 16
+        num_attention_heads = 4
+        num_hidden_layers = 3
+        intermediate_size = 32
+        max_position_embeddings = 128
+
+    class DummyAutoConfig:
+        @staticmethod
+        def from_pretrained(*args: object, **kwargs: object) -> DummyConfig:
+            return DummyConfig()
+
+    class DummyHfModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=16, num_hidden_layers=3, pad_token_id=None)
+            self.resized_to: int | None = None
+            self._state = self._make_state(vocab_size=8)
+
+        @staticmethod
+        def _make_state(vocab_size: int) -> dict[str, torch.Tensor]:
+            state: dict[str, torch.Tensor] = {
+                "embeddings.tok_embeddings.weight": torch.arange(
+                    vocab_size * 16, dtype=torch.float32
+                ).reshape(vocab_size, 16),
+                "embeddings.norm.weight": torch.full((16,), 0.25),
+                "final_norm.weight": torch.full((16,), 0.75),
+            }
+            for layer in range(3):
+                prefix = f"layers.{layer}"
+                if layer > 0:
+                    state[f"{prefix}.attn_norm.weight"] = torch.full((16,), 0.1 + layer)
+                state[f"{prefix}.attn.Wqkv.weight"] = torch.full((48, 16), 1.0 + layer)
+                state[f"{prefix}.attn.Wo.weight"] = torch.full((16, 16), 2.0 + layer)
+                state[f"{prefix}.mlp_norm.weight"] = torch.full((16,), 3.0 + layer)
+                state[f"{prefix}.mlp.Wi.weight"] = torch.full((64, 16), 4.0 + layer)
+                state[f"{prefix}.mlp.Wo.weight"] = torch.full((16, 32), 5.0 + layer)
+            return state
+
+        def resize_token_embeddings(
+            self, vocab_size: int, pad_to_multiple_of: int | None = None
+        ) -> None:
+            del pad_to_multiple_of
+            self.resized_to = vocab_size
+            self._state = self._make_state(vocab_size=vocab_size)
+
+        def state_dict(self, *args: object, **kwargs: object) -> dict[str, torch.Tensor]:
+            del args, kwargs
+            return self._state
+
+    class DummyAutoModel:
+        last_model: DummyHfModel | None = None
+
+        @classmethod
+        def from_pretrained(cls, *args: object, **kwargs: object) -> DummyHfModel:
+            cls.last_model = DummyHfModel()
+            return cls.last_model
+
+    monkeypatch.setattr(text_model, "AutoConfig", DummyAutoConfig)
+    monkeypatch.setattr(text_model, "AutoModel", DummyAutoModel)
+
+    cfg = text_model.text_encoder_config_from_hf(
+        model_name="dummy/checkpoint",
+        vocab_size=20,
+        pad_id=0,
+        truncate_layers=2,
+    )
+    policy = TextPolicy(cfg)
+
+    assert cfg.d_model == 16
+    assert cfg.n_layers == 2
+    assert cfg.n_heads == 4
+    assert cfg.d_ff == 32
+    assert DummyAutoModel.last_model is not None
+    assert DummyAutoModel.last_model.resized_to == 20
+    assert isinstance(policy.encoder, text_model.TextStateEncoder)
+    assert torch.equal(
+        policy.encoder.tok_emb.weight.detach().cpu(),
+        DummyAutoModel.last_model.state_dict()["embeddings.tok_embeddings.weight"],
+    )
+    assert torch.equal(
+        cast(text_model.EncoderBlock, policy.encoder.blocks[1]).attn.qkv.weight.detach().cpu(),
+        DummyAutoModel.last_model.state_dict()["layers.1.attn.Wqkv.weight"],
+    )
+
+    batch = TextEncodedBatch(
+        token_ids=torch.tensor([[1, 2, 0], [3, 0, 0]], dtype=torch.int64),
+        attention_mask=torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.int64),
+        card_ref_positions=torch.full((2, 256), -1, dtype=torch.int64),
+        option_positions=torch.tensor([[0], [0]], dtype=torch.int64),
+        option_mask=torch.ones((2, 1), dtype=torch.bool),
+        target_positions=torch.full((2, 1, 0), -1, dtype=torch.int64),
+        target_mask=torch.zeros((2, 1, 0), dtype=torch.bool),
+        seq_lengths=torch.tensor([2, 1], dtype=torch.int64),
+    )
+    out = policy(batch)
+    assert out.state_vector.shape == (2, 16)
+    assert out.option_vectors.shape == (2, 1, 16)

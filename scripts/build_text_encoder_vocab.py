@@ -14,6 +14,7 @@ Usage::
 
 from __future__ import annotations
 
+import argparse
 import shutil
 import sys
 from pathlib import Path
@@ -31,9 +32,30 @@ from magic_ai.text_encoder.tokenizer import (  # noqa: E402
 from transformers import AutoTokenizer, PreTrainedTokenizerFast  # noqa: E402
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--base-tokenizer",
+        default=MODERNBERT_REPO,
+        help="HF tokenizer/model repo to augment with text-encoder custom tokens",
+    )
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="optional HF revision for --base-tokenizer; defaults to the pinned "
+        "ModernBERT revision when using the built-in base tokenizer",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
-    print(f"Loading base tokenizer {MODERNBERT_REPO}@{MODERNBERT_REVISION[:12]}…")
-    tok = AutoTokenizer.from_pretrained(MODERNBERT_REPO, revision=MODERNBERT_REVISION)
+    args = parse_args()
+    revision = args.revision
+    if revision is None and args.base_tokenizer == MODERNBERT_REPO:
+        revision = MODERNBERT_REVISION
+    rev_label = revision[:12] if revision else "default"
+    print(f"Loading base tokenizer {args.base_tokenizer}@{rev_label}…")
+    tok = AutoTokenizer.from_pretrained(args.base_tokenizer, revision=revision)
     if not isinstance(tok, PreTrainedTokenizerFast):
         raise TypeError(f"Expected PreTrainedTokenizerFast, got {type(tok).__name__}")
 

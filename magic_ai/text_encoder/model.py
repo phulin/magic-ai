@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+from transformers import AutoConfig, AutoModel
 
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 
@@ -42,6 +43,66 @@ class TextEncoderConfig:
     max_seq_len: int = 2048
     dropout: float = 0.0
     pad_id: int = 0
+    hf_model_name: str | None = None
+    hf_revision: str | None = None
+    hf_truncate_layers: int | None = None
+    hf_trust_remote_code: bool = False
+
+
+DEFAULT_HF_ENCODER_MODEL = "jhu-clsp/ettin-encoder-17m"
+
+
+def text_encoder_config_from_hf(
+    *,
+    model_name: str = DEFAULT_HF_ENCODER_MODEL,
+    vocab_size: int,
+    pad_id: int,
+    revision: str | None = None,
+    truncate_layers: int | None = None,
+    max_seq_len: int | None = None,
+    dropout: float = 0.0,
+    trust_remote_code: bool = False,
+) -> TextEncoderConfig:
+    """Build a :class:`TextEncoderConfig` from a Hugging Face encoder config.
+
+    The loaded HF checkpoint remains the source of truth for hidden size,
+    number of heads, feed-forward width, and layer count. ``truncate_layers``
+    optionally keeps only the first N transformer layers at model construction
+    time; when omitted, the full checkpoint depth is used.
+    """
+
+    hf_cfg = AutoConfig.from_pretrained(
+        model_name,
+        revision=revision,
+        trust_remote_code=trust_remote_code,
+    )
+    hidden_size = int(getattr(hf_cfg, "hidden_size"))
+    num_heads = int(getattr(hf_cfg, "num_attention_heads"))
+    full_layers = int(getattr(hf_cfg, "num_hidden_layers"))
+    n_layers = full_layers if truncate_layers is None else int(truncate_layers)
+    if n_layers < 1:
+        raise ValueError("truncate_layers must be at least 1")
+    if n_layers > full_layers:
+        raise ValueError(
+            f"truncate_layers ({n_layers}) exceeds checkpoint layer count ({full_layers})"
+        )
+    intermediate = int(getattr(hf_cfg, "intermediate_size", hidden_size * 4))
+    if max_seq_len is None:
+        max_seq_len = int(getattr(hf_cfg, "max_position_embeddings", 2048))
+    return TextEncoderConfig(
+        vocab_size=vocab_size,
+        d_model=hidden_size,
+        n_layers=n_layers,
+        n_heads=num_heads,
+        d_ff=intermediate,
+        max_seq_len=max_seq_len,
+        dropout=dropout,
+        pad_id=pad_id,
+        hf_model_name=model_name,
+        hf_revision=revision,
+        hf_truncate_layers=truncate_layers,
+        hf_trust_remote_code=trust_remote_code,
+    )
 
 
 class RMSNorm(nn.Module):
@@ -360,6 +421,93 @@ class TextStateEncoder(nn.Module):
         return x_dense.squeeze(0)
 
 
+def _copy_matching_param(dst: Tensor, src: Tensor, *, name: str) -> None:
+    if dst.shape != src.shape:
+        raise ValueError(
+            f"{name} shape mismatch: local {tuple(dst.shape)} vs HF {tuple(src.shape)}"
+        )
+    with torch.no_grad():
+        dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
+
+
+def _copy_embedding_param(dst: Tensor, src: Tensor) -> None:
+    rows = min(dst.shape[0], src.shape[0])
+    if dst.shape[1:] != src.shape[1:]:
+        raise ValueError(
+            f"embedding shape mismatch: local {tuple(dst.shape)} vs HF {tuple(src.shape)}"
+        )
+    with torch.no_grad():
+        dst[:rows].copy_(src[:rows].to(device=dst.device, dtype=dst.dtype))
+
+
+def initialize_text_state_encoder_from_hf(
+    encoder: TextStateEncoder, cfg: TextEncoderConfig
+) -> None:
+    """Warm-initialize ``encoder`` from an HF ModernBERT/Ettin-style checkpoint.
+
+    The HF model is only used as a checkpoint reader. Compatible tensors are
+    copied into the local PyTorch implementation, then the temporary HF module
+    goes out of scope; inference continues through :class:`TextStateEncoder`.
+    """
+
+    if cfg.hf_model_name is None:
+        raise ValueError("hf_model_name is required for HF initialization")
+    hf_model = AutoModel.from_pretrained(
+        cfg.hf_model_name,
+        revision=cfg.hf_revision,
+        trust_remote_code=cfg.hf_trust_remote_code,
+    )
+    hf_model.resize_token_embeddings(cfg.vocab_size, pad_to_multiple_of=None)
+    hidden_size = int(getattr(hf_model.config, "hidden_size"))
+    if hidden_size != cfg.d_model:
+        raise ValueError(
+            f"HF model hidden_size ({hidden_size}) does not match cfg.d_model ({cfg.d_model})"
+        )
+    sd = hf_model.state_dict()
+    _copy_embedding_param(encoder.tok_emb.weight, sd["embeddings.tok_embeddings.weight"])
+    first_block = cast(EncoderBlock, encoder.blocks[0])
+    if "embeddings.norm.weight" in sd:
+        _copy_matching_param(
+            first_block.norm1.weight,
+            sd["embeddings.norm.weight"],
+            name="blocks.0.norm1.weight",
+        )
+    for i, raw_block in enumerate(encoder.blocks):
+        block = cast(EncoderBlock, raw_block)
+        prefix = f"layers.{i}"
+        attn_norm = sd.get(f"{prefix}.attn_norm.weight")
+        if attn_norm is not None:
+            _copy_matching_param(block.norm1.weight, attn_norm, name=f"blocks.{i}.norm1.weight")
+        _copy_matching_param(
+            block.attn.qkv.weight,
+            sd[f"{prefix}.attn.Wqkv.weight"],
+            name=f"blocks.{i}.attn.qkv.weight",
+        )
+        _copy_matching_param(
+            block.attn.proj.weight,
+            sd[f"{prefix}.attn.Wo.weight"],
+            name=f"blocks.{i}.attn.proj.weight",
+        )
+        _copy_matching_param(
+            block.norm2.weight,
+            sd[f"{prefix}.mlp_norm.weight"],
+            name=f"blocks.{i}.norm2.weight",
+        )
+        _copy_matching_param(
+            block.ffn.gate_up.weight,
+            sd[f"{prefix}.mlp.Wi.weight"],
+            name=f"blocks.{i}.ffn.gate_up.weight",
+        )
+        _copy_matching_param(
+            block.ffn.down.weight,
+            sd[f"{prefix}.mlp.Wo.weight"],
+            name=f"blocks.{i}.ffn.down.weight",
+        )
+    _copy_matching_param(
+        encoder.final_norm.weight, sd["final_norm.weight"], name="final_norm.weight"
+    )
+
+
 def _gather_at(hidden: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
     """Gather hidden states at integer positions; -1 entries become zeros.
 
@@ -503,6 +651,7 @@ __all__ = [
     "PolicyHead",
     "TargetHead",
     "ValueHead",
+    "DEFAULT_HF_ENCODER_MODEL",
     "gather_card_vectors",
     "gather_option_vectors",
     "gather_target_vectors",
@@ -511,4 +660,6 @@ __all__ = [
     "gather_option_vectors_packed",
     "gather_target_vectors_packed",
     "gather_state_vector_packed",
+    "initialize_text_state_encoder_from_hf",
+    "text_encoder_config_from_hf",
 ]
