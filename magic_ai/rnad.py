@@ -136,6 +136,11 @@ class RNaDConfig:
     cap activation memory at the cost of truncating gradient flow at
     chunk boundaries."""
 
+    draw_reward: float = -1.0
+    """Terminal reward given to both players when a game ends in a draw
+    (``winner_idx < 0``). Default ``-1.0`` treats a draw the same as a
+    loss, removing any incentive to drag games out to the step cap."""
+
 
 # ---------------------------------------------------------------------------
 # Reward transformation
@@ -1396,6 +1401,8 @@ def _trajectory_loss_from_forwards(
         rewards = torch.zeros(t_len, dtype=dtype, device=device)
         if winner_idx >= 0:
             rewards[-1] = 1.0 if winner_idx == own_idx else -1.0
+        else:
+            rewards[-1] = config.draw_reward
 
         transformed = transform_rewards(
             rewards,
@@ -1658,7 +1665,8 @@ def _batched_trajectory_loss_from_forwards(
         ~online_moved_up, is_bias_step, torch.zeros_like(is_bias_step)
     ).sum()
 
-    # Terminal rewards: scatter ±1 (or 0) at each episode's last step.
+    # Terminal rewards: scatter ±1 at each episode's last step; draws get
+    # draw_reward for both players (not 0, to remove any incentive to stall).
     last_idx = ep_offsets[1:] - 1
     winner_dev = winners.to(device=device, dtype=torch.long)
     valid_w = winner_dev >= 0
@@ -1671,6 +1679,11 @@ def _batched_trajectory_loss_from_forwards(
     rewards_p0 = torch.zeros(T_total, dtype=dtype, device=device)
     rewards_p0.scatter_(0, last_idx, sign_per_ep)
     rewards_p1 = -rewards_p0
+    # Both players receive draw_reward on drawn episodes (scatter_add is a no-op
+    # for win/loss episodes where the draw mask is zero).
+    draw_ep_reward = (~valid_w).to(dtype=dtype) * config.draw_reward
+    rewards_p0.scatter_add_(0, last_idx, draw_ep_reward)
+    rewards_p1.scatter_add_(0, last_idx, draw_ep_reward)
 
     is_own_p0 = perspective == 0
     is_own_p1 = perspective == 1

@@ -244,6 +244,87 @@ def lstm_recompute_per_step_h_out(
     return [parts[0] if len(parts) == 1 else torch.cat(parts, dim=0) for parts in chunks_per_ep]
 
 
+def lstm_recompute_per_step_h_out_per_player(
+    lstm: nn.LSTM,
+    projected: Tensor,
+    perspective: Tensor,
+    ep_lengths: Sequence[int],
+    *,
+    chunk_size: int = 200,
+    compiled_lstm: Callable[..., Any] | None = None,
+) -> Tensor:
+    """Per-player split LSTM recompute returning per-step top-layer h_out.
+
+    Mirrors rollout behaviour: each player's LSTM state advances only on
+    *their own* turns and resets to zero at the start of every episode.
+
+    Each ``(episode, player)`` pair is treated as an independent virtual
+    sequence.  Steps are regrouped by virtual sequence ID
+    ``ep_id * 2 + player`` via a stable argsort, the fused cuDNN LSTM runs
+    once over all virtual sequences via :func:`lstm_recompute_per_step_h_out`,
+    and outputs are scattered back with ``h_out[sort_idx] = all_h_cat``.
+
+    Args:
+        lstm: The LSTM module.
+        projected: ``[T_total, hidden]`` flat projected features (all
+            episodes concatenated in order).
+        perspective: ``[T_total]`` long tensor with values 0 or 1; the
+            player whose turn it is at each step.
+        ep_lengths: Length of each episode; ``sum(ep_lengths)`` must equal
+            ``T_total``.
+        chunk_size: BPTT chunk size forwarded to
+            :func:`lstm_recompute_per_step_h_out`.
+        compiled_lstm: Optional ``torch.compile``'d LSTM callable.
+
+    Returns:
+        ``[T_total, hidden]`` h_out at every step.
+    """
+    if projected.dim() != 2:
+        raise ValueError("projected must be (T_total, hidden)")
+    t_total = int(projected.shape[0])
+    hidden = int(lstm.hidden_size)
+    if int(projected.shape[1]) != hidden:
+        raise ValueError(f"projected dim 1 must equal lstm.hidden_size ({hidden})")
+    if perspective.dim() != 1 or int(perspective.shape[0]) != t_total:
+        raise ValueError("perspective must be (T_total,) matching projected")
+    if sum(ep_lengths) != t_total:
+        raise ValueError(f"sum(ep_lengths)={sum(ep_lengths)} must equal T_total={t_total}")
+
+    n_eps = len(ep_lengths)
+    device = projected.device
+
+    # Episode ID for every flat step: [T_total]
+    ep_ids = torch.repeat_interleave(
+        torch.arange(n_eps, device=device),
+        torch.tensor(ep_lengths, dtype=torch.long, device=device),
+    )
+
+    # Virtual sequence ID: ep_id * 2 + player, values in [0, 2*n_eps)
+    virt_ids = ep_ids * 2 + perspective  # [T_total]
+
+    # Stable sort by virtual ID; within each virtual seq game order is preserved
+    sort_idx = torch.argsort(virt_ids, stable=True)  # [T_total]
+    feats_sorted = projected[sort_idx]  # [T_total, hidden]
+
+    # Per-virtual-sequence lengths; sum == T_total
+    virt_lengths = torch.bincount(virt_ids, minlength=2 * n_eps)  # [2*n_eps]
+
+    # Build list of non-empty per-virtual-sequence tensors for lstm_recompute
+    seqs = [s for s in torch.split(feats_sorted, virt_lengths.tolist()) if s.shape[0] > 0]
+
+    all_h_outs = lstm_recompute_per_step_h_out(
+        lstm,
+        seqs,
+        chunk_size=chunk_size,
+        compiled_lstm=compiled_lstm,
+    )
+
+    # Scatter back: feats_sorted[j] came from projected[sort_idx[j]]
+    h_out = projected.new_zeros(t_total, hidden)
+    h_out[sort_idx] = torch.cat(all_h_outs, dim=0)
+    return h_out
+
+
 @torch.no_grad()
 def lstm_recompute_per_step_states(
     lstm: nn.LSTM,

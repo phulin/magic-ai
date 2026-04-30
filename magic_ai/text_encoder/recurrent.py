@@ -63,6 +63,7 @@ class RecurrentTextPolicyOutput:
     target_mask: Tensor
     card_vectors: Tensor
     card_mask: Tensor
+    lstm_input: Tensor | None = None  # [B, lstm_hidden] in_proj(state_vector); None when bypassed
 
 
 class RecurrentTextPolicy(nn.Module):
@@ -201,6 +202,7 @@ class RecurrentTextPolicy(nn.Module):
         if h_in is None or c_in is None:
             h_in, c_in = self.init_state(b, device)
 
+        lstm_input: Tensor | None
         if state_hidden_override is not None:
             if state_hidden_override.shape != (b, self.lstm_hidden):
                 raise ValueError(
@@ -209,9 +211,10 @@ class RecurrentTextPolicy(nn.Module):
                 )
             state_hidden = state_hidden_override
             h_out, c_out = h_in, c_in
+            lstm_input = None
         else:
-            x = self.in_proj(encoded.state_vector).unsqueeze(1)
-            y, (h_out, c_out) = self.lstm(x, (h_in, c_in))
+            lstm_input = self.in_proj(encoded.state_vector)
+            y, (h_out, c_out) = self.lstm(lstm_input.unsqueeze(1), (h_in, c_in))
             state_hidden = y.squeeze(1)
 
         state_for_heads = self.out_proj(state_hidden)
@@ -230,6 +233,7 @@ class RecurrentTextPolicy(nn.Module):
             target_mask=encoded.target_mask,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,
+            lstm_input=lstm_input,
         )
         return out, (h_out, c_out)
 

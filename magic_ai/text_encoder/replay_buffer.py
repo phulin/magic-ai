@@ -51,6 +51,7 @@ class TextReplayBuffer:
         max_cached_choices: int,
         recurrent_layers: int = 0,
         recurrent_hidden_dim: int = 0,
+        lstm_proj_hidden: int = 0,
         max_card_refs: int = MAX_CARD_REFS,
         device: torch.device | str = "cpu",
         validate: bool = True,
@@ -73,6 +74,8 @@ class TextReplayBuffer:
             raise ValueError(
                 "recurrent_layers and recurrent_hidden_dim must both be zero or nonzero"
             )
+        if lstm_proj_hidden < 0:
+            raise ValueError("lstm_proj_hidden must be >= 0")
 
         self.capacity = int(capacity)
         self.max_tokens = int(max_tokens)
@@ -82,6 +85,7 @@ class TextReplayBuffer:
         self.max_cached_choices = int(max_cached_choices)
         self.recurrent_layers = int(recurrent_layers)
         self.recurrent_hidden_dim = int(recurrent_hidden_dim)
+        self.lstm_proj_hidden = int(lstm_proj_hidden)
         self.max_card_refs = int(max_card_refs)
         self.device = torch.device(device)
         self.validate = bool(validate)
@@ -173,6 +177,11 @@ class TextReplayBuffer:
             )
             self.lstm_h_in = torch.zeros(recurrent_shape, dtype=torch.float32, device=self.device)
             self.lstm_c_in = torch.zeros_like(self.lstm_h_in)
+        self.projected_state: Tensor | None = None
+        if self.lstm_proj_hidden > 0:
+            self.projected_state = torch.zeros(
+                self.capacity, self.lstm_proj_hidden, dtype=torch.float16, device=self.device
+            )
 
         self._occupied = torch.zeros(self.capacity, dtype=torch.bool, device=self.device)
         self._free_rows = list(range(self.capacity - 1, -1, -1))
@@ -710,6 +719,18 @@ class TextReplayBuffer:
             perspective_player_idx=perspective_player_idx,
             lstm_h_in=h_in,
             lstm_c_in=c_in,
+        )
+
+    def write_projected_state(self, rows: Tensor, projected: Tensor) -> None:
+        """Write cached LSTM input projections for the given rows.
+
+        ``rows``: ``[N]`` long tensor of row indices.
+        ``projected``: ``[N, lstm_proj_hidden]`` tensor; stored as float16.
+        """
+        if self.projected_state is None:
+            raise ValueError("buffer was constructed without projected_state storage")
+        self.projected_state[rows.to(device=self.device, dtype=torch.long)] = projected.to(
+            device=self.device, dtype=torch.float16
         )
 
     def _write_encoded_row(

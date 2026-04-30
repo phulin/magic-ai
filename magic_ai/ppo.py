@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import cast
 
@@ -47,6 +47,7 @@ def ppo_update(
     entropy_coef: float = 0.01,
     max_grad_norm: float = 0.5,
     spr_coef: float = 0.0,
+    between_epoch_fn: Callable[[], None] | None = None,
 ) -> PPOStats:
     """Run PPO over cached policy inputs.
 
@@ -88,7 +89,7 @@ def ppo_update(
     sums_t = torch.zeros(len(stat_names), dtype=torch.float32, device=device)
     num_minibatches = 0
     indices = list(range(len(steps)))
-    for _ in range(epochs):
+    for epoch_idx in range(epochs):
         random.shuffle(indices)
         for start in range(0, len(indices), minibatch_size):
             batch_indices = indices[start : start + minibatch_size]
@@ -136,6 +137,8 @@ def ppo_update(
                 )
             )
             num_minibatches += 1
+        if between_epoch_fn is not None and epoch_idx < epochs - 1:
+            between_epoch_fn()
 
     if num_minibatches == 0:
         raise RuntimeError("PPO update did not run any minibatches")
@@ -159,7 +162,7 @@ def gae_returns(
     winner_idx: int,
     gamma: float = 1.0,
     gae_lambda: float = 0.95,
-    draw_penalty: float = 0.1,
+    draw_penalty: float = 1.0,
 ) -> Tensor:
     """Compute perspective-aware GAE returns for a zero-sum two-player game.
 

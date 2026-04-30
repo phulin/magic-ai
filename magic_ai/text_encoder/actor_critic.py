@@ -29,6 +29,7 @@ from magic_ai.actions import (
     selected_option_id,
 )
 from magic_ai.game_state import PendingState
+from magic_ai.lstm_recompute import lstm_recompute_per_step_h_out_per_player
 from magic_ai.replay_decisions import (
     ReplayPerChoice,
     ReplayScoringForward,
@@ -492,6 +493,15 @@ class TextActorCritic(nn.Module):
                     may_selected=may_selected,
                 )
             )
+        if (
+            results
+            and self.rollout_buffer.projected_state is not None
+            and output.lstm_input is not None
+        ):
+            rows = torch.tensor(
+                [r.replay_idx for r in results], dtype=torch.long, device=self.device
+            )
+            self.rollout_buffer.write_projected_state(rows, output.lstm_input.detach())
         return results
 
     def sample_native_tensor_batch(
@@ -647,6 +657,8 @@ class TextActorCritic(nn.Module):
                 lstm_h_in=h_in.detach(),
                 lstm_c_in=c_in.detach(),
             )
+            if self.rollout_buffer.projected_state is not None and output.lstm_input is not None:
+                self.rollout_buffer.write_projected_state(replay_rows, output.lstm_input.detach())
         else:
             replay_rows = torch.full((batch_size,), -1, dtype=torch.long, device=device)
 
@@ -899,6 +911,86 @@ class TextActorCritic(nn.Module):
             encoded=encoded,
             h_concat=h_concat,
         )
+
+    @torch.no_grad()
+    def refresh_lstm_states(
+        self,
+        episodes_replay_rows: Sequence[Sequence[int]],
+    ) -> None:
+        """Refresh ``lstm_h_in`` in the replay buffer using cached projected features.
+
+        Runs the per-player LSTM recompute on the cached ``in_proj`` outputs
+        stored at rollout time, then writes fresh per-step ``h_in`` back.
+        ``lstm_c_in`` is zeroed because per-step cell states are not captured
+        during the fused cuDNN forward. Only supports ``lstm_layers == 1``.
+
+        Safe to call between PPO epochs: runs under ``torch.no_grad()`` and
+        only writes to the buffer, so it does not affect the gradient graph.
+        """
+        if self.rollout_buffer is None or self.rollout_buffer.projected_state is None:
+            return
+        if self.rollout_buffer.lstm_h_in is None:
+            return
+        if self.lstm_layers != 1:
+            raise ValueError("refresh_lstm_states only supports lstm_layers == 1")
+
+        flat_rows = [int(r) for ep in episodes_replay_rows for r in ep]
+        ep_lens = [len(list(ep)) for ep in episodes_replay_rows]
+        if not flat_rows:
+            return
+
+        rows_t = torch.tensor(flat_rows, dtype=torch.long, device=self.device)
+        target_dtype = next(self.policy.lstm.parameters()).dtype
+
+        projected = self.rollout_buffer.projected_state[rows_t].to(
+            device=self.device, dtype=target_dtype
+        )
+        perspective = self.rollout_buffer.perspective_player_idx[rows_t].long()
+
+        h_out = lstm_recompute_per_step_h_out_per_player(
+            self.policy.lstm,
+            projected,
+            perspective,
+            ep_lens,
+        )
+
+        # Shift within each player's sub-sequence per episode:
+        # h_in[step k] = h_out[step k-1]; h_in[first step] = 0.
+        n_eps = len(ep_lens)
+        ep_lens_t = torch.tensor(ep_lens, dtype=torch.long, device=self.device)
+        ep_ids = torch.repeat_interleave(torch.arange(n_eps, device=self.device), ep_lens_t)
+        virt_ids = ep_ids * 2 + perspective
+        sort_idx = torch.argsort(virt_ids, stable=True)
+        virt_lengths = torch.bincount(virt_ids, minlength=2 * n_eps)
+
+        h_out_sorted = h_out[sort_idx]
+        h_in_sorted = h_out_sorted.new_zeros(h_out_sorted.shape)
+
+        seq_starts = torch.cat(
+            [
+                h_out_sorted.new_zeros(1, dtype=torch.long),
+                virt_lengths.cumsum(0)[:-1],
+            ]
+        )
+        is_first = h_out_sorted.new_zeros(len(flat_rows), dtype=torch.bool)
+        is_first[seq_starts[virt_lengths > 0]] = True
+
+        h_in_sorted[1:] = torch.where(
+            is_first[1:].unsqueeze(-1),
+            h_in_sorted.new_zeros(1, self.lstm_hidden),
+            h_out_sorted[:-1],
+        )
+
+        h_in_flat = h_in_sorted.new_empty(h_in_sorted.shape)
+        h_in_flat[sort_idx] = h_in_sorted
+
+        buf_device = self.rollout_buffer.device
+        buf_rows = rows_t.to(device=buf_device)
+        lstm_h_in = self.rollout_buffer.lstm_h_in
+        lstm_c_in = self.rollout_buffer.lstm_c_in
+        assert lstm_h_in is not None and lstm_c_in is not None
+        lstm_h_in[buf_rows] = h_in_flat.to(device=buf_device, dtype=torch.float32).unsqueeze(1)
+        lstm_c_in[buf_rows] = 0.0
 
     def scatter_lstm_env_states(
         self,

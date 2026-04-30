@@ -402,6 +402,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         max_cached_choices=args.max_cached_choices,
         recurrent_layers=args.hidden_layers,
         recurrent_hidden_dim=cfg.d_model,
+        lstm_proj_hidden=recurrent_cfg.lstm_hidden,
         device=device,
         validate=not getattr(args, "no_validate", False),
     )
@@ -1674,6 +1675,7 @@ def train_native_batched_envs(
                 q_corr_rho_bar=args.rnad_q_corr_rho_bar,
                 bptt_chunk_size=args.rnad_bptt_chunk_size,
                 step_minibatch_size=args.minibatch_size,
+                draw_reward=-args.draw_penalty,
             ),
             reg_snapshot_dir=args.output.parent / "rnad",
             device=policy.device,
@@ -2259,6 +2261,7 @@ def train_text_envs(
 
     pending_steps: list[RolloutStep] = []
     pending_returns: list[torch.Tensor] = []
+    pending_episode_rows: list[list[int]] = []
     win_stats = WinFractionStats()
     backend.replay_buffer.reset()
     backend.policy.init_lstm_env_states(1)
@@ -2280,6 +2283,13 @@ def train_text_envs(
             return
         rollout_returns = torch.cat(pending_returns)
         rollout_step_count = len(pending_steps)
+        ep_rows_snapshot = list(pending_episode_rows)
+        refresh_fn = None
+        if ep_rows_snapshot and hasattr(backend.policy, "refresh_lstm_states"):
+
+            def refresh_fn() -> None:
+                backend.policy.refresh_lstm_states(ep_rows_snapshot)  # type: ignore[union-attr]
+
         stats = ppo_update(
             backend.policy,
             optimizer,
@@ -2292,6 +2302,7 @@ def train_text_envs(
             entropy_coef=args.entropy_coef,
             max_grad_norm=args.max_grad_norm,
             spr_coef=args.spr_coef if args.spr else 0.0,
+            between_epoch_fn=refresh_fn,
         )
         now = time.monotonic()
         elapsed = now - last_step_time
@@ -2325,6 +2336,7 @@ def train_text_envs(
         backend.replay_buffer.reset()
         pending_steps.clear()
         pending_returns.clear()
+        pending_episode_rows.clear()
         win_stats.reset()
 
     for episode_idx in range(completed_games, args.episodes):
@@ -2411,6 +2423,9 @@ def train_text_envs(
         else:
             win_stats.draws += 1
         if episode_steps:
+            ep_rows = [s.replay_idx for s in episode_steps if s.replay_idx is not None]
+            if ep_rows:
+                pending_episode_rows.append(ep_rows)
             pending_steps.extend(episode_steps)
             pending_returns.append(
                 gae_returns(
@@ -2612,6 +2627,7 @@ def train_text_native_batched_envs(
     pending_steps: list[RolloutStep] = []
     pending_returns: list[torch.Tensor] = []
     pending_episodes: list[EpisodeBatch] = []
+    pending_episode_rows: list[list[int]] = []
     rnad_state: RNaDTrainerState | None = None
     if args.trainer == "rnad":
         rnad_state = build_trainer_state(
@@ -2629,6 +2645,7 @@ def train_text_native_batched_envs(
                 q_corr_rho_bar=args.rnad_q_corr_rho_bar,
                 bptt_chunk_size=args.rnad_bptt_chunk_size,
                 step_minibatch_size=args.minibatch_size,
+                draw_reward=-args.draw_penalty,
             ),
             reg_snapshot_dir=args.output.parent / "rnad",
             device=backend.policy.device,
@@ -2716,6 +2733,9 @@ def train_text_native_batched_envs(
                     encoder="text",
                 )
             if env.episode_steps:
+                ep_rows = [s.replay_idx for s in env.episode_steps if s.replay_idx is not None]
+                if ep_rows:
+                    pending_episode_rows.append(ep_rows)
                 pending_steps.extend(env.episode_steps)
                 pending_returns.append(
                     gae_returns(
@@ -2792,6 +2812,13 @@ def train_text_native_batched_envs(
                     torch.cuda.memory._record_memory_history(enabled=None)
             trainer_label = "rnad,text,native"
         else:
+            ep_rows_snapshot = list(pending_episode_rows)
+            native_refresh_fn = None
+            if ep_rows_snapshot and hasattr(backend.policy, "refresh_lstm_states"):
+
+                def native_refresh_fn() -> None:
+                    backend.policy.refresh_lstm_states(ep_rows_snapshot)  # type: ignore[union-attr]
+
             try:
                 stats = ppo_update(
                     backend.policy,
@@ -2805,6 +2832,7 @@ def train_text_native_batched_envs(
                     entropy_coef=args.entropy_coef,
                     max_grad_norm=args.max_grad_norm,
                     spr_coef=0.0,
+                    between_epoch_fn=native_refresh_fn,
                 )
             except torch.OutOfMemoryError:
                 if snapshot_armed:
@@ -2888,6 +2916,7 @@ def train_text_native_batched_envs(
         pending_steps.clear()
         pending_returns.clear()
         pending_episodes.clear()
+        pending_episode_rows.clear()
         win_stats.reset()
 
     maybe_start_games()
