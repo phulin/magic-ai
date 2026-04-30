@@ -319,10 +319,10 @@ def lstm_recompute_per_step_h_out_per_player(
         compiled_lstm=compiled_lstm,
     )
 
-    # Scatter back: feats_sorted[j] came from projected[sort_idx[j]]
-    h_out = projected.new_zeros(t_total, hidden)
-    h_out[sort_idx] = torch.cat(all_h_outs, dim=0)
-    return h_out
+    # Unsort: all_h_cat[j] is the output for sort_idx[j] in the original flat order.
+    # Gather via the inverse permutation so the result stays in the autograd graph.
+    all_h_cat = torch.cat(all_h_outs, dim=0)
+    return all_h_cat[torch.argsort(sort_idx)]
 
 
 @torch.no_grad()

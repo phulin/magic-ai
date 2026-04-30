@@ -853,16 +853,13 @@ class TextActorCritic(nn.Module):
         self,
         episodes_replay_rows: Sequence[Sequence[int]],
     ) -> CachedReplayForward:
-        """Run encoder once on the flat replay batch + per-episode LSTM scan.
+        """Run encoder + per-player LSTM recompute for a batch of episodes.
 
-        R-NaD's batched-trajectory loss runs an LSTM recompute and a per-choice
-        scoring forward against the same replay rows under the same parameters.
-        Both used to call :meth:`TextPolicy.encode_only` independently, paying
-        the encoder cost twice. This helper consolidates them: the encoder runs
-        once on the concatenated flat batch (under the same bf16 autocast as
-        the live forward path), and the cached :class:`CachedReplayForward` is
-        consumed by ``evaluate_replay_batch_per_choice(cached=...)`` to skip
-        the second forward.
+        Replaces the old per-episode sequential scan with a fully batched
+        per-player recompute that matches rollout semantics: each player's
+        LSTM state advances only on their own turns and resets to zero at
+        game start. Gradients flow through the encoder, ``in_proj``, and the
+        LSTM so all parameters receive signal from the R-NaD loss.
         """
 
         if self.rollout_buffer is None:
@@ -888,22 +885,14 @@ class TextActorCritic(nn.Module):
         target_dtype = self.policy.in_proj.weight.dtype
         encoded = _cast_encoded(encoded, target_dtype)
 
-        # cuDNN's fused LSTM doesn't expose intermediate cell states for a
-        # multi-episode batched call without padding-and-masking, and the
-        # episodes here have ragged lengths. The per-episode LSTM scan stays;
-        # what we save is the encoder forward, which is the dominant cost.
         state = self.policy.in_proj(encoded.state_vector)
-        device = state.device
-        h_chunks: list[Tensor] = []
-        cursor = 0
-        for n_ep in ep_lens:
-            x = state[cursor : cursor + n_ep].unsqueeze(0)
-            h0 = torch.zeros(self.lstm_layers, 1, self.lstm_hidden, device=device)
-            c0 = torch.zeros_like(h0)
-            out, _ = self.policy.lstm(x, (h0, c0))
-            h_chunks.append(out.squeeze(0).contiguous())
-            cursor += n_ep
-        h_concat = torch.cat(h_chunks, dim=0)
+        perspective = batch.perspective_player_idx.to(device=state.device, dtype=torch.long)
+        h_concat = lstm_recompute_per_step_h_out_per_player(
+            self.policy.lstm,
+            state,
+            perspective,
+            ep_lens,
+        )
 
         return CachedReplayForward(
             flat_rows=tuple(flat_rows),
