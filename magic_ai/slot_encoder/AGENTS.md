@@ -10,4 +10,4 @@ Slot-based game-state encoding, PPO actor-critic, rollout buffers, and native Cg
 - `model.py` — PPOPolicy actor-critic with policy/value heads and action decoding for legal action spaces
 - `native_encoder.py` — ctypes bindings to libmage's parallel batch encoder (game→features)
 - `native_rollout.py` — ctypes bindings to libmage's step-by-choice game simulator
-- `sharded_native.py` — thread-pool sharding for parallel encoder/rollout calls (ShardedNativeBatchEncoder, ShardedNativeRolloutDriver)
+- `sharded_native.py` — compatibility re-export for shared native sharding helpers in `magic_ai/native/sharded.py`

@@ -6,6 +6,6 @@ Submodules:
 - ``buffer`` — ``RolloutBuffer``, ``NativeTrajectoryBuffer`` GPU rollout buffers.
 - ``native_encoder`` — ``NativeBatchEncoder``, ``NativeEncodedBatch`` (Cgo-backed).
 - ``native_rollout`` — ``NativeRolloutDriver``, ``NativeRolloutUnavailable``.
-- ``sharded_native`` — ``ShardedNativeBatchEncoder``, ``ShardedNativeRolloutDriver``.
+- ``sharded_native`` — compatibility re-export for shared native sharding helpers.
 - ``encoder_parity`` — parity helpers for validating batch encoding.
 """

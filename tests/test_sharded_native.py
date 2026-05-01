@@ -5,14 +5,14 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
-from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
-from magic_ai.slot_encoder.native_rollout import NativeRolloutDriver
-from magic_ai.slot_encoder.sharded_native import (
+from magic_ai.native.sharded import (
     ShardedNativeRolloutDriver,
     _concat_encoded_batches,
     _merge_packed_outputs,
     _shard_ranges,
 )
+from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
+from magic_ai.slot_encoder.native_rollout import NativeRolloutDriver
 
 
 def _make_batch(batch_size: int, decision_rows: int, *, start_offset: int) -> NativeEncodedBatch:
@@ -151,6 +151,8 @@ class ConcatEncodedBatchesTests(unittest.TestCase):
 @dataclass
 class _PackedOutputs:
     token_ids: torch.Tensor
+    seq_id: torch.Tensor
+    pos_in_seq: torch.Tensor
     cu_seqlens: torch.Tensor
     seq_lengths: torch.Tensor
     state_positions: torch.Tensor
@@ -166,6 +168,8 @@ class _PackedOutputs:
 def _packed_outputs(batch_size: int, max_tokens: int = 8) -> _PackedOutputs:
     return _PackedOutputs(
         token_ids=torch.empty(batch_size * max_tokens, dtype=torch.int32),
+        seq_id=torch.empty(batch_size * max_tokens, dtype=torch.int32),
+        pos_in_seq=torch.empty(batch_size * max_tokens, dtype=torch.int32),
         cu_seqlens=torch.zeros(batch_size + 1, dtype=torch.int32),
         seq_lengths=torch.zeros(batch_size, dtype=torch.int32),
         state_positions=torch.zeros(batch_size, dtype=torch.int32),
@@ -183,6 +187,8 @@ class MergePackedOutputsTests(unittest.TestCase):
     def test_concatenates_tokens_and_rebases_absolute_positions(self) -> None:
         a = _packed_outputs(2)
         a.token_ids[:5] = torch.tensor([10, 11, 12, 13, 14], dtype=torch.int32)
+        a.seq_id[:5] = torch.tensor([0, 0, 1, 1, 1], dtype=torch.int32)
+        a.pos_in_seq[:5] = torch.tensor([0, 1, 0, 1, 2], dtype=torch.int32)
         a.cu_seqlens[:] = torch.tensor([0, 2, 5], dtype=torch.int32)
         a.seq_lengths[:] = torch.tensor([2, 3], dtype=torch.int32)
         a.state_positions[:] = torch.tensor([0, 2], dtype=torch.int32)
@@ -198,6 +204,8 @@ class MergePackedOutputsTests(unittest.TestCase):
 
         b = _packed_outputs(1)
         b.token_ids[:4] = torch.tensor([20, 21, 22, 23], dtype=torch.int32)
+        b.seq_id[:4] = torch.tensor([0, 0, 0, 0], dtype=torch.int32)
+        b.pos_in_seq[:4] = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
         b.cu_seqlens[:] = torch.tensor([0, 4], dtype=torch.int32)
         b.seq_lengths[:] = torch.tensor([4], dtype=torch.int32)
         b.state_positions[:] = torch.tensor([0], dtype=torch.int32)
@@ -216,6 +224,14 @@ class MergePackedOutputsTests(unittest.TestCase):
         torch.testing.assert_close(
             out.token_ids[:9],
             torch.tensor([10, 11, 12, 13, 14, 20, 21, 22, 23], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            out.seq_id[:9],
+            torch.tensor([0, 0, 1, 1, 1, 2, 2, 2, 2], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            out.pos_in_seq[:9],
+            torch.tensor([0, 1, 0, 1, 2, 0, 1, 2, 3], dtype=torch.int32),
         )
         torch.testing.assert_close(
             out.cu_seqlens[:4], torch.tensor([0, 2, 5, 9], dtype=torch.int32)

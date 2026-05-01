@@ -43,6 +43,10 @@ from magic_ai.game_state import (  # noqa: E402
     PendingOptionState,
     PendingState,
 )
+from magic_ai.native.sharded import (  # noqa: E402
+    ShardedNativeBatchEncoder,
+    ShardedNativeRolloutDriver,
+)
 from magic_ai.opponent_pool import (  # noqa: E402
     OpponentEntry,
     OpponentPool,
@@ -73,10 +77,6 @@ from magic_ai.slot_encoder.native_encoder import (  # noqa: E402,F401
 from magic_ai.slot_encoder.native_rollout import (  # noqa: E402
     NativeRolloutDriver,  # noqa: F401
     NativeRolloutUnavailable,
-)
-from magic_ai.slot_encoder.sharded_native import (  # noqa: E402
-    ShardedNativeBatchEncoder,
-    ShardedNativeRolloutDriver,
 )
 from magic_ai.text_encoder.actor_critic import (  # noqa: E402
     TextActorCritic,  # noqa: E402

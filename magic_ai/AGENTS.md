@@ -4,6 +4,7 @@ Core training and inference pipeline for a Magic: The Gathering-playing RL agent
 
 ## Subpackages
 - `slot_encoder/` — slot-based game-state encoder, PPO actor-critic, rollout buffers, and native Cgo bindings
+- `native/` — shared native-runtime orchestration for sharded encoder/rollout calls
 - `text_encoder/` — alternative policy using card-text embeddings instead of token slots
 
 ## Files
