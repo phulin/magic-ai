@@ -102,6 +102,58 @@ def _concat_encoded_batches(results: list[NativeEncodedBatch]) -> NativeEncodedB
     )
 
 
+def _add_token_offset(pos: torch.Tensor, token_offset: int) -> torch.Tensor:
+    if token_offset == 0:
+        return pos
+    return torch.where(pos >= 0, pos + token_offset, pos)
+
+
+def _merge_packed_outputs(
+    results: list[Any],
+    output: Any,
+) -> Any:
+    """Merge shard-local packed-token outputs into one batch-ordered output."""
+
+    active_sizes = [int(r.active_batch_size) for r in results]
+    batch_size = sum(active_sizes)
+    output.active_batch_size = batch_size
+    output.cu_seqlens[0] = 0
+
+    batch_cursor = 0
+    token_cursor = 0
+    for shard, shard_n in zip(results, active_sizes, strict=True):
+        if shard_n == 0:
+            continue
+        shard_cu = shard.cu_seqlens[: shard_n + 1]
+        shard_total = int(shard_cu[-1].item()) if shard_cu.numel() else 0
+        next_batch = batch_cursor + shard_n
+        next_token = token_cursor + shard_total
+
+        output.token_ids[token_cursor:next_token].copy_(shard.token_ids[:shard_total])
+        output.cu_seqlens[batch_cursor + 1 : next_batch + 1].copy_(shard_cu[1:] + token_cursor)
+        output.seq_lengths[batch_cursor:next_batch].copy_(shard.seq_lengths[:shard_n])
+        output.state_positions[batch_cursor:next_batch].copy_(
+            _add_token_offset(shard.state_positions[:shard_n], token_cursor)
+        )
+        output.option_positions[batch_cursor:next_batch].copy_(
+            _add_token_offset(shard.option_positions[:shard_n], token_cursor)
+        )
+        output.option_mask[batch_cursor:next_batch].copy_(shard.option_mask[:shard_n])
+        output.target_positions[batch_cursor:next_batch].copy_(
+            _add_token_offset(shard.target_positions[:shard_n], token_cursor)
+        )
+        output.target_mask[batch_cursor:next_batch].copy_(shard.target_mask[:shard_n])
+        output.card_ref_positions[batch_cursor:next_batch].copy_(
+            _add_token_offset(shard.card_ref_positions[:shard_n], token_cursor)
+        )
+        output.token_overflow[batch_cursor:next_batch].copy_(shard.token_overflow[:shard_n])
+
+        batch_cursor = next_batch
+        token_cursor = next_token
+
+    return output
+
+
 class ShardedNativeBatchEncoder:
     """Fan `encode_handles` calls across a thread pool of NativeBatchEncoders."""
 
@@ -109,14 +161,21 @@ class ShardedNativeBatchEncoder:
         self,
         encoders: list[NativeBatchEncoder],
         pool: ThreadPoolExecutor | None,
+        *,
+        shard_packed_tokens: bool = False,
     ) -> None:
         if not encoders:
             raise ValueError("ShardedNativeBatchEncoder requires at least one encoder")
         self._encoders = encoders
         self._pool = pool
+        self._shard_packed_tokens = bool(shard_packed_tokens)
         self.is_available = encoders[0].is_available
         self._packed_token_outputs: Any | None = None
         self._packed_token_outputs_spec: tuple[int, int, int, int, int] | None = None
+        self._packed_token_shard_outputs: list[Any | None] = [None] * len(encoders)
+        self._packed_token_shard_specs: list[tuple[int, int, int, int, int] | None] = [None] * len(
+            encoders
+        )
 
     @classmethod
     def for_policy(
@@ -183,6 +242,7 @@ class ShardedNativeBatchEncoder:
         workers: int,
         pool: ThreadPoolExecutor | None,
         dedup_card_bodies: bool = False,
+        shard_packed_tokens: bool = False,
     ) -> ShardedNativeBatchEncoder:
         if workers < 1:
             raise ValueError("workers must be >= 1")
@@ -203,6 +263,7 @@ class ShardedNativeBatchEncoder:
                     )
                 ],
                 pool=None,
+                shard_packed_tokens=False,
             )
 
         encoders: list[NativeBatchEncoder] = []
@@ -225,7 +286,11 @@ class ShardedNativeBatchEncoder:
                     dedup_card_bodies=dedup_card_bodies,
                 )
             )
-        return cls(encoders, pool=pool if workers > 1 else None)
+        return cls(
+            encoders,
+            pool=pool if workers > 1 else None,
+            shard_packed_tokens=shard_packed_tokens,
+        )
 
     def encode_tokens_packed(
         self,
@@ -245,12 +310,61 @@ class ShardedNativeBatchEncoder:
         )
 
         batch_size = len(games)
-        spec = (batch_size, max_tokens, max_options, max_targets, max_card_refs)
+        if batch_size == 0:
+            raise ValueError("encode_tokens_packed requires at least one game")
+        if (
+            not self._shard_packed_tokens
+            or self._pool is None
+            or batch_size <= 1
+            or len(self._encoders) == 1
+        ):
+            spec = (batch_size, max_tokens, max_options, max_targets, max_card_refs)
+            if (
+                self._packed_token_outputs is None
+                or self._packed_token_outputs_spec is None
+                or self._packed_token_outputs_spec[0] < batch_size
+                or self._packed_token_outputs_spec[1:] != spec[1:]
+            ):
+                capacity = max(
+                    batch_size,
+                    self._packed_token_outputs_spec[0] * 2
+                    if self._packed_token_outputs_spec
+                    else 0,
+                )
+                self._packed_token_outputs = allocate_packed_outputs(
+                    capacity,
+                    max_tokens=max_tokens,
+                    max_options=max_options,
+                    max_targets=max_targets,
+                    max_card_refs=max_card_refs,
+                )
+                self._packed_token_outputs_spec = (
+                    capacity,
+                    max_tokens,
+                    max_options,
+                    max_targets,
+                    max_card_refs,
+                )
+
+            return encode_tokens_packed(
+                self._encoders[0],
+                games,
+                perspective_player_indices=perspective_player_indices,
+                max_tokens=max_tokens,
+                max_options=max_options,
+                max_targets=max_targets,
+                max_card_refs=max_card_refs,
+                outputs=self._packed_token_outputs,
+                include_trace_kinds=False,
+            )
+
+        shards = _shard_ranges(batch_size, len(self._encoders))
+        merged_spec = (batch_size, max_tokens, max_options, max_targets, max_card_refs)
         if (
             self._packed_token_outputs is None
             or self._packed_token_outputs_spec is None
             or self._packed_token_outputs_spec[0] < batch_size
-            or self._packed_token_outputs_spec[1:] != spec[1:]
+            or self._packed_token_outputs_spec[1:] != merged_spec[1:]
         ):
             capacity = max(
                 batch_size,
@@ -271,17 +385,57 @@ class ShardedNativeBatchEncoder:
                 max_card_refs,
             )
 
-        return encode_tokens_packed(
-            self._encoders[0],
-            games,
-            perspective_player_indices=perspective_player_indices,
-            max_tokens=max_tokens,
-            max_options=max_options,
-            max_targets=max_targets,
-            max_card_refs=max_card_refs,
-            outputs=self._packed_token_outputs,
-            include_trace_kinds=False,
+        def shard_outputs(idx: int, shard_n: int) -> Any:
+            spec = (shard_n, max_tokens, max_options, max_targets, max_card_refs)
+            current = self._packed_token_shard_outputs[idx]
+            current_spec = self._packed_token_shard_specs[idx]
+            if (
+                current is None
+                or current_spec is None
+                or current_spec[0] < shard_n
+                or current_spec[1:] != spec[1:]
+            ):
+                capacity = max(shard_n, current_spec[0] * 2 if current_spec else 0)
+                current = allocate_packed_outputs(
+                    capacity,
+                    max_tokens=max_tokens,
+                    max_options=max_options,
+                    max_targets=max_targets,
+                    max_card_refs=max_card_refs,
+                )
+                current_spec = (capacity, max_tokens, max_options, max_targets, max_card_refs)
+                self._packed_token_shard_outputs[idx] = current
+                self._packed_token_shard_specs[idx] = current_spec
+            return current
+
+        encoded_results: list[NativeEncodedBatch | None] = [None] * len(shards)
+        packed_results: list[Any | None] = [None] * len(shards)
+
+        def run(idx: int, a: int, b: int) -> None:
+            encoded, packed = encode_tokens_packed(
+                self._encoders[idx],
+                games[a:b],
+                perspective_player_indices=perspective_player_indices[a:b],
+                max_tokens=max_tokens,
+                max_options=max_options,
+                max_targets=max_targets,
+                max_card_refs=max_card_refs,
+                outputs=shard_outputs(idx, b - a),
+                include_trace_kinds=False,
+            )
+            encoded_results[idx] = encoded
+            packed_results[idx] = packed
+
+        futures = [self._pool.submit(run, i, a, b) for i, (a, b) in enumerate(shards)]
+        _collect(futures)
+        native_batch = _concat_encoded_batches(
+            [cast(NativeEncodedBatch, r) for r in encoded_results]
         )
+        packed_outputs = _merge_packed_outputs(
+            [r for r in packed_results if r is not None],
+            self._packed_token_outputs,
+        )
+        return native_batch, packed_outputs
 
     def encode_handles(
         self,

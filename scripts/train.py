@@ -435,6 +435,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             workers=batch_workers,
             pool=batch_pool,
             dedup_card_bodies=bool(getattr(args, "card_body_dedup", False)),
+            shard_packed_tokens=bool(getattr(args, "shard_packed_tokens", False)),
         )
     backend = TextTrainingBackend(
         policy=policy,
@@ -1294,6 +1295,14 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="parallel worker threads for Go-side engine step/encode batches "
         "(default: 1 = serial; cgo releases the GIL so N threads run in parallel)",
+    )
+    parser.add_argument(
+        "--shard-packed-tokens",
+        action="store_true",
+        help=(
+            "experimentally shard native packed-token assembly across --batch-workers; "
+            "off by default because current benchmarks show merge overhead dominates"
+        ),
     )
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=256)
