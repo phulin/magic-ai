@@ -1581,12 +1581,26 @@ def _move_packed_text_batch(batch: PackedTextBatch, device: torch.device) -> Pac
         option_mask = option_mask.to(dtype=torch.bool)
     if target_mask.dtype != torch.bool:
         target_mask = target_mask.to(dtype=torch.bool)
+    seq_lengths = batch.seq_lengths.to(device, non_blocking=nb)
+    cu_seqlens = batch.cu_seqlens.to(device, non_blocking=nb)
+    if batch.seq_id.numel() == 0 and batch.pos_in_seq.numel() == 0:
+        total = int(cu_seqlens[-1].item()) if cu_seqlens.numel() else 0
+        seq_id = torch.repeat_interleave(
+            torch.arange(int(seq_lengths.shape[0]), dtype=torch.int32, device=device),
+            seq_lengths,
+        )
+        pos_in_seq = torch.arange(total, dtype=torch.int32, device=device) - (
+            cu_seqlens[:-1].repeat_interleave(seq_lengths)
+        )
+    else:
+        seq_id = batch.seq_id.to(device, non_blocking=nb)
+        pos_in_seq = batch.pos_in_seq.to(device, non_blocking=nb)
     return PackedTextBatch(
         token_ids=batch.token_ids.to(device, non_blocking=nb),
-        seq_id=batch.seq_id.to(device, non_blocking=nb),
-        pos_in_seq=batch.pos_in_seq.to(device, non_blocking=nb),
-        cu_seqlens=batch.cu_seqlens.to(device, non_blocking=nb),
-        seq_lengths=batch.seq_lengths.to(device, non_blocking=nb),
+        seq_id=seq_id,
+        pos_in_seq=pos_in_seq,
+        cu_seqlens=cu_seqlens,
+        seq_lengths=seq_lengths,
         state_positions=batch.state_positions.to(device, non_blocking=nb),
         card_ref_positions=batch.card_ref_positions.to(device, non_blocking=nb),
         option_positions=batch.option_positions.to(device, non_blocking=nb),

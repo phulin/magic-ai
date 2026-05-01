@@ -33,8 +33,6 @@ class _MageTokenAssemblerConfigC(ctypes.Structure):
 class _MagePackedTokenAssemblerOutputsC(ctypes.Structure):
     _fields_ = [
         ("token_ids", ctypes.POINTER(ctypes.c_int32)),
-        ("seq_id", ctypes.POINTER(ctypes.c_int32)),
-        ("pos_in_seq", ctypes.POINTER(ctypes.c_int32)),
         ("cu_seqlens", ctypes.POINTER(ctypes.c_int32)),
         ("seq_lengths", ctypes.POINTER(ctypes.c_int32)),
         ("state_positions", ctypes.POINTER(ctypes.c_int32)),
@@ -100,8 +98,6 @@ class NativePackedAssemblerOutputs:
     """
 
     token_ids: torch.Tensor  # (B*max_tokens,) int32
-    seq_id: torch.Tensor  # (B*max_tokens,) int32
-    pos_in_seq: torch.Tensor  # (B*max_tokens,) int32
     cu_seqlens: torch.Tensor  # (B+1,) int32
     seq_lengths: torch.Tensor  # (B,) int32
     state_positions: torch.Tensor  # (B,) int32
@@ -117,7 +113,9 @@ class NativePackedAssemblerOutputs:
     _packed_out_ctypes: _MagePackedTokenAssemblerOutputsC | None = None
     _tok_cfg_ctypes: _MageTokenAssemblerConfigC | None = None
 
-    def to_packed_text_batch(self, *, trim: bool = True) -> PackedTextBatch:
+    def to_packed_text_batch(
+        self, *, trim: bool = True, derive_token_metadata: bool = True
+    ) -> PackedTextBatch:
         """Slice the live region into a :class:`PackedTextBatch`.
 
         Trims anchor tensors to per-batch maxima so the result matches
@@ -137,8 +135,17 @@ class NativePackedAssemblerOutputs:
 
         total = int(cu_seqlens[-1].item()) if cu_seqlens.numel() else 0
         token_ids = self.token_ids[:total]
-        seq_id = self.seq_id[:total]
-        pos_in_seq = self.pos_in_seq[:total]
+        if derive_token_metadata:
+            seq_id = torch.repeat_interleave(
+                torch.arange(active_n, dtype=torch.int32, device=seq_lengths.device),
+                seq_lengths,
+            )
+            pos_in_seq = torch.arange(total, dtype=torch.int32, device=seq_lengths.device) - (
+                cu_seqlens[:-1].repeat_interleave(seq_lengths)
+            )
+        else:
+            seq_id = self.token_ids[:0]
+            pos_in_seq = self.token_ids[:0]
 
         if trim:
             opt_any = option_mask_full.any(dim=0)
@@ -191,8 +198,6 @@ def allocate_packed_outputs(
     cap = batch_size * max_tokens
     return NativePackedAssemblerOutputs(
         token_ids=torch.empty((cap,), dtype=torch.int32, pin_memory=pin),
-        seq_id=torch.empty((cap,), dtype=torch.int32, pin_memory=pin),
-        pos_in_seq=torch.empty((cap,), dtype=torch.int32, pin_memory=pin),
         cu_seqlens=torch.zeros((batch_size + 1,), dtype=torch.int32, pin_memory=pin),
         seq_lengths=torch.zeros((batch_size,), dtype=torch.int32, pin_memory=pin),
         state_positions=torch.zeros((batch_size,), dtype=torch.int32, pin_memory=pin),
@@ -287,8 +292,6 @@ def encode_tokens_packed(
             "MagePackedTokenAssemblerOutputs *",
             {
                 "token_ids": ffi.cast("int32_t *", outputs.token_ids.data_ptr()),
-                "seq_id": ffi.cast("int32_t *", outputs.seq_id.data_ptr()),
-                "pos_in_seq": ffi.cast("int32_t *", outputs.pos_in_seq.data_ptr()),
                 "cu_seqlens": ffi.cast("int32_t *", outputs.cu_seqlens.data_ptr()),
                 "seq_lengths": ffi.cast("int32_t *", outputs.seq_lengths.data_ptr()),
                 "state_positions": ffi.cast("int32_t *", outputs.state_positions.data_ptr()),
@@ -329,8 +332,6 @@ def encode_tokens_packed(
                 if outputs._packed_out_ctypes is None:
                     outputs._packed_out_ctypes = _MagePackedTokenAssemblerOutputsC(
                         token_ids=_tensor_ptr(outputs.token_ids, ctypes.c_int32),
-                        seq_id=_tensor_ptr(outputs.seq_id, ctypes.c_int32),
-                        pos_in_seq=_tensor_ptr(outputs.pos_in_seq, ctypes.c_int32),
                         cu_seqlens=_tensor_ptr(outputs.cu_seqlens, ctypes.c_int32),
                         seq_lengths=_tensor_ptr(outputs.seq_lengths, ctypes.c_int32),
                         state_positions=_tensor_ptr(outputs.state_positions, ctypes.c_int32),

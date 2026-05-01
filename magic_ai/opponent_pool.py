@@ -471,7 +471,9 @@ def run_eval_matches(
                 max_targets=max_targets_per_option,
                 max_card_refs=256,
             )
-            packed_text_batch = nat_outputs.to_packed_text_batch(trim=False)
+            packed_text_batch = nat_outputs.to_packed_text_batch(
+                trim=False, derive_token_metadata=False
+            )
             with torch.no_grad():
                 sample = policy.sample_native_tensor_batch(
                     native_batch=native_batch,
