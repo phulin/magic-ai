@@ -400,7 +400,7 @@ class TextStateEncoder(nn.Module):
         if x.device.type == "cuda":
             block_mask = cast(BlockMask, None)
             attn_bias = x.new_zeros(())
-            cu_seqlens: Tensor | None = batch.cu_seqlens.to(device=x.device, dtype=torch.int64)
+            cu_seqlens: Tensor | None = batch.cu_seqlens.to(device=x.device, dtype=torch.int32)
             for block in self.blocks:
                 x = block(x, block_mask, attn_bias, cos, sin, cu_seqlens)
             x = self.final_norm(x)

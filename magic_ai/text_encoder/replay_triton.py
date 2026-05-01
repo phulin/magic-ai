@@ -838,8 +838,8 @@ def gather_sequence_layout_triton(
     if batch_size == 0:
         return None
 
-    seq_lengths = row_token_length[rows].to(torch.int64)
-    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int64, device=rows.device)
+    seq_lengths = row_token_length[rows]
+    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=rows.device)
     torch.cumsum(seq_lengths, dim=0, out=cu_seqlens[1:])
     return seq_lengths, cu_seqlens
 
@@ -866,8 +866,8 @@ def gather_encoded_triton(
     total_tokens = int(cu_seqlens[-1].item())
 
     token_ids = torch.empty(total_tokens, dtype=packed_token_ids.dtype, device=rows.device)
-    seq_id = torch.empty(total_tokens, dtype=torch.int64, device=rows.device)
-    pos_in_seq = torch.empty(total_tokens, dtype=torch.int64, device=rows.device)
+    seq_id = torch.empty(total_tokens, dtype=torch.int32, device=rows.device)
+    pos_in_seq = torch.empty(total_tokens, dtype=torch.int32, device=rows.device)
     _launch(
         _gather_packed_tokens_kernel,
         (batch_size,),
@@ -1004,14 +1004,14 @@ def gather_flat_triton(
     _c_out = c_out if c_out is not None else torch.empty(1, device=rows.device, dtype=torch.float32)
 
     card_ref_positions_out = torch.empty(
-        (batch_size, card_width), dtype=torch.int64, device=rows.device
+        (batch_size, card_width), dtype=torch.int32, device=rows.device
     )
     option_positions_out = torch.empty(
-        (batch_size, option_width), dtype=torch.int64, device=rows.device
+        (batch_size, option_width), dtype=torch.int32, device=rows.device
     )
     option_mask_out = torch.empty((batch_size, option_width), dtype=torch.bool, device=rows.device)
     target_positions_out = torch.empty(
-        (batch_size, option_width, target_width), dtype=torch.int64, device=rows.device
+        (batch_size, option_width, target_width), dtype=torch.int32, device=rows.device
     )
     target_mask_out = torch.empty(
         (batch_size, option_width, target_width), dtype=torch.bool, device=rows.device

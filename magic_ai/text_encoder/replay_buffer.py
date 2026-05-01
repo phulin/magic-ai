@@ -105,7 +105,7 @@ class TextReplayBuffer:
             device=self.device,
         )
         self.row_token_start = torch.full(
-            (self.capacity,), -1, dtype=torch.int64, device=self.device
+            (self.capacity,), -1, dtype=torch.int32, device=self.device
         )
         self.row_token_length = torch.zeros(self.capacity, dtype=torch.int32, device=self.device)
         self._token_cursor = 0
@@ -413,7 +413,7 @@ class TextReplayBuffer:
             if total_tokens > 0:
                 self.packed_token_ids[token_start:token_end] = token_ids
             self.row_token_start[rows] = token_start + encoded.cu_seqlens[:-1].to(
-                device=self.device, dtype=torch.int64
+                device=self.device, dtype=torch.int32
             )
             seq_lengths_i32 = seq_lengths.to(dtype=torch.int32)
             self.row_token_length[rows] = seq_lengths_i32
@@ -583,8 +583,8 @@ class TextReplayBuffer:
                 row_token_length=self.row_token_length,
             )
         if gathered_layout is None:
-            seq_lengths = self.seq_lengths[idx].to(torch.long)
-            cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
+            seq_lengths = self.row_token_length[idx]
+            cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
             cu_seqlens[1:] = seq_lengths.cumsum(0)
         else:
             seq_lengths, cu_seqlens = gathered_layout
@@ -633,23 +633,27 @@ class TextReplayBuffer:
 
         if gathered_encoded is None or gathered_flat is None:
             token_starts = self.row_token_start[idx]
-            seq_id = torch.repeat_interleave(
+            seq_lengths_long = seq_lengths.to(torch.long)
+            state_positions_long = state_positions.to(torch.long)
+            seq_id_long = torch.repeat_interleave(
                 torch.arange(batch_size, dtype=torch.long, device=self.device),
-                seq_lengths,
+                seq_lengths_long,
             )
-            pos_in_seq = torch.arange(
+            pos_in_seq_long = torch.arange(
                 total_tokens, dtype=torch.long, device=self.device
             ) - torch.repeat_interleave(
-                state_positions,
-                seq_lengths,
+                state_positions_long,
+                seq_lengths_long,
             )
-            token_offsets = token_starts[seq_id] + pos_in_seq
+            token_offsets = token_starts.to(torch.long)[seq_id_long] + pos_in_seq_long
             token_ids = self.packed_token_ids[token_offsets]
+            seq_id = seq_id_long.to(torch.int32)
+            pos_in_seq = pos_in_seq_long.to(torch.int32)
 
             def pack_positions(pos: Tensor, view_shape: tuple[int, ...]) -> Tensor:
                 valid = pos >= 0
-                shifted = pos.to(torch.long) + state_positions.view(view_shape)
-                return torch.where(valid, shifted, pos.to(torch.long))
+                shifted = pos.to(torch.int32) + state_positions.view(view_shape)
+                return torch.where(valid, shifted, pos.to(torch.int32))
 
             card_ref_positions = pack_positions(self.card_ref_positions[idx], (batch_size, 1))
             option_positions = pack_positions(self.option_positions[idx], (batch_size, 1))

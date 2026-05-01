@@ -32,17 +32,17 @@ class _MageTokenAssemblerConfigC(ctypes.Structure):
 
 class _MagePackedTokenAssemblerOutputsC(ctypes.Structure):
     _fields_ = [
-        ("token_ids", ctypes.POINTER(ctypes.c_int64)),
-        ("seq_id", ctypes.POINTER(ctypes.c_int64)),
-        ("pos_in_seq", ctypes.POINTER(ctypes.c_int64)),
-        ("cu_seqlens", ctypes.POINTER(ctypes.c_int64)),
-        ("seq_lengths", ctypes.POINTER(ctypes.c_int64)),
-        ("state_positions", ctypes.POINTER(ctypes.c_int64)),
-        ("option_positions", ctypes.POINTER(ctypes.c_int64)),
+        ("token_ids", ctypes.POINTER(ctypes.c_int32)),
+        ("seq_id", ctypes.POINTER(ctypes.c_int32)),
+        ("pos_in_seq", ctypes.POINTER(ctypes.c_int32)),
+        ("cu_seqlens", ctypes.POINTER(ctypes.c_int32)),
+        ("seq_lengths", ctypes.POINTER(ctypes.c_int32)),
+        ("state_positions", ctypes.POINTER(ctypes.c_int32)),
+        ("option_positions", ctypes.POINTER(ctypes.c_int32)),
         ("option_mask", ctypes.POINTER(ctypes.c_uint8)),
-        ("target_positions", ctypes.POINTER(ctypes.c_int64)),
+        ("target_positions", ctypes.POINTER(ctypes.c_int32)),
         ("target_mask", ctypes.POINTER(ctypes.c_uint8)),
-        ("card_ref_positions", ctypes.POINTER(ctypes.c_int64)),
+        ("card_ref_positions", ctypes.POINTER(ctypes.c_int32)),
         ("token_overflow", ctypes.POINTER(ctypes.c_int32)),
     ]
 
@@ -99,17 +99,17 @@ class NativePackedAssemblerOutputs:
     storage is unspecified.
     """
 
-    token_ids: torch.Tensor  # (B*max_tokens,) int64
-    seq_id: torch.Tensor  # (B*max_tokens,) int64
-    pos_in_seq: torch.Tensor  # (B*max_tokens,) int64
-    cu_seqlens: torch.Tensor  # (B+1,) int64
-    seq_lengths: torch.Tensor  # (B,) int64
-    state_positions: torch.Tensor  # (B,) int64
-    option_positions: torch.Tensor  # (B, max_options) int64 (-1 absent)
+    token_ids: torch.Tensor  # (B*max_tokens,) int32
+    seq_id: torch.Tensor  # (B*max_tokens,) int32
+    pos_in_seq: torch.Tensor  # (B*max_tokens,) int32
+    cu_seqlens: torch.Tensor  # (B+1,) int32
+    seq_lengths: torch.Tensor  # (B,) int32
+    state_positions: torch.Tensor  # (B,) int32
+    option_positions: torch.Tensor  # (B, max_options) int32 (-1 absent)
     option_mask: torch.Tensor  # (B, max_options) uint8
-    target_positions: torch.Tensor  # (B, max_options, max_targets) int64
+    target_positions: torch.Tensor  # (B, max_options, max_targets) int32
     target_mask: torch.Tensor  # (B, max_options, max_targets) uint8
-    card_ref_positions: torch.Tensor  # (B, max_card_refs) int64
+    card_ref_positions: torch.Tensor  # (B, max_card_refs) int32
     token_overflow: torch.Tensor  # (B,) int32
     active_batch_size: int = 0
     _packed_out_cffi: Any = None
@@ -208,24 +208,24 @@ def allocate_packed_outputs(
     pin = torch.cuda.is_available()
     cap = batch_size * max_tokens
     return NativePackedAssemblerOutputs(
-        token_ids=torch.empty((cap,), dtype=torch.int64, pin_memory=pin),
-        seq_id=torch.empty((cap,), dtype=torch.int64, pin_memory=pin),
-        pos_in_seq=torch.empty((cap,), dtype=torch.int64, pin_memory=pin),
-        cu_seqlens=torch.zeros((batch_size + 1,), dtype=torch.int64, pin_memory=pin),
-        seq_lengths=torch.zeros((batch_size,), dtype=torch.int64, pin_memory=pin),
-        state_positions=torch.zeros((batch_size,), dtype=torch.int64, pin_memory=pin),
+        token_ids=torch.empty((cap,), dtype=torch.int32, pin_memory=pin),
+        seq_id=torch.empty((cap,), dtype=torch.int32, pin_memory=pin),
+        pos_in_seq=torch.empty((cap,), dtype=torch.int32, pin_memory=pin),
+        cu_seqlens=torch.zeros((batch_size + 1,), dtype=torch.int32, pin_memory=pin),
+        seq_lengths=torch.zeros((batch_size,), dtype=torch.int32, pin_memory=pin),
+        state_positions=torch.zeros((batch_size,), dtype=torch.int32, pin_memory=pin),
         option_positions=torch.full(
-            (batch_size, max_options), -1, dtype=torch.int64, pin_memory=pin
+            (batch_size, max_options), -1, dtype=torch.int32, pin_memory=pin
         ),
         option_mask=torch.zeros((batch_size, max_options), dtype=torch.uint8, pin_memory=pin),
         target_positions=torch.full(
-            (batch_size, max_options, max_targets), -1, dtype=torch.int64, pin_memory=pin
+            (batch_size, max_options, max_targets), -1, dtype=torch.int32, pin_memory=pin
         ),
         target_mask=torch.zeros(
             (batch_size, max_options, max_targets), dtype=torch.uint8, pin_memory=pin
         ),
         card_ref_positions=torch.full(
-            (batch_size, max_card_refs), -1, dtype=torch.int64, pin_memory=pin
+            (batch_size, max_card_refs), -1, dtype=torch.int32, pin_memory=pin
         ),
         token_overflow=torch.zeros((batch_size,), dtype=torch.int32),
     )
@@ -305,17 +305,17 @@ def encode_tokens_packed(
         outputs._packed_out_cffi = ffi.new(
             "MagePackedTokenAssemblerOutputs *",
             {
-                "token_ids": ffi.cast("int64_t *", outputs.token_ids.data_ptr()),
-                "seq_id": ffi.cast("int64_t *", outputs.seq_id.data_ptr()),
-                "pos_in_seq": ffi.cast("int64_t *", outputs.pos_in_seq.data_ptr()),
-                "cu_seqlens": ffi.cast("int64_t *", outputs.cu_seqlens.data_ptr()),
-                "seq_lengths": ffi.cast("int64_t *", outputs.seq_lengths.data_ptr()),
-                "state_positions": ffi.cast("int64_t *", outputs.state_positions.data_ptr()),
-                "option_positions": ffi.cast("int64_t *", outputs.option_positions.data_ptr()),
+                "token_ids": ffi.cast("int32_t *", outputs.token_ids.data_ptr()),
+                "seq_id": ffi.cast("int32_t *", outputs.seq_id.data_ptr()),
+                "pos_in_seq": ffi.cast("int32_t *", outputs.pos_in_seq.data_ptr()),
+                "cu_seqlens": ffi.cast("int32_t *", outputs.cu_seqlens.data_ptr()),
+                "seq_lengths": ffi.cast("int32_t *", outputs.seq_lengths.data_ptr()),
+                "state_positions": ffi.cast("int32_t *", outputs.state_positions.data_ptr()),
+                "option_positions": ffi.cast("int32_t *", outputs.option_positions.data_ptr()),
                 "option_mask": ffi.cast("uint8_t *", outputs.option_mask.data_ptr()),
-                "target_positions": ffi.cast("int64_t *", outputs.target_positions.data_ptr()),
+                "target_positions": ffi.cast("int32_t *", outputs.target_positions.data_ptr()),
                 "target_mask": ffi.cast("uint8_t *", outputs.target_mask.data_ptr()),
-                "card_ref_positions": ffi.cast("int64_t *", outputs.card_ref_positions.data_ptr()),
+                "card_ref_positions": ffi.cast("int32_t *", outputs.card_ref_positions.data_ptr()),
                 "token_overflow": ffi.cast("int32_t *", outputs.token_overflow.data_ptr()),
             },
         )
@@ -347,17 +347,17 @@ def encode_tokens_packed(
                     )
                 if outputs._packed_out_ctypes is None:
                     outputs._packed_out_ctypes = _MagePackedTokenAssemblerOutputsC(
-                        token_ids=_tensor_ptr(outputs.token_ids, ctypes.c_int64),
-                        seq_id=_tensor_ptr(outputs.seq_id, ctypes.c_int64),
-                        pos_in_seq=_tensor_ptr(outputs.pos_in_seq, ctypes.c_int64),
-                        cu_seqlens=_tensor_ptr(outputs.cu_seqlens, ctypes.c_int64),
-                        seq_lengths=_tensor_ptr(outputs.seq_lengths, ctypes.c_int64),
-                        state_positions=_tensor_ptr(outputs.state_positions, ctypes.c_int64),
-                        option_positions=_tensor_ptr(outputs.option_positions, ctypes.c_int64),
+                        token_ids=_tensor_ptr(outputs.token_ids, ctypes.c_int32),
+                        seq_id=_tensor_ptr(outputs.seq_id, ctypes.c_int32),
+                        pos_in_seq=_tensor_ptr(outputs.pos_in_seq, ctypes.c_int32),
+                        cu_seqlens=_tensor_ptr(outputs.cu_seqlens, ctypes.c_int32),
+                        seq_lengths=_tensor_ptr(outputs.seq_lengths, ctypes.c_int32),
+                        state_positions=_tensor_ptr(outputs.state_positions, ctypes.c_int32),
+                        option_positions=_tensor_ptr(outputs.option_positions, ctypes.c_int32),
                         option_mask=_tensor_ptr(outputs.option_mask, ctypes.c_uint8),
-                        target_positions=_tensor_ptr(outputs.target_positions, ctypes.c_int64),
+                        target_positions=_tensor_ptr(outputs.target_positions, ctypes.c_int32),
                         target_mask=_tensor_ptr(outputs.target_mask, ctypes.c_uint8),
-                        card_ref_positions=_tensor_ptr(outputs.card_ref_positions, ctypes.c_int64),
+                        card_ref_positions=_tensor_ptr(outputs.card_ref_positions, ctypes.c_int32),
                         token_overflow=_tensor_ptr(outputs.token_overflow, ctypes.c_int32),
                     )
                 tok_cfg_c = outputs._tok_cfg_ctypes
