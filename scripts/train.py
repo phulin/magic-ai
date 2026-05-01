@@ -1257,6 +1257,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-envs", type=int, default=128)
     parser.add_argument("--rollout-steps", type=int, default=4096)
     parser.add_argument(
+        "--rollout-min-ready-batch",
+        type=int,
+        default=1,
+        help="if more envs are still running, wait before policy inference until at "
+        "least this many envs are ready; default 1 preserves immediate stepping",
+    )
+    parser.add_argument(
+        "--rollout-ready-wait-ms",
+        type=float,
+        default=0.0,
+        help="sleep this many milliseconds when waiting for --rollout-min-ready-batch; "
+        "default 0 disables coalescing waits",
+    )
+    parser.add_argument(
         "--rollout-buffer-capacity",
         type=int,
         default=None,
@@ -1507,6 +1521,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--num-envs must be at least 1")
     if args.rollout_steps < 1:
         raise ValueError("--rollout-steps must be at least 1")
+    if args.rollout_min_ready_batch < 1:
+        raise ValueError("--rollout-min-ready-batch must be at least 1")
+    if args.rollout_ready_wait_ms < 0.0:
+        raise ValueError("--rollout-ready-wait-ms must be non-negative")
     if args.max_steps_per_game < 1:
         raise ValueError("--max-steps-per-game must be at least 1")
     if args.minibatch_size < 1:
@@ -1591,6 +1609,16 @@ def validate_args(args: argparse.Namespace) -> None:
                 "delta_m * target_ema ~= 10-100 (delta_m=10k-100k, ema=1e-3).",
                 flush=True,
             )
+
+
+def _defer_ready_batch(args: argparse.Namespace, *, ready_count: int, live_count: int) -> bool:
+    if args.rollout_ready_wait_ms <= 0.0:
+        return False
+    if ready_count >= args.rollout_min_ready_batch:
+        return False
+    # If every remaining live env is ready, waiting cannot coalesce a larger
+    # batch; process what we have to avoid a deadlock near rollout tail.
+    return live_count > ready_count
 
 
 def log_ppo_stats(
@@ -2014,6 +2042,10 @@ def train_native_batched_envs(
         _t = time.perf_counter()
         finish_games(finished_games)
         _record_phase("finish", _t)
+
+        if _defer_ready_batch(args, ready_count=len(ready_envs), live_count=len(live_games)):
+            time.sleep(args.rollout_ready_wait_ms / 1000.0)
+            continue
 
         if ready_envs:
             _t = time.perf_counter()
@@ -3073,6 +3105,10 @@ def train_text_native_batched_envs(
                 ready_players.append(int(player_l[idx]))
         live_games = still_live
         finish_games(finished_games)
+
+        if _defer_ready_batch(args, ready_count=len(ready_envs), live_count=len(live_games)):
+            time.sleep(args.rollout_ready_wait_ms / 1000.0)
+            continue
 
         if (
             args.save_every
