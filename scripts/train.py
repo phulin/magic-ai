@@ -447,11 +447,10 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         batch_pool=batch_pool,
         batch_workers=batch_workers,
     )
-    # Phase 5: register the closed-vocabulary token tables with the
-    # mage-go side so the rollout hot path can dispatch through
-    # MageEncodeTokens. Falls back gracefully if the native lib doesn't
-    # have MageRegisterTokenTables (older libmage.so), with a clear
-    # warning so users know to rebuild.
+    # Register the closed-vocabulary token tables with the mage-go side so
+    # the rollout hot path can dispatch through MageEncodeTokensPacked. Falls
+    # back gracefully if the native lib doesn't have MageRegisterTokenTables
+    # (older libmage.so), with a clear warning so users know to rebuild.
     if getattr(args, "text_native_assembler", True):
         try:
             from magic_ai.text_encoder.native_token_tables import (
@@ -461,7 +460,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
 
             tables = build_token_tables(tokenizer, cache)
             register_native_token_tables(tables)
-            print("native token assembler registered (MageEncodeTokens path)")
+            print("native token assembler registered (MageEncodeTokensPacked path)")
         except Exception as exc:  # pragma: no cover - environment-dependent
             print(
                 f"warning: MageRegisterTokenTables unavailable ({exc}); "
@@ -1370,8 +1369,8 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="run the text-encoder assembler natively in mage-go via "
-        "MageEncodeTokens (default: on; pass --no-text-native-assembler to "
-        "fall back to the Python assemble_batch path)",
+        "MageEncodeTokensPacked (default: on; pass --no-text-native-assembler "
+        "to fall back to the Python assemble_batch path)",
     )
     parser.add_argument(
         "--lstm",

@@ -212,8 +212,8 @@ class _EncoderScratch:
     req_c: _MageBatchRequest | None = None
     cfg_c: _MageEncodeConfig | None = None
     out_c: _MageEncodeOutputs | None = None
-    # cffi mirrors of the same structs, used by the native_assembler.encode_tokens
-    # path. cffi struct construction was the dominant Python-side cost on
+    # cffi mirrors of the same structs, used by the native packed-token
+    # assembler path. cffi struct construction was the dominant Python-side cost on
     # the rollout hot path before this cache (~1 ms/call building 50+
     # ``ffi.cast(..., tensor.data_ptr())`` fields). Rebuilt on
     # reallocation; per-call work is just updating ``n`` and
@@ -515,8 +515,8 @@ class NativeBatchEncoder:
             scratch.perspectives_np = scratch.perspectives_t.numpy()
             if self._ctypes_lib is not None:
                 self._rebuild_encode_structs()
-            # Drop cached cffi structs — pointers into the just-realloced
-            # scratch are stale. Rebuilt lazily on next encode_tokens call.
+            # Drop cached cffi structs: pointers into the just-realloced
+            # scratch are stale. Rebuilt lazily on next packed-token call.
             scratch.req_cffi = None
             scratch.cfg_cffi = None
             scratch.enc_out_cffi = None
@@ -526,9 +526,9 @@ class NativeBatchEncoder:
     def rebuild_cffi_structs(self, ffi: Any, decision_capacity: int) -> None:
         """Build (or rebuild) cached cffi structs over the current scratch.
 
-        Called by ``native_assembler.encode_tokens`` when its cached
-        structs are stale (first call, or scratch was reallocated since
-        the last call). Per-call hot-path work is then just mutating
+        Called by ``native_assembler.encode_tokens_packed`` when its cached
+        structs are stale (first call, or scratch was reallocated since the
+        last call). Per-call hot-path work is then just mutating
         ``req_cffi.n`` and ``cfg_cffi.decision_capacity``.
         """
         scratch = self._scratch
