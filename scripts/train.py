@@ -391,7 +391,6 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
     recurrent_cfg = RecurrentTextPolicyConfig(
         encoder=cfg,
         lstm_hidden=cfg.d_model,
-        lstm_layers=args.hidden_layers,
         compile_forward=args.torch_compile,
     )
     policy = TextActorCritic(recurrent_cfg).to(device)
@@ -406,7 +405,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         max_targets_per_option=args.max_targets_per_option,
         max_decision_groups=args.max_decision_groups,
         max_cached_choices=args.max_cached_choices,
-        recurrent_layers=args.hidden_layers,
+        recurrent_layers=recurrent_cfg.lstm_layers,
         recurrent_hidden_dim=cfg.d_model,
         lstm_proj_hidden=recurrent_cfg.lstm_hidden,
         device=device,
