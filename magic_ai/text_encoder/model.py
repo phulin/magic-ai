@@ -340,10 +340,7 @@ class TextStateEncoder(nn.Module):
         token_ids = batch.token_ids
         attention_mask = batch.attention_mask
         b, t = token_ids.shape
-        # nn.Embedding requires Long; the replay buffer stores int32 to halve
-        # token-storage memory and the live assembler may emit int32 too.
-        # ``.to(torch.long)`` is a no-op when the tensor is already Long.
-        x = self.tok_emb(token_ids.to(torch.long))
+        x = self.tok_emb(token_ids)
         key_pad = ~attention_mask.bool()
         # Guard rows whose entire key axis is masked: softmax over an empty
         # set is NaN, which would poison the whole batch. Such rows produce
@@ -388,10 +385,10 @@ class TextStateEncoder(nn.Module):
         ``pos_in_seq``.
         """
 
-        token_ids = batch.token_ids.to(torch.long)  # [T]
+        token_ids = batch.token_ids  # [T]
         t = token_ids.shape[0]
         x = self.tok_emb(token_ids)  # [T, D] — packed path stays rank-2
-        pos = batch.pos_in_seq.to(device=x.device, dtype=torch.long)
+        pos = batch.pos_in_seq.to(device=x.device)
         rope_cos = cast(Tensor, self.rope_cos)
         rope_sin = cast(Tensor, self.rope_sin)
         cos = rope_cos.index_select(0, pos).to(x.dtype)  # [T, Dh/2]
@@ -409,7 +406,7 @@ class TextStateEncoder(nn.Module):
         # CPU fallback: flex_attention has no CPU backward in current torch,
         # so run dense SDPA with a block-diagonal additive mask. We add a
         # leading B=1 here just for the dense attention path's expectations.
-        seq_id = batch.seq_id.to(device=x.device, dtype=torch.long)
+        seq_id = batch.seq_id.to(device=x.device)
         same = seq_id[:, None] == seq_id[None, :]  # [T, T] bool
         attn_bias = torch.zeros(1, 1, t, t, device=x.device, dtype=x.dtype)
         attn_bias = attn_bias.masked_fill(~same[None, None, :, :], float("-inf"))
@@ -511,7 +508,7 @@ def initialize_text_state_encoder_from_hf(
 def _gather_at(hidden: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
     """Gather hidden states at integer positions; -1 entries become zeros.
 
-    hidden: [B, T, D]; positions: [B, ...] int64. Returns (gathered, mask)
+    hidden: [B, T, D]; positions: [B, ...] int. Returns (gathered, mask)
     where ``gathered`` has shape ``[B, ..., D]`` and ``mask`` has shape
     ``[B, ...]`` (bool, True where present).
     """
@@ -520,9 +517,7 @@ def _gather_at(hidden: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
     mask = positions >= 0
     safe = positions.clamp(min=0)
     flat = safe.reshape(b, -1)  # [B, K]
-    # ``torch.gather`` requires Long indices; the replay buffer stores
-    # positions as int32 to halve their footprint.
-    idx = flat.unsqueeze(-1).expand(-1, -1, d).to(torch.long)  # [B, K, D]
+    idx = flat.unsqueeze(-1).expand(-1, -1, d)  # [B, K, D]
     gathered = torch.gather(hidden, 1, idx)  # [B, K, D]
     gathered = gathered.reshape(*positions.shape, d)
     gathered = gathered * mask.unsqueeze(-1).to(gathered.dtype)
@@ -556,7 +551,7 @@ def _gather_packed(hidden: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
     """
 
     mask = positions >= 0
-    safe = positions.clamp(min=0).to(torch.long)
+    safe = positions.clamp(min=0)
     flat = safe.reshape(-1)
     gathered = hidden.index_select(0, flat).reshape(*positions.shape, hidden.shape[-1])
     gathered = gathered * mask.unsqueeze(-1).to(gathered.dtype)
@@ -578,8 +573,7 @@ def gather_target_vectors_packed(hidden: Tensor, batch: PackedTextBatch) -> tupl
 
 
 def gather_state_vector_packed(hidden: Tensor, batch: PackedTextBatch) -> Tensor:
-    idx = batch.state_positions.to(torch.long)
-    return hidden.index_select(0, idx)
+    return hidden.index_select(0, batch.state_positions)
 
 
 class _MLP(nn.Module):

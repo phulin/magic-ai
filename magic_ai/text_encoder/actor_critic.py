@@ -1525,8 +1525,8 @@ def _dense_from_packed_batch(
     )
     attention_mask = torch.zeros((b, max_tokens), dtype=torch.bool, device=batch.token_ids.device)
     in_range = batch.pos_in_seq < max_tokens
-    seq_id = batch.seq_id[in_range].to(torch.long)
-    pos = batch.pos_in_seq[in_range].to(torch.long)
+    seq_id = batch.seq_id[in_range]
+    pos = batch.pos_in_seq[in_range]
     token_ids[seq_id, pos] = batch.token_ids[in_range]
     attention_mask[seq_id, pos] = True
     base = batch.state_positions

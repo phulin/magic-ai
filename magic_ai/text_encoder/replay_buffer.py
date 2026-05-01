@@ -633,22 +633,18 @@ class TextReplayBuffer:
 
         if gathered_encoded is None or gathered_flat is None:
             token_starts = self.row_token_start[idx]
-            seq_lengths_long = seq_lengths.to(torch.long)
-            state_positions_long = state_positions.to(torch.long)
-            seq_id_long = torch.repeat_interleave(
-                torch.arange(batch_size, dtype=torch.long, device=self.device),
-                seq_lengths_long,
+            seq_id = torch.repeat_interleave(
+                torch.arange(batch_size, dtype=torch.int32, device=self.device),
+                seq_lengths,
             )
-            pos_in_seq_long = torch.arange(
-                total_tokens, dtype=torch.long, device=self.device
+            pos_in_seq = torch.arange(
+                total_tokens, dtype=torch.int32, device=self.device
             ) - torch.repeat_interleave(
-                state_positions_long,
-                seq_lengths_long,
+                state_positions,
+                seq_lengths,
             )
-            token_offsets = token_starts.to(torch.long)[seq_id_long] + pos_in_seq_long
+            token_offsets = token_starts[seq_id] + pos_in_seq
             token_ids = self.packed_token_ids[token_offsets]
-            seq_id = seq_id_long.to(torch.int32)
-            pos_in_seq = pos_in_seq_long.to(torch.int32)
 
             def pack_positions(pos: Tensor, view_shape: tuple[int, ...]) -> Tensor:
                 valid = pos >= 0
