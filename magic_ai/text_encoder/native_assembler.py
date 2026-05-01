@@ -554,6 +554,10 @@ def encode_tokens_packed(
     enc_out = scratch.enc_out_cffi
     req.n = batch_size
     cfg.decision_capacity = decision_capacity
+    original_emit_render_plan = int(cfg.emit_render_plan)
+    original_render_plan_capacity = int(cfg.render_plan_capacity)
+    cfg.emit_render_plan = 0
+    cfg.render_plan_capacity = int(encoder.render_plan_capacity)
 
     handles_np = scratch.handles_np
     for i, g in enumerate(games):
@@ -594,69 +598,101 @@ def encode_tokens_packed(
     buffers = scratch.buffers
     assert buffers is not None
     ctypes_lib = _load_packed_ctypes_lib()
-    if ctypes_lib is not None and scratch.req_c is not None:
-        req_c = scratch.req_c
-        cfg_c = scratch.cfg_c
-        enc_out_c = scratch.out_c
-        assert cfg_c is not None and enc_out_c is not None
-        req_c.n = batch_size
-        cfg_c.decision_capacity = decision_capacity
-        if outputs._tok_cfg_ctypes is None:
-            outputs._tok_cfg_ctypes = _MageTokenAssemblerConfigC(
-                max_tokens=max_tokens,
-                max_options=max_options,
-                max_targets=max_targets,
-                max_card_refs=max_card_refs,
-            )
-        if outputs._packed_out_ctypes is None:
-            outputs._packed_out_ctypes = _MagePackedTokenAssemblerOutputsC(
-                token_ids=_tensor_ptr(outputs.token_ids, ctypes.c_int64),
-                seq_id=_tensor_ptr(outputs.seq_id, ctypes.c_int64),
-                pos_in_seq=_tensor_ptr(outputs.pos_in_seq, ctypes.c_int64),
-                cu_seqlens=_tensor_ptr(outputs.cu_seqlens, ctypes.c_int64),
-                seq_lengths=_tensor_ptr(outputs.seq_lengths, ctypes.c_int64),
-                state_positions=_tensor_ptr(outputs.state_positions, ctypes.c_int64),
-                option_positions=_tensor_ptr(outputs.option_positions, ctypes.c_int64),
-                option_mask=_tensor_ptr(outputs.option_mask, ctypes.c_uint8),
-                target_positions=_tensor_ptr(outputs.target_positions, ctypes.c_int64),
-                target_mask=_tensor_ptr(outputs.target_mask, ctypes.c_uint8),
-                card_ref_positions=_tensor_ptr(outputs.card_ref_positions, ctypes.c_int64),
-                token_overflow=_tensor_ptr(outputs.token_overflow, ctypes.c_int32),
-            )
-        tok_cfg_c = outputs._tok_cfg_ctypes
-        packed_out_c = outputs._packed_out_ctypes
-        assert tok_cfg_c is not None and packed_out_c is not None
-        result = ctypes_lib.MageEncodeTokensPacked(
-            ctypes.byref(req_c),
-            ctypes.byref(cfg_c),
-            ctypes.byref(enc_out_c),
-            ctypes.byref(tok_cfg_c),
-            ctypes.byref(packed_out_c),
-        )
-        if result.error_code != 0:
-            message = "MageEncodeTokensPacked failed"
-            if result.error_message:
-                try:
-                    raw = ctypes.cast(result.error_message, ctypes.c_char_p).value
-                    if raw is not None:
-                        message = raw.decode("utf-8")
-                finally:
-                    ctypes_lib.MageFreeString(result.error_message)
-            from magic_ai.slot_encoder.native_encoder import NativeEncodingError
+    try:
+        if ctypes_lib is not None and scratch.req_c is not None:
+            req_c = scratch.req_c
+            cfg_c = scratch.cfg_c
+            enc_out_c = scratch.out_c
+            assert cfg_c is not None and enc_out_c is not None
+            req_c.n = batch_size
+            cfg_c.decision_capacity = decision_capacity
+            original_emit_render_plan_c = int(cfg_c.emit_render_plan)
+            original_render_plan_capacity_c = int(cfg_c.render_plan_capacity)
+            cfg_c.emit_render_plan = 0
+            cfg_c.render_plan_capacity = int(encoder.render_plan_capacity)
+            try:
+                if outputs._tok_cfg_ctypes is None:
+                    outputs._tok_cfg_ctypes = _MageTokenAssemblerConfigC(
+                        max_tokens=max_tokens,
+                        max_options=max_options,
+                        max_targets=max_targets,
+                        max_card_refs=max_card_refs,
+                    )
+                if outputs._packed_out_ctypes is None:
+                    outputs._packed_out_ctypes = _MagePackedTokenAssemblerOutputsC(
+                        token_ids=_tensor_ptr(outputs.token_ids, ctypes.c_int64),
+                        seq_id=_tensor_ptr(outputs.seq_id, ctypes.c_int64),
+                        pos_in_seq=_tensor_ptr(outputs.pos_in_seq, ctypes.c_int64),
+                        cu_seqlens=_tensor_ptr(outputs.cu_seqlens, ctypes.c_int64),
+                        seq_lengths=_tensor_ptr(outputs.seq_lengths, ctypes.c_int64),
+                        state_positions=_tensor_ptr(outputs.state_positions, ctypes.c_int64),
+                        option_positions=_tensor_ptr(outputs.option_positions, ctypes.c_int64),
+                        option_mask=_tensor_ptr(outputs.option_mask, ctypes.c_uint8),
+                        target_positions=_tensor_ptr(outputs.target_positions, ctypes.c_int64),
+                        target_mask=_tensor_ptr(outputs.target_mask, ctypes.c_uint8),
+                        card_ref_positions=_tensor_ptr(outputs.card_ref_positions, ctypes.c_int64),
+                        token_overflow=_tensor_ptr(outputs.token_overflow, ctypes.c_int32),
+                    )
+                tok_cfg_c = outputs._tok_cfg_ctypes
+                packed_out_c = outputs._packed_out_ctypes
+                assert tok_cfg_c is not None and packed_out_c is not None
+                result = ctypes_lib.MageEncodeTokensPacked(
+                    ctypes.byref(req_c),
+                    ctypes.byref(cfg_c),
+                    ctypes.byref(enc_out_c),
+                    ctypes.byref(tok_cfg_c),
+                    ctypes.byref(packed_out_c),
+                )
+                if result.error_code != 0:
+                    message = "MageEncodeTokensPacked failed"
+                    if result.error_message:
+                        try:
+                            raw = ctypes.cast(result.error_message, ctypes.c_char_p).value
+                            if raw is not None:
+                                message = raw.decode("utf-8")
+                        finally:
+                            ctypes_lib.MageFreeString(result.error_message)
+                    if "requires cfg.emit_render_plan=1" in message:
+                        cfg_c.emit_render_plan = original_emit_render_plan_c
+                        cfg_c.render_plan_capacity = original_render_plan_capacity_c
+                        result = ctypes_lib.MageEncodeTokensPacked(
+                            ctypes.byref(req_c),
+                            ctypes.byref(cfg_c),
+                            ctypes.byref(enc_out_c),
+                            ctypes.byref(tok_cfg_c),
+                            ctypes.byref(packed_out_c),
+                        )
+                        if result.error_code == 0:
+                            message = ""
+                    from magic_ai.slot_encoder.native_encoder import NativeEncodingError
 
-            raise NativeEncodingError(message)
-    else:
-        result = lib.MageEncodeTokensPacked(req, cfg, enc_out, tok_cfg, packed_out)
-        if result.error_code != 0:
-            message = "MageEncodeTokensPacked failed"
-            if result.error_message != ffi.NULL:
-                try:
-                    message = ffi.string(result.error_message).decode("utf-8")
-                finally:
-                    lib.MageFreeString(result.error_message)
-            from magic_ai.slot_encoder.native_encoder import NativeEncodingError
+                    if result.error_code != 0:
+                        raise NativeEncodingError(message)
+            finally:
+                cfg_c.emit_render_plan = original_emit_render_plan_c
+                cfg_c.render_plan_capacity = original_render_plan_capacity_c
+        else:
+            result = lib.MageEncodeTokensPacked(req, cfg, enc_out, tok_cfg, packed_out)
+            if result.error_code != 0:
+                message = "MageEncodeTokensPacked failed"
+                if result.error_message != ffi.NULL:
+                    try:
+                        message = ffi.string(result.error_message).decode("utf-8")
+                    finally:
+                        lib.MageFreeString(result.error_message)
+                if "requires cfg.emit_render_plan=1" in message:
+                    cfg.emit_render_plan = original_emit_render_plan
+                    cfg.render_plan_capacity = original_render_plan_capacity
+                    result = lib.MageEncodeTokensPacked(req, cfg, enc_out, tok_cfg, packed_out)
+                    if result.error_code == 0:
+                        message = ""
+                from magic_ai.slot_encoder.native_encoder import NativeEncodingError
 
-            raise NativeEncodingError(message)
+                if result.error_code != 0:
+                    raise NativeEncodingError(message)
+    finally:
+        cfg.emit_render_plan = original_emit_render_plan
+        cfg.render_plan_capacity = original_render_plan_capacity
 
     decision_rows_written = int(result.decision_rows_written)
     batch = encoder._slice_batch_buffers(buffers, batch_size)
@@ -703,9 +739,9 @@ def encode_tokens_packed(
         decision_rows_written=decision_rows_written,
         pendings=[],
         trace_kinds=trace_kinds,
-        render_plan=batch.get("render_plan"),
-        render_plan_lengths=batch.get("render_plan_lengths"),
-        render_plan_overflow=batch.get("render_plan_overflow"),
+        render_plan=None,
+        render_plan_lengths=None,
+        render_plan_overflow=None,
     )
     return native_batch, outputs
 
