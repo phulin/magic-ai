@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
 import torch
 from dotenv import load_dotenv
 
@@ -96,6 +97,11 @@ from magic_ai.text_encoder.card_cache import (  # noqa: E402
     fetch_registered_card_names_from_engine,
     load_card_cache,
     load_oracle_db,
+)
+from magic_ai.text_encoder.mlm import (  # noqa: E402
+    BinTokenDataset,
+    MLMConfig,
+    MLMTrainer,
 )
 from magic_ai.text_encoder.model import (  # noqa: E402
     DEFAULT_HF_ENCODER_MODEL,
@@ -929,6 +935,96 @@ def _build_opponent_schedules(
     return opponent_pool, snapshot_schedule, retrospective_schedule
 
 
+def run_mlm_pretrain(
+    args: argparse.Namespace,
+    text_backend: TextTrainingBackend,
+    device: torch.device,
+) -> None:
+    """Pretrain the text encoder trunk with a masked language model objective.
+
+    Reads ``*.bin`` files of raw uint16 tokens from ``args.pretrain_mlm_dir``,
+    samples random fixed-length spans, masks 15% of non-special tokens and
+    trains the encoder via tied-embedding cross-entropy. The encoder lives
+    inside ``text_backend.policy`` (TextActorCritic.policy.text_policy.encoder),
+    so the resulting checkpoint slots straight into a ``--checkpoint``-resumed
+    RL run with the same ``--text-*`` hyperparameters.
+    """
+
+    tokenizer = text_backend.tokenizer
+    encoder = text_backend.policy.policy.text_policy.encoder
+
+    pad_id = int(tokenizer.pad_token_id)
+    mask_token_id = tokenizer.mask_token_id
+    if mask_token_id is None:
+        raise ValueError("tokenizer must define mask_token_id for MLM pretraining")
+    bos_id = tokenizer.convert_tokens_to_ids("<bos>")
+    eos_id = tokenizer.convert_tokens_to_ids("<eos>")
+    custom_pad_id = tokenizer.convert_tokens_to_ids("<pad>")
+    special_ids = tuple(
+        s for s in (pad_id, custom_pad_id, mask_token_id, bos_id, eos_id) if s is not None
+    )
+
+    seq_len = args.pretrain_mlm_seq_len
+    if seq_len > args.text_max_tokens:
+        raise ValueError(
+            f"--pretrain-mlm-seq-len ({seq_len}) must be <= --text-max-tokens "
+            f"({args.text_max_tokens})"
+        )
+
+    cfg = MLMConfig(
+        data_dir=args.pretrain_mlm_dir,
+        seq_len=seq_len,
+        batch_size=args.pretrain_mlm_batch_size,
+        mask_prob=args.pretrain_mlm_mask_prob,
+        mask_token_id=int(mask_token_id),
+        pad_token_id=pad_id,
+        vocab_size=len(tokenizer),
+        special_token_ids=special_ids,
+    )
+    dataset = BinTokenDataset(cfg.data_dir, seq_len=cfg.seq_len)
+    trainer = MLMTrainer(
+        encoder=encoder,
+        cfg=cfg,
+        lr=args.pretrain_mlm_lr,
+        grad_clip=args.pretrain_mlm_grad_clip,
+    )
+
+    np_rng = np.random.default_rng(args.seed)
+    torch_rng = torch.Generator(device=device)
+    torch_rng.manual_seed(args.seed)
+
+    spans = dataset.spans_per_epoch()
+    batches_per_epoch = spans // cfg.batch_size
+    print(
+        f"[mlm] corpus tokens={dataset.total_tokens} spans={spans} "
+        f"batches/epoch={batches_per_epoch} epochs={args.pretrain_mlm_epochs}"
+    )
+    if batches_per_epoch == 0:
+        raise ValueError(
+            f"corpus has only {spans} non-overlapping spans of length "
+            f"{cfg.seq_len}; need at least batch_size={cfg.batch_size}"
+        )
+
+    log_every = max(1, args.pretrain_mlm_log_every)
+    global_step = 0
+    for epoch in range(args.pretrain_mlm_epochs):
+        for batch_np in dataset.iter_epoch(cfg.batch_size, np_rng):
+            token_ids = torch.from_numpy(batch_np).to(device=device, dtype=torch.long)
+            stats = trainer.step(token_ids, torch_rng)
+            if global_step % log_every == 0:
+                print(
+                    f"[mlm] epoch={epoch} step={global_step:6d} loss={stats['loss']:.4f} "
+                    f"ppl={stats['perplexity']:.2f} acc={stats['accuracy']:.3f} "
+                    f"grad_norm={stats['grad_norm']:.3f} n_masked={int(stats['n_masked'])}"
+                )
+                if not args.no_wandb and wandb.run is not None:
+                    wandb.log(
+                        {f"pretrain_mlm/{k}": v for k, v in stats.items()},
+                        step=global_step,
+                    )
+            global_step += 1
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -1000,6 +1096,23 @@ def main() -> None:
         policy.load_state_dict(checkpoint["policy"])
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
+
+    if args.pretrain_mlm_dir is not None:
+        if encoder_kind != "text" or text_backend is None:
+            raise ValueError("--pretrain-mlm-dir requires --encoder text")
+        run_mlm_pretrain(args, text_backend, device)
+        # Reset optimizer state: MLM used a separate AdamW; the RL optimizer
+        # tracks the still-randomly-initialized policy heads alongside the
+        # pretrained encoder, so its moments must start fresh.
+        if args.trainer == "rnad":
+            optimizer = torch.optim.Adam(
+                policy.parameters(),
+                lr=args.learning_rate,
+                betas=(0.0, 0.999),
+                eps=1e-8,
+            )
+        else:
+            optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
 
     mage = importlib.import_module("mage")
     result = train_selected_backend(
@@ -1218,6 +1331,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="pass trust_remote_code=True when loading the HF text encoder",
     )
+    parser.add_argument(
+        "--pretrain-mlm-dir",
+        type=Path,
+        default=None,
+        help="if set, run masked-LM pretraining of the text encoder over a "
+        "directory of *.bin files (raw uint16 tokens delimited by <bos>/<eos>) "
+        "before starting RL training. Requires --encoder text.",
+    )
+    parser.add_argument(
+        "--pretrain-mlm-epochs",
+        type=int,
+        default=1,
+        help="number of full passes over the corpus (one pass = each "
+        "non-overlapping seq_len-length span seen exactly once)",
+    )
+    parser.add_argument("--pretrain-mlm-batch-size", type=int, default=32)
+    parser.add_argument("--pretrain-mlm-seq-len", type=int, default=512)
+    parser.add_argument("--pretrain-mlm-mask-prob", type=float, default=0.15)
+    parser.add_argument("--pretrain-mlm-lr", type=float, default=1e-4)
+    parser.add_argument("--pretrain-mlm-grad-clip", type=float, default=1.0)
+    parser.add_argument("--pretrain-mlm-log-every", type=int, default=50)
     parser.add_argument(
         "--native-render-plan",
         action="store_true",

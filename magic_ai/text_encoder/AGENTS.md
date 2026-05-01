@@ -8,6 +8,7 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 - `assembler.py` — Render-plan → TextEncodedBatch converter; walks opcodes and memcpys cached card tokens.
 - `batch.py` — Tokenize snapshots and collate into padded batches with position-anchored gather masks.
 - `card_cache.py` — Pre-tokenized card-body cache (Name/Type/P/T/oracle) keyed by engine card-row IDs.
+- `mlm.py` — Masked-LM pretraining: uint16 .bin token-stream dataset, BERT-style masking, tied LM head, MLMTrainer.
 - `model.py` — ModernBERT encoder trunk with position-anchored gather pools and policy/target/value heads.
 - `native_assembler.py` — Python wrapper for native Go MageEncodeTokens assembler; manages tensor I/O.
 - `native_token_tables.py` — Serialize TokenTables into flat buffers and register with Go-side mage lib.
