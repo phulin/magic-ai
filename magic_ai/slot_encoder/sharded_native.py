@@ -130,6 +130,8 @@ def _merge_packed_outputs(
         next_token = token_cursor + shard_total
 
         output.token_ids[token_cursor:next_token].copy_(shard.token_ids[:shard_total])
+        output.seq_id[token_cursor:next_token].copy_(shard.seq_id[:shard_total] + batch_cursor)
+        output.pos_in_seq[token_cursor:next_token].copy_(shard.pos_in_seq[:shard_total])
         output.cu_seqlens[batch_cursor + 1 : next_batch + 1].copy_(shard_cu[1:] + token_cursor)
         output.seq_lengths[batch_cursor:next_batch].copy_(shard.seq_lengths[:shard_n])
         output.state_positions[batch_cursor:next_batch].copy_(
