@@ -1286,6 +1286,8 @@ class TrainPPOTests(unittest.TestCase):
             episodes=1,
             num_envs=1,
             rollout_steps=1,
+            rollout_min_ready_batch=1,
+            rollout_ready_wait_ms=0.0,
             max_steps_per_game=1,
             minibatch_size=1,
             hidden_layers=1,
@@ -1307,6 +1309,8 @@ class TrainPPOTests(unittest.TestCase):
             episodes=1,
             num_envs=1,
             rollout_steps=1,
+            rollout_min_ready_batch=1,
+            rollout_ready_wait_ms=0.0,
             max_steps_per_game=1,
             minibatch_size=1,
             hidden_layers=1,
@@ -1323,11 +1327,20 @@ class TrainPPOTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--gae-lambda must be in \\[0, 1\\]"):
             validate_args(args)
 
-    def test_validate_args_text_rnad_requires_native_render_plan(self) -> None:
+    def test_parse_args_defaults_native_text_rollout_and_assembler_on(self) -> None:
+        with patch("sys.argv", ["train.py", "--encoder", "text"]):
+            args = train_mod.parse_args()
+
+        self.assertTrue(args.native_render_plan)
+        self.assertTrue(args.text_native_assembler)
+
+    def test_validate_args_text_native_rollout_can_be_disabled_for_ppo(self) -> None:
         args = Namespace(
             episodes=1,
             num_envs=1,
             rollout_steps=1,
+            rollout_min_ready_batch=1,
+            rollout_ready_wait_ms=0.0,
             max_steps_per_game=1,
             minibatch_size=1,
             hidden_layers=1,
@@ -1343,12 +1356,40 @@ class TrainPPOTests(unittest.TestCase):
             trainer="ppo",
             spr=True,
             native_render_plan=False,
+            text_native_assembler=True,
         )
 
         validate_args(args)
         self.assertFalse(args.spr)
+        self.assertFalse(args.native_render_plan)
+
+    def test_validate_args_text_rnad_requires_native_text_rollout(self) -> None:
+        args = Namespace(
+            episodes=1,
+            num_envs=1,
+            rollout_steps=1,
+            rollout_min_ready_batch=1,
+            rollout_ready_wait_ms=0.0,
+            max_steps_per_game=1,
+            minibatch_size=1,
+            hidden_layers=1,
+            gae_lambda=0.95,
+            torch_compile=False,
+            no_validate=False,
+            deck_json=None,
+            deck_dir=None,
+            eval_games_per_snapshot=0,
+            eval_recency_tau=4.0,
+            eval_num_envs=None,
+            encoder="text",
+            trainer="rnad",
+            spr=True,
+            native_render_plan=False,
+            text_native_assembler=False,
+        )
+
         args.trainer = "rnad"
-        with self.assertRaisesRegex(ValueError, "requires --native-render-plan"):
+        with self.assertRaisesRegex(ValueError, "requires --native-text-rollout"):
             validate_args(args)
 
 

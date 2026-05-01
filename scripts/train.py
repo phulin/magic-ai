@@ -1709,9 +1709,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrain-mlm-grad-clip", type=float, default=1.0)
     parser.add_argument("--pretrain-mlm-log-every", type=int, default=50)
     parser.add_argument(
+        "--native-text-rollout",
         "--native-render-plan",
-        action="store_true",
-        help="use mage-go native render-plan emission for text encoder rollouts",
+        dest="native_render_plan",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "use mage-go native batched text rollouts for --encoder text "
+            "(default: on; pass --no-native-text-rollout to use the older "
+            "Python text rollout path). The old --native-render-plan spelling "
+            "is kept as an alias."
+        ),
     )
     parser.add_argument("--render-plan-capacity", type=int, default=4096)
     parser.add_argument(
@@ -1908,7 +1916,7 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if getattr(args, "encoder", "slots") == "text":
         if args.trainer == "rnad" and not getattr(args, "native_render_plan", False):
-            raise ValueError("--encoder text --trainer rnad requires --native-render-plan")
+            raise ValueError("--encoder text --trainer rnad requires --native-text-rollout")
         args.spr = False
     if args.torch_compile and not args.no_validate:
         raise ValueError("--torch-compile requires --no-validate")

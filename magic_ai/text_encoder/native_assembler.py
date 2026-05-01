@@ -33,8 +33,6 @@ class _MageTokenAssemblerConfigC(ctypes.Structure):
 class _MagePackedTokenAssemblerOutputsC(ctypes.Structure):
     _fields_ = [
         ("token_ids", ctypes.POINTER(ctypes.c_int32)),
-        ("seq_id", ctypes.POINTER(ctypes.c_int32)),
-        ("pos_in_seq", ctypes.POINTER(ctypes.c_int32)),
         ("cu_seqlens", ctypes.POINTER(ctypes.c_int32)),
         ("seq_lengths", ctypes.POINTER(ctypes.c_int32)),
         ("state_positions", ctypes.POINTER(ctypes.c_int32)),
@@ -293,8 +291,6 @@ def encode_tokens_packed(
             "MagePackedTokenAssemblerOutputs *",
             {
                 "token_ids": ffi.cast("int32_t *", outputs.token_ids.data_ptr()),
-                "seq_id": ffi.cast("int32_t *", outputs.seq_id.data_ptr()),
-                "pos_in_seq": ffi.cast("int32_t *", outputs.pos_in_seq.data_ptr()),
                 "cu_seqlens": ffi.cast("int32_t *", outputs.cu_seqlens.data_ptr()),
                 "seq_lengths": ffi.cast("int32_t *", outputs.seq_lengths.data_ptr()),
                 "state_positions": ffi.cast("int32_t *", outputs.state_positions.data_ptr()),
@@ -335,8 +331,6 @@ def encode_tokens_packed(
                 if outputs._packed_out_ctypes is None:
                     outputs._packed_out_ctypes = _MagePackedTokenAssemblerOutputsC(
                         token_ids=_tensor_ptr(outputs.token_ids, ctypes.c_int32),
-                        seq_id=_tensor_ptr(outputs.seq_id, ctypes.c_int32),
-                        pos_in_seq=_tensor_ptr(outputs.pos_in_seq, ctypes.c_int32),
                         cu_seqlens=_tensor_ptr(outputs.cu_seqlens, ctypes.c_int32),
                         seq_lengths=_tensor_ptr(outputs.seq_lengths, ctypes.c_int32),
                         state_positions=_tensor_ptr(outputs.state_positions, ctypes.c_int32),
