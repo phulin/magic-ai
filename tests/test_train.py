@@ -17,7 +17,9 @@ from magic_ai.opponent_pool import OpponentPool, SnapshotSchedule
 from magic_ai.ppo import PPOStats, RolloutStep, gae_returns
 from magic_ai.slot_encoder.game_state import GameStateEncoder
 from magic_ai.slot_encoder.model import PPOPolicy
-from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.actor_critic import NativeTextReplayPayload
+from magic_ai.text_encoder.batch import TextEncodedBatch, pack_batch
+from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from scripts.train import (
     RetrospectiveLogSchedule,
@@ -855,6 +857,287 @@ class TrainPPOTests(unittest.TestCase):
         rollout.assert_called_once()
         train_native_text.assert_called_once()
         train_text.assert_not_called()
+
+    def test_native_text_staging_commits_completed_env_to_replay(self) -> None:
+        replay_buffer = TextReplayBuffer(
+            capacity=4,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=2,
+            max_cached_choices=4,
+            recurrent_layers=1,
+            recurrent_hidden_dim=6,
+            lstm_proj_hidden=6,
+            use_triton_append=False,
+            use_triton_gather=False,
+        )
+        staging = train_mod.NativeTextTrajectoryBuffer(
+            replay_buffer,
+            num_envs=2,
+            max_steps=3,
+        )
+        encoded = TextEncodedBatch(
+            token_ids=torch.tensor([[101, 102, 103, 0, 0], [201, 202, 0, 0, 0]]),
+            attention_mask=torch.tensor([[1, 1, 1, 0, 0], [1, 1, 0, 0, 0]]),
+            card_ref_positions=torch.full((2, MAX_CARD_REFS), -1, dtype=torch.long),
+            option_positions=torch.tensor([[1, -1, -1], [0, -1, -1]]),
+            option_mask=torch.tensor([[True, False, False], [True, False, False]]),
+            target_positions=torch.full((2, 3, 2), -1, dtype=torch.long),
+            target_mask=torch.zeros((2, 3, 2), dtype=torch.bool),
+            seq_lengths=torch.tensor([3, 2]),
+        )
+        payload = NativeTextReplayPayload(
+            encoded=pack_batch(encoded),
+            trace_kind_id=torch.tensor([1, 2]),
+            decision_count=torch.tensor([1, 1]),
+            decision_option_idx=torch.tensor([[0, -1, -1, -1], [1, -1, -1, -1]]),
+            decision_target_idx=torch.tensor([[-1, -1, -1, -1], [0, -1, -1, -1]]),
+            decision_mask=torch.tensor([[True, False, False, False]]).expand(2, -1),
+            uses_none_head=torch.tensor([False, True]),
+            selected_indices=torch.tensor([0, 0]),
+            may_selected=torch.tensor([0.0, 1.0]),
+            old_log_prob=torch.tensor([-0.1, -0.2]),
+            value=torch.tensor([0.3, 0.4]),
+            perspective_player_idx=torch.tensor([0, 1]),
+            lstm_h_in=torch.arange(12, dtype=torch.float32).reshape(1, 2, 6),
+            lstm_c_in=torch.arange(100, 112, dtype=torch.float32).reshape(1, 2, 6),
+            projected_state=torch.arange(12, dtype=torch.float32).reshape(2, 6),
+        )
+
+        staging.stage_batch([0, 1], payload)
+        rows_by_env = staging.append_envs_to_replay([0, 1], replay_buffer)
+        rows = rows_by_env[0] + rows_by_env[1]
+        gathered = replay_buffer.gather(rows)
+
+        self.assertEqual(rows_by_env, [[0], [1]])
+        self.assertEqual(int(staging.step_count[0].item()), 0)
+        self.assertEqual(int(staging.step_count[1].item()), 0)
+        torch.testing.assert_close(
+            gathered.encoded.token_ids,
+            torch.tensor([101, 102, 103, 201, 202], dtype=torch.int32),
+        )
+        self.assertEqual(int(gathered.trace_kind_id[0]), 1)
+        self.assertEqual(int(gathered.trace_kind_id[1]), 2)
+        self.assertAlmostEqual(float(gathered.old_log_prob[0]), -0.1, places=6)
+        self.assertAlmostEqual(float(gathered.old_log_prob[1]), -0.2, places=6)
+        self.assertIsNotNone(replay_buffer.projected_state)
+        assert replay_buffer.projected_state is not None
+        torch.testing.assert_close(
+            replay_buffer.projected_state[rows[0]].float(),
+            torch.arange(6, dtype=torch.float32),
+        )
+        torch.testing.assert_close(
+            replay_buffer.projected_state[rows[1]].float(),
+            torch.arange(6, 12, dtype=torch.float32),
+        )
+
+    def test_native_text_rollout_updates_without_draining_live_games(self) -> None:
+        class FakeGame:
+            def __init__(self, idx: int) -> None:
+                self.idx = idx
+                self.closed = False
+                self.stepped = 0
+                self.state = {
+                    "players": [{"ID": "A", "Name": "A"}, {"ID": "B", "Name": "B"}],
+                    "active_player": "A",
+                    "turn": 1,
+                    "step": "Precombat Main",
+                }
+                self.pending = {
+                    "kind": "priority",
+                    "player_idx": 0,
+                    "options": [{"kind": "pass"}],
+                }
+
+            def refresh_state(self) -> dict[str, object]:
+                return cast(dict[str, object], self.state)
+
+            def legal(self) -> dict[str, object]:
+                return cast(dict[str, object], self.pending)
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeMage:
+            def __init__(self) -> None:
+                self.games: list[FakeGame] = []
+
+            def new_game(self, *_args: object, **_kwargs: object) -> FakeGame:
+                game = FakeGame(len(self.games))
+                self.games.append(game)
+                return game
+
+        class FakeRollout:
+            def poll(self, games: list[FakeGame]) -> tuple[torch.Tensor, ...]:
+                ready = torch.ones(len(games), dtype=torch.bool)
+                over = torch.tensor(
+                    [game.stepped > game.idx for game in games],
+                    dtype=torch.bool,
+                )
+                player = torch.zeros(len(games), dtype=torch.long)
+                winner = torch.zeros(len(games), dtype=torch.long)
+                return ready, over, player, winner
+
+            def step_by_choice(
+                self,
+                games: list[FakeGame],
+                **_kwargs: object,
+            ) -> None:
+                for game in games:
+                    game.stepped += 1
+
+        class FakeEncoder:
+            is_available = True
+
+            def encode_handles(
+                self,
+                games: list[FakeGame],
+                **_kwargs: object,
+            ) -> Namespace:
+                return Namespace(trace_kind_id=torch.zeros(len(games), dtype=torch.long))
+
+        class FakeReplayBuffer:
+            def __init__(self) -> None:
+                self.reset_calls = 0
+
+            def reset(self) -> None:
+                self.reset_calls += 1
+
+        class FakePolicy(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.param = torch.nn.Parameter(torch.tensor(0.0))
+                self.device = torch.device("cpu")
+                self.next_replay = 0
+
+            def init_lstm_env_states(self, _num_envs: int) -> None:
+                pass
+
+            def reset_lstm_env_states(self, _env_indices: list[int]) -> None:
+                pass
+
+            def sample_native_tensor_batch(
+                self,
+                *,
+                native_batch: Namespace,
+                **_kwargs: object,
+            ) -> Namespace:
+                n = int(native_batch.trace_kind_id.numel())
+                replay_rows = list(range(self.next_replay, self.next_replay + n))
+                self.next_replay += n
+                return Namespace(
+                    decision_counts=[1] * n,
+                    selected_choice_cols=[0] * n,
+                    may_selected=[False] * n,
+                    old_log_prob=torch.full((n,), -0.5),
+                    value=torch.zeros(n),
+                    replay_rows=replay_rows,
+                    replay_payload=object(),
+                )
+
+        class FakeStaging:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                self.step_counts = [0, 0]
+
+            def stage_batch(self, env_indices: list[int], _payload: object) -> None:
+                for env_idx in env_indices:
+                    self.step_counts[env_idx] += 1
+
+            def append_env_to_replay(
+                self, env_idx: int, _replay_buffer: FakeReplayBuffer
+            ) -> list[int]:
+                rows = list(range(self.step_counts[env_idx]))
+                self.step_counts[env_idx] = 0
+                return rows
+
+            def append_envs_to_replay(
+                self,
+                env_indices: list[int],
+                replay_buffer: FakeReplayBuffer,
+            ) -> list[list[int]]:
+                return [
+                    self.append_env_to_replay(env_idx, replay_buffer) for env_idx in env_indices
+                ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                trainer="ppo",
+                episodes=2,
+                num_envs=2,
+                max_steps_per_game=100,
+                seed=7,
+                deck_json=None,
+                name_a="A",
+                name_b="B",
+                no_shuffle=True,
+                hand_size=7,
+                deterministic_rollout=True,
+                rollout_steps=1,
+                rollout_min_ready_batch=1,
+                rollout_ready_wait_ms=0.0,
+                ppo_epochs=1,
+                minibatch_size=1,
+                clip_epsilon=0.2,
+                value_coef=0.5,
+                entropy_coef=0.01,
+                max_grad_norm=0.5,
+                gamma=1.0,
+                gae_lambda=1.0,
+                draw_penalty=1.0,
+                save_every=0,
+                output=Path(tmpdir) / "unused.pt",
+                sample_actions=80,
+                game_log_path=Path(tmpdir) / "game_logs.txt",
+                max_options=2,
+                max_targets_per_option=1,
+                text_native_assembler=False,
+                text_max_tokens=8,
+                cuda_memory_snapshot=None,
+            )
+            initialize_game_log(args.game_log_path)
+            mage = FakeMage()
+            policy = FakePolicy()
+            backend = Namespace(policy=policy, replay_buffer=FakeReplayBuffer())
+            optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+            update_calls = 0
+
+            def fake_ppo_update(*_args: object, **_kwargs: object) -> PPOStats:
+                nonlocal update_calls
+                update_calls += 1
+                if update_calls == 1:
+                    self.assertFalse(mage.games[1].closed)
+                return PPOStats(
+                    loss=1.0,
+                    policy_loss=0.5,
+                    value_loss=0.25,
+                    entropy=0.0,
+                    approx_kl=0.0,
+                    clip_fraction=0.0,
+                )
+
+            with (
+                patch(
+                    "scripts.train.ppo_update",
+                    side_effect=fake_ppo_update,
+                ) as update,
+                patch.object(train_mod, "NativeTextTrajectoryBuffer", FakeStaging),
+            ):
+                resume, _rnad_state = train_mod.train_text_native_batched_envs(
+                    args,
+                    mage,
+                    [{"cards": []}],
+                    cast(Any, backend),
+                    optimizer,
+                    cast(Any, FakeRollout()),
+                    cast(Any, FakeEncoder()),
+                )
+
+        self.assertEqual(update.call_count, 2)
+        self.assertEqual(resume.completed_games, 2)
+        self.assertEqual(resume.total_generated_rollout_steps, 3)
+        self.assertEqual(resume.total_rollout_steps, 3)
+        self.assertEqual([game.closed for game in mage.games], [True, True])
 
     def test_save_checkpoint_serializes_resume_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

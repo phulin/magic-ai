@@ -15,7 +15,7 @@ import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -79,6 +79,7 @@ from magic_ai.slot_encoder.native_rollout import (  # noqa: E402
     NativeRolloutUnavailable,
 )
 from magic_ai.text_encoder.actor_critic import (  # noqa: E402
+    NativeTextReplayPayload,
     TextActorCritic,  # noqa: E402
     TextDecisionLayout,
     _decode_text_action,
@@ -90,6 +91,7 @@ from magic_ai.text_encoder.assembler import (  # noqa: E402
     assemble_batch,
     build_assembler_tokens,
 )
+from magic_ai.text_encoder.batch import PackedTextBatch  # noqa: E402
 from magic_ai.text_encoder.card_cache import (  # noqa: E402
     DEFAULT_ORACLE_DB_PATH,
     CardTokenCache,
@@ -273,6 +275,339 @@ class TextTrainingBackend:
     native_encoder: ShardedNativeBatchEncoder | None = None
     batch_pool: ThreadPoolExecutor | None = None
     batch_workers: int = 1
+
+
+class NativeTextTrajectoryBuffer:
+    """Fixed-width per-env staging for native text rollouts before replay commit."""
+
+    def __init__(self, replay_buffer: TextReplayBuffer, *, num_envs: int, max_steps: int) -> None:
+        self.num_envs = int(num_envs)
+        self.max_steps = int(max_steps)
+        self.device = replay_buffer.device
+        self.max_tokens = replay_buffer.max_tokens
+        self.max_options = replay_buffer.max_options
+        self.max_targets_per_option = replay_buffer.max_targets_per_option
+        self.max_decision_groups = replay_buffer.max_decision_groups
+        self.max_cached_choices = replay_buffer.max_cached_choices
+        self.max_card_refs = replay_buffer.max_card_refs
+        self.recurrent_layers = replay_buffer.recurrent_layers
+        self.recurrent_hidden_dim = replay_buffer.recurrent_hidden_dim
+        self.lstm_proj_hidden = replay_buffer.lstm_proj_hidden
+
+        shape = (self.num_envs, self.max_steps)
+        self.step_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.token_ids = torch.zeros(*shape, self.max_tokens, dtype=torch.int32, device=self.device)
+        self.seq_lengths = torch.zeros(*shape, dtype=torch.int32, device=self.device)
+        self.card_ref_positions = torch.full(
+            (*shape, self.max_card_refs), -1, dtype=torch.int32, device=self.device
+        )
+        self.option_positions = torch.full(
+            (*shape, self.max_options), -1, dtype=torch.int32, device=self.device
+        )
+        self.option_mask = torch.zeros(
+            *shape, self.max_options, dtype=torch.bool, device=self.device
+        )
+        self.target_positions = torch.full(
+            (*shape, self.max_options, self.max_targets_per_option),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.target_mask = torch.zeros(
+            *shape,
+            self.max_options,
+            self.max_targets_per_option,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        self.trace_kind_id = torch.zeros(*shape, dtype=torch.int8, device=self.device)
+        self.decision_count = torch.zeros(*shape, dtype=torch.int16, device=self.device)
+        decision_shape = (*shape, self.max_decision_groups, self.max_cached_choices)
+        self.decision_option_idx = torch.full(
+            decision_shape, -1, dtype=torch.int16, device=self.device
+        )
+        self.decision_target_idx = torch.full_like(self.decision_option_idx, -1)
+        self.decision_mask = torch.zeros(decision_shape, dtype=torch.bool, device=self.device)
+        self.uses_none_head = torch.zeros(
+            *shape, self.max_decision_groups, dtype=torch.bool, device=self.device
+        )
+        self.selected_indices = torch.full(
+            (*shape, self.max_decision_groups), -1, dtype=torch.int16, device=self.device
+        )
+        self.may_selected = torch.zeros(*shape, dtype=torch.float32, device=self.device)
+        self.old_log_prob = torch.zeros(*shape, dtype=torch.float32, device=self.device)
+        self.value = torch.zeros(*shape, dtype=torch.float32, device=self.device)
+        self.perspective_player_idx = torch.zeros(*shape, dtype=torch.int8, device=self.device)
+        self.lstm_h_in: torch.Tensor | None = None
+        self.lstm_c_in: torch.Tensor | None = None
+        if self.recurrent_layers > 0:
+            recurrent_shape = (
+                self.num_envs,
+                self.max_steps,
+                self.recurrent_layers,
+                self.recurrent_hidden_dim,
+            )
+            self.lstm_h_in = torch.zeros(recurrent_shape, dtype=torch.float32, device=self.device)
+            self.lstm_c_in = torch.zeros_like(self.lstm_h_in)
+        self.projected_state: torch.Tensor | None = None
+        if self.lstm_proj_hidden > 0:
+            self.projected_state = torch.zeros(
+                self.num_envs,
+                self.max_steps,
+                self.lstm_proj_hidden,
+                dtype=torch.float16,
+                device=self.device,
+            )
+
+    def reset_env(self, env_idx: int) -> None:
+        self.step_count[int(env_idx)] = 0
+
+    def stage_batch(
+        self,
+        env_indices: list[int],
+        payload: NativeTextReplayPayload,
+    ) -> None:
+        if not env_indices:
+            return
+        batch_size = len(env_indices)
+        env_t = torch.tensor(env_indices, dtype=torch.long, device=self.device)
+        step_t = self.step_count[env_t]
+        if bool((step_t >= self.max_steps).any().item()):
+            env_idx = int(env_t[step_t >= self.max_steps][0].item())
+            raise RuntimeError(f"native text staging buffer is full for env {env_idx}")
+
+        encoded = payload.encoded
+        seq_lengths = encoded.seq_lengths.to(device=self.device, dtype=torch.long)
+        if int(seq_lengths.max().item()) > self.max_tokens:
+            raise ValueError("encoded packed row token width exceeds staging max_tokens")
+        row_tokens = torch.zeros(batch_size, self.max_tokens, dtype=torch.int32, device=self.device)
+        row_tokens[
+            encoded.seq_id.to(device=self.device, dtype=torch.long),
+            encoded.pos_in_seq.to(device=self.device, dtype=torch.long),
+        ] = encoded.token_ids.to(device=self.device, dtype=torch.int32)
+        self.token_ids[env_t, step_t] = row_tokens
+        self.seq_lengths[env_t, step_t] = seq_lengths.to(dtype=torch.int32)
+
+        base = encoded.state_positions.to(device=self.device, dtype=torch.int32)
+
+        def rebase_positions(pos: torch.Tensor, view_shape: tuple[int, ...]) -> torch.Tensor:
+            pos_dev = pos.to(device=self.device, dtype=torch.int32)
+            valid = pos_dev >= 0
+            shifted = pos_dev - base.view(view_shape)
+            return torch.where(valid, shifted, pos_dev)
+
+        self.card_ref_positions[env_t, step_t] = rebase_positions(
+            encoded.card_ref_positions,
+            (batch_size, 1),
+        )
+        option_width = min(int(encoded.option_positions.shape[1]), self.max_options)
+        target_width = min(int(encoded.target_positions.shape[2]), self.max_targets_per_option)
+        self.option_positions[env_t, step_t].fill_(-1)
+        self.option_mask[env_t, step_t].zero_()
+        self.target_positions[env_t, step_t].fill_(-1)
+        self.target_mask[env_t, step_t].zero_()
+        if option_width > 0:
+            self.option_positions[env_t, step_t, :option_width] = rebase_positions(
+                encoded.option_positions[:, :option_width],
+                (batch_size, 1),
+            )
+            self.option_mask[env_t, step_t, :option_width] = encoded.option_mask[
+                :, :option_width
+            ].to(device=self.device, dtype=torch.bool)
+        if option_width > 0 and target_width > 0:
+            self.target_positions[env_t, step_t, :option_width, :target_width] = rebase_positions(
+                encoded.target_positions[:, :option_width, :target_width],
+                (batch_size, 1, 1),
+            )
+            self.target_mask[env_t, step_t, :option_width, :target_width] = encoded.target_mask[
+                :, :option_width, :target_width
+            ].to(device=self.device, dtype=torch.bool)
+
+        decision_count = payload.decision_count.to(device=self.device, dtype=torch.long)
+        stored_count = decision_count.clamp(max=self.max_decision_groups)
+        self.trace_kind_id[env_t, step_t] = payload.trace_kind_id.to(
+            device=self.device, dtype=torch.int8
+        )
+        self.decision_count[env_t, step_t] = stored_count.to(dtype=torch.int16)
+        self.decision_option_idx[env_t, step_t].fill_(-1)
+        self.decision_target_idx[env_t, step_t].fill_(-1)
+        self.decision_mask[env_t, step_t].zero_()
+        self.uses_none_head[env_t, step_t].zero_()
+        self.selected_indices[env_t, step_t].fill_(-1)
+        g_total = int(decision_count.sum().item())
+        if g_total > 0:
+            step_for_group = torch.repeat_interleave(
+                torch.arange(batch_size, device=self.device), decision_count
+            )
+            group_starts = torch.cumsum(decision_count, dim=0) - decision_count
+            group_in_step = torch.arange(g_total, device=self.device) - group_starts[step_for_group]
+            keep = group_in_step < self.max_decision_groups
+            flat_keep = keep.nonzero(as_tuple=False).squeeze(-1)
+            kept_steps = step_for_group[keep]
+            replay_env = env_t[kept_steps]
+            replay_step = step_t[kept_steps]
+            replay_group = group_in_step[keep]
+            self.decision_option_idx[replay_env, replay_step, replay_group] = (
+                payload.decision_option_idx[flat_keep].to(device=self.device, dtype=torch.int16)
+            )
+            self.decision_target_idx[replay_env, replay_step, replay_group] = (
+                payload.decision_target_idx[flat_keep].to(device=self.device, dtype=torch.int16)
+            )
+            self.decision_mask[replay_env, replay_step, replay_group] = payload.decision_mask[
+                flat_keep
+            ].to(device=self.device, dtype=torch.bool)
+            self.uses_none_head[replay_env, replay_step, replay_group] = payload.uses_none_head[
+                flat_keep
+            ].to(device=self.device, dtype=torch.bool)
+            self.selected_indices[replay_env, replay_step, replay_group] = payload.selected_indices[
+                flat_keep
+            ].to(device=self.device, dtype=torch.int16)
+
+        self.may_selected[env_t, step_t] = payload.may_selected.to(
+            device=self.device, dtype=torch.float32
+        )
+        self.old_log_prob[env_t, step_t] = payload.old_log_prob.to(
+            device=self.device, dtype=torch.float32
+        )
+        self.value[env_t, step_t] = payload.value.to(device=self.device, dtype=torch.float32)
+        self.perspective_player_idx[env_t, step_t] = payload.perspective_player_idx.to(
+            device=self.device, dtype=torch.int8
+        )
+        if self.lstm_h_in is not None and self.lstm_c_in is not None:
+            self.lstm_h_in[env_t, step_t] = payload.lstm_h_in.permute(1, 0, 2).to(
+                device=self.device, dtype=torch.float32
+            )
+            self.lstm_c_in[env_t, step_t] = payload.lstm_c_in.permute(1, 0, 2).to(
+                device=self.device, dtype=torch.float32
+            )
+        if self.projected_state is not None and payload.projected_state is not None:
+            self.projected_state[env_t, step_t] = payload.projected_state.to(
+                device=self.device, dtype=torch.float16
+            )
+        self.step_count[env_t] = step_t + 1
+
+    def append_envs_to_replay(
+        self,
+        env_indices: list[int],
+        replay_buffer: TextReplayBuffer,
+    ) -> list[list[int]]:
+        if not env_indices:
+            return []
+        env_t_all = torch.tensor(env_indices, dtype=torch.long, device=self.device)
+        counts_all = self.step_count[env_t_all]
+        if bool((counts_all == 0).all().item()):
+            return [[] for _ in env_indices]
+
+        active_mask = counts_all > 0
+        active_env = env_t_all[active_mask]
+        active_counts = counts_all[active_mask]
+        step_pos = torch.arange(self.max_steps, device=self.device).unsqueeze(0)
+        valid_steps = step_pos < active_counts[:, None]
+        flat_env = active_env[:, None].expand(len(active_env), self.max_steps)[valid_steps]
+        flat_step = step_pos.expand(len(active_env), self.max_steps)[valid_steps]
+
+        seq_lengths = self.seq_lengths[flat_env, flat_step].to(dtype=torch.long)
+        state_positions = torch.cat([seq_lengths.new_zeros(1), seq_lengths.cumsum(0)[:-1]]).to(
+            dtype=torch.int32
+        )
+        total_tokens = int(seq_lengths.sum().item())
+        token_mask = (
+            torch.arange(self.max_tokens, device=self.device).unsqueeze(0) < seq_lengths[:, None]
+        )
+        token_ids = self.token_ids[flat_env, flat_step][token_mask]
+        row_count = int(seq_lengths.numel())
+        seq_id = torch.repeat_interleave(
+            torch.arange(row_count, dtype=torch.int32, device=self.device), seq_lengths
+        )
+        pos_in_seq = torch.arange(total_tokens, dtype=torch.int32, device=self.device) - (
+            torch.repeat_interleave(state_positions, seq_lengths)
+        )
+        cu_seqlens = torch.zeros(row_count + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens[1:] = seq_lengths.cumsum(0).to(dtype=torch.int32)
+
+        def pack_positions(pos: torch.Tensor, view_shape: tuple[int, ...]) -> torch.Tensor:
+            valid = pos >= 0
+            shifted = pos.to(torch.int32) + state_positions.view(view_shape)
+            return torch.where(valid, shifted, pos.to(torch.int32))
+
+        encoded = PackedTextBatch(
+            token_ids=token_ids,
+            seq_id=seq_id,
+            pos_in_seq=pos_in_seq,
+            cu_seqlens=cu_seqlens,
+            seq_lengths=seq_lengths.to(dtype=torch.int32),
+            state_positions=state_positions,
+            card_ref_positions=pack_positions(
+                self.card_ref_positions[flat_env, flat_step], (row_count, 1)
+            ),
+            option_positions=pack_positions(
+                self.option_positions[flat_env, flat_step], (row_count, 1)
+            ),
+            option_mask=self.option_mask[flat_env, flat_step],
+            target_positions=pack_positions(
+                self.target_positions[flat_env, flat_step], (row_count, 1, 1)
+            ),
+            target_mask=self.target_mask[flat_env, flat_step],
+        )
+        decision_count = self.decision_count[flat_env, flat_step].to(dtype=torch.long)
+        group_mask = (
+            torch.arange(self.max_decision_groups, device=self.device).unsqueeze(0)
+            < decision_count[:, None]
+        )
+        lstm_h = (
+            self.lstm_h_in[flat_env, flat_step].permute(1, 0, 2)
+            if self.lstm_h_in is not None
+            else None
+        )
+        lstm_c = (
+            self.lstm_c_in[flat_env, flat_step].permute(1, 0, 2)
+            if self.lstm_c_in is not None
+            else None
+        )
+        rows = replay_buffer.append_batch(
+            encoded=encoded,
+            trace_kind_id=self.trace_kind_id[flat_env, flat_step].to(dtype=torch.long),
+            decision_count=decision_count,
+            decision_option_idx=self.decision_option_idx[flat_env, flat_step][group_mask].to(
+                dtype=torch.long
+            ),
+            decision_target_idx=self.decision_target_idx[flat_env, flat_step][group_mask].to(
+                dtype=torch.long
+            ),
+            decision_mask=self.decision_mask[flat_env, flat_step][group_mask],
+            uses_none_head=self.uses_none_head[flat_env, flat_step][group_mask],
+            selected_indices=self.selected_indices[flat_env, flat_step][group_mask].to(
+                dtype=torch.long
+            ),
+            may_selected=self.may_selected[flat_env, flat_step],
+            old_log_prob=self.old_log_prob[flat_env, flat_step],
+            value=self.value[flat_env, flat_step],
+            perspective_player_idx=self.perspective_player_idx[flat_env, flat_step].to(
+                dtype=torch.long
+            ),
+            lstm_h_in=lstm_h,
+            lstm_c_in=lstm_c,
+        )
+        if replay_buffer.projected_state is not None and self.projected_state is not None:
+            replay_buffer.write_projected_state(rows, self.projected_state[flat_env, flat_step])
+
+        rows_by_active = [
+            list(chunk)
+            for chunk in torch.split(rows.detach().cpu(), active_counts.detach().cpu().tolist())
+        ]
+        result: list[list[int]] = []
+        active_cursor = 0
+        for env_idx, count in zip(env_indices, counts_all.detach().cpu().tolist(), strict=True):
+            if count > 0:
+                result.append([int(row) for row in rows_by_active[active_cursor]])
+                active_cursor += 1
+                self.reset_env(int(env_idx))
+            else:
+                result.append([])
+        return result
+
+    def append_env_to_replay(self, env_idx: int, replay_buffer: TextReplayBuffer) -> list[int]:
+        return self.append_envs_to_replay([env_idx], replay_buffer)[0]
 
 
 @dataclass
@@ -2827,6 +3162,11 @@ def train_text_native_batched_envs(
         cast(TextActorCritic, rnad_state.target).init_lstm_env_states(args.num_envs)
     win_stats = WinFractionStats()
     backend.replay_buffer.reset()
+    staging_buffer = NativeTextTrajectoryBuffer(
+        backend.replay_buffer,
+        num_envs=args.num_envs,
+        max_steps=args.max_steps_per_game,
+    )
     backend.policy.init_lstm_env_states(args.num_envs)
     sampling_policy: TextActorCritic = (
         cast(TextActorCritic, rnad_state.target) if rnad_state is not None else backend.policy
@@ -2891,6 +3231,18 @@ def train_text_native_batched_envs(
 
     def finish_games(finished: list[tuple[LiveGame, int]]) -> None:
         nonlocal completed_games, total_generated_rollout_steps
+        replay_rows_by_env = staging_buffer.append_envs_to_replay(
+            [env.slot_idx for env, _winner_idx in finished if env.episode_steps],
+            backend.replay_buffer,
+        )
+        replay_rows_by_slot = {
+            env.slot_idx: replay_rows
+            for (env, _winner_idx), replay_rows in zip(
+                [(env, winner_idx) for env, winner_idx in finished if env.episode_steps],
+                replay_rows_by_env,
+                strict=True,
+            )
+        }
         for env, winner_idx in finished:
             try:
                 env.game.close()
@@ -2906,6 +3258,11 @@ def train_text_native_batched_envs(
                     encoder="text",
                 )
             if env.episode_steps:
+                replay_rows = replay_rows_by_slot[env.slot_idx]
+                env.episode_steps = [
+                    replace(step, replay_idx=replay_idx)
+                    for step, replay_idx in zip(env.episode_steps, replay_rows, strict=True)
+                ]
                 ep_rows = [s.replay_idx for s in env.episode_steps if s.replay_idx is not None]
                 if ep_rows:
                     pending_episode_rows.append(ep_rows)
@@ -3085,11 +3442,11 @@ def train_text_native_batched_envs(
             log_fn=tracked_wandb_log,
             run_active=True,
         )
-        backend.replay_buffer.reset()
         pending_steps.clear()
         pending_returns.clear()
         pending_episodes.clear()
         pending_episode_rows.clear()
+        backend.replay_buffer.reset()
         win_stats.reset()
 
     maybe_start_games()
@@ -3114,6 +3471,11 @@ def train_text_native_batched_envs(
                 ready_players.append(int(player_l[idx]))
         live_games = still_live
         finish_games(finished_games)
+
+        if len(pending_steps) >= args.rollout_steps:
+            run_update()
+            maybe_start_games()
+            continue
 
         if _defer_ready_batch(args, ready_count=len(ready_envs), live_count=len(live_games)):
             time.sleep(args.rollout_ready_wait_ms / 1000.0)
@@ -3209,18 +3571,22 @@ def train_text_native_batched_envs(
                     text_batch=text_batch,
                     packed_batch=packed_text_batch,
                     deterministic=args.deterministic_rollout,
+                    append_replay=False,
+                    return_replay_payload=True,
                 )
+            if policy_batch.replay_payload is None:
+                raise RuntimeError("native text rollout expected a replay payload")
+            staging_buffer.stage_batch(ready_env_indices, policy_batch.replay_payload)
             counts = policy_batch.decision_counts
             starts: list[int] = list(itertools.accumulate(counts, initial=0))[:-1]
             selected_cols = policy_batch.selected_choice_cols
             may_selected = policy_batch.may_selected
             log_probs_cpu = policy_batch.old_log_prob
             values_cpu = policy_batch.value
-            replay_rows_cpu = policy_batch.replay_rows
             trace_kind_ids = native_batch.trace_kind_id.tolist()
             selected_cursor = 0
-            for step_idx, (env, player_idx, replay_idx) in enumerate(
-                zip(ready_envs, ready_players, replay_rows_cpu, strict=True)
+            for step_idx, (env, player_idx) in enumerate(
+                zip(ready_envs, ready_players, strict=True)
             ):
                 env.action_count += 1
                 selected_for_step = selected_cols[
@@ -3260,7 +3626,7 @@ def train_text_native_batched_envs(
                         perspective_player_idx=int(player_idx),
                         old_log_prob=float(log_probs_cpu[step_idx]),
                         value=float(values_cpu[step_idx]),
-                        replay_idx=int(replay_idx),
+                        replay_idx=None,
                     )
                 )
             native_rollout.step_by_choice(
@@ -3273,8 +3639,6 @@ def train_text_native_batched_envs(
                 max_targets_per_option=args.max_targets_per_option,
             )
 
-        if len(pending_steps) >= args.rollout_steps and not live_games:
-            run_update()
         maybe_start_games()
 
     run_update(final=True)

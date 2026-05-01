@@ -82,6 +82,25 @@ class TextDecisionLayout:
 
 
 @dataclass(frozen=True)
+class NativeTextReplayPayload:
+    encoded: PackedTextBatch
+    trace_kind_id: Tensor
+    decision_count: Tensor
+    decision_option_idx: Tensor
+    decision_target_idx: Tensor
+    decision_mask: Tensor
+    uses_none_head: Tensor
+    selected_indices: Tensor
+    may_selected: Tensor
+    old_log_prob: Tensor
+    value: Tensor
+    perspective_player_idx: Tensor
+    lstm_h_in: Tensor
+    lstm_c_in: Tensor
+    projected_state: Tensor | None = None
+
+
+@dataclass(frozen=True)
 class NativeTextSampleBatch:
     decision_counts: list[int]
     selected_choice_cols: list[int]
@@ -89,6 +108,7 @@ class NativeTextSampleBatch:
     old_log_prob: list[float]
     value: list[float]
     replay_rows: list[int]
+    replay_payload: NativeTextReplayPayload | None = None
 
 
 class TextActorCritic(nn.Module):
@@ -513,6 +533,8 @@ class TextActorCritic(nn.Module):
         text_batch: TextEncodedBatch | None = None,
         packed_batch: PackedTextBatch | None = None,
         deterministic: bool = False,
+        append_replay: bool = True,
+        return_replay_payload: bool = False,
     ) -> NativeTextSampleBatch:
         """Sample a native text batch without Python loops over tensor rows/groups."""
 
@@ -535,11 +557,11 @@ class TextActorCritic(nn.Module):
         h_in, c_in = self.lstm_env_state_inputs(env_indices, perspective_player_indices)
         if moved_packed is not None:
             output, (h_out, c_out) = self.policy.forward_packed(moved_packed, h_in=h_in, c_in=c_in)
-            replay_encoded = moved_packed if self.rollout_buffer is not None else None
+            replay_encoded = moved_packed
         else:
             moved = cast(TextEncodedBatch, moved_text)
             output, (h_out, c_out) = self.policy(moved, h_in=h_in, c_in=c_in)
-            replay_encoded = pack_batch(moved) if self.rollout_buffer is not None else None
+            replay_encoded = pack_batch(moved)
         self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
 
         trace_kind_id = native_batch.trace_kind_id.to(self.device, dtype=torch.long)
@@ -636,11 +658,36 @@ class TextActorCritic(nn.Module):
         step_entropies = step_entropies + may_entropy * may_mask_f
         del step_entropies
 
-        if self.rollout_buffer is not None:
+        replay_payload = (
+            NativeTextReplayPayload(
+                encoded=replay_encoded,
+                trace_kind_id=trace_kind_id.detach(),
+                decision_count=decision_count.detach(),
+                decision_option_idx=option_idx.detach(),
+                decision_target_idx=target_idx.detach(),
+                decision_mask=decision_mask.detach(),
+                uses_none_head=uses_none.detach(),
+                selected_indices=selected.detach(),
+                may_selected=may_selected_t.detach(),
+                old_log_prob=step_log_probs.detach(),
+                value=output.values.detach(),
+                perspective_player_idx=torch.tensor(
+                    perspective_player_indices, dtype=torch.long, device=self.device
+                ),
+                lstm_h_in=h_in.detach(),
+                lstm_c_in=c_in.detach(),
+                projected_state=output.lstm_input.detach()
+                if output.lstm_input is not None
+                else None,
+            )
+            if return_replay_payload
+            else None
+        )
+
+        if append_replay and self.rollout_buffer is not None:
             perspective_t = torch.tensor(
                 perspective_player_indices, dtype=torch.long, device=self.device
             )
-            assert replay_encoded is not None
             replay_rows = self.rollout_buffer.append_batch(
                 encoded=replay_encoded,
                 trace_kind_id=trace_kind_id,
@@ -685,6 +732,7 @@ class TextActorCritic(nn.Module):
             old_log_prob=[float(x) for x in old_log_prob],
             value=[float(x) for x in value],
             replay_rows=[int(x) for x in replay_rows_cpu],
+            replay_payload=replay_payload,
         )
 
     def evaluate_replay_batch(
