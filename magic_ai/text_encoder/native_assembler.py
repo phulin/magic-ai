@@ -117,24 +117,6 @@ class NativePackedAssemblerOutputs:
     _packed_out_ctypes: _MagePackedTokenAssemblerOutputsC | None = None
     _tok_cfg_ctypes: _MageTokenAssemblerConfigC | None = None
 
-    def reset_active(self, batch_size: int) -> None:
-        """Clear fixed-shape active rows before reusing this output slab.
-
-        MageEncodeTokensPacked writes variable-length token data but does not
-        currently clear every fixed-shape anchor/mask slot on reuse. Keep the
-        reset vectorized here until that clearing moves into Go.
-        """
-
-        self.cu_seqlens[: batch_size + 1].zero_()
-        self.seq_lengths[:batch_size].zero_()
-        self.state_positions[:batch_size].zero_()
-        self.option_positions[:batch_size].fill_(-1)
-        self.option_mask[:batch_size].zero_()
-        self.target_positions[:batch_size].fill_(-1)
-        self.target_mask[:batch_size].zero_()
-        self.card_ref_positions[:batch_size].fill_(-1)
-        self.token_overflow[:batch_size].zero_()
-
     def to_packed_text_batch(self, *, trim: bool = True) -> PackedTextBatch:
         """Slice the live region into a :class:`PackedTextBatch`.
 
@@ -269,7 +251,6 @@ def encode_tokens_packed(
             max_card_refs=max_card_refs,
         )
     outputs.active_batch_size = batch_size
-    outputs.reset_active(batch_size)
 
     decision_capacity = max(1, batch_size * encoder.max_options)
     encoder._scratch_buffers(batch_size, decision_capacity)
