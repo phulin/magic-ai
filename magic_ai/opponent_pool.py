@@ -232,16 +232,34 @@ def build_opponent_policy(main_policy: PPOPolicy, device: torch.device) -> PPOPo
 def build_text_opponent_policy(
     main_policy: TextActorCritic, device: torch.device
 ) -> TextActorCritic:
-    """Inference-only clone of a TextActorCritic that does not share replay state."""
-    original_buffer = main_policy.rollout_buffer
-    main_policy.rollout_buffer = None
-    try:
-        opponent = copy.deepcopy(main_policy)
-    finally:
-        main_policy.rollout_buffer = original_buffer
+    """Inference-only clone of a TextActorCritic that does not share replay state.
+
+    Constructs a fresh ``TextActorCritic`` with the same config and copies
+    weights via ``load_state_dict`` rather than ``copy.deepcopy``. Deepcopy
+    walks every submodule and ends up cloning the ``torch.compile`` wrappers
+    on the encoder forward; the cloned wrappers don't share dynamo's
+    in-memory graph cache with the original, so the opponent's first call
+    re-traces from scratch even though the inductor on-disk cache would
+    otherwise have hit. State-dict copy avoids that — the new instance's
+    compile wrappers are constructed at ``__init__`` time and pick up the
+    on-disk cache normally.
+    """
+
+    cfg = main_policy.policy.cfg
+    opponent = TextActorCritic(cfg).to(device)
+
+    # ``live_lstm_h``/``live_lstm_c`` are per-env recurrence buffers sized
+    # by the main policy's ``num_envs``; the opponent runs with 0 envs so
+    # those shapes won't match. Skip them — they're re-initialized below.
+    state = {
+        k: v
+        for k, v in main_policy.state_dict().items()
+        if not k.startswith(("live_lstm_h", "live_lstm_c"))
+    }
+    opponent.load_state_dict(state, strict=False)
+
     opponent.rollout_buffer = None
     opponent.spr_enabled = False
-    opponent.to(device)
     opponent.eval()
     for p in opponent.parameters():
         p.requires_grad_(False)

@@ -1,6 +1,24 @@
 """Utilities for Magic AI experiments."""
 
-from magic_ai.actions import (
+# Persistent torch.compile / TorchInductor on-disk cache. Set before *anything*
+# that might trigger a compile (flex_attention, policy forwards, MLM encoder).
+# Subsequent runs — including loading a checkpoint into eval — hit the cache
+# and skip recompilation; without this, every fresh process pays the full
+# compile cost again.
+import os as _os
+from pathlib import Path as _Path
+
+_os.environ.setdefault(
+    "TORCHINDUCTOR_CACHE_DIR",
+    str(_Path.home() / ".cache" / "magic-ai" / "inductor"),
+)
+# Also direct dynamo's eval-frame cache (smaller, but worth keeping warm).
+_os.environ.setdefault(
+    "TORCH_COMPILE_DEBUG_DIR",
+    str(_Path.home() / ".cache" / "magic-ai" / "compile-debug"),
+)
+
+from magic_ai.actions import (  # noqa: E402
     ActionOptionsEncoder,
     ActionRequest,
     ActionTrace,

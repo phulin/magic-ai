@@ -1322,6 +1322,12 @@ def run_mlm_pretrain(
         special_token_ids=special_ids,
     )
     dataset = BinTokenDataset(cfg.data_dir, seq_len=cfg.seq_len)
+    if args.torch_compile:
+        # Cached on disk via TORCHINDUCTOR_CACHE_DIR (see magic_ai.__init__).
+        # ``dynamic=True`` lets the dataset's variable-length spans share a
+        # single compiled graph instead of recompiling per shape.
+        _compiled_forward: Any = torch.compile(encoder.forward, dynamic=True)
+        object.__setattr__(encoder, "forward", _compiled_forward)
     trainer = MLMTrainer(
         encoder=encoder,
         cfg=cfg,
