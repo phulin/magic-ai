@@ -16,6 +16,7 @@ Comprehensive test suite covering text encoding (rendering, tokenization, assemb
 - `test_recurrent_text_policy.py` — Smoke tests for v1 history adapter with LSTM around state vector.
 - `test_render_plan_parity.py` — Byte-for-byte parity between slow renderer and fast assembler paths.
 - `test_render_plan_writer.py` — Round-trip test for int32 render-plan wire format independence.
+- `test_replay_buffer.py` — Unit tests for backend-neutral ReplayCore row, decision, PPO target, and common metadata storage.
 - `test_replay_decisions.py` — Unit tests for replay scoring, decision logits, and Bernoulli scoring helpers.
 - `test_rnad.py` — Unit tests for R-NaD primitives (v-trace, NeuRD loss, critic loss, reward transform).
 - `test_rnad_coverage.py` — Coverage tests for four open R-NaD claims (v-trace end-to-end, Polyak stabilization, beta-gate guard, dense NeuRD).

@@ -1054,7 +1054,7 @@ class PPOPolicy(nn.Module):
         if isinstance(replay_rows, Tensor):
             if int(replay_rows.numel()) == 0:
                 raise ValueError("replay_rows must not be empty")
-            step_indices = replay_rows.to(device=device, dtype=torch.long)
+            step_indices = replay_rows.to(device=device)
         else:
             if not replay_rows:
                 raise ValueError("replay_rows must not be empty")
@@ -1678,6 +1678,7 @@ class PPOPolicy(nn.Module):
             return inputs, None
 
         dtype = self._compute_hidden_dtype()
+        assert rb.lstm_h_in is not None and rb.lstm_c_in is not None
         return inputs, (
             rb.lstm_h_in[step_indices].permute(1, 0, 2).contiguous().to(dtype=dtype),
             rb.lstm_c_in[step_indices].permute(1, 0, 2).contiguous().to(dtype=dtype),

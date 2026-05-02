@@ -183,7 +183,7 @@ class TextActorCritic(nn.Module):
         cl_count_total = int(step_indices.numel())
         trace_kind = rb.trace_kind_id[step_indices]
         may_count_total = int((trace_kind == TRACE_KIND_TO_ID["may"]).sum().item())
-        flat_count_total = int(rb.decision_mask[step_indices].sum().item())
+        flat_count_total = int(rb.decisions.valid_choice_count(step_indices).item())
         return cl_count_total, may_count_total + flat_count_total
 
     def init_lstm_env_states(self, num_envs: int, *, players_per_env: int = 2) -> None:
@@ -564,8 +564,8 @@ class TextActorCritic(nn.Module):
             replay_encoded = pack_batch(moved)
         self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
 
-        trace_kind_id = native_batch.trace_kind_id.to(self.device, dtype=torch.long)
-        decision_count = native_batch.decision_count.to(self.device, dtype=torch.long)
+        trace_kind_id = native_batch.trace_kind_id.to(self.device)
+        decision_count = native_batch.decision_count.to(self.device)
         decision_rows = int(native_batch.decision_rows_written)
         max_cached_choices = int(native_batch.decision_mask.shape[1])
         device = output.values.device
@@ -577,10 +577,10 @@ class TextActorCritic(nn.Module):
 
         if decision_rows > 0:
             option_idx = native_batch.decision_option_idx[:decision_rows].to(
-                device, dtype=torch.long, non_blocking=device.type == "cuda"
+                device, non_blocking=device.type == "cuda"
             )
             target_idx = native_batch.decision_target_idx[:decision_rows].to(
-                device, dtype=torch.long, non_blocking=device.type == "cuda"
+                device, non_blocking=device.type == "cuda"
             )
             decision_mask = native_batch.decision_mask[:decision_rows].to(
                 device, dtype=torch.bool, non_blocking=device.type == "cuda"
@@ -719,11 +719,11 @@ class TextActorCritic(nn.Module):
             ]
         ).cpu()
         b = batch_size
-        decision_counts = host[:b].to(dtype=torch.long).tolist()
-        may_selected = host[b : 2 * b].to(dtype=torch.long).tolist()
+        decision_counts = host[:b].tolist()
+        may_selected = host[b : 2 * b].tolist()
         old_log_prob = host[2 * b : 3 * b].tolist()
         value = host[3 * b : 4 * b].tolist()
-        replay_rows_cpu = host[4 * b : 5 * b].to(dtype=torch.long).tolist()
+        replay_rows_cpu = host[4 * b : 5 * b].tolist()
         selected_choice_cols = selected.detach().cpu().tolist()
         return NativeTextSampleBatch(
             decision_counts=[int(x) for x in decision_counts],
@@ -950,7 +950,7 @@ class TextActorCritic(nn.Module):
         encoded = _cast_encoded(encoded, target_dtype)
 
         state = self.policy.in_proj(encoded.state_vector)
-        perspective = batch.perspective_player_idx.to(device=state.device, dtype=torch.long)
+        perspective = batch.perspective_player_idx.to(device=state.device)
         h_concat = lstm_recompute_per_step_h_out_per_player(
             self.policy.lstm,
             state,
@@ -1117,8 +1117,7 @@ class TextActorCritic(nn.Module):
         forward = self._replay_scoring_forward(output)
         device = forward.values.device
 
-        decision_count_long = decision_count.to(dtype=torch.long)
-        g_total = int(decision_count_long.sum().item())
+        g_total = int(decision_count.sum().item())
         if g_total == 0:
             if not return_per_choice:
                 return log_probs, entropies
@@ -1144,18 +1143,15 @@ class TextActorCritic(nn.Module):
         # Flatten (step, group) pairs in step-major / group-ascending order.
         # ``decision_group_id`` is the position in this flat list, so ordering
         # has to match what the per-choice consumers in ``rnad`` expect.
-        steps_t = torch.arange(n, device=device).repeat_interleave(decision_count_long)
-        group_starts = torch.cumsum(decision_count_long, dim=0) - decision_count_long
+        steps_t = torch.arange(n, device=device).repeat_interleave(decision_count)
+        group_starts = torch.cumsum(decision_count, dim=0) - decision_count
         groups_t = torch.arange(g_total, device=device) - group_starts[steps_t]
 
-        # The replay buffer stores ``decision_*_idx`` as int16 to shrink the
-        # ``(capacity, max_decision_groups, max_cached_choices)`` tensors;
-        # cast to Long here since downstream ``torch.gather`` requires it.
-        flat_option_idx = batch.decision_option_idx[steps_t, groups_t].to(torch.long)
-        flat_target_idx = batch.decision_target_idx[steps_t, groups_t].to(torch.long)
+        flat_option_idx = batch.decision_option_idx[steps_t, groups_t]
+        flat_target_idx = batch.decision_target_idx[steps_t, groups_t]
         flat_masks = batch.decision_mask[steps_t, groups_t]
         flat_uses_none = batch.uses_none_head[steps_t, groups_t]
-        flat_selected = batch.selected_indices[steps_t, groups_t].to(dtype=torch.long)
+        flat_selected = batch.selected_indices[steps_t, groups_t]
 
         if not bool(flat_masks.any(dim=-1).all()):
             raise ValueError("decision group must include at least one valid choice")
@@ -1288,8 +1284,8 @@ class TextActorCritic(nn.Module):
         return direct_decision_logits_from_forward(
             forward,
             step_positions=torch.tensor([step_idx], dtype=torch.long, device=device),
-            option_idx=batch.decision_option_idx[step_idx, group_idx].unsqueeze(0).to(torch.long),
-            target_idx=batch.decision_target_idx[step_idx, group_idx].unsqueeze(0).to(torch.long),
+            option_idx=batch.decision_option_idx[step_idx, group_idx].unsqueeze(0),
+            target_idx=batch.decision_target_idx[step_idx, group_idx].unsqueeze(0),
             masks=batch.decision_mask[step_idx, group_idx].unsqueeze(0),
             uses_none=batch.uses_none_head[step_idx, group_idx].unsqueeze(0),
         )[0]

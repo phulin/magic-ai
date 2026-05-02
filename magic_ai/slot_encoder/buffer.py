@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor, nn
 
+from magic_ai.replay_buffer import ReplayCore
+
 if TYPE_CHECKING:
     from magic_ai.actions import ParsedBatch, ParsedStep
     from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
@@ -195,9 +197,9 @@ class NativeTrajectoryBuffer(nn.Module):
 
         player_idx_t = torch.tensor(perspective_player_indices, dtype=torch.long, device=device)
         may_selected_t = torch.tensor(may_selected, dtype=torch.float32, device=device)
-        counts_t = native_batch.decision_count.to(device=device, dtype=torch.long)
+        counts_t = native_batch.decision_count.to(device=device)
         starts_t = self.decision_cursor[env_idx_t]
-        selected_choice_cols_flat = selected_choice_cols_flat.to(device=device, dtype=torch.long)
+        selected_choice_cols_flat = selected_choice_cols_flat.to(device=device)
 
         self.slot_card_rows[env_idx_t, step_idx_t] = native_batch.slot_card_rows.to(device)
         self.slot_occupied[env_idx_t, step_idx_t] = native_batch.slot_occupied.to(device)
@@ -249,7 +251,7 @@ class NativeTrajectoryBuffer(nn.Module):
         self.decision_start[env_idx_t, step_idx_t] = starts_t
         self.decision_count[env_idx_t, step_idx_t] = counts_t
 
-        source_starts_t = native_batch.decision_start.to(device=device, dtype=torch.long)
+        source_starts_t = native_batch.decision_start.to(device=device)
         if total_decisions:
             decision_pos = torch.arange(max_decisions, device=device).expand(
                 len(env_indices), max_decisions
@@ -311,9 +313,6 @@ class RolloutBuffer(nn.Module):
         _reg("slot_occupied", (capacity, zone_slot_count), torch.float32)
         _reg("slot_tapped", (capacity, zone_slot_count), torch.float32)
         _reg("game_info", (capacity, game_info_dim), torch.float32)
-        _reg("trace_kind_id", (capacity,), torch.long)
-        _reg("decision_start", (capacity,), torch.long)
-        _reg("decision_count", (capacity,), torch.long)
         _reg("pending_kind_id", (capacity,), torch.long)
         _reg("option_kind_ids", (capacity, max_options), torch.long)
         _reg("option_scalars", (capacity, max_options, option_scalar_dim), torch.float32)
@@ -351,46 +350,36 @@ class RolloutBuffer(nn.Module):
             (capacity, max_options, max_targets_per_option),
             torch.bool,
         )
-        _reg("may_selected", (capacity,), torch.float32)
-        _reg("old_log_prob", (capacity,), torch.float32)
-        _reg("value", (capacity,), torch.float32)
-        _reg("ppo_return", (capacity,), torch.float32)
-        _reg("ppo_advantage", (capacity,), torch.float32)
-        _reg(
-            "lstm_h_in",
-            (capacity, recurrent_layers, recurrent_hidden_dim),
-            torch.float32,
-        )
-        _reg(
-            "lstm_c_in",
-            (capacity, recurrent_layers, recurrent_hidden_dim),
-            torch.float32,
-        )
         _reg("next_step_idx", (capacity,), torch.long)
         _reg("has_next", (capacity,), torch.float32)
         _reg("next_same_perspective_step_idx", (capacity,), torch.long)
         _reg("has_next_same_perspective", (capacity,), torch.float32)
 
-        _reg(
-            "decision_option_idx",
-            (decision_capacity, max_cached_choices),
-            torch.long,
+        self.core = ReplayCore(
+            capacity=capacity,
+            decision_capacity=decision_capacity,
+            max_decision_groups=max(1, decision_capacity),
+            max_cached_choices=max_cached_choices,
+            device=self.slot_card_rows.device,
+            recurrent_layers=recurrent_layers,
+            recurrent_hidden_dim=recurrent_hidden_dim,
         )
-        _reg(
-            "decision_target_idx",
-            (decision_capacity, max_cached_choices),
-            torch.long,
-        )
-        _reg(
-            "decision_mask",
-            (decision_capacity, max_cached_choices),
-            torch.bool,
-        )
-        _reg("uses_none_head", (decision_capacity,), torch.bool)
-        _reg("selected_indices", (decision_capacity,), torch.long)
-
-        self._step_cursor = 0
-        self._decision_cursor = 0
+        self.trace_kind_id = self.core.trace_kind_id
+        self.may_selected = self.core.may_selected
+        self.old_log_prob = self.core.old_log_prob
+        self.value = self.core.value
+        self.ppo_return = self.core.ppo_return
+        self.ppo_advantage = self.core.ppo_advantage
+        self.perspective_player_idx = self.core.perspective_player_idx
+        self.lstm_h_in = self.core.lstm_h_in
+        self.lstm_c_in = self.core.lstm_c_in
+        self.decision_start = self.core.decision_start
+        self.decision_count = self.core.decision_count
+        self.decision_option_idx = self.core.decision_option_idx
+        self.decision_target_idx = self.core.decision_target_idx
+        self.decision_mask = self.core.decision_mask
+        self.uses_none_head = self.core.uses_none_head
+        self.selected_indices = self.core.selected_indices
 
     # Declared so type checkers see buffer Tensors as Tensors.
     slot_card_rows: Tensor
@@ -416,10 +405,11 @@ class RolloutBuffer(nn.Module):
     may_selected: Tensor
     old_log_prob: Tensor
     value: Tensor
+    perspective_player_idx: Tensor
     ppo_return: Tensor
     ppo_advantage: Tensor
-    lstm_h_in: Tensor
-    lstm_c_in: Tensor
+    lstm_h_in: Tensor | None
+    lstm_c_in: Tensor | None
     next_step_idx: Tensor
     has_next: Tensor
     next_same_perspective_step_idx: Tensor
@@ -435,34 +425,22 @@ class RolloutBuffer(nn.Module):
         return self.slot_card_rows.device
 
     def reset(self) -> None:
-        self._step_cursor = 0
-        self._decision_cursor = 0
+        self.core.reset()
 
     @property
     def active_step_count(self) -> int:
-        return self._step_cursor
+        return self.core.size
 
     def _allocate_step_rows(self, count: int) -> list[int]:
-        if self._step_cursor + count > self.capacity:
+        if self.active_step_count + count > self.capacity:
             raise RuntimeError(
                 f"rollout buffer capacity {self.capacity} exceeded "
                 f"(active={self.active_step_count}, add={count})"
             )
-        start = self._step_cursor
-        self._step_cursor += count
-        return list(range(start, start + count))
+        return self.core.allocate_rows(count)
 
     def _allocate_decision_range(self, count: int) -> int:
-        if count == 0:
-            return 0
-        if self._decision_cursor + count > self.decision_capacity:
-            raise RuntimeError(
-                f"decision buffer capacity {self.decision_capacity} exceeded "
-                f"(active={self._decision_cursor}, add={count})"
-            )
-        start = self._decision_cursor
-        self._decision_cursor += count
-        return start
+        return self.core.allocate_decision_range(count)
 
     def release_steps(self, step_indices: list[int]) -> None:
         return
@@ -474,14 +452,10 @@ class RolloutBuffer(nn.Module):
         returns: Tensor,
         advantages: Tensor,
     ) -> None:
-        idx = replay_rows.to(device=self.device, dtype=torch.long)
-        self.old_log_prob[idx] = old_log_probs.to(device=self.device, dtype=torch.float32)
-        self.ppo_return[idx] = returns.to(device=self.device, dtype=torch.float32)
-        self.ppo_advantage[idx] = advantages.to(device=self.device, dtype=torch.float32)
+        self.core.write_ppo_targets(replay_rows, old_log_probs, returns, advantages)
 
     def gather_ppo_targets(self, replay_rows: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        idx = replay_rows.to(device=self.device, dtype=torch.long)
-        return self.old_log_prob[idx], self.ppo_return[idx], self.ppo_advantage[idx]
+        return self.core.gather_ppo_targets(replay_rows)
 
     def ingest_batch(self, parsed_steps: list[ParsedStep]) -> BufferWrite:
         return self.ingest_batch_legacy(parsed_steps)
@@ -660,7 +634,7 @@ class RolloutBuffer(nn.Module):
 
         device = self.device
         env_idx_t = torch.tensor(env_indices, dtype=torch.long, device=device)
-        step_counts_t = staging.step_count[env_idx_t].to(dtype=torch.long)
+        step_counts_t = staging.step_count[env_idx_t]
         n = int(step_counts_t.sum().item())
         device = self.device
         if n == 0:
@@ -700,8 +674,9 @@ class RolloutBuffer(nn.Module):
         self.may_selected[step_indices] = staging.may_selected[src_env, src_step]
         self.old_log_prob[step_indices] = staging.old_log_prob[src_env, src_step]
         self.value[step_indices] = staging.value[src_env, src_step]
-        self.lstm_h_in[step_indices] = staging.lstm_h_in[src_env, src_step]
-        self.lstm_c_in[step_indices] = staging.lstm_c_in[src_env, src_step]
+        if self.lstm_h_in is not None and self.lstm_c_in is not None:
+            self.lstm_h_in[step_indices] = staging.lstm_h_in[src_env, src_step]
+            self.lstm_c_in[step_indices] = staging.lstm_c_in[src_env, src_step]
 
         step_counts_per_row = step_counts_t[:, None].expand(len(env_indices), max_steps)[
             valid_step_mask
@@ -768,8 +743,8 @@ class RolloutBuffer(nn.Module):
         self.next_same_perspective_step_idx[step_indices] = next_flat_2d[valid_step_mask]
         self.has_next_same_perspective[step_indices] = has_next_same_2d[valid_step_mask]
 
-        decision_counts_t = staging.decision_count[src_env, src_step].to(dtype=torch.long)
-        source_starts_t = staging.decision_start[src_env, src_step].to(dtype=torch.long)
+        decision_counts_t = staging.decision_count[src_env, src_step]
+        source_starts_t = staging.decision_start[src_env, src_step]
         total_decisions = int(decision_counts_t.sum().item())
         if total_decisions:
             decision_base = self._allocate_decision_range(total_decisions)

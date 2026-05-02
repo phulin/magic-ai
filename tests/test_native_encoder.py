@@ -233,6 +233,7 @@ class NativeEncoderTests(unittest.TestCase):
         self.assertTrue(torch.equal(staging.lstm_h_in[0, 0], state_inputs[0][0]))
 
         write = policy.rollout_buffer.ingest_staged_episodes(staging, env_indices)
+        assert policy.rollout_buffer.lstm_h_in is not None
         self.assertTrue(
             torch.equal(policy.rollout_buffer.lstm_h_in[write.step_indices[0]], state_inputs[0][0])
         )
