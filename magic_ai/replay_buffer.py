@@ -9,8 +9,8 @@ from torch import Tensor, nn
 
 
 @dataclass(frozen=True)
-class FlatDecisionBatch:
-    """Per-step decision groups gathered into a flat minibatch layout."""
+class DecisionLayoutBatch:
+    """Per-step decision groups gathered into a flat tensor layout."""
 
     decision_start: Tensor
     decision_count: Tensor
@@ -20,6 +20,9 @@ class FlatDecisionBatch:
     uses_none_head: Tensor
     selected_indices: Tensor
     step_for_group: Tensor
+
+
+FlatDecisionBatch = DecisionLayoutBatch
 
 
 @dataclass(frozen=True)
@@ -519,18 +522,36 @@ class ReplayCore(nn.Module):
         self._decision_cursor += count
         return start
 
-    def gather_decisions(self, rows: Tensor) -> FlatDecisionBatch:
+    def _decision_sources(
+        self,
+        rows: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None]:
         rows = rows.to(device=self.device)
         batch_size = int(rows.numel())
         starts = self.decision_start[rows]
         counts = self.decision_count[rows]
         gathered_starts = torch.cumsum(counts, dim=0) - counts
+        total = int(counts.sum().item())
+        if total == 0:
+            return (
+                starts,
+                counts,
+                gathered_starts,
+                torch.empty(0, dtype=torch.long, device=self.device),
+                None,
+            )
+        step_pos = torch.repeat_interleave(torch.arange(batch_size, device=self.device), counts)
+        group_pos = torch.arange(total, device=self.device) - gathered_starts[step_pos]
+        source = starts[step_pos] + group_pos
+        return starts, counts, gathered_starts, step_pos, source
+
+    def gather_decisions(self, rows: Tensor) -> DecisionLayoutBatch:
+        _starts, counts, gathered_starts, step_pos, source = self._decision_sources(rows)
         index_dtype = (
             self.index_dtype if self.index_dtype in (torch.int32, torch.long) else torch.int32
         )
-        total = int(counts.sum().item())
-        if total == 0:
-            return FlatDecisionBatch(
+        if source is None:
+            return DecisionLayoutBatch(
                 decision_start=gathered_starts,
                 decision_count=counts,
                 decision_option_idx=torch.empty(
@@ -546,11 +567,7 @@ class ReplayCore(nn.Module):
                 selected_indices=torch.empty(0, dtype=index_dtype, device=self.device),
                 step_for_group=torch.empty(0, dtype=torch.long, device=self.device),
             )
-        else:
-            step_pos = torch.repeat_interleave(torch.arange(batch_size, device=self.device), counts)
-            group_pos = torch.arange(total, device=self.device) - gathered_starts[step_pos]
-            source = starts[step_pos] + group_pos
-        return FlatDecisionBatch(
+        return DecisionLayoutBatch(
             decision_start=gathered_starts,
             decision_count=counts,
             decision_option_idx=self.decision_option_idx[source].to(dtype=index_dtype),
@@ -562,16 +579,9 @@ class ReplayCore(nn.Module):
         )
 
     def valid_choice_count(self, rows: Tensor) -> Tensor:
-        rows = rows.to(device=self.device)
-        starts = self.decision_start[rows]
-        counts = self.decision_count[rows]
-        total = int(counts.sum().item())
-        if total == 0:
+        _starts, _counts, _gathered_starts, _step_pos, source = self._decision_sources(rows)
+        if source is None:
             return torch.zeros((), dtype=torch.long, device=self.device)
-        step_pos = torch.repeat_interleave(torch.arange(rows.numel(), device=self.device), counts)
-        group_starts = torch.cumsum(counts, dim=0) - counts
-        group_pos = torch.arange(total, device=self.device) - group_starts[step_pos]
-        source = starts[step_pos] + group_pos
         return self.decision_mask[source].sum()
 
     def _validate_group_shapes(
@@ -596,4 +606,4 @@ class ReplayCore(nn.Module):
             raise ValueError(f"selected_indices must have shape {(count,)}")
 
 
-__all__ = ["FlatDecisionBatch", "ReplayCommonBatch", "ReplayCore"]
+__all__ = ["DecisionLayoutBatch", "FlatDecisionBatch", "ReplayCommonBatch", "ReplayCore"]

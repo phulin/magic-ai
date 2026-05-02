@@ -1150,90 +1150,30 @@ def rnad_trajectory_loss(
     if logp_mu.shape != (t_len,):
         raise ValueError(f"logp_mu must have shape ({t_len},), got {tuple(logp_mu.shape)}")
 
-    device = next(iter(online.parameters())).device
-    perspective = torch.tensor(perspective_player_idx, dtype=torch.long, device=device)
-
-    online_per_choice = getattr(online, "evaluate_replay_batch_per_choice")  # noqa: B009
-    target_per_choice = getattr(target, "evaluate_replay_batch_per_choice")  # noqa: B009
-    reg_cur_per_choice = getattr(reg_cur, "evaluate_replay_batch_per_choice")  # noqa: B009
-    reg_prev_per_choice = getattr(reg_prev, "evaluate_replay_batch_per_choice")  # noqa: B009
-
-    # Issue 2: per-policy LSTM recompute via the fused single-call path.
-    # Each policy re-runs the LSTM scan from h=0 over the episode under its
-    # own parameters; ``recompute_lstm_outputs_for_episodes`` does this in
-    # one fused ``nn.LSTM`` call and returns the top-layer ``h_out`` per
-    # step. The per-choice forward then consumes ``h_out`` directly via
-    # ``hidden_override``, skipping the per-step LSTM cell. Online runs
-    # under grad (full BPTT through the fused cuDNN backward); target /
-    # reg_cur / reg_prev are no-grad. Callers (e.g. ``run_rnad_update``)
-    # may precompute ``*_h_out`` once across the whole rollout batch -- if
-    # provided, we skip recompute here and use them directly.
-    if online_h_out is None:
-        online_h_out = _maybe_recompute_lstm_h_out(online, replay_rows)
-    if online_h_out is not None:
-        lp_online, _, v_online, pc_online = online_per_choice(
-            list(replay_rows), hidden_override=online_h_out
-        )
-    else:
-        online_lstm = _maybe_recompute_lstm(online, replay_rows)
-        lp_online, _, v_online, pc_online = online_per_choice(
-            list(replay_rows), lstm_state_override=online_lstm
+    if (
+        online_h_out is not None
+        or target_h_out is not None
+        or reg_cur_h_out is not None
+        or reg_prev_h_out is not None
+    ):
+        raise ValueError(
+            "precomputed single-episode h_out overrides are no longer supported; "
+            "use rnad_batched_trajectory_loss for fused recurrent recompute"
         )
 
-    with torch.no_grad():
-        if target_h_out is None:
-            target_h_out = _maybe_recompute_lstm_h_out(target, replay_rows)
-        if reg_cur_h_out is None:
-            reg_cur_h_out = _maybe_recompute_lstm_h_out(reg_cur, replay_rows)
-        if reg_prev_h_out is None:
-            reg_prev_h_out = _maybe_recompute_lstm_h_out(reg_prev, replay_rows)
-
-        if target_h_out is not None:
-            _lp_tgt_scalar, _, v_tgt, pc_tgt = target_per_choice(
-                list(replay_rows), hidden_override=target_h_out
-            )
-        else:
-            target_lstm = _maybe_recompute_lstm(target, replay_rows)
-            _lp_tgt_scalar, _, v_tgt, pc_tgt = target_per_choice(
-                list(replay_rows), lstm_state_override=target_lstm
-            )
-
-        if reg_cur_h_out is not None:
-            _, _, _, pc_reg_cur = reg_cur_per_choice(
-                list(replay_rows), hidden_override=reg_cur_h_out
-            )
-        else:
-            reg_cur_lstm = _maybe_recompute_lstm(reg_cur, replay_rows)
-            _, _, _, pc_reg_cur = reg_cur_per_choice(
-                list(replay_rows), lstm_state_override=reg_cur_lstm
-            )
-
-        if reg_prev_h_out is not None:
-            _, _, _, pc_reg_prev = reg_prev_per_choice(
-                list(replay_rows), hidden_override=reg_prev_h_out
-            )
-        else:
-            reg_prev_lstm = _maybe_recompute_lstm(reg_prev, replay_rows)
-            _, _, _, pc_reg_prev = reg_prev_per_choice(
-                list(replay_rows), lstm_state_override=reg_prev_lstm
-            )
-
-    return _trajectory_loss_from_forwards(
-        lp_online=lp_online,
-        v_online=v_online,
-        pc_online=pc_online,
-        lp_tgt_scalar=_lp_tgt_scalar,
-        v_tgt=v_tgt,
-        pc_tgt=pc_tgt,
-        pc_reg_cur=pc_reg_cur,
-        pc_reg_prev=pc_reg_prev,
-        perspective=perspective,
-        winner_idx=winner_idx,
-        logp_mu=logp_mu,
+    return rnad_batched_trajectory_loss(
+        online=online,
+        target=target,
+        reg_cur=reg_cur,
+        reg_prev=reg_prev,
+        episodes_replay_rows=[replay_rows],
+        episodes_perspective=[perspective_player_idx],
+        episodes_winner_idx=[winner_idx],
+        episodes_logp_mu=[logp_mu],
         config=config,
         alpha=alpha,
         compute_v_target_reg_share=compute_v_target_reg_share,
-    )
+    )[0]
 
 
 def _trajectory_loss_from_forwards(

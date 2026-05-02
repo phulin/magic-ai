@@ -704,6 +704,65 @@ class NativeBatchEncoder:
             out["render_plan_overflow"] = buffers.render_plan_overflow[:batch_size]
         return out
 
+    def _finalize_encoded_batch(
+        self,
+        buffers: _BufferSet,
+        *,
+        batch_size: int,
+        decision_rows_written: int,
+        pendings: list[PendingState],
+    ) -> NativeEncodedBatch:
+        batch = self._slice_batch_buffers(buffers, batch_size)
+        trace_kind_id = batch["trace_kind_id"]
+        trace_kinds = list(map(lambda idx: TRACE_KIND_VALUES[int(idx)], trace_kind_id.tolist()))
+        decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
+        decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
+        decision_mask = buffers.decision_mask_u8[:decision_rows_written]
+        uses_none_head = buffers.uses_none_head_u8[:decision_rows_written]
+        if self.validate:
+            _validate_decision_layout(
+                decision_option_idx=decision_option_idx,
+                decision_target_idx=decision_target_idx,
+                decision_mask=decision_mask,
+                uses_none_head=uses_none_head,
+                max_options=self.max_options,
+                max_targets_per_option=self.max_targets_per_option,
+            )
+        return NativeEncodedBatch(
+            trace_kind_id=trace_kind_id,
+            slot_card_rows=batch["slot_card_rows"],
+            slot_occupied=batch["slot_occupied"],
+            slot_tapped=batch["slot_tapped"],
+            game_info=batch["game_info"],
+            pending_kind_id=batch["pending_kind_id"],
+            num_present_options=batch["num_present_options"],
+            option_kind_ids=batch["option_kind_ids"],
+            option_scalars=batch["option_scalars"],
+            option_mask=batch["option_mask"],
+            option_ref_slot_idx=batch["option_ref_slot_idx"],
+            option_ref_card_row=batch["option_ref_card_row"],
+            target_mask=batch["target_mask"],
+            target_type_ids=batch["target_type_ids"],
+            target_scalars=batch["target_scalars"],
+            target_overflow=batch["target_overflow"],
+            target_ref_slot_idx=batch["target_ref_slot_idx"],
+            target_ref_is_player=batch["target_ref_is_player"],
+            target_ref_is_self=batch["target_ref_is_self"],
+            may_mask=batch["may_mask"],
+            decision_start=batch["decision_start"],
+            decision_count=batch["decision_count"],
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            decision_rows_written=decision_rows_written,
+            pendings=pendings,
+            trace_kinds=trace_kinds,
+            render_plan=batch.get("render_plan"),
+            render_plan_lengths=batch.get("render_plan_lengths"),
+            render_plan_overflow=batch.get("render_plan_overflow"),
+        )
+
     def encode_batch(
         self,
         games: list[Any],
@@ -844,55 +903,11 @@ class NativeBatchEncoder:
                     lib.MageFreeString(result.error_message)
             raise NativeEncodingError(message)
         decision_rows_written = int(result.decision_rows_written)
-        batch = self._slice_batch_buffers(buffers, batch_size)
-        trace_kind_id = batch["trace_kind_id"]
-        trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
-        decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
-        decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
-        decision_mask = buffers.decision_mask_u8[:decision_rows_written]
-        uses_none_head = buffers.uses_none_head_u8[:decision_rows_written]
-        if self.validate:
-            _validate_decision_layout(
-                decision_option_idx=decision_option_idx,
-                decision_target_idx=decision_target_idx,
-                decision_mask=decision_mask,
-                uses_none_head=uses_none_head,
-                max_options=self.max_options,
-                max_targets_per_option=self.max_targets_per_option,
-            )
-        return NativeEncodedBatch(
-            trace_kind_id=trace_kind_id,
-            slot_card_rows=batch["slot_card_rows"],
-            slot_occupied=batch["slot_occupied"],
-            slot_tapped=batch["slot_tapped"],
-            game_info=batch["game_info"],
-            pending_kind_id=batch["pending_kind_id"],
-            num_present_options=batch["num_present_options"],
-            option_kind_ids=batch["option_kind_ids"],
-            option_scalars=batch["option_scalars"],
-            option_mask=batch["option_mask"],
-            option_ref_slot_idx=batch["option_ref_slot_idx"],
-            option_ref_card_row=batch["option_ref_card_row"],
-            target_mask=batch["target_mask"],
-            target_type_ids=batch["target_type_ids"],
-            target_scalars=batch["target_scalars"],
-            target_overflow=batch["target_overflow"],
-            target_ref_slot_idx=batch["target_ref_slot_idx"],
-            target_ref_is_player=batch["target_ref_is_player"],
-            target_ref_is_self=batch["target_ref_is_self"],
-            may_mask=batch["may_mask"],
-            decision_start=batch["decision_start"],
-            decision_count=batch["decision_count"],
-            decision_option_idx=decision_option_idx,
-            decision_target_idx=decision_target_idx,
-            decision_mask=decision_mask,
-            uses_none_head=uses_none_head,
+        return self._finalize_encoded_batch(
+            buffers,
+            batch_size=batch_size,
             decision_rows_written=decision_rows_written,
             pendings=pendings,
-            trace_kinds=trace_kinds,
-            render_plan=batch.get("render_plan"),
-            render_plan_lengths=batch.get("render_plan_lengths"),
-            render_plan_overflow=batch.get("render_plan_overflow"),
         )
 
     def _encode_batch_cffi(
@@ -918,6 +933,40 @@ class NativeBatchEncoder:
         scratch.perspectives_np[:batch_size] = perspective_player_indices
         handles_t = scratch.handles_t[:batch_size]
         perspectives_t = scratch.perspectives_t[:batch_size]
+
+        ctypes_lib = self._ctypes_lib
+        if ctypes_lib is not None:
+            # Reuse the cached ctypes structs (pointers into scratch are
+            # stable across calls until scratch is reallocated). Per-call
+            # work is just updating n / decision_capacity. Keep this branch
+            # before cffi struct construction so the GIL-releasing hot path
+            # does not pay for unused ffi.new/ffi.cast work.
+            req_c = scratch.req_c
+            cfg_c = scratch.cfg_c
+            out_c = scratch.out_c
+            assert req_c is not None and cfg_c is not None and out_c is not None
+            req_c.n = batch_size
+            cfg_c.decision_capacity = decision_capacity
+            result_c = ctypes_lib.MageEncodeBatch(
+                ctypes.byref(req_c), ctypes.byref(cfg_c), ctypes.byref(out_c)
+            )
+            if result_c.error_code != 0:
+                message = "native encoder failed"
+                if result_c.error_message:
+                    try:
+                        raw = ctypes.cast(result_c.error_message, ctypes.c_char_p).value
+                        if raw is not None:
+                            message = raw.decode("utf-8")
+                    finally:
+                        ctypes_lib.MageFreeString(result_c.error_message)
+                raise NativeEncodingError(message)
+            return self._finalize_encoded_batch(
+                buffers,
+                batch_size=batch_size,
+                decision_rows_written=int(result_c.decision_rows_written),
+                pendings=pendings,
+            )
+
         req = ffi.new(
             "MageBatchRequest *",
             {
@@ -985,89 +1034,18 @@ class NativeBatchEncoder:
                 "int64_t *", buffers.render_plan_overflow.data_ptr()
             )
         out = ffi.new("MageEncodeOutputs *", out_fields)
-        ctypes_lib = self._ctypes_lib
-        if ctypes_lib is not None:
-            # Reuse the cached ctypes structs (pointers into scratch are
-            # stable across calls until scratch is reallocated). Per-call
-            # work is just updating n / decision_capacity.
-            req_c = scratch.req_c
-            cfg_c = scratch.cfg_c
-            out_c = scratch.out_c
-            assert req_c is not None and cfg_c is not None and out_c is not None
-            req_c.n = batch_size
-            cfg_c.decision_capacity = decision_capacity
-            result_c = ctypes_lib.MageEncodeBatch(
-                ctypes.byref(req_c), ctypes.byref(cfg_c), ctypes.byref(out_c)
-            )
-            if result_c.error_code != 0:
-                message = "native encoder failed"
-                if result_c.error_message:
-                    try:
-                        raw = ctypes.cast(result_c.error_message, ctypes.c_char_p).value
-                        if raw is not None:
-                            message = raw.decode("utf-8")
-                    finally:
-                        ctypes_lib.MageFreeString(result_c.error_message)
-                raise NativeEncodingError(message)
-            decision_rows_written = int(result_c.decision_rows_written)
-        else:
-            result = lib.MageEncodeBatch(req, cfg, out)
-            if result.error_code != 0:
-                message = "native encoder failed"
-                if result.error_message != ffi.NULL:
-                    try:
-                        message = ffi.string(result.error_message).decode("utf-8")
-                    finally:
-                        lib.MageFreeString(result.error_message)
-                raise NativeEncodingError(message)
-            decision_rows_written = int(result.decision_rows_written)
-        batch = self._slice_batch_buffers(buffers, batch_size)
-        trace_kind_id = batch["trace_kind_id"]
-        trace_kinds = [TRACE_KIND_VALUES[int(idx)] for idx in trace_kind_id.tolist()]
-        decision_option_idx = buffers.decision_option_idx[:decision_rows_written]
-        decision_target_idx = buffers.decision_target_idx[:decision_rows_written]
-        decision_mask = buffers.decision_mask_u8[:decision_rows_written]
-        uses_none_head = buffers.uses_none_head_u8[:decision_rows_written]
-        if self.validate:
-            _validate_decision_layout(
-                decision_option_idx=decision_option_idx,
-                decision_target_idx=decision_target_idx,
-                decision_mask=decision_mask,
-                uses_none_head=uses_none_head,
-                max_options=self.max_options,
-                max_targets_per_option=self.max_targets_per_option,
-            )
-        return NativeEncodedBatch(
-            trace_kind_id=trace_kind_id,
-            slot_card_rows=batch["slot_card_rows"],
-            slot_occupied=batch["slot_occupied"],
-            slot_tapped=batch["slot_tapped"],
-            game_info=batch["game_info"],
-            pending_kind_id=batch["pending_kind_id"],
-            num_present_options=batch["num_present_options"],
-            option_kind_ids=batch["option_kind_ids"],
-            option_scalars=batch["option_scalars"],
-            option_mask=batch["option_mask"],
-            option_ref_slot_idx=batch["option_ref_slot_idx"],
-            option_ref_card_row=batch["option_ref_card_row"],
-            target_mask=batch["target_mask"],
-            target_type_ids=batch["target_type_ids"],
-            target_scalars=batch["target_scalars"],
-            target_overflow=batch["target_overflow"],
-            target_ref_slot_idx=batch["target_ref_slot_idx"],
-            target_ref_is_player=batch["target_ref_is_player"],
-            target_ref_is_self=batch["target_ref_is_self"],
-            may_mask=batch["may_mask"],
-            decision_start=batch["decision_start"],
-            decision_count=batch["decision_count"],
-            decision_option_idx=decision_option_idx,
-            decision_target_idx=decision_target_idx,
-            decision_mask=decision_mask,
-            uses_none_head=uses_none_head,
-            decision_rows_written=decision_rows_written,
+        result = lib.MageEncodeBatch(req, cfg, out)
+        if result.error_code != 0:
+            message = "native encoder failed"
+            if result.error_message != ffi.NULL:
+                try:
+                    message = ffi.string(result.error_message).decode("utf-8")
+                finally:
+                    lib.MageFreeString(result.error_message)
+            raise NativeEncodingError(message)
+        return self._finalize_encoded_batch(
+            buffers,
+            batch_size=batch_size,
+            decision_rows_written=int(result.decision_rows_written),
             pendings=pendings,
-            trace_kinds=trace_kinds,
-            render_plan=batch.get("render_plan"),
-            render_plan_lengths=batch.get("render_plan_lengths"),
-            render_plan_overflow=batch.get("render_plan_overflow"),
         )
