@@ -92,7 +92,6 @@ def _assert_replay_batch_close(
     expected,
 ) -> None:
     torch.testing.assert_close(actual.encoded.token_ids, expected.encoded.token_ids)
-    torch.testing.assert_close(actual.encoded.seq_id, expected.encoded.seq_id)
     torch.testing.assert_close(actual.encoded.pos_in_seq, expected.encoded.pos_in_seq)
     torch.testing.assert_close(actual.encoded.cu_seqlens, expected.encoded.cu_seqlens)
     torch.testing.assert_close(actual.encoded.seq_lengths, expected.encoded.seq_lengths)

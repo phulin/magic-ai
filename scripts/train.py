@@ -746,6 +746,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         lstm_proj_hidden=recurrent_cfg.lstm_hidden,
         device=device,
         validate=not getattr(args, "no_validate", False),
+        materialize_gather_seq_id=device.type != "cuda",
     )
     policy.rollout_buffer = replay_buffer
     batch_workers = max(1, getattr(args, "batch_workers", 1))

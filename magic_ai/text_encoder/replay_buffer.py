@@ -17,8 +17,10 @@ from magic_ai.text_encoder.batch import (
 )
 from magic_ai.text_encoder.replay_triton import (
     append_batch_encoded_triton,
+    gather_decisions_triton,
     gather_encoded_triton,
     gather_sequence_layout_triton,
+    gather_text_fields_triton,
 )
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -63,6 +65,7 @@ class TextReplayBuffer:
         validate: bool = True,
         use_triton_append: bool = True,
         use_triton_gather: bool = True,
+        materialize_gather_seq_id: bool | None = None,
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be at least 1")
@@ -97,6 +100,11 @@ class TextReplayBuffer:
         self.validate = bool(validate)
         self.use_triton_append = bool(use_triton_append)
         self.use_triton_gather = bool(use_triton_gather)
+        self.materialize_gather_seq_id = (
+            self.device.type != "cuda"
+            if materialize_gather_seq_id is None
+            else bool(materialize_gather_seq_id)
+        )
 
         # Storage dtypes are sized to the value ranges they hold, then cast to
         # int64 at the few consumption sites that actually require Long
@@ -462,6 +470,7 @@ class TextReplayBuffer:
                 cu_seqlens=cu_seqlens,
                 packed_token_ids=self.packed_token_ids,
                 row_token_start=self.row_token_start,
+                include_seq_id=self.materialize_gather_seq_id,
             )
 
         if gathered_encoded is None:
@@ -470,36 +479,91 @@ class TextReplayBuffer:
             token_starts = self.row_token_start[idx]
             token_offsets = token_starts[seq_id] + pos_in_seq
             token_ids = self.packed_token_ids[token_offsets]
-
-            card_ref_positions = add_packed_offsets(self.card_ref_positions[idx], state_positions)
-            option_positions = add_packed_offsets(self.option_positions[idx], state_positions)
-            option_mask = self.option_mask[idx]
-            target_positions = add_packed_offsets(self.target_positions[idx], state_positions)
-            target_mask = self.target_mask[idx]
         else:
             token_ids, seq_id, pos_in_seq = gathered_encoded
+
+        gathered_fields = None
+        if self.use_triton_gather:
+            gathered_fields = gather_text_fields_triton(
+                rows=idx,
+                state_positions=state_positions,
+                card_ref_positions=self.card_ref_positions,
+                option_positions=self.option_positions,
+                option_mask=self.option_mask,
+                target_positions=self.target_positions,
+                target_mask=self.target_mask,
+                trace_kind_id=self.trace_kind_id,
+                may_selected=self.may_selected,
+                old_log_prob=self.old_log_prob,
+                value=self.value,
+                perspective_player_idx=self.perspective_player_idx,
+                lstm_h_in=self.lstm_h_in,
+                lstm_c_in=self.lstm_c_in,
+            )
+        if gathered_fields is None:
             card_ref_positions = add_packed_offsets(self.card_ref_positions[idx], state_positions)
             option_positions = add_packed_offsets(self.option_positions[idx], state_positions)
             option_mask = self.option_mask[idx]
             target_positions = add_packed_offsets(self.target_positions[idx], state_positions)
             target_mask = self.target_mask[idx]
-        decision_batch = self.core.gather_decisions(idx)
-        common = self.core.gather_common(idx)
-        trace_kind_id = common.trace_kind_id
-        decision_start = decision_batch.decision_start
-        decision_count = decision_batch.decision_count
-        decision_option_idx = decision_batch.decision_option_idx
-        decision_target_idx = decision_batch.decision_target_idx
-        decision_mask = decision_batch.decision_mask
-        uses_none_head = decision_batch.uses_none_head
-        selected_indices = decision_batch.selected_indices
-        step_for_decision_group = decision_batch.step_for_group
-        may_selected = common.may_selected
-        old_log_prob = common.old_log_prob
-        value = common.value
-        perspective_player_idx = common.perspective_player_idx
-        h_in = common.lstm_h_in
-        c_in = common.lstm_c_in
+            common = self.core.gather_common(idx)
+            trace_kind_id = common.trace_kind_id
+            may_selected = common.may_selected
+            old_log_prob = common.old_log_prob
+            value = common.value
+            perspective_player_idx = common.perspective_player_idx
+            h_in = common.lstm_h_in
+            c_in = common.lstm_c_in
+        else:
+            (
+                card_ref_positions,
+                option_positions,
+                option_mask,
+                target_positions,
+                target_mask,
+                trace_kind_id,
+                may_selected,
+                old_log_prob,
+                value,
+                perspective_player_idx,
+                h_in,
+                c_in,
+            ) = gathered_fields
+
+        gathered_decisions = None
+        if self.use_triton_gather:
+            gathered_decisions = gather_decisions_triton(
+                rows=idx,
+                decision_start=self.decision_start,
+                decision_count=self.decision_count,
+                decision_option_idx=self.decision_option_idx,
+                decision_target_idx=self.decision_target_idx,
+                decision_mask=self.decision_mask,
+                uses_none_head=self.uses_none_head,
+                selected_indices=self.selected_indices,
+                max_decision_groups=self.max_decision_groups,
+            )
+        if gathered_decisions is None:
+            decision_batch = self.core.gather_decisions(idx)
+            decision_start = decision_batch.decision_start
+            decision_count = decision_batch.decision_count
+            decision_option_idx = decision_batch.decision_option_idx
+            decision_target_idx = decision_batch.decision_target_idx
+            decision_mask = decision_batch.decision_mask
+            uses_none_head = decision_batch.uses_none_head
+            selected_indices = decision_batch.selected_indices
+            step_for_decision_group = decision_batch.step_for_group
+        else:
+            (
+                decision_start,
+                decision_count,
+                decision_option_idx,
+                decision_target_idx,
+                decision_mask,
+                uses_none_head,
+                selected_indices,
+                step_for_decision_group,
+            ) = gathered_decisions
         encoded = PackedTextBatch(
             token_ids=token_ids,
             seq_id=seq_id,

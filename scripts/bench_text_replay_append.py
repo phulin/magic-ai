@@ -191,6 +191,7 @@ def _run_gather(
         validate=False,
         use_triton_append=True,
         use_triton_gather=use_triton,
+        materialize_gather_seq_id=device.type != "cuda",
     )
     rows = buffer.append_batch(encoded=encoded, **meta)
     _sync(device)
