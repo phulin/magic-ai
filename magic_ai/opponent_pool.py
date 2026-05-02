@@ -379,11 +379,15 @@ def run_eval_matches(
 
     saved_main_h: torch.Tensor | None = None
     saved_main_c: torch.Tensor | None = None
+    saved_main_num_envs: int = 0
+    saved_main_players_per_env: int = 2
     main_uses_lstm = bool(getattr(main_policy, "use_lstm", True))
     opp_uses_lstm = bool(getattr(opponent_policy, "use_lstm", True))
     if main_uses_lstm:
         saved_main_h = main_policy.live_lstm_h.clone()
         saved_main_c = main_policy.live_lstm_c.clone()
+        saved_main_num_envs = int(getattr(main_policy, "_num_envs", 0))
+        saved_main_players_per_env = int(getattr(main_policy, "_players_per_env", 2))
         main_policy.init_lstm_env_states(num_envs)
     if opp_uses_lstm:
         opponent_policy.init_lstm_env_states(num_envs)
@@ -564,6 +568,8 @@ def run_eval_matches(
     if saved_main_h is not None and saved_main_c is not None:
         main_policy.live_lstm_h = saved_main_h
         main_policy.live_lstm_c = saved_main_c
+        main_policy._num_envs = saved_main_num_envs
+        main_policy._players_per_env = saved_main_players_per_env
 
     outcomes.sort(key=lambda t: t[0])
     for _, opp_entry, main_won in outcomes:
