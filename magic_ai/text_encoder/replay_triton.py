@@ -1319,6 +1319,7 @@ def gather_decisions_triton(
     counts = decision_count[rows]
     gathered_starts = torch.cumsum(counts, dim=0) - counts
     total = gathered_starts[-1] + counts[-1]
+    total_int = int(total.item())
     max_cached_choices = int(decision_option_idx.shape[1])
     max_groups = batch_size * max_decision_groups
     out_index_dtype = (
@@ -1327,14 +1328,14 @@ def gather_decisions_triton(
         else torch.int32
     )
     decision_option_idx_out = torch.empty(
-        (max_groups, max_cached_choices), dtype=decision_option_idx.dtype, device=rows.device
+        (max_groups, max_cached_choices), dtype=out_index_dtype, device=rows.device
     )
     decision_target_idx_out = torch.empty_like(decision_option_idx_out)
     decision_mask_out = torch.empty(
         (max_groups, max_cached_choices), dtype=decision_mask.dtype, device=rows.device
     )
     uses_none_head_out = torch.empty(max_groups, dtype=uses_none_head.dtype, device=rows.device)
-    selected_indices_out = torch.empty(max_groups, dtype=selected_indices.dtype, device=rows.device)
+    selected_indices_out = torch.empty(max_groups, dtype=out_index_dtype, device=rows.device)
     step_for_group_out = torch.empty(max_groups, dtype=torch.long, device=rows.device)
 
     total_group = batch_size * max_decision_groups
@@ -1370,12 +1371,12 @@ def gather_decisions_triton(
     return (
         gathered_starts,
         counts,
-        decision_option_idx_out[:total].to(dtype=out_index_dtype),
-        decision_target_idx_out[:total].to(dtype=out_index_dtype),
-        decision_mask_out[:total],
-        uses_none_head_out[:total],
-        selected_indices_out[:total].to(dtype=out_index_dtype),
-        step_for_group_out[:total],
+        decision_option_idx_out[:total_int],
+        decision_target_idx_out[:total_int],
+        decision_mask_out[:total_int],
+        uses_none_head_out[:total_int],
+        selected_indices_out[:total_int],
+        step_for_group_out[:total_int],
     )
 
 
