@@ -9,8 +9,8 @@ from torch import Tensor, nn
 
 
 @dataclass(frozen=True)
-class DenseDecisionBatch:
-    """Per-step decision groups gathered into a dense minibatch layout."""
+class FlatDecisionBatch:
+    """Per-step decision groups gathered into a flat minibatch layout."""
 
     decision_start: Tensor
     decision_count: Tensor
@@ -19,6 +19,7 @@ class DenseDecisionBatch:
     decision_mask: Tensor
     uses_none_head: Tensor
     selected_indices: Tensor
+    step_for_group: Tensor
 
 
 @dataclass(frozen=True)
@@ -518,43 +519,46 @@ class ReplayCore(nn.Module):
         self._decision_cursor += count
         return start
 
-    def gather_dense_decisions(self, rows: Tensor) -> DenseDecisionBatch:
+    def gather_decisions(self, rows: Tensor) -> FlatDecisionBatch:
         rows = rows.to(device=self.device)
         batch_size = int(rows.numel())
-        dense_shape = (batch_size, self.max_decision_groups, self.max_cached_choices)
-        option_idx = torch.full(dense_shape, -1, dtype=self.index_dtype, device=self.device)
-        target_idx = torch.full_like(option_idx, -1)
-        mask = torch.zeros(dense_shape, dtype=torch.bool, device=self.device)
-        uses_none = torch.zeros(
-            (batch_size, self.max_decision_groups), dtype=torch.bool, device=self.device
-        )
-        selected = torch.full(
-            (batch_size, self.max_decision_groups),
-            -1,
-            dtype=self.index_dtype,
-            device=self.device,
-        )
         starts = self.decision_start[rows]
         counts = self.decision_count[rows]
+        gathered_starts = torch.cumsum(counts, dim=0) - counts
+        index_dtype = (
+            self.index_dtype if self.index_dtype in (torch.int32, torch.long) else torch.int32
+        )
         total = int(counts.sum().item())
-        if total:
+        if total == 0:
+            return FlatDecisionBatch(
+                decision_start=gathered_starts,
+                decision_count=counts,
+                decision_option_idx=torch.empty(
+                    (0, self.max_cached_choices), dtype=index_dtype, device=self.device
+                ),
+                decision_target_idx=torch.empty(
+                    (0, self.max_cached_choices), dtype=index_dtype, device=self.device
+                ),
+                decision_mask=torch.empty(
+                    (0, self.max_cached_choices), dtype=torch.bool, device=self.device
+                ),
+                uses_none_head=torch.empty(0, dtype=torch.bool, device=self.device),
+                selected_indices=torch.empty(0, dtype=index_dtype, device=self.device),
+                step_for_group=torch.empty(0, dtype=torch.long, device=self.device),
+            )
+        else:
             step_pos = torch.repeat_interleave(torch.arange(batch_size, device=self.device), counts)
-            group_starts = torch.cumsum(counts, dim=0) - counts
-            group_pos = torch.arange(total, device=self.device) - group_starts[step_pos]
+            group_pos = torch.arange(total, device=self.device) - gathered_starts[step_pos]
             source = starts[step_pos] + group_pos
-            option_idx[step_pos, group_pos] = self.decision_option_idx[source]
-            target_idx[step_pos, group_pos] = self.decision_target_idx[source]
-            mask[step_pos, group_pos] = self.decision_mask[source]
-            uses_none[step_pos, group_pos] = self.uses_none_head[source]
-            selected[step_pos, group_pos] = self.selected_indices[source]
-        return DenseDecisionBatch(
-            decision_start=starts,
+        return FlatDecisionBatch(
+            decision_start=gathered_starts,
             decision_count=counts,
-            decision_option_idx=option_idx,
-            decision_target_idx=target_idx,
-            decision_mask=mask,
-            uses_none_head=uses_none,
-            selected_indices=selected,
+            decision_option_idx=self.decision_option_idx[source].to(dtype=index_dtype),
+            decision_target_idx=self.decision_target_idx[source].to(dtype=index_dtype),
+            decision_mask=self.decision_mask[source],
+            uses_none_head=self.uses_none_head[source],
+            selected_indices=self.selected_indices[source].to(dtype=index_dtype),
+            step_for_group=step_pos,
         )
 
     def valid_choice_count(self, rows: Tensor) -> Tensor:
@@ -592,4 +596,4 @@ class ReplayCore(nn.Module):
             raise ValueError(f"selected_indices must have shape {(count,)}")
 
 
-__all__ = ["DenseDecisionBatch", "ReplayCommonBatch", "ReplayCore"]
+__all__ = ["FlatDecisionBatch", "ReplayCommonBatch", "ReplayCore"]

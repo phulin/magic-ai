@@ -165,10 +165,9 @@ class TextActorCritic(nn.Module):
     ) -> tuple[int, int]:
         """Compute R-NaD ``(cl_count, pl_count)`` totals from text replay rows.
 
-        TextReplayBuffer stores decisions as ``(capacity, max_decision_groups,
-        max_cached_choices)`` per step (no flat ``decision_start`` table), so
-        the per-choice count is just the active-cell sum of ``decision_mask``
-        over the selected rows.
+        TextReplayBuffer stores decision groups in ReplayCore's flat decision
+        arena, so the per-choice count is just the active-cell sum over the
+        selected rows' decision masks.
         """
 
         if not per_episode_replay_rows:
@@ -183,7 +182,7 @@ class TextActorCritic(nn.Module):
         cl_count_total = int(step_indices.numel())
         trace_kind = rb.trace_kind_id[step_indices]
         may_count_total = int((trace_kind == TRACE_KIND_TO_ID["may"]).sum().item())
-        flat_count_total = int(rb.decisions.valid_choice_count(step_indices).item())
+        flat_count_total = int(rb.core.valid_choice_count(step_indices).item())
         return cl_count_total, may_count_total + flat_count_total
 
     def init_lstm_env_states(self, num_envs: int, *, players_per_env: int = 2) -> None:
@@ -1140,18 +1139,12 @@ class TextActorCritic(nn.Module):
                 ),
             )
 
-        # Flatten (step, group) pairs in step-major / group-ascending order.
-        # ``decision_group_id`` is the position in this flat list, so ordering
-        # has to match what the per-choice consumers in ``rnad`` expect.
-        steps_t = torch.arange(n, device=device).repeat_interleave(decision_count)
-        group_starts = torch.cumsum(decision_count, dim=0) - decision_count
-        groups_t = torch.arange(g_total, device=device) - group_starts[steps_t]
-
-        flat_option_idx = batch.decision_option_idx[steps_t, groups_t]
-        flat_target_idx = batch.decision_target_idx[steps_t, groups_t]
-        flat_masks = batch.decision_mask[steps_t, groups_t]
-        flat_uses_none = batch.uses_none_head[steps_t, groups_t]
-        flat_selected = batch.selected_indices[steps_t, groups_t]
+        steps_t = batch.step_for_decision_group
+        flat_option_idx = batch.decision_option_idx
+        flat_target_idx = batch.decision_target_idx
+        flat_masks = batch.decision_mask
+        flat_uses_none = batch.uses_none_head
+        flat_selected = batch.selected_indices
 
         if not bool(flat_masks.any(dim=-1).all()):
             raise ValueError("decision group must include at least one valid choice")
@@ -1271,24 +1264,6 @@ class TextActorCritic(nn.Module):
             option_logits=output.policy_logits,
             target_logits=output.target_logits,
         )
-
-    def _direct_decision_logits(
-        self,
-        forward: ReplayScoringForward,
-        *,
-        step_idx: int,
-        group_idx: int,
-        batch: TextReplayBatch,
-    ) -> Tensor:
-        device = forward.values.device
-        return direct_decision_logits_from_forward(
-            forward,
-            step_positions=torch.tensor([step_idx], dtype=torch.long, device=device),
-            option_idx=batch.decision_option_idx[step_idx, group_idx].unsqueeze(0),
-            target_idx=batch.decision_target_idx[step_idx, group_idx].unsqueeze(0),
-            masks=batch.decision_mask[step_idx, group_idx].unsqueeze(0),
-            uses_none=batch.uses_none_head[step_idx, group_idx].unsqueeze(0),
-        )[0]
 
     def _direct_live_decision_logits(
         self,

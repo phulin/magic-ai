@@ -75,22 +75,25 @@ class ReplayCoreTests(unittest.TestCase):
         )
 
         self.assertEqual(int(core.decision_count[row]), 2)
-        gathered = core.gather_dense_decisions(torch.tensor([row]))
+        gathered = core.gather_decisions(torch.tensor([row]))
+        torch.testing.assert_close(gathered.decision_start, torch.tensor([0]))
+        torch.testing.assert_close(gathered.decision_count, torch.tensor([2]))
+        torch.testing.assert_close(gathered.step_for_group, torch.tensor([0, 0]))
         torch.testing.assert_close(
-            gathered.decision_option_idx[0],
-            torch.tensor([[0, 1, -1], [2, -1, -1]], dtype=torch.int16),
+            gathered.decision_option_idx,
+            torch.tensor([[0, 1, -1], [2, -1, -1]], dtype=torch.int32),
         )
         torch.testing.assert_close(
-            gathered.decision_target_idx[0],
-            torch.tensor([[-1, 0, -1], [1, -1, -1]], dtype=torch.int16),
+            gathered.decision_target_idx,
+            torch.tensor([[-1, 0, -1], [1, -1, -1]], dtype=torch.int32),
         )
         torch.testing.assert_close(
-            gathered.decision_mask[0],
+            gathered.decision_mask,
             torch.tensor([[True, True, False], [True, False, False]]),
         )
-        torch.testing.assert_close(gathered.uses_none_head[0], torch.tensor([False, True]))
+        torch.testing.assert_close(gathered.uses_none_head, torch.tensor([False, True]))
         torch.testing.assert_close(
-            gathered.selected_indices[0], torch.tensor([1, 0], dtype=torch.int16)
+            gathered.selected_indices, torch.tensor([1, 0], dtype=torch.int32)
         )
         self.assertEqual(int(core.valid_choice_count(torch.tensor([row])).item()), 3)
 
@@ -113,10 +116,11 @@ class ReplayCoreTests(unittest.TestCase):
         )
 
         torch.testing.assert_close(core.decision_count[rows], torch.tensor([2]))
-        gathered = core.gather_dense_decisions(rows)
+        gathered = core.gather_decisions(rows)
         self.assertEqual(int(gathered.decision_count[0]), 2)
+        torch.testing.assert_close(gathered.step_for_group, torch.tensor([0, 0]))
         torch.testing.assert_close(
-            gathered.decision_option_idx[0],
+            gathered.decision_option_idx,
             torch.tensor([[0, -1], [1, -1]]),
         )
 

@@ -21,12 +21,14 @@ from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 class TextReplayBatch:
     encoded: PackedTextBatch
     trace_kind_id: Tensor
+    decision_start: Tensor
+    decision_count: Tensor
     decision_option_idx: Tensor
     decision_target_idx: Tensor
     decision_mask: Tensor
     uses_none_head: Tensor
-    decision_count: Tensor
     selected_indices: Tensor
+    step_for_decision_group: Tensor
     may_selected: Tensor
     old_log_prob: Tensor
     value: Tensor
@@ -148,7 +150,6 @@ class TextReplayBuffer:
             trace_dtype=torch.int8,
             perspective_dtype=torch.int8,
         )
-        self.decisions = self.core
         self.trace_kind_id = self.core.trace_kind_id
         self.may_selected = self.core.may_selected
         self.old_log_prob = self.core.old_log_prob
@@ -494,15 +495,17 @@ class TextReplayBuffer:
             option_mask = self.option_mask[idx]
             target_positions = pack_positions(self.target_positions[idx], (batch_size, 1, 1))
             target_mask = self.target_mask[idx]
-        decision_batch = self.core.gather_dense_decisions(idx)
+        decision_batch = self.core.gather_decisions(idx)
         common = self.core.gather_common(idx)
         trace_kind_id = common.trace_kind_id
+        decision_start = decision_batch.decision_start
+        decision_count = decision_batch.decision_count
         decision_option_idx = decision_batch.decision_option_idx
         decision_target_idx = decision_batch.decision_target_idx
         decision_mask = decision_batch.decision_mask
         uses_none_head = decision_batch.uses_none_head
-        decision_count = decision_batch.decision_count
         selected_indices = decision_batch.selected_indices
+        step_for_decision_group = decision_batch.step_for_group
         may_selected = common.may_selected
         old_log_prob = common.old_log_prob
         value = common.value
@@ -525,12 +528,14 @@ class TextReplayBuffer:
         return TextReplayBatch(
             encoded=encoded,
             trace_kind_id=trace_kind_id,
+            decision_start=decision_start,
+            decision_count=decision_count,
             decision_option_idx=decision_option_idx,
             decision_target_idx=decision_target_idx,
             decision_mask=decision_mask,
             uses_none_head=uses_none_head,
-            decision_count=decision_count,
             selected_indices=selected_indices,
+            step_for_decision_group=step_for_decision_group,
             may_selected=may_selected,
             old_log_prob=old_log_prob,
             value=value,

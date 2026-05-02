@@ -105,12 +105,14 @@ def _assert_replay_batch_close(
     torch.testing.assert_close(actual.encoded.target_positions, expected.encoded.target_positions)
     torch.testing.assert_close(actual.encoded.target_mask, expected.encoded.target_mask)
     torch.testing.assert_close(actual.trace_kind_id, expected.trace_kind_id)
+    torch.testing.assert_close(actual.decision_start, expected.decision_start)
+    torch.testing.assert_close(actual.decision_count, expected.decision_count)
     torch.testing.assert_close(actual.decision_option_idx, expected.decision_option_idx)
     torch.testing.assert_close(actual.decision_target_idx, expected.decision_target_idx)
     torch.testing.assert_close(actual.decision_mask, expected.decision_mask)
     torch.testing.assert_close(actual.uses_none_head, expected.uses_none_head)
-    torch.testing.assert_close(actual.decision_count, expected.decision_count)
     torch.testing.assert_close(actual.selected_indices, expected.selected_indices)
+    torch.testing.assert_close(actual.step_for_decision_group, expected.step_for_decision_group)
     torch.testing.assert_close(actual.may_selected, expected.may_selected)
     torch.testing.assert_close(actual.old_log_prob, expected.old_log_prob)
     torch.testing.assert_close(actual.value, expected.value)
@@ -169,16 +171,14 @@ class TextReplayBufferTests(unittest.TestCase):
             check_dtype=False,
         )
         torch.testing.assert_close(
-            gathered.decision_option_idx[0, :2], decision_option_idx, check_dtype=False
+            gathered.decision_option_idx, decision_option_idx, check_dtype=False
         )
         torch.testing.assert_close(
-            gathered.decision_target_idx[0, :2], decision_target_idx, check_dtype=False
+            gathered.decision_target_idx, decision_target_idx, check_dtype=False
         )
-        torch.testing.assert_close(gathered.decision_mask[0, :2], decision_mask)
-        torch.testing.assert_close(gathered.uses_none_head[0, :2], uses_none_head)
-        torch.testing.assert_close(
-            gathered.selected_indices[0, :2], selected_indices, check_dtype=False
-        )
+        torch.testing.assert_close(gathered.decision_mask, decision_mask)
+        torch.testing.assert_close(gathered.uses_none_head, uses_none_head)
+        torch.testing.assert_close(gathered.selected_indices, selected_indices, check_dtype=False)
         self.assertEqual(int(gathered.trace_kind_id[0]), 3)
         self.assertEqual(int(gathered.decision_count[0]), 2)
         self.assertAlmostEqual(float(gathered.old_log_prob[0]), -1.25)
@@ -243,7 +243,7 @@ class TextReplayBufferTests(unittest.TestCase):
             encoded.target_positions[0],
             check_dtype=False,
         )
-        torch.testing.assert_close(gathered.decision_mask[0, :1], decision_mask)
+        torch.testing.assert_close(gathered.decision_mask, decision_mask)
         self.assertEqual(int(gathered.decision_count[0]), 1)
         self.assertAlmostEqual(float(gathered.old_log_prob[0]), -1.25)
 
@@ -366,7 +366,7 @@ class TextReplayBufferTests(unittest.TestCase):
             gathered.decision_count, torch.tensor([1, 1, 1]), check_dtype=False
         )
         torch.testing.assert_close(
-            gathered.decision_option_idx[:, 0],
+            gathered.decision_option_idx,
             torch.tensor([[2, 3, -1, -1], [0, -1, -1, -1], [0, 1, -1, -1]]),
             check_dtype=False,
         )
