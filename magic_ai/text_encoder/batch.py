@@ -86,6 +86,47 @@ class PackedTextBatch:
     target_mask: Tensor  # [B, max_opts, max_targets] bool
 
 
+def packed_sequence_layout(seq_lengths: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Build packed sequence offsets and token coordinates from row lengths."""
+
+    seq_lens = seq_lengths.to(torch.int32)
+    if seq_lens.dim() != 1:
+        raise ValueError("seq_lengths must be 1-D")
+    batch_size = int(seq_lens.numel())
+    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=seq_lens.device)
+    cu_seqlens[1:] = seq_lens.cumsum(0)
+    total_tokens = int(cu_seqlens[-1].item())
+    state_positions = cu_seqlens[:-1]
+    seq_id = torch.repeat_interleave(
+        torch.arange(batch_size, dtype=torch.int32, device=seq_lens.device),
+        seq_lens,
+    )
+    pos_in_seq = torch.arange(total_tokens, dtype=torch.int32, device=seq_lens.device) - (
+        state_positions.repeat_interleave(seq_lens)
+    )
+    return cu_seqlens, state_positions, seq_id, pos_in_seq
+
+
+def add_packed_offsets(pos: Tensor, state_positions: Tensor) -> Tensor:
+    """Shift per-row positions into packed coordinates, preserving -1 sentinels."""
+
+    pos_i32 = pos.to(torch.int32)
+    valid = pos_i32 >= 0
+    view_shape = (int(state_positions.shape[0]),) + (1,) * (pos_i32.dim() - 1)
+    shifted = pos_i32 + state_positions.to(torch.int32).view(view_shape)
+    return torch.where(valid, shifted, pos_i32)
+
+
+def subtract_packed_offsets(pos: Tensor, state_positions: Tensor) -> Tensor:
+    """Shift packed positions back to row-local coordinates, preserving -1 sentinels."""
+
+    pos_i32 = pos.to(torch.int32)
+    valid = pos_i32 >= 0
+    view_shape = (int(state_positions.shape[0]),) + (1,) * (pos_i32.dim() - 1)
+    shifted = pos_i32 - state_positions.to(torch.int32).view(view_shape)
+    return torch.where(valid, shifted, pos_i32)
+
+
 def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
     """Pack a padded :class:`TextEncodedBatch` into a :class:`PackedTextBatch`.
 
@@ -98,11 +139,7 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
     """
 
     seq_lens = padded.seq_lengths.to(torch.int32)
-    if seq_lens.dim() != 1:
-        raise ValueError("seq_lengths must be 1-D")
-    batch_size = int(seq_lens.numel())
-    cu = torch.zeros(batch_size + 1, dtype=torch.int32, device=seq_lens.device)
-    cu[1:] = seq_lens.cumsum(0)
+    cu, state_positions, seq_id, pos_in_seq = packed_sequence_layout(seq_lens)
     t_packed = int(cu[-1].item())
 
     live = padded.attention_mask.to(torch.bool)
@@ -113,34 +150,16 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
             f"({int(token_ids.numel())} vs {t_packed})"
         )
 
-    seq_id = torch.repeat_interleave(
-        torch.arange(batch_size, dtype=torch.int32, device=seq_lens.device), seq_lens
-    )
-    base = cu[:-1]  # [B] int32
-    pos_in_seq = torch.arange(t_packed, dtype=torch.int32, device=seq_lens.device) - (
-        base.repeat_interleave(seq_lens)
-    )
-
-    def _rebase(pos: Tensor) -> Tensor:
-        # ``pos`` is [B, ...] int with -1 for absent slots. Add the
-        # per-row base offset, broadcasting over trailing dims, while
-        # preserving the -1 sentinel.
-        pos_i32 = pos.to(torch.int32)
-        valid = pos_i32 >= 0
-        shape = [batch_size] + [1] * (pos.dim() - 1)
-        shifted = pos_i32 + base.view(shape)
-        return torch.where(valid, shifted, pos_i32)
-
     return PackedTextBatch(
         token_ids=token_ids,
         seq_id=seq_id,
         pos_in_seq=pos_in_seq,
         cu_seqlens=cu,
         seq_lengths=seq_lens,
-        state_positions=base.clone(),
-        card_ref_positions=_rebase(padded.card_ref_positions),
-        option_positions=_rebase(padded.option_positions),
-        target_positions=_rebase(padded.target_positions),
+        state_positions=state_positions.clone(),
+        card_ref_positions=add_packed_offsets(padded.card_ref_positions, state_positions),
+        option_positions=add_packed_offsets(padded.option_positions, state_positions),
+        target_positions=add_packed_offsets(padded.target_positions, state_positions),
         option_mask=padded.option_mask.to(torch.bool),
         target_mask=padded.target_mask.to(torch.bool),
     )

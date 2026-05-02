@@ -8,7 +8,13 @@ import torch
 from torch import Tensor
 
 from magic_ai.replay_buffer import ReplayCore
-from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
+from magic_ai.text_encoder.batch import (
+    PackedTextBatch,
+    TextEncodedBatch,
+    add_packed_offsets,
+    packed_sequence_layout,
+    subtract_packed_offsets,
+)
 from magic_ai.text_encoder.replay_triton import (
     append_batch_encoded_triton,
     gather_encoded_triton,
@@ -374,30 +380,26 @@ class TextReplayBuffer:
             seq_lengths_i32 = seq_lengths.to(dtype=torch.int32)
             self.row_token_length[rows] = seq_lengths_i32
 
-            base = encoded.state_positions.to(device=self.device, dtype=torch.int32)
+            state_positions = encoded.state_positions.to(device=self.device, dtype=torch.int32)
 
-            def rebase_positions(pos: Tensor, view_shape: tuple[int, ...]) -> Tensor:
-                pos_dev = pos.to(device=self.device, dtype=torch.int32)
-                valid = pos_dev >= 0
-                shifted = pos_dev - base.view(view_shape)
-                return torch.where(valid, shifted, pos_dev)
-
-            self.card_ref_positions[rows] = rebase_positions(
-                encoded.card_ref_positions,
-                (batch_size, 1),
+            self.card_ref_positions[rows] = subtract_packed_offsets(
+                encoded.card_ref_positions.to(device=self.device),
+                state_positions,
             )
             if option_width > 0:
-                self.option_positions[rows, :option_width] = rebase_positions(
-                    encoded.option_positions[:, :option_width],
-                    (batch_size, 1),
+                self.option_positions[rows, :option_width] = subtract_packed_offsets(
+                    encoded.option_positions[:, :option_width].to(device=self.device),
+                    state_positions,
                 )
                 self.option_mask[rows, :option_width] = encoded.option_mask[:, :option_width].to(
                     device=self.device, dtype=torch.bool
                 )
             if option_width > 0 and target_width > 0:
-                self.target_positions[rows, :option_width, :target_width] = rebase_positions(
-                    encoded.target_positions[:, :option_width, :target_width],
-                    (batch_size, 1, 1),
+                self.target_positions[rows, :option_width, :target_width] = subtract_packed_offsets(
+                    encoded.target_positions[:, :option_width, :target_width].to(
+                        device=self.device
+                    ),
+                    state_positions,
                 )
                 self.target_mask[rows, :option_width, :target_width] = encoded.target_mask[
                     :, :option_width, :target_width
@@ -427,7 +429,6 @@ class TextReplayBuffer:
             if not replay_rows:
                 raise ValueError("replay_rows must not be empty")
             idx = torch.tensor(replay_rows, dtype=torch.long, device=self.device)
-        batch_size = int(idx.numel())
         if self.validate:
             in_range = (idx >= 0) & (idx < self.capacity)
             if not bool(in_range.all().item()):
@@ -442,17 +443,17 @@ class TextReplayBuffer:
             )
         if gathered_layout is None:
             seq_lengths = self.row_token_length[idx]
-            cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
-            cu_seqlens[1:] = seq_lengths.cumsum(0)
+            cu_seqlens, state_positions, seq_id, pos_in_seq = packed_sequence_layout(seq_lengths)
         else:
             seq_lengths, cu_seqlens = gathered_layout
+            state_positions = cu_seqlens[:-1]
+            seq_id = torch.empty(0, dtype=torch.int32, device=self.device)
+            pos_in_seq = torch.empty(0, dtype=torch.int32, device=self.device)
         if self.validate:
             token_starts = self.row_token_start[idx]
             if bool((token_starts < 0).any().item()):
                 bad = int(idx[token_starts < 0][0].item())
                 raise ValueError(f"replay row {bad} has no packed token span")
-        state_positions = cu_seqlens[:-1]
-        total_tokens = int(cu_seqlens[-1].item())
         gathered_encoded = None
         if self.use_triton_gather:
             gathered_encoded = gather_encoded_triton(
@@ -463,37 +464,24 @@ class TextReplayBuffer:
                 row_token_start=self.row_token_start,
             )
 
-        def pack_positions(pos: Tensor, view_shape: tuple[int, ...]) -> Tensor:
-            valid = pos >= 0
-            shifted = pos.to(torch.int32) + state_positions.view(view_shape)
-            return torch.where(valid, shifted, pos.to(torch.int32))
-
         if gathered_encoded is None:
+            if seq_id.numel() == 0 and pos_in_seq.numel() == 0:
+                _, _, seq_id, pos_in_seq = packed_sequence_layout(seq_lengths)
             token_starts = self.row_token_start[idx]
-            seq_id = torch.repeat_interleave(
-                torch.arange(batch_size, dtype=torch.int32, device=self.device),
-                seq_lengths,
-            )
-            pos_in_seq = torch.arange(
-                total_tokens, dtype=torch.int32, device=self.device
-            ) - torch.repeat_interleave(
-                state_positions,
-                seq_lengths,
-            )
             token_offsets = token_starts[seq_id] + pos_in_seq
             token_ids = self.packed_token_ids[token_offsets]
 
-            card_ref_positions = pack_positions(self.card_ref_positions[idx], (batch_size, 1))
-            option_positions = pack_positions(self.option_positions[idx], (batch_size, 1))
+            card_ref_positions = add_packed_offsets(self.card_ref_positions[idx], state_positions)
+            option_positions = add_packed_offsets(self.option_positions[idx], state_positions)
             option_mask = self.option_mask[idx]
-            target_positions = pack_positions(self.target_positions[idx], (batch_size, 1, 1))
+            target_positions = add_packed_offsets(self.target_positions[idx], state_positions)
             target_mask = self.target_mask[idx]
         else:
             token_ids, seq_id, pos_in_seq = gathered_encoded
-            card_ref_positions = pack_positions(self.card_ref_positions[idx], (batch_size, 1))
-            option_positions = pack_positions(self.option_positions[idx], (batch_size, 1))
+            card_ref_positions = add_packed_offsets(self.card_ref_positions[idx], state_positions)
+            option_positions = add_packed_offsets(self.option_positions[idx], state_positions)
             option_mask = self.option_mask[idx]
-            target_positions = pack_positions(self.target_positions[idx], (batch_size, 1, 1))
+            target_positions = add_packed_offsets(self.target_positions[idx], state_positions)
             target_mask = self.target_mask[idx]
         decision_batch = self.core.gather_decisions(idx)
         common = self.core.gather_common(idx)
@@ -621,32 +609,42 @@ class TextReplayBuffer:
             encoded.token_ids[start:end].to(device=self.device, dtype=torch.int32),
         )
 
-        base = int(encoded.state_positions[batch_index].item())
-
-        def rebase(pos: Tensor) -> Tensor:
-            valid = pos >= 0
-            shifted = pos - base
-            return torch.where(valid, shifted, pos)
+        state_positions = encoded.state_positions[batch_index : batch_index + 1].to(
+            device=self.device, dtype=torch.int32
+        )
 
         self.card_ref_positions[row].copy_(
-            rebase(encoded.card_ref_positions[batch_index]).to(
-                device=self.device, dtype=torch.int32
+            subtract_packed_offsets(
+                encoded.card_ref_positions[batch_index : batch_index + 1].to(device=self.device),
+                state_positions,
             )
+            .squeeze(0)
+            .to(device=self.device, dtype=torch.int32)
         )
         option_width = min(encoded.option_positions.shape[1], self.max_options)
         target_width = min(encoded.target_positions.shape[2], self.max_targets_per_option)
         self.option_positions[row, :option_width].copy_(
-            rebase(encoded.option_positions[batch_index, :option_width]).to(
-                device=self.device, dtype=torch.int32
+            subtract_packed_offsets(
+                encoded.option_positions[batch_index : batch_index + 1, :option_width].to(
+                    device=self.device
+                ),
+                state_positions,
             )
+            .squeeze(0)
+            .to(device=self.device, dtype=torch.int32)
         )
         self.option_mask[row, :option_width].copy_(
             encoded.option_mask[batch_index, :option_width].to(device=self.device)
         )
         self.target_positions[row, :option_width, :target_width].copy_(
-            rebase(encoded.target_positions[batch_index, :option_width, :target_width]).to(
-                device=self.device, dtype=torch.int32
+            subtract_packed_offsets(
+                encoded.target_positions[
+                    batch_index : batch_index + 1, :option_width, :target_width
+                ].to(device=self.device),
+                state_positions,
             )
+            .squeeze(0)
+            .to(device=self.device, dtype=torch.int32)
         )
         self.target_mask[row, :option_width, :target_width].copy_(
             encoded.target_mask[batch_index, :option_width, :target_width].to(device=self.device)

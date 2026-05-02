@@ -37,7 +37,13 @@ from magic_ai.replay_decisions import (
     score_may_decisions_from_forward,
 )
 from magic_ai.slot_encoder.model import _clone_detaching_buffer
-from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch, pack_batch
+from magic_ai.text_encoder.batch import (
+    PackedTextBatch,
+    TextEncodedBatch,
+    pack_batch,
+    packed_sequence_layout,
+    subtract_packed_offsets,
+)
 from magic_ai.text_encoder.policy import EncodedSnapshots
 from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
@@ -1564,20 +1570,13 @@ def _dense_from_packed_batch(
     pos = batch.pos_in_seq[in_range]
     token_ids[seq_id, pos] = batch.token_ids[in_range]
     attention_mask[seq_id, pos] = True
-    base = batch.state_positions
-
-    def rebase(pos_tensor: Tensor, view_shape: tuple[int, ...]) -> Tensor:
-        valid = pos_tensor >= 0
-        shifted = pos_tensor - base.view(view_shape)
-        return torch.where(valid, shifted, pos_tensor)
-
     return TextEncodedBatch(
         token_ids=token_ids,
         attention_mask=attention_mask,
-        card_ref_positions=rebase(batch.card_ref_positions, (b, 1)),
-        option_positions=rebase(batch.option_positions, (b, 1)),
+        card_ref_positions=subtract_packed_offsets(batch.card_ref_positions, batch.state_positions),
+        option_positions=subtract_packed_offsets(batch.option_positions, batch.state_positions),
         option_mask=batch.option_mask,
-        target_positions=rebase(batch.target_positions, (b, 1, 1)),
+        target_positions=subtract_packed_offsets(batch.target_positions, batch.state_positions),
         target_mask=batch.target_mask,
         seq_lengths=batch.seq_lengths,
     )
@@ -1619,14 +1618,7 @@ def _move_packed_text_batch(batch: PackedTextBatch, device: torch.device) -> Pac
     seq_lengths = batch.seq_lengths.to(device, non_blocking=nb)
     cu_seqlens = batch.cu_seqlens.to(device, non_blocking=nb)
     if batch.seq_id.numel() == 0 and batch.pos_in_seq.numel() == 0:
-        total = int(cu_seqlens[-1].item()) if cu_seqlens.numel() else 0
-        seq_id = torch.repeat_interleave(
-            torch.arange(int(seq_lengths.shape[0]), dtype=torch.int32, device=device),
-            seq_lengths,
-        )
-        pos_in_seq = torch.arange(total, dtype=torch.int32, device=device) - (
-            cu_seqlens[:-1].repeat_interleave(seq_lengths)
-        )
+        _, _, seq_id, pos_in_seq = packed_sequence_layout(seq_lengths)
     else:
         seq_id = batch.seq_id.to(device, non_blocking=nb)
         pos_in_seq = batch.pos_in_seq.to(device, non_blocking=nb)
