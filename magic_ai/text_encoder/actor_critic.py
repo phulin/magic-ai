@@ -34,6 +34,7 @@ from magic_ai.replay_decisions import (
     ReplayPerChoice,
     ReplayScoringForward,
     direct_decision_logits_from_forward,
+    direct_flat_decision_distribution_from_forward,
     score_may_decisions_from_forward,
 )
 from magic_ai.slot_encoder.model import _clone_detaching_buffer
@@ -1122,7 +1123,7 @@ class TextActorCritic(nn.Module):
         forward = self._replay_scoring_forward(output)
         device = forward.values.device
 
-        g_total = int(decision_count.sum().item())
+        g_total = int(batch.step_for_decision_group.shape[0])
         if g_total == 0:
             if not return_per_choice:
                 return log_probs, entropies
@@ -1151,18 +1152,6 @@ class TextActorCritic(nn.Module):
         flat_masks = batch.decision_mask
         flat_uses_none = batch.uses_none_head
         flat_selected = batch.selected_indices
-
-        if not bool(flat_masks.any(dim=-1).all()):
-            raise ValueError("decision group must include at least one valid choice")
-
-        all_logits = direct_decision_logits_from_forward(
-            forward,
-            step_positions=steps_t,
-            option_idx=flat_option_idx,
-            target_idx=flat_target_idx,
-            masks=flat_masks,
-            uses_none=flat_uses_none,
-        )
 
         # AND in model-visibility on top of the engine mask, mirroring the
         # filter ``sample_text_batch`` applies. Layout cols pointing at
@@ -1196,8 +1185,7 @@ class TextActorCritic(nn.Module):
         visible = opt_visible & (~target_required | tgt_visible)
         # The ``none`` slot lives at col 0 and isn't a real option/target;
         # keep it visible whenever ``uses_none`` is set.
-        if bool(flat_uses_none.any()):
-            visible[flat_uses_none, 0] = True
+        visible[flat_uses_none, 0] = True
         visible_mask = flat_masks & visible
 
         # Groups where every engine-valid col is truncated-invisible mirror
@@ -1208,23 +1196,68 @@ class TextActorCritic(nn.Module):
         # gradient through the policy head.
         group_has_visible = visible_mask.any(dim=-1, keepdim=True)
         effective_mask = torch.where(group_has_visible, visible_mask, flat_masks)
-        # ``torch.where`` with ``-inf`` in either branch produces NaN
-        # gradients on the unselected branch (autograd evaluates both),
-        # so keep both branches finite and mask only after the where.
-        safe_logits = torch.where(group_has_visible, all_logits, torch.zeros_like(all_logits))
-        masked_logits = safe_logits.masked_fill(~effective_mask, float("-inf"))
-        log_probs_dense = torch.log_softmax(masked_logits, dim=-1)
-        probs_dense = log_probs_dense.exp()
-        # log_probs_dense is ``-inf`` at masked-out positions; ``probs_dense``
-        # there is 0, so the entropy term is 0 — but ``0 * -inf`` is NaN both
-        # in forward and (more dangerously) in backward through ``where``.
-        # Replace the log-prob with 0 outside the effective mask before the
-        # multiply so neither path produces NaN.
-        safe_log_probs = torch.where(effective_mask, log_probs_dense, log_probs_dense.new_zeros(()))
-        entropy_terms = probs_dense * safe_log_probs
 
-        per_group_log_prob = log_probs_dense.gather(-1, flat_selected.unsqueeze(-1)).squeeze(-1)
-        per_group_entropy = -entropy_terms.sum(dim=-1)
+        if return_per_choice:
+            all_logits = direct_decision_logits_from_forward(
+                forward,
+                step_positions=steps_t,
+                option_idx=flat_option_idx,
+                target_idx=flat_target_idx,
+                masks=flat_masks,
+                uses_none=flat_uses_none,
+            )
+            # ``torch.where`` with ``-inf`` in either branch produces NaN
+            # gradients on the unselected branch (autograd evaluates both),
+            # so keep both branches finite and mask only after the where.
+            safe_logits = torch.where(
+                group_has_visible,
+                all_logits,
+                torch.zeros_like(all_logits),
+            )
+            masked_logits = safe_logits.masked_fill(~effective_mask, float("-inf"))
+            log_probs_dense = torch.log_softmax(masked_logits, dim=-1)
+            probs_dense = log_probs_dense.exp()
+            # log_probs_dense is ``-inf`` at masked-out positions; ``probs_dense``
+            # there is 0, so the entropy term is 0 — but ``0 * -inf`` is NaN both
+            # in forward and (more dangerously) in backward through ``where``.
+            # Replace the log-prob with 0 outside the effective mask before the
+            # multiply so neither path produces NaN.
+            safe_log_probs = torch.where(
+                effective_mask,
+                log_probs_dense,
+                log_probs_dense.new_zeros(()),
+            )
+            entropy_terms = probs_dense * safe_log_probs
+
+            per_group_log_prob = log_probs_dense.gather(
+                -1,
+                flat_selected.unsqueeze(-1),
+            ).squeeze(-1)
+            per_group_entropy = -entropy_terms.sum(dim=-1)
+        else:
+            group_idx, choice_cols, _flat_logits, flat_log_probs, per_group_entropy = (
+                direct_flat_decision_distribution_from_forward(
+                    forward,
+                    step_positions=steps_t,
+                    option_idx=flat_option_idx,
+                    target_idx=flat_target_idx,
+                    masks=effective_mask,
+                    uses_none=flat_uses_none,
+                )
+            )
+            group_has_visible_1d = group_has_visible.squeeze(-1)
+            valid_counts = effective_mask.sum(dim=-1).to(dtype=flat_log_probs.dtype)
+            fallback_flat = ~group_has_visible_1d[group_idx]
+            fallback_log_probs = -valid_counts[group_idx].log()
+            flat_log_probs = torch.where(fallback_flat, fallback_log_probs, flat_log_probs)
+            per_group_entropy = torch.where(
+                group_has_visible_1d,
+                per_group_entropy,
+                valid_counts.log(),
+            )
+            is_selected = choice_cols == flat_selected[group_idx]
+            per_group_log_prob = output.values.new_zeros(g_total)
+            per_group_log_prob.scatter_add_(0, group_idx[is_selected], flat_log_probs[is_selected])
 
         log_probs = log_probs.scatter_add(0, steps_t, per_group_log_prob)
         entropies = entropies.scatter_add(0, steps_t, per_group_entropy)
