@@ -737,7 +737,7 @@ class TextActorCritic(nn.Module):
 
     def evaluate_replay_batch(
         self,
-        replay_rows: list[int],
+        replay_rows: list[int] | Tensor,
         *,
         return_extras: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, None]:
@@ -776,6 +776,22 @@ class TextActorCritic(nn.Module):
         log_probs = log_probs + decision_log_probs
         entropies = entropies + decision_entropies
         return log_probs, entropies, output.values, None
+
+    def write_ppo_targets(
+        self,
+        replay_rows: Tensor,
+        old_log_probs: Tensor,
+        returns: Tensor,
+        advantages: Tensor,
+    ) -> None:
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+        self.rollout_buffer.write_ppo_targets(replay_rows, old_log_probs, returns, advantages)
+
+    def gather_ppo_targets(self, replay_rows: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+        return self.rollout_buffer.gather_ppo_targets(replay_rows)
 
     def compute_spr_loss(
         self,

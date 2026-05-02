@@ -164,6 +164,8 @@ class TextReplayBuffer:
         self.may_selected = torch.zeros(self.capacity, dtype=torch.float32, device=self.device)
         self.old_log_prob = torch.zeros(self.capacity, dtype=torch.float32, device=self.device)
         self.value = torch.zeros(self.capacity, dtype=torch.float32, device=self.device)
+        self.ppo_return = torch.zeros(self.capacity, dtype=torch.float32, device=self.device)
+        self.ppo_advantage = torch.zeros(self.capacity, dtype=torch.float32, device=self.device)
         self.perspective_player_idx = torch.zeros(
             self.capacity, dtype=torch.int8, device=self.device
         )
@@ -203,6 +205,22 @@ class TextReplayBuffer:
             if bool(self._occupied[row].item()):
                 self._occupied[row] = False
                 self._free_rows.append(int(row))
+
+    def write_ppo_targets(
+        self,
+        replay_rows: Tensor,
+        old_log_probs: Tensor,
+        returns: Tensor,
+        advantages: Tensor,
+    ) -> None:
+        idx = replay_rows.to(device=self.device, dtype=torch.long)
+        self.old_log_prob[idx] = old_log_probs.to(device=self.device, dtype=torch.float32)
+        self.ppo_return[idx] = returns.to(device=self.device, dtype=torch.float32)
+        self.ppo_advantage[idx] = advantages.to(device=self.device, dtype=torch.float32)
+
+    def gather_ppo_targets(self, replay_rows: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        idx = replay_rows.to(device=self.device, dtype=torch.long)
+        return self.old_log_prob[idx], self.ppo_return[idx], self.ppo_advantage[idx]
 
     def append(
         self,

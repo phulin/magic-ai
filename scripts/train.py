@@ -130,6 +130,7 @@ DEFAULT_DECK = {
 }
 
 DEFAULT_GAME_LOG_PATH = Path("/tmp/game_logs.txt")
+DEFAULT_TEXT_MINIBATCH_TOKEN_LIMIT = 262_144
 
 
 # Optional subphase profiling hook. The profile script binds this to a
@@ -703,7 +704,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         raise ValueError("text tokenizer must define pad_token_id")
-    if args.text_encoder_backend == "hf":
+    if getattr(args, "text_encoder_backend", "scratch") == "hf":
         cfg = text_encoder_config_from_hf(
             model_name=args.text_hf_model,
             revision=args.text_hf_revision,
@@ -1431,7 +1432,7 @@ def main() -> None:
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
 
-    if args.pretrain_mlm_dir is not None:
+    if getattr(args, "pretrain_mlm_dir", None) is not None:
         if encoder_kind != "text" or text_backend is None:
             raise ValueError("--pretrain-mlm-dir requires --encoder text")
         run_mlm_pretrain(args, text_backend, device)
@@ -1799,6 +1800,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ppo-epochs", type=int, default=4)
     parser.add_argument("--minibatch-size", type=int, default=2048)
+    parser.add_argument(
+        "--minibatch-token-limit",
+        type=int,
+        default=None,
+        help=(
+            "maximum packed text tokens per PPO minibatch; text encoder default is "
+            f"min(--minibatch-size * --text-max-tokens, {DEFAULT_TEXT_MINIBATCH_TOKEN_LIMIT}); "
+            "set 0 to disable"
+        ),
+    )
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
     parser.add_argument("--value-coef", type=float, default=0.5)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
@@ -1881,6 +1892,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-steps-per-game must be at least 1")
     if args.minibatch_size < 1:
         raise ValueError("--minibatch-size must be at least 1")
+    minibatch_token_limit = getattr(args, "minibatch_token_limit", None)
+    if minibatch_token_limit is not None and minibatch_token_limit < 0:
+        raise ValueError("--minibatch-token-limit must be non-negative")
+    if minibatch_token_limit == 0:
+        args.minibatch_token_limit = None
+    elif minibatch_token_limit is None and getattr(args, "encoder", "slots") == "text":
+        args.minibatch_token_limit = min(
+            args.minibatch_size * getattr(args, "text_max_tokens", 1),
+            DEFAULT_TEXT_MINIBATCH_TOKEN_LIMIT,
+        )
     if not 0.0 <= args.gae_lambda <= 1.0:
         raise ValueError("--gae-lambda must be in [0, 1]")
     if args.hidden_layers < 1:
@@ -2225,7 +2246,11 @@ def train_native_batched_envs(
         if sampling_policy is not policy:
             sampling_policy.reset_lstm_env_states([slot_idx])
         seed = args.seed + episode_idx
-        deck_a, deck_b = sample_decks(deck_pool, seed, fixed=args.deck_json is not None)
+        deck_a, deck_b = sample_decks(
+            deck_pool,
+            seed,
+            fixed=getattr(args, "deck_json", None) is not None,
+        )
         return LiveGame(
             game=mage.new_game(
                 deck_a,
@@ -2552,6 +2577,10 @@ def train_native_batched_envs(
                     entropy_coef=args.entropy_coef,
                     max_grad_norm=args.max_grad_norm,
                     spr_coef=args.spr_coef if args.spr else 0.0,
+                    minibatch_token_limit=getattr(args, "minibatch_token_limit", None),
+                    minibatch_max_tokens_per_row=getattr(args, "text_max_tokens", None)
+                    if getattr(args, "encoder", "slots") == "text"
+                    else None,
                 )
             now = time.monotonic()
             elapsed = now - last_step_time
@@ -2703,6 +2732,10 @@ def train_native_batched_envs(
                 entropy_coef=args.entropy_coef,
                 max_grad_norm=args.max_grad_norm,
                 spr_coef=args.spr_coef if args.spr else 0.0,
+                minibatch_token_limit=getattr(args, "minibatch_token_limit", None),
+                minibatch_max_tokens_per_row=getattr(args, "text_max_tokens", None)
+                if getattr(args, "encoder", "slots") == "text"
+                else None,
             )
         print(
             cli_step_prefix(),
@@ -2819,6 +2852,8 @@ def train_text_envs(
             max_grad_norm=args.max_grad_norm,
             spr_coef=args.spr_coef if args.spr else 0.0,
             between_epoch_fn=refresh_fn,
+            minibatch_token_limit=getattr(args, "minibatch_token_limit", None),
+            minibatch_max_tokens_per_row=getattr(args, "text_max_tokens", None),
         )
         now = time.monotonic()
         elapsed = now - last_step_time
@@ -2858,7 +2893,11 @@ def train_text_envs(
     for episode_idx in range(completed_games, args.episodes):
         backend.policy.reset_lstm_env_states([0])
         seed = args.seed + episode_idx
-        deck_a, deck_b = sample_decks(deck_pool, seed, fixed=args.deck_json is not None)
+        deck_a, deck_b = sample_decks(
+            deck_pool,
+            seed,
+            fixed=getattr(args, "deck_json", None) is not None,
+        )
         game = mage.new_game(
             deck_a,
             deck_b,
@@ -3371,6 +3410,8 @@ def train_text_native_batched_envs(
                     max_grad_norm=args.max_grad_norm,
                     spr_coef=0.0,
                     between_epoch_fn=native_refresh_fn,
+                    minibatch_token_limit=getattr(args, "minibatch_token_limit", None),
+                    minibatch_max_tokens_per_row=getattr(args, "text_max_tokens", None),
                 )
             except torch.OutOfMemoryError:
                 if snapshot_armed:

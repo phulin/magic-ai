@@ -23,10 +23,20 @@ class PPOReplayPolicy(Protocol):
 
     def evaluate_replay_batch(
         self,
-        replay_rows: list[int],
+        replay_rows: list[int] | Tensor,
         *,
         return_extras: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, Any | None]: ...
+
+    def write_ppo_targets(
+        self,
+        replay_rows: Tensor,
+        old_log_probs: Tensor,
+        returns: Tensor,
+        advantages: Tensor,
+    ) -> None: ...
+
+    def gather_ppo_targets(self, replay_rows: Tensor) -> tuple[Tensor, Tensor, Tensor]: ...
 
     def compute_spr_loss(
         self,

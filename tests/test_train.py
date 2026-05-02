@@ -1333,6 +1333,72 @@ class TrainPPOTests(unittest.TestCase):
 
         self.assertTrue(args.native_render_plan)
         self.assertTrue(args.text_native_assembler)
+        self.assertIsNone(args.minibatch_token_limit)
+
+    def test_validate_args_sets_text_minibatch_token_limit_default(self) -> None:
+        args = Namespace(
+            episodes=1,
+            num_envs=1,
+            rollout_steps=1,
+            rollout_min_ready_batch=1,
+            rollout_ready_wait_ms=0.0,
+            max_steps_per_game=1,
+            minibatch_size=512,
+            minibatch_token_limit=None,
+            hidden_layers=1,
+            gae_lambda=0.95,
+            torch_compile=False,
+            no_validate=False,
+            deck_json=None,
+            deck_dir=None,
+            eval_games_per_snapshot=0,
+            eval_recency_tau=4.0,
+            eval_num_envs=None,
+            encoder="text",
+            trainer="ppo",
+            spr=True,
+            native_render_plan=True,
+            text_native_assembler=True,
+            text_max_tokens=1024,
+        )
+
+        validate_args(args)
+
+        self.assertEqual(
+            args.minibatch_token_limit,
+            train_mod.DEFAULT_TEXT_MINIBATCH_TOKEN_LIMIT,
+        )
+
+    def test_validate_args_can_disable_minibatch_token_limit(self) -> None:
+        args = Namespace(
+            episodes=1,
+            num_envs=1,
+            rollout_steps=1,
+            rollout_min_ready_batch=1,
+            rollout_ready_wait_ms=0.0,
+            max_steps_per_game=1,
+            minibatch_size=512,
+            minibatch_token_limit=0,
+            hidden_layers=1,
+            gae_lambda=0.95,
+            torch_compile=False,
+            no_validate=False,
+            deck_json=None,
+            deck_dir=None,
+            eval_games_per_snapshot=0,
+            eval_recency_tau=4.0,
+            eval_num_envs=None,
+            encoder="text",
+            trainer="ppo",
+            spr=True,
+            native_render_plan=True,
+            text_native_assembler=True,
+            text_max_tokens=1024,
+        )
+
+        validate_args(args)
+
+        self.assertIsNone(args.minibatch_token_limit)
 
     def test_validate_args_text_native_rollout_can_be_disabled_for_ppo(self) -> None:
         args = Namespace(

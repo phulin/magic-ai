@@ -12,6 +12,7 @@ Comprehensive test suite covering text encoding (rendering, tokenization, assemb
 - `test_native_rollout.py` — Tests for native rollout driver library availability checks.
 - `test_native_token_tables.py` — Phase 3 round-trip parity test: TokenTables via Go FFI and echo back.
 - `test_opponent_pool.py` — Tests for opponent snapshot state filtering and runtime-buffer-safe weight loading.
+- `test_ppo.py` — Unit tests for PPO replay minibatch construction and token-capped batching.
 - `test_recurrent_text_policy.py` — Smoke tests for v1 history adapter with LSTM around state vector.
 - `test_render_plan_parity.py` — Byte-for-byte parity between slow renderer and fast assembler paths.
 - `test_render_plan_writer.py` — Round-trip test for int32 render-plan wire format independence.

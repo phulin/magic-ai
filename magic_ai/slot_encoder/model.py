@@ -345,6 +345,18 @@ class PPOPolicy(nn.Module):
     def release_replay_rows(self, replay_rows: list[int]) -> None:
         return
 
+    def write_ppo_targets(
+        self,
+        replay_rows: Tensor,
+        old_log_probs: Tensor,
+        returns: Tensor,
+        advantages: Tensor,
+    ) -> None:
+        self.rollout_buffer.write_ppo_targets(replay_rows, old_log_probs, returns, advantages)
+
+    def gather_ppo_targets(self, replay_rows: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        return self.rollout_buffer.gather_ppo_targets(replay_rows)
+
     def append_staged_episode_to_rollout(
         self,
         staging: NativeTrajectoryBuffer,
@@ -1026,7 +1038,7 @@ class PPOPolicy(nn.Module):
 
     def evaluate_replay_batch(
         self,
-        replay_rows: list[int],
+        replay_rows: list[int] | Tensor,
         *,
         return_extras: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, _ReplayBatchExtras | None]:
@@ -1037,12 +1049,16 @@ class PPOPolicy(nn.Module):
         can reuse them without recomputing.
         """
 
-        if not replay_rows:
-            raise ValueError("replay_rows must not be empty")
-
         device = self.device
         rb = self.rollout_buffer
-        step_indices = torch.tensor(replay_rows, dtype=torch.long, device=device)
+        if isinstance(replay_rows, Tensor):
+            if int(replay_rows.numel()) == 0:
+                raise ValueError("replay_rows must not be empty")
+            step_indices = replay_rows.to(device=device, dtype=torch.long)
+        else:
+            if not replay_rows:
+                raise ValueError("replay_rows must not be empty")
+            step_indices = torch.tensor(replay_rows, dtype=torch.long, device=device)
         n = int(step_indices.numel())
         forward = self._forward_batch(step_indices)
         log_probs = torch.zeros(n, dtype=forward.values.dtype, device=device)

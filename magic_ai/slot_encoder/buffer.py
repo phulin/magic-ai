@@ -352,6 +352,10 @@ class RolloutBuffer(nn.Module):
             torch.bool,
         )
         _reg("may_selected", (capacity,), torch.float32)
+        _reg("old_log_prob", (capacity,), torch.float32)
+        _reg("value", (capacity,), torch.float32)
+        _reg("ppo_return", (capacity,), torch.float32)
+        _reg("ppo_advantage", (capacity,), torch.float32)
         _reg(
             "lstm_h_in",
             (capacity, recurrent_layers, recurrent_hidden_dim),
@@ -410,6 +414,10 @@ class RolloutBuffer(nn.Module):
     target_ref_is_player: Tensor
     target_ref_is_self: Tensor
     may_selected: Tensor
+    old_log_prob: Tensor
+    value: Tensor
+    ppo_return: Tensor
+    ppo_advantage: Tensor
     lstm_h_in: Tensor
     lstm_c_in: Tensor
     next_step_idx: Tensor
@@ -458,6 +466,22 @@ class RolloutBuffer(nn.Module):
 
     def release_steps(self, step_indices: list[int]) -> None:
         return
+
+    def write_ppo_targets(
+        self,
+        replay_rows: Tensor,
+        old_log_probs: Tensor,
+        returns: Tensor,
+        advantages: Tensor,
+    ) -> None:
+        idx = replay_rows.to(device=self.device, dtype=torch.long)
+        self.old_log_prob[idx] = old_log_probs.to(device=self.device, dtype=torch.float32)
+        self.ppo_return[idx] = returns.to(device=self.device, dtype=torch.float32)
+        self.ppo_advantage[idx] = advantages.to(device=self.device, dtype=torch.float32)
+
+    def gather_ppo_targets(self, replay_rows: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        idx = replay_rows.to(device=self.device, dtype=torch.long)
+        return self.old_log_prob[idx], self.ppo_return[idx], self.ppo_advantage[idx]
 
     def ingest_batch(self, parsed_steps: list[ParsedStep]) -> BufferWrite:
         return self.ingest_batch_legacy(parsed_steps)
@@ -674,6 +698,8 @@ class RolloutBuffer(nn.Module):
         self.target_ref_is_player[step_indices] = staging.target_ref_is_player[src_env, src_step]
         self.target_ref_is_self[step_indices] = staging.target_ref_is_self[src_env, src_step]
         self.may_selected[step_indices] = staging.may_selected[src_env, src_step]
+        self.old_log_prob[step_indices] = staging.old_log_prob[src_env, src_step]
+        self.value[step_indices] = staging.value[src_env, src_step]
         self.lstm_h_in[step_indices] = staging.lstm_h_in[src_env, src_step]
         self.lstm_c_in[step_indices] = staging.lstm_c_in[src_env, src_step]
 
