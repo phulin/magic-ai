@@ -79,7 +79,7 @@ def test_disable_text_replay_capture_restores_buffer_after_exception() -> None:
 def test_save_snapshot_excludes_runtime_lstm_buffers(tmp_path: Path) -> None:
     policy = _PolicyWithRuntimeBuffers(slots=64)
 
-    path = save_snapshot(policy, tmp_path, "g000001_p001.0")
+    path = save_snapshot(policy, tmp_path, "p001.0")
     payload = torch.load(path, map_location="cpu")
 
     assert "linear.weight" in payload["policy"]

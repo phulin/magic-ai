@@ -1042,6 +1042,9 @@ def _restore_opponent_pool(
     checkpoint: dict[str, Any] | None,
     snapshot_dir: Path,
 ) -> OpponentPool:
+    if checkpoint is None:
+        return OpponentPool()
+
     training_state = _training_state_dict(checkpoint)
     pool_state = training_state.get("opponent_pool")
     if isinstance(pool_state, dict):

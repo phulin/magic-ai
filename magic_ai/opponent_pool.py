@@ -182,7 +182,7 @@ class SnapshotSchedule:
 
 def snapshot_tag(threshold: int, total_episodes: int) -> str:
     pct = 100.0 * threshold / max(1, total_episodes)
-    return f"g{threshold:06d}_p{pct:05.1f}"
+    return f"p{pct:05.1f}"
 
 
 def opponent_policy_state_dict(policy: torch.nn.Module) -> dict[str, torch.Tensor]:
