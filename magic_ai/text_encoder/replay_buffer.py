@@ -176,9 +176,6 @@ class TextReplayBuffer:
         self.row_token_length.zero_()
         self._token_cursor = 0
 
-    def release_replay_rows(self, replay_rows: list[int]) -> None:
-        self.core.release_rows(replay_rows)
-
     def write_ppo_targets(
         self,
         replay_rows: Tensor,
@@ -209,29 +206,25 @@ class TextReplayBuffer:
         lstm_h_in: Tensor | None = None,
         lstm_c_in: Tensor | None = None,
     ) -> int:
+        self._validate_batch_index(encoded, batch_index)
         try:
-            row = self.core.allocate_row()
+            row = self.core.append_row(
+                trace_kind_id=trace_kind_id,
+                decision_option_idx=decision_option_idx,
+                decision_target_idx=decision_target_idx,
+                decision_mask=decision_mask,
+                uses_none_head=uses_none_head,
+                selected_indices=selected_indices,
+                may_selected=may_selected,
+                old_log_prob=old_log_prob,
+                value=value,
+                perspective_player_idx=perspective_player_idx,
+                lstm_h_in=lstm_h_in,
+                lstm_c_in=lstm_c_in,
+            )
         except RuntimeError as exc:
             raise RuntimeError("TextReplayBuffer is full") from exc
         self._write_encoded_row(row, encoded, batch_index)
-        self.core.write_decision_row(
-            row,
-            decision_option_idx=decision_option_idx,
-            decision_target_idx=decision_target_idx,
-            decision_mask=decision_mask,
-            uses_none_head=uses_none_head,
-            selected_indices=selected_indices,
-        )
-        self.core.write_common_row(
-            row,
-            trace_kind_id=trace_kind_id,
-            may_selected=may_selected,
-            old_log_prob=old_log_prob,
-            value=value,
-            perspective_player_idx=perspective_player_idx,
-            lstm_h_in=lstm_h_in,
-            lstm_c_in=lstm_c_in,
-        )
         return row
 
     def append_packed(
@@ -252,29 +245,25 @@ class TextReplayBuffer:
         lstm_h_in: Tensor | None = None,
         lstm_c_in: Tensor | None = None,
     ) -> int:
+        self._validate_packed_batch_index(encoded, batch_index)
         try:
-            row = self.core.allocate_row()
+            row = self.core.append_row(
+                trace_kind_id=trace_kind_id,
+                decision_option_idx=decision_option_idx,
+                decision_target_idx=decision_target_idx,
+                decision_mask=decision_mask,
+                uses_none_head=uses_none_head,
+                selected_indices=selected_indices,
+                may_selected=may_selected,
+                old_log_prob=old_log_prob,
+                value=value,
+                perspective_player_idx=perspective_player_idx,
+                lstm_h_in=lstm_h_in,
+                lstm_c_in=lstm_c_in,
+            )
         except RuntimeError as exc:
             raise RuntimeError("TextReplayBuffer is full") from exc
         self._write_packed_encoded_row(row, encoded, batch_index)
-        self.core.write_decision_row(
-            row,
-            decision_option_idx=decision_option_idx,
-            decision_target_idx=decision_target_idx,
-            decision_mask=decision_mask,
-            uses_none_head=uses_none_head,
-            selected_indices=selected_indices,
-        )
-        self.core.write_common_row(
-            row,
-            trace_kind_id=trace_kind_id,
-            may_selected=may_selected,
-            old_log_prob=old_log_prob,
-            value=value,
-            perspective_player_idx=perspective_player_idx,
-            lstm_h_in=lstm_h_in,
-            lstm_c_in=lstm_c_in,
-        )
         return row
 
     def append_batch(
@@ -300,9 +289,6 @@ class TextReplayBuffer:
             return torch.empty(0, dtype=torch.long, device=self.device)
         if self.capacity - self.size < batch_size:
             raise RuntimeError("TextReplayBuffer is full")
-        rows_list = self.core.allocate_rows(batch_size)
-        rows = torch.tensor(rows_list, dtype=torch.long, device=self.device)
-
         seq_lengths = encoded.seq_lengths.to(device=self.device)
         if self.validate:
             max_seq_length = int(seq_lengths.max().item()) if batch_size > 0 else 0
@@ -314,6 +300,35 @@ class TextReplayBuffer:
         if token_end > int(self.packed_token_ids.numel()):
             raise RuntimeError("TextReplayBuffer packed token arena is full")
         self._token_cursor = token_end
+        if self.lstm_h_in is not None and self.lstm_c_in is not None:
+            if lstm_h_in is None or lstm_c_in is None:
+                raise ValueError("h_in and c_in are required for recurrent text replay")
+            h_store = lstm_h_in.permute(1, 0, 2)
+            c_store = lstm_c_in.permute(1, 0, 2)
+        elif lstm_h_in is not None or lstm_c_in is not None:
+            raise ValueError("buffer was constructed without recurrent state storage")
+        else:
+            h_store = None
+            c_store = None
+
+        try:
+            rows = self.core.append_batch(
+                trace_kind_id=trace_kind_id,
+                decision_count=decision_count,
+                decision_option_idx=decision_option_idx,
+                decision_target_idx=decision_target_idx,
+                decision_mask=decision_mask,
+                uses_none_head=uses_none_head,
+                selected_indices=selected_indices,
+                may_selected=may_selected,
+                old_log_prob=old_log_prob,
+                value=value,
+                perspective_player_idx=perspective_player_idx,
+                lstm_h_in=h_store,
+                lstm_c_in=c_store,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError("TextReplayBuffer is full") from exc
 
         wrote_encoded_with_triton = False
         if self.use_triton_append:
@@ -388,34 +403,6 @@ class TextReplayBuffer:
                 ].to(device=self.device, dtype=torch.bool)
             self.seq_lengths[rows] = seq_lengths_i32
 
-        self.core.write_decision_batch(
-            rows,
-            decision_count=decision_count,
-            decision_option_idx=decision_option_idx,
-            decision_target_idx=decision_target_idx,
-            decision_mask=decision_mask,
-            uses_none_head=uses_none_head,
-            selected_indices=selected_indices,
-        )
-        self.core.write_common_batch(
-            rows,
-            trace_kind_id=trace_kind_id,
-            may_selected=may_selected,
-            old_log_prob=old_log_prob,
-            value=value,
-            perspective_player_idx=perspective_player_idx,
-        )
-        if self.lstm_h_in is not None and self.lstm_c_in is not None:
-            if lstm_h_in is None or lstm_c_in is None:
-                raise ValueError("h_in and c_in are required for recurrent text replay")
-            self.lstm_h_in[rows] = lstm_h_in.permute(1, 0, 2).to(
-                device=self.device, dtype=torch.float32
-            )
-            self.lstm_c_in[rows] = lstm_c_in.permute(1, 0, 2).to(
-                device=self.device, dtype=torch.float32
-            )
-        elif lstm_h_in is not None or lstm_c_in is not None:
-            raise ValueError("buffer was constructed without recurrent state storage")
         return rows
 
     def _write_row_packed_tokens(self, row: int, token_ids: Tensor) -> None:

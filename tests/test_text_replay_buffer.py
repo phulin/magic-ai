@@ -381,7 +381,7 @@ class TextReplayBufferTests(unittest.TestCase):
             gathered.lstm_c_in[1], torch.arange(100, 106, dtype=torch.float32).reshape(1, 6)
         )
 
-    def test_release_reuses_rows_and_reset_clears_occupancy(self) -> None:
+    def test_append_only_rows_and_reset_clears_occupancy(self) -> None:
         buffer = _buffer()
         encoded = _encoded_batch()
         empty_groups = torch.empty(0, 4, dtype=torch.long)
@@ -442,25 +442,8 @@ class TextReplayBufferTests(unittest.TestCase):
                 lstm_c_in=c_in,
             )
 
-        buffer.release_replay_rows([row0])
-        self.assertEqual(buffer.size, 1)
-        reused = buffer.append(
-            encoded=encoded,
-            batch_index=1,
-            trace_kind_id=1,
-            decision_option_idx=empty_groups,
-            decision_target_idx=empty_groups,
-            decision_mask=empty_mask,
-            uses_none_head=empty_bool,
-            selected_indices=empty_selected,
-            may_selected=0.0,
-            old_log_prob=0.0,
-            value=0.0,
-            perspective_player_idx=1,
-            lstm_h_in=h_in,
-            lstm_c_in=c_in,
-        )
-        self.assertEqual(reused, row0)
+        self.assertEqual(row0, 0)
+        self.assertEqual(row1, 1)
         buffer.reset()
         self.assertEqual(buffer.size, 0)
         with self.assertRaisesRegex(ValueError, f"replay row {row1} is not occupied"):

@@ -5,7 +5,7 @@ from magic_ai.replay_buffer import ReplayCore
 
 
 class ReplayCoreTests(unittest.TestCase):
-    def test_row_allocation_reset_and_release(self) -> None:
+    def test_append_rows_reset_and_capacity(self) -> None:
         core = ReplayCore(
             capacity=3,
             decision_capacity=8,
@@ -14,19 +14,43 @@ class ReplayCoreTests(unittest.TestCase):
             device="cpu",
         )
 
-        rows = core.allocate_rows(2)
-        self.assertEqual(rows, [0, 1])
+        rows = core.append_batch(
+            trace_kind_id=torch.tensor([1, 2]),
+            decision_count=torch.tensor([0, 0]),
+            decision_option_idx=torch.empty(0, 3, dtype=torch.long),
+            decision_target_idx=torch.empty(0, 3, dtype=torch.long),
+            decision_mask=torch.empty(0, 3, dtype=torch.bool),
+            uses_none_head=torch.empty(0, dtype=torch.bool),
+            selected_indices=torch.empty(0, dtype=torch.long),
+        )
+        torch.testing.assert_close(rows, torch.tensor([0, 1]))
         self.assertEqual(core.size, 2)
-
-        core.release_rows([rows[0]])
-        self.assertEqual(core.size, 1)
-        self.assertEqual(core.allocate_row(), rows[0])
 
         core.reset()
         self.assertEqual(core.size, 0)
-        self.assertEqual(core.allocate_rows(3), [0, 1, 2])
+        rows = core.append_batch(
+            trace_kind_id=torch.tensor([1, 2, 3]),
+            decision_count=torch.tensor([0, 0, 0]),
+            decision_option_idx=torch.empty(0, 3, dtype=torch.long),
+            decision_target_idx=torch.empty(0, 3, dtype=torch.long),
+            decision_mask=torch.empty(0, 3, dtype=torch.bool),
+            uses_none_head=torch.empty(0, dtype=torch.bool),
+            selected_indices=torch.empty(0, dtype=torch.long),
+        )
+        torch.testing.assert_close(rows, torch.tensor([0, 1, 2]))
         with self.assertRaisesRegex(RuntimeError, "full"):
-            core.allocate_row()
+            core.append_row(
+                trace_kind_id=4,
+                decision_option_idx=torch.empty(0, 3, dtype=torch.long),
+                decision_target_idx=torch.empty(0, 3, dtype=torch.long),
+                decision_mask=torch.empty(0, 3, dtype=torch.bool),
+                uses_none_head=torch.empty(0, dtype=torch.bool),
+                selected_indices=torch.empty(0, dtype=torch.long),
+                may_selected=0.0,
+                old_log_prob=0.0,
+                value=0.0,
+                perspective_player_idx=0,
+            )
 
     def test_decision_append_gather_and_valid_choice_count(self) -> None:
         core = ReplayCore(
@@ -37,18 +61,20 @@ class ReplayCoreTests(unittest.TestCase):
             device="cpu",
             index_dtype=torch.int16,
         )
-        row = core.allocate_row()
-
-        stored = core.write_decision_row(
-            row,
+        row = core.append_row(
+            trace_kind_id=0,
             decision_option_idx=torch.tensor([[0, 1, -1], [2, -1, -1]]),
             decision_target_idx=torch.tensor([[-1, 0, -1], [1, -1, -1]]),
             decision_mask=torch.tensor([[True, True, False], [True, False, False]]),
             uses_none_head=torch.tensor([False, True]),
             selected_indices=torch.tensor([1, 0]),
+            may_selected=0.0,
+            old_log_prob=0.0,
+            value=0.0,
+            perspective_player_idx=0,
         )
 
-        self.assertEqual(stored, 2)
+        self.assertEqual(int(core.decision_count[row]), 2)
         gathered = core.gather_dense_decisions(torch.tensor([row]))
         torch.testing.assert_close(
             gathered.decision_option_idx[0],
@@ -76,10 +102,8 @@ class ReplayCoreTests(unittest.TestCase):
             max_cached_choices=2,
             device="cpu",
         )
-        rows = torch.tensor(core.allocate_rows(1), dtype=torch.long)
-
-        stored = core.write_decision_batch(
-            rows,
+        rows = core.append_batch(
+            trace_kind_id=torch.tensor([0]),
             decision_count=torch.tensor([3]),
             decision_option_idx=torch.tensor([[0, -1], [1, -1], [2, -1]]),
             decision_target_idx=torch.tensor([[-1, -1], [0, -1], [1, -1]]),
@@ -88,7 +112,7 @@ class ReplayCoreTests(unittest.TestCase):
             selected_indices=torch.tensor([0, 0, 0]),
         )
 
-        torch.testing.assert_close(stored, torch.tensor([2]))
+        torch.testing.assert_close(core.decision_count[rows], torch.tensor([2]))
         gathered = core.gather_dense_decisions(rows)
         self.assertEqual(int(gathered.decision_count[0]), 2)
         torch.testing.assert_close(
@@ -106,12 +130,15 @@ class ReplayCoreTests(unittest.TestCase):
             recurrent_hidden_dim=3,
             device="cpu",
         )
-        row = core.allocate_row()
         h_in = torch.full((1, 3), 0.25)
         c_in = torch.full((1, 3), -0.5)
-        core.write_common_row(
-            row,
+        row = core.append_row(
             trace_kind_id=5,
+            decision_option_idx=torch.empty(0, 2, dtype=torch.long),
+            decision_target_idx=torch.empty(0, 2, dtype=torch.long),
+            decision_mask=torch.empty(0, 2, dtype=torch.bool),
+            uses_none_head=torch.empty(0, dtype=torch.bool),
+            selected_indices=torch.empty(0, dtype=torch.long),
             may_selected=1.0,
             old_log_prob=-0.75,
             value=0.5,

@@ -431,17 +431,6 @@ class RolloutBuffer(nn.Module):
     def active_step_count(self) -> int:
         return self.core.size
 
-    def _allocate_step_rows(self, count: int) -> list[int]:
-        if self.active_step_count + count > self.capacity:
-            raise RuntimeError(
-                f"rollout buffer capacity {self.capacity} exceeded "
-                f"(active={self.active_step_count}, add={count})"
-            )
-        return self.core.allocate_rows(count)
-
-    def _allocate_decision_range(self, count: int) -> int:
-        return self.core.allocate_decision_range(count)
-
     def release_steps(self, step_indices: list[int]) -> None:
         return
 
@@ -470,14 +459,25 @@ class RolloutBuffer(nn.Module):
                 decision_counts=[],
             )
 
-        step_rows = self._allocate_step_rows(n)
-        step_indices = torch.tensor(step_rows, dtype=torch.long, device=device)
+        decision_counts = parsed_batch.decision_counts
+        decision_counts_t = torch.tensor(decision_counts, dtype=torch.long, device=device)
+        selected_indices = torch.full(
+            (int(decision_counts_t.sum().item()),), -1, dtype=torch.long, device=device
+        )
+        step_indices = self.core.append_batch(
+            trace_kind_id=parsed_batch.trace_kind_ids,
+            decision_count=decision_counts_t,
+            decision_option_idx=parsed_batch.decision_option_idx,
+            decision_target_idx=parsed_batch.decision_target_idx,
+            decision_mask=parsed_batch.decision_mask,
+            uses_none_head=parsed_batch.uses_none_head,
+            selected_indices=selected_indices,
+        )
 
         self.slot_card_rows[step_indices] = parsed_batch.parsed_state.slot_card_rows.to(device)
         self.slot_occupied[step_indices] = parsed_batch.parsed_state.slot_occupied.to(device)
         self.slot_tapped[step_indices] = parsed_batch.parsed_state.slot_tapped.to(device)
         self.game_info[step_indices] = parsed_batch.parsed_state.game_info.to(device)
-        self.trace_kind_id[step_indices] = parsed_batch.trace_kind_ids.to(device)
         self.pending_kind_id[step_indices] = parsed_batch.parsed_action.pending_kind_id.to(device)
         self.option_kind_ids[step_indices] = parsed_batch.parsed_action.option_kind_ids.to(device)
         self.option_scalars[step_indices] = parsed_batch.parsed_action.option_scalars.to(device)
@@ -502,36 +502,7 @@ class RolloutBuffer(nn.Module):
             device
         )
 
-        decision_counts = parsed_batch.decision_counts
-        decision_starts: list[int] = []
-        flat_cursor = 0
-        for count in decision_counts:
-            start = self._allocate_decision_range(count)
-            decision_starts.append(start)
-            if count == 0:
-                continue
-            end = start + count
-            flat_end = flat_cursor + count
-            self.decision_option_idx[start:end] = parsed_batch.decision_option_idx[
-                flat_cursor:flat_end
-            ].to(device)
-            self.decision_target_idx[start:end] = parsed_batch.decision_target_idx[
-                flat_cursor:flat_end
-            ].to(device)
-            self.decision_mask[start:end] = parsed_batch.decision_mask[flat_cursor:flat_end].to(
-                device
-            )
-            self.uses_none_head[start:end] = parsed_batch.uses_none_head[flat_cursor:flat_end].to(
-                device
-            )
-            flat_cursor = flat_end
-
-        self.decision_start[step_indices] = torch.tensor(
-            decision_starts, dtype=torch.long, device=device
-        )
-        self.decision_count[step_indices] = torch.tensor(
-            decision_counts, dtype=torch.long, device=device
-        )
+        decision_starts = [int(v) for v in self.decision_start[step_indices].cpu().tolist()]
 
         return BufferWrite(
             step_indices=step_indices,
@@ -549,14 +520,24 @@ class RolloutBuffer(nn.Module):
                 decision_counts=[],
             )
 
-        step_rows = self._allocate_step_rows(n)
-        step_indices = torch.tensor(step_rows, dtype=torch.long, device=device)
+        decision_counts_t = native_batch.decision_count.to(device)
+        selected_indices = torch.full(
+            (int(decision_counts_t.sum().item()),), -1, dtype=torch.long, device=device
+        )
+        step_indices = self.core.append_batch(
+            trace_kind_id=native_batch.trace_kind_id,
+            decision_count=decision_counts_t,
+            decision_option_idx=native_batch.decision_option_idx,
+            decision_target_idx=native_batch.decision_target_idx,
+            decision_mask=native_batch.decision_mask,
+            uses_none_head=native_batch.uses_none_head,
+            selected_indices=selected_indices,
+        )
 
         self.slot_card_rows[step_indices] = native_batch.slot_card_rows.to(device)
         self.slot_occupied[step_indices] = native_batch.slot_occupied.to(device)
         self.slot_tapped[step_indices] = native_batch.slot_tapped.to(device)
         self.game_info[step_indices] = native_batch.game_info.to(device)
-        self.trace_kind_id[step_indices] = native_batch.trace_kind_id.to(device)
         self.pending_kind_id[step_indices] = native_batch.pending_kind_id.to(device)
         self.option_kind_ids[step_indices] = native_batch.option_kind_ids.to(device)
         self.option_scalars[step_indices] = native_batch.option_scalars.to(device)
@@ -576,35 +557,7 @@ class RolloutBuffer(nn.Module):
         )
 
         decision_counts = native_batch.decision_count.detach().cpu().tolist()
-        decision_starts: list[int] = []
-        flat_cursor = 0
-        for count in decision_counts:
-            start = self._allocate_decision_range(count)
-            decision_starts.append(start)
-            if count == 0:
-                continue
-            end = start + count
-            flat_end = flat_cursor + count
-            self.decision_option_idx[start:end] = native_batch.decision_option_idx[
-                flat_cursor:flat_end
-            ].to(device)
-            self.decision_target_idx[start:end] = native_batch.decision_target_idx[
-                flat_cursor:flat_end
-            ].to(device)
-            self.decision_mask[start:end] = native_batch.decision_mask[flat_cursor:flat_end].to(
-                device=device, dtype=torch.bool
-            )
-            self.uses_none_head[start:end] = native_batch.uses_none_head[flat_cursor:flat_end].to(
-                device=device, dtype=torch.bool
-            )
-            flat_cursor = flat_end
-
-        self.decision_start[step_indices] = torch.tensor(
-            decision_starts, dtype=torch.long, device=device
-        )
-        self.decision_count[step_indices] = torch.tensor(
-            decision_counts, dtype=torch.long, device=device
-        )
+        decision_starts = [int(v) for v in self.decision_start[step_indices].cpu().tolist()]
 
         return BufferWrite(
             step_indices=step_indices,
@@ -644,20 +597,57 @@ class RolloutBuffer(nn.Module):
                 decision_counts=[],
             )
 
-        step_rows = self._allocate_step_rows(n)
-        step_indices = torch.tensor(step_rows, dtype=torch.long, device=device)
-
         max_steps = int(step_counts_t.max().item())
         step_pos = torch.arange(max_steps, device=device).expand(len(env_indices), max_steps)
         valid_step_mask = step_pos < step_counts_t[:, None]
         src_env = env_idx_t[:, None].expand(len(env_indices), max_steps)[valid_step_mask]
         src_step = step_pos[valid_step_mask]
+        decision_counts_t = staging.decision_count[src_env, src_step]
+        source_starts_t = staging.decision_start[src_env, src_step]
+        total_decisions = int(decision_counts_t.sum().item())
+        if total_decisions:
+            max_decisions = int(decision_counts_t.max().item())
+            decision_pos = torch.arange(max_decisions, device=device).expand(n, max_decisions)
+            valid_decision_mask = decision_pos < decision_counts_t[:, None]
+            decision_env = src_env[:, None].expand(n, max_decisions)[valid_decision_mask]
+            source_rows = (source_starts_t[:, None] + decision_pos)[valid_decision_mask]
+            decision_option_idx = staging.decision_option_idx[decision_env, source_rows]
+            decision_target_idx = staging.decision_target_idx[decision_env, source_rows]
+            decision_mask = staging.decision_mask[decision_env, source_rows]
+            uses_none_head = staging.uses_none_head[decision_env, source_rows]
+            selected_indices = staging.selected_indices[decision_env, source_rows]
+        else:
+            decision_option_idx = torch.empty(
+                (0, staging.decision_option_idx.shape[-1]), dtype=torch.long, device=device
+            )
+            decision_target_idx = torch.empty_like(decision_option_idx)
+            decision_mask = torch.empty(
+                (0, staging.decision_mask.shape[-1]), dtype=torch.bool, device=device
+            )
+            uses_none_head = torch.empty(0, dtype=torch.bool, device=device)
+            selected_indices = torch.empty(0, dtype=torch.long, device=device)
+        h_in = staging.lstm_h_in[src_env, src_step] if self.lstm_h_in is not None else None
+        c_in = staging.lstm_c_in[src_env, src_step] if self.lstm_c_in is not None else None
+        step_indices = self.core.append_batch(
+            trace_kind_id=staging.trace_kind_id[src_env, src_step],
+            decision_count=decision_counts_t,
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            selected_indices=selected_indices,
+            may_selected=staging.may_selected[src_env, src_step],
+            old_log_prob=staging.old_log_prob[src_env, src_step],
+            value=staging.value[src_env, src_step],
+            perspective_player_idx=staging.perspective_player_idx[src_env, src_step],
+            lstm_h_in=h_in,
+            lstm_c_in=c_in,
+        )
 
         self.slot_card_rows[step_indices] = staging.slot_card_rows[src_env, src_step]
         self.slot_occupied[step_indices] = staging.slot_occupied[src_env, src_step]
         self.slot_tapped[step_indices] = staging.slot_tapped[src_env, src_step]
         self.game_info[step_indices] = staging.game_info[src_env, src_step]
-        self.trace_kind_id[step_indices] = staging.trace_kind_id[src_env, src_step]
         self.pending_kind_id[step_indices] = staging.pending_kind_id[src_env, src_step]
         self.option_kind_ids[step_indices] = staging.option_kind_ids[src_env, src_step]
         self.option_scalars[step_indices] = staging.option_scalars[src_env, src_step]
@@ -671,13 +661,6 @@ class RolloutBuffer(nn.Module):
         self.target_ref_slot_idx[step_indices] = staging.target_ref_slot_idx[src_env, src_step]
         self.target_ref_is_player[step_indices] = staging.target_ref_is_player[src_env, src_step]
         self.target_ref_is_self[step_indices] = staging.target_ref_is_self[src_env, src_step]
-        self.may_selected[step_indices] = staging.may_selected[src_env, src_step]
-        self.old_log_prob[step_indices] = staging.old_log_prob[src_env, src_step]
-        self.value[step_indices] = staging.value[src_env, src_step]
-        if self.lstm_h_in is not None and self.lstm_c_in is not None:
-            self.lstm_h_in[step_indices] = staging.lstm_h_in[src_env, src_step]
-            self.lstm_c_in[step_indices] = staging.lstm_c_in[src_env, src_step]
-
         step_counts_per_row = step_counts_t[:, None].expand(len(env_indices), max_steps)[
             valid_step_mask
         ]
@@ -743,35 +726,9 @@ class RolloutBuffer(nn.Module):
         self.next_same_perspective_step_idx[step_indices] = next_flat_2d[valid_step_mask]
         self.has_next_same_perspective[step_indices] = has_next_same_2d[valid_step_mask]
 
-        decision_counts_t = staging.decision_count[src_env, src_step]
-        source_starts_t = staging.decision_start[src_env, src_step]
-        total_decisions = int(decision_counts_t.sum().item())
-        if total_decisions:
-            decision_base = self._allocate_decision_range(total_decisions)
-            decision_offsets = torch.cumsum(decision_counts_t, dim=0) - decision_counts_t
-            decision_starts_t = decision_base + decision_offsets
-            max_decisions = int(decision_counts_t.max().item())
-            decision_pos = torch.arange(max_decisions, device=device).expand(n, max_decisions)
-            valid_decision_mask = decision_pos < decision_counts_t[:, None]
-            decision_env = src_env[:, None].expand(n, max_decisions)[valid_decision_mask]
-            source_rows = (source_starts_t[:, None] + decision_pos)[valid_decision_mask]
-            dest_rows = (decision_starts_t[:, None] + decision_pos)[valid_decision_mask]
-            self.decision_option_idx[dest_rows] = staging.decision_option_idx[
-                decision_env, source_rows
-            ]
-            self.decision_target_idx[dest_rows] = staging.decision_target_idx[
-                decision_env, source_rows
-            ]
-            self.decision_mask[dest_rows] = staging.decision_mask[decision_env, source_rows]
-            self.uses_none_head[dest_rows] = staging.uses_none_head[decision_env, source_rows]
-            self.selected_indices[dest_rows] = staging.selected_indices[decision_env, source_rows]
-        else:
-            decision_starts_t = torch.zeros(n, dtype=torch.long, device=device)
-
-        self.decision_start[step_indices] = decision_starts_t
-        self.decision_count[step_indices] = decision_counts_t
-
-        decision_starts = [int(v) for v in decision_starts_t.detach().cpu().tolist()]
+        decision_starts = [
+            int(v) for v in self.decision_start[step_indices].detach().cpu().tolist()
+        ]
         decision_counts = [int(v) for v in decision_counts_t.detach().cpu().tolist()]
 
         return BufferWrite(
@@ -790,8 +747,47 @@ class RolloutBuffer(nn.Module):
                 decision_counts=[],
             )
 
-        step_rows = self._allocate_step_rows(n)
-        step_indices = torch.tensor(step_rows, dtype=torch.long, device=device)
+        decision_counts = [len(p.decision_option_idx) for p in parsed_steps]
+        if sum(decision_counts):
+            decision_option_idx = torch.tensor(
+                [row for p in parsed_steps for row in p.decision_option_idx],
+                dtype=torch.long,
+                device=device,
+            )
+            decision_target_idx = torch.tensor(
+                [row for p in parsed_steps for row in p.decision_target_idx],
+                dtype=torch.long,
+                device=device,
+            )
+            decision_mask = torch.tensor(
+                [row for p in parsed_steps for row in p.decision_mask],
+                dtype=torch.bool,
+                device=device,
+            )
+            uses_none_head = torch.tensor(
+                [v for p in parsed_steps for v in p.uses_none_head],
+                dtype=torch.bool,
+                device=device,
+            )
+        else:
+            decision_option_idx = torch.empty(
+                (0, self.decision_option_idx.shape[-1]), dtype=torch.long, device=device
+            )
+            decision_target_idx = torch.empty_like(decision_option_idx)
+            decision_mask = torch.empty(
+                (0, self.decision_mask.shape[-1]), dtype=torch.bool, device=device
+            )
+            uses_none_head = torch.empty(0, dtype=torch.bool, device=device)
+        selected_indices = torch.full((sum(decision_counts),), -1, dtype=torch.long, device=device)
+        step_indices = self.core.append_batch(
+            trace_kind_id=torch.tensor([p.trace_kind_id for p in parsed_steps], device=device),
+            decision_count=torch.tensor(decision_counts, dtype=torch.long, device=device),
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            selected_indices=selected_indices,
+        )
 
         self.slot_card_rows[step_indices] = torch.tensor(
             [p.parsed_state.slot_card_rows for p in parsed_steps],
@@ -811,11 +807,6 @@ class RolloutBuffer(nn.Module):
         self.game_info[step_indices] = torch.tensor(
             [p.parsed_state.game_info for p in parsed_steps],
             dtype=torch.float32,
-            device=device,
-        )
-        self.trace_kind_id[step_indices] = torch.tensor(
-            [p.trace_kind_id for p in parsed_steps],
-            dtype=torch.long,
             device=device,
         )
         self.pending_kind_id[step_indices] = torch.tensor(
@@ -884,37 +875,7 @@ class RolloutBuffer(nn.Module):
             device=device,
         )
 
-        decision_counts = [len(p.decision_option_idx) for p in parsed_steps]
-        decision_starts: list[int] = []
-        for parsed, count in zip(parsed_steps, decision_counts, strict=True):
-            start = self._allocate_decision_range(count)
-            decision_starts.append(start)
-            if count == 0:
-                continue
-            end = start + count
-            self.decision_option_idx[start:end] = torch.tensor(
-                parsed.decision_option_idx, dtype=torch.long, device=device
-            )
-            self.decision_target_idx[start:end] = torch.tensor(
-                parsed.decision_target_idx, dtype=torch.long, device=device
-            )
-            self.decision_mask[start:end] = torch.tensor(
-                parsed.decision_mask, dtype=torch.bool, device=device
-            )
-            self.uses_none_head[start:end] = torch.tensor(
-                parsed.uses_none_head, dtype=torch.bool, device=device
-            )
-
-        self.decision_start[step_indices] = torch.tensor(
-            decision_starts,
-            dtype=torch.long,
-            device=device,
-        )
-        self.decision_count[step_indices] = torch.tensor(
-            decision_counts,
-            dtype=torch.long,
-            device=device,
-        )
+        decision_starts = [int(v) for v in self.decision_start[step_indices].cpu().tolist()]
 
         return BufferWrite(
             step_indices=step_indices,

@@ -164,12 +164,7 @@ class ReplayCore(nn.Module):
             torch.full((self.decision_capacity,), -1, dtype=self.index_dtype, device=device_t),
             persistent=False,
         )
-        self.register_buffer(
-            "_occupied",
-            torch.zeros(self.capacity, dtype=torch.bool, device=device_t),
-            persistent=False,
-        )
-        self._free_rows = list(range(self.capacity - 1, -1, -1))
+        self._row_cursor = 0
         self._decision_cursor = 0
 
     @property
@@ -178,7 +173,7 @@ class ReplayCore(nn.Module):
 
     @property
     def size(self) -> int:
-        return int(self._occupied.sum().item())
+        return self._row_cursor
 
     trace_kind_id: Tensor
     may_selected: Tensor
@@ -196,38 +191,12 @@ class ReplayCore(nn.Module):
     selected_indices: Tensor
     lstm_h_in: Tensor | None
     lstm_c_in: Tensor | None
-    _occupied: Tensor
 
     def reset(self) -> None:
-        self._occupied.zero_()
-        self._free_rows = list(range(self.capacity - 1, -1, -1))
+        self._row_cursor = 0
         self.decision_start.zero_()
         self.decision_count.zero_()
         self._decision_cursor = 0
-
-    def allocate_row(self) -> int:
-        if not self._free_rows:
-            raise RuntimeError("replay buffer is full")
-        row = self._free_rows.pop()
-        self._occupied[row] = True
-        return int(row)
-
-    def allocate_rows(self, count: int) -> list[int]:
-        if count < 0:
-            raise ValueError("count must be non-negative")
-        if len(self._free_rows) < count:
-            raise RuntimeError("replay buffer is full")
-        rows = [self._free_rows.pop() for _ in range(count)]
-        if rows:
-            self._occupied[torch.tensor(rows, device=self.device)] = True
-        return [int(row) for row in rows]
-
-    def release_rows(self, replay_rows: list[int]) -> None:
-        for row in replay_rows:
-            self.validate_row(row)
-            if bool(self._occupied[row].item()):
-                self._occupied[row] = False
-                self._free_rows.append(int(row))
 
     def validate_row(self, row: int) -> None:
         if row < 0 or row >= self.capacity:
@@ -235,16 +204,94 @@ class ReplayCore(nn.Module):
 
     def validate_occupied(self, rows: Tensor) -> None:
         idx = rows.to(device=self.device)
-        in_range = (idx >= 0) & (idx < self.capacity)
+        in_range = (idx >= 0) & (idx < self._row_cursor)
         if not bool(in_range.all().item()):
             bad = int(idx[~in_range][0].item())
-            raise ValueError(f"replay row {bad} out of range")
-        occupied = self._occupied[idx]
-        if not bool(occupied.all().item()):
-            bad = int(idx[~occupied][0].item())
             raise ValueError(f"replay row {bad} is not occupied")
 
-    def write_common_row(
+    def append_row(
+        self,
+        *,
+        trace_kind_id: int,
+        decision_option_idx: Tensor,
+        decision_target_idx: Tensor,
+        decision_mask: Tensor,
+        uses_none_head: Tensor,
+        selected_indices: Tensor,
+        may_selected: float,
+        old_log_prob: float,
+        value: float,
+        perspective_player_idx: int,
+        lstm_h_in: Tensor | None = None,
+        lstm_c_in: Tensor | None = None,
+    ) -> int:
+        row = self._append_row_index()
+        self._write_decision_row(
+            row,
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            selected_indices=selected_indices,
+        )
+        self._write_common_row(
+            row,
+            trace_kind_id=trace_kind_id,
+            may_selected=may_selected,
+            old_log_prob=old_log_prob,
+            value=value,
+            perspective_player_idx=perspective_player_idx,
+            lstm_h_in=lstm_h_in,
+            lstm_c_in=lstm_c_in,
+        )
+        return row
+
+    def append_batch(
+        self,
+        *,
+        trace_kind_id: Tensor,
+        decision_count: Tensor,
+        decision_option_idx: Tensor,
+        decision_target_idx: Tensor,
+        decision_mask: Tensor,
+        uses_none_head: Tensor,
+        selected_indices: Tensor,
+        may_selected: Tensor | None = None,
+        old_log_prob: Tensor | None = None,
+        value: Tensor | None = None,
+        perspective_player_idx: Tensor | None = None,
+        lstm_h_in: Tensor | None = None,
+        lstm_c_in: Tensor | None = None,
+    ) -> Tensor:
+        batch_size = int(trace_kind_id.shape[0])
+        rows, start, end = self._append_row_indices(batch_size)
+        self._write_decision_batch(
+            start,
+            end,
+            decision_count=decision_count,
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            selected_indices=selected_indices,
+        )
+        self.trace_kind_id[start:end] = trace_kind_id.to(
+            device=self.device, dtype=self.trace_kind_id.dtype
+        )
+        if may_selected is not None:
+            self.may_selected[start:end] = may_selected.to(device=self.device, dtype=torch.float32)
+        if old_log_prob is not None:
+            self.old_log_prob[start:end] = old_log_prob.to(device=self.device, dtype=torch.float32)
+        if value is not None:
+            self.value[start:end] = value.to(device=self.device, dtype=torch.float32)
+        if perspective_player_idx is not None:
+            self.perspective_player_idx[start:end] = perspective_player_idx.to(
+                device=self.device, dtype=self.perspective_player_idx.dtype
+            )
+        self._write_recurrent_batch(start, end, lstm_h_in, lstm_c_in)
+        return rows
+
+    def _write_common_row(
         self,
         row: int,
         *,
@@ -261,28 +308,7 @@ class ReplayCore(nn.Module):
         self.old_log_prob[row] = float(old_log_prob)
         self.value[row] = float(value)
         self.perspective_player_idx[row] = int(perspective_player_idx)
-        self.write_recurrent_row(row, lstm_h_in, lstm_c_in)
-
-    def write_common_batch(
-        self,
-        rows: Tensor,
-        *,
-        trace_kind_id: Tensor,
-        may_selected: Tensor,
-        old_log_prob: Tensor,
-        value: Tensor,
-        perspective_player_idx: Tensor,
-    ) -> None:
-        idx = rows.to(device=self.device)
-        self.trace_kind_id[idx] = trace_kind_id.to(
-            device=self.device, dtype=self.trace_kind_id.dtype
-        )
-        self.may_selected[idx] = may_selected.to(device=self.device, dtype=torch.float32)
-        self.old_log_prob[idx] = old_log_prob.to(device=self.device, dtype=torch.float32)
-        self.value[idx] = value.to(device=self.device, dtype=torch.float32)
-        self.perspective_player_idx[idx] = perspective_player_idx.to(
-            device=self.device, dtype=self.perspective_player_idx.dtype
-        )
+        self._write_recurrent_row(row, lstm_h_in, lstm_c_in)
 
     def gather_common(self, rows: Tensor) -> ReplayCommonBatch:
         idx = rows.to(device=self.device)
@@ -298,7 +324,7 @@ class ReplayCore(nn.Module):
             lstm_c_in=c_in[idx] if c_in is not None else None,
         )
 
-    def write_recurrent_row(
+    def _write_recurrent_row(
         self,
         row: int,
         h_in: Tensor | None,
@@ -319,6 +345,28 @@ class ReplayCore(nn.Module):
         self.lstm_h_in[row].copy_(h_in.to(device=self.device, dtype=torch.float32))
         self.lstm_c_in[row].copy_(c_in.to(device=self.device, dtype=torch.float32))
 
+    def _write_recurrent_batch(
+        self,
+        start: int,
+        end: int,
+        h_in: Tensor | None,
+        c_in: Tensor | None,
+    ) -> None:
+        if self.lstm_h_in is None or self.lstm_c_in is None:
+            if h_in is not None or c_in is not None:
+                raise ValueError("buffer was constructed without recurrent state storage")
+            return
+        if h_in is None or c_in is None:
+            return
+        expected = (end - start, self.recurrent_layers, self.recurrent_hidden_dim)
+        if tuple(h_in.shape) != expected or tuple(c_in.shape) != expected:
+            raise ValueError(
+                f"recurrent state must have shape {expected}, got {tuple(h_in.shape)} "
+                f"and {tuple(c_in.shape)}"
+            )
+        self.lstm_h_in[start:end].copy_(h_in.to(device=self.device, dtype=torch.float32))
+        self.lstm_c_in[start:end].copy_(c_in.to(device=self.device, dtype=torch.float32))
+
     def write_ppo_targets(
         self,
         replay_rows: Tensor,
@@ -335,7 +383,7 @@ class ReplayCore(nn.Module):
         idx = replay_rows.to(device=self.device)
         return self.old_log_prob[idx], self.ppo_return[idx], self.ppo_advantage[idx]
 
-    def write_decision_row(
+    def _write_decision_row(
         self,
         row: int,
         *,
@@ -347,7 +395,7 @@ class ReplayCore(nn.Module):
     ) -> int:
         count = int(decision_option_idx.shape[0])
         stored_count = min(count, self.max_decision_groups)
-        start = self.allocate_decision_range(stored_count)
+        start = self._allocate_decision_range(stored_count)
         self.decision_start[row] = start
         self.decision_count[row] = stored_count
         if stored_count == 0:
@@ -378,9 +426,10 @@ class ReplayCore(nn.Module):
         )
         return stored_count
 
-    def write_decision_batch(
+    def _write_decision_batch(
         self,
-        rows: Tensor,
+        row_start: int,
+        row_end: int,
         *,
         decision_count: Tensor,
         decision_option_idx: Tensor,
@@ -389,14 +438,16 @@ class ReplayCore(nn.Module):
         uses_none_head: Tensor,
         selected_indices: Tensor,
     ) -> Tensor:
-        rows = rows.to(device=self.device)
         counts = decision_count.to(device=self.device)
+        batch_size = row_end - row_start
+        if int(counts.shape[0]) != batch_size:
+            raise ValueError("decision_count length must match appended row count")
         stored_counts = counts.clamp(max=self.max_decision_groups)
         total_stored = int(stored_counts.sum().item())
-        start = self.allocate_decision_range(total_stored)
+        start = self._allocate_decision_range(total_stored)
         starts = torch.cumsum(stored_counts, dim=0) - stored_counts + start
-        self.decision_start[rows] = starts
-        self.decision_count[rows] = stored_counts
+        self.decision_start[row_start:row_end] = starts
+        self.decision_count[row_start:row_end] = stored_counts
         if total_stored == 0:
             return stored_counts
 
@@ -404,7 +455,7 @@ class ReplayCore(nn.Module):
         if total_source < int(counts.sum().item()):
             raise ValueError("decision tensors do not contain decision_count groups")
         step_for_source = torch.repeat_interleave(
-            torch.arange(rows.numel(), device=self.device), counts
+            torch.arange(batch_size, device=self.device), counts
         )
         source_group_starts = torch.cumsum(counts, dim=0) - counts
         group_in_step = (
@@ -435,7 +486,25 @@ class ReplayCore(nn.Module):
         )
         return stored_counts
 
-    def allocate_decision_range(self, count: int) -> int:
+    def _append_row_index(self) -> int:
+        if self._row_cursor >= self.capacity:
+            raise RuntimeError("replay buffer is full")
+        row = self._row_cursor
+        self._row_cursor += 1
+        return row
+
+    def _append_row_indices(self, count: int) -> tuple[Tensor, int, int]:
+        if count < 0:
+            raise ValueError("count must be non-negative")
+        if self._row_cursor + count > self.capacity:
+            raise RuntimeError("replay buffer is full")
+        start = self._row_cursor
+        end = start + count
+        self._row_cursor = end
+        rows = torch.arange(start, end, device=self.device)
+        return rows, start, end
+
+    def _allocate_decision_range(self, count: int) -> int:
         if count == 0:
             return self._decision_cursor
         if count < 0:
@@ -522,7 +591,5 @@ class ReplayCore(nn.Module):
         if tuple(selected_indices.shape) != (count,):
             raise ValueError(f"selected_indices must have shape {(count,)}")
 
-
-FlatDecisionStorage = ReplayCore
 
 __all__ = ["DenseDecisionBatch", "ReplayCommonBatch", "ReplayCore"]

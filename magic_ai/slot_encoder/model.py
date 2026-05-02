@@ -342,9 +342,6 @@ class PPOPolicy(nn.Module):
             self.live_lstm_c[:, idx_t].permute(1, 0, 2).contiguous().detach(),
         )
 
-    def release_replay_rows(self, replay_rows: list[int]) -> None:
-        return
-
     def write_ppo_targets(
         self,
         replay_rows: Tensor,
