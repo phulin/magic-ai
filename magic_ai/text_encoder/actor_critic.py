@@ -1254,7 +1254,7 @@ class TextActorCritic(nn.Module):
         )
 
     def _replay_scoring_forward(self, output: RecurrentTextPolicyOutput) -> ReplayScoringForward:
-        return ReplayScoringForward(
+        return ReplayScoringForward.direct(
             values=output.values,
             option_vectors=output.option_vectors,
             target_vectors=output.target_vectors,

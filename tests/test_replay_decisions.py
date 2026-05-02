@@ -41,7 +41,7 @@ class ReplayDecisionHelpersTests(unittest.TestCase):
 
     def test_replay_scoring_forward_drives_shared_helpers(self) -> None:
         query = torch.tensor([[2.0, -1.0]])
-        forward = ReplayScoringForward(
+        forward = ReplayScoringForward.vector(
             values=torch.tensor([0.1]),
             option_vectors=torch.tensor([[[1.0, 0.0], [0.0, 1.0]]]),
             target_vectors=torch.zeros(1, 2, 1, 2),
@@ -92,7 +92,7 @@ class ReplayDecisionHelpersTests(unittest.TestCase):
             torch.testing.assert_close(forward_tensor, direct_tensor)
 
     def test_direct_decision_logits_from_forward_scores_text_heads(self) -> None:
-        forward = ReplayScoringForward(
+        forward = ReplayScoringForward.direct(
             values=torch.zeros(2),
             option_vectors=torch.zeros(2, 3, 2),
             target_vectors=torch.zeros(2, 3, 2, 2),

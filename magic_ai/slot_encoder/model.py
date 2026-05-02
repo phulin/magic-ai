@@ -2130,7 +2130,7 @@ class PPOPolicy(nn.Module):
 
         self._maybe_init_compiled_functions()
         return flat_decision_distribution_from_forward(
-            ReplayScoringForward(
+            ReplayScoringForward.vector(
                 values=query.new_zeros(query.shape[0]),
                 option_vectors=option_vectors,
                 target_vectors=target_vectors,

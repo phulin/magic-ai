@@ -51,6 +51,56 @@ class ReplayScoringForward:
     option_logits: Tensor | None = None
     target_logits: Tensor | None = None
 
+    @classmethod
+    def vector(
+        cls,
+        *,
+        values: Tensor,
+        option_vectors: Tensor,
+        target_vectors: Tensor,
+        none_logits: Tensor,
+        may_logits: Tensor,
+        hidden: Tensor,
+        query: Tensor,
+    ) -> ReplayScoringForward:
+        """Build the slot/vector scorer shape with an explicit query tensor."""
+
+        return cls(
+            values=values,
+            option_vectors=option_vectors,
+            target_vectors=target_vectors,
+            none_logits=none_logits,
+            may_logits=may_logits,
+            hidden=hidden,
+            query=query,
+        )
+
+    @classmethod
+    def direct(
+        cls,
+        *,
+        values: Tensor,
+        option_vectors: Tensor,
+        target_vectors: Tensor,
+        none_logits: Tensor,
+        may_logits: Tensor,
+        hidden: Tensor,
+        option_logits: Tensor,
+        target_logits: Tensor,
+    ) -> ReplayScoringForward:
+        """Build the text/direct-logit scorer shape with explicit logits."""
+
+        return cls(
+            values=values,
+            option_vectors=option_vectors,
+            target_vectors=target_vectors,
+            none_logits=none_logits,
+            may_logits=may_logits,
+            hidden=hidden,
+            option_logits=option_logits,
+            target_logits=target_logits,
+        )
+
 
 def score_may_decisions(
     *,

@@ -22,7 +22,6 @@ top of these primitives in the trainer module. See ``docs/rnad_design.md`` and
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -1843,53 +1842,6 @@ def _batched_trajectory_loss_from_forwards(
         is_bias_down_count=int(diag_h[5]),
         v_target_reg_share_sum=diag_h[8],
         v_target_reg_share_count=v_target_reg_share_count_t,
-    )
-
-
-def _slice_per_choice(
-    pc: Any,
-    *,
-    step_lo: int,
-    step_hi: int,
-    flat_lo: int,
-    flat_hi: int,
-    dg_lo: int,
-    dg_hi: int,
-) -> Any:
-    """Slice a batched ``ReplayPerChoice`` to a single episode.
-
-    Re-bases ``group_idx`` (per-flat-entry → step), ``decision_group_id_flat``
-    (per-flat-entry → unique decision-group id), and ``step_for_decision_group``
-    (per-decision-group → step) into the episode-local index space [0, T_ep)
-    and [0, n_dg_ep). Caller is responsible for supplying the correct
-    boundary indices (``rnad_batched_trajectory_loss`` derives them via
-    one ``torch.searchsorted`` per pc).
-    """
-
-    flat_logits = pc.flat_logits[flat_lo:flat_hi]
-    flat_log_probs = pc.flat_log_probs[flat_lo:flat_hi]
-    group_idx = pc.group_idx[flat_lo:flat_hi]
-    if group_idx.numel() > 0:
-        group_idx = group_idx - step_lo
-    decision_group_id_flat = pc.decision_group_id_flat[flat_lo:flat_hi]
-    if decision_group_id_flat.numel() > 0:
-        decision_group_id_flat = decision_group_id_flat - dg_lo
-    step_for_decision_group = pc.step_for_decision_group[dg_lo:dg_hi]
-    if step_for_decision_group.numel() > 0:
-        step_for_decision_group = step_for_decision_group - step_lo
-
-    return dataclasses.replace(
-        pc,
-        flat_logits=flat_logits,
-        flat_log_probs=flat_log_probs,
-        group_idx=group_idx,
-        choice_cols=pc.choice_cols[flat_lo:flat_hi],
-        is_sampled_flat=pc.is_sampled_flat[flat_lo:flat_hi],
-        decision_group_id_flat=decision_group_id_flat,
-        step_for_decision_group=step_for_decision_group,
-        may_is_active=pc.may_is_active[step_lo:step_hi],
-        may_logits_per_step=pc.may_logits_per_step[step_lo:step_hi],
-        may_selected_per_step=pc.may_selected_per_step[step_lo:step_hi],
     )
 
 
