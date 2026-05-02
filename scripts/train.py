@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import hashlib
 import importlib
@@ -1345,11 +1346,17 @@ def run_mlm_pretrain(
         )
 
     log_every = max(1, args.pretrain_mlm_log_every)
+    use_amp = bool(args.pretrain_mlm_amp) and device.type == "cuda"
+    if use_amp:
+        amp_ctx: Any = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    else:
+        amp_ctx = contextlib.nullcontext()
     global_step = 0
     for epoch in range(args.pretrain_mlm_epochs):
         for batch_np in dataset.iter_epoch(cfg.batch_size, np_rng):
             token_ids = torch.from_numpy(batch_np).to(device=device, dtype=torch.long)
-            stats = trainer.step(token_ids, torch_rng)
+            with amp_ctx:
+                stats = trainer.step(token_ids, torch_rng)
             if global_step % log_every == 0:
                 print(
                     f"[mlm] epoch={epoch} step={global_step:6d} loss={stats['loss']:.4f} "
@@ -1490,7 +1497,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--encoder",
         choices=("slots", "text"),
-        default="slots",
+        default="text",
         help="state encoder backend to train; slots preserves the existing native slot path",
     )
     parser.add_argument("--embeddings", type=Path, default=Path("data/embeddings.json"))
@@ -1595,7 +1602,7 @@ def parse_args() -> argparse.Namespace:
         "matches --max-steps-per-game so the whole trace is one chunk.",
     )
     parser.add_argument("--episodes", type=int, default=65536)
-    parser.add_argument("--num-envs", type=int, default=128)
+    parser.add_argument("--num-envs", type=int, default=412)
     parser.add_argument("--rollout-steps", type=int, default=4096)
     parser.add_argument(
         "--rollout-min-ready-batch",
@@ -1659,7 +1666,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ORACLE_DB_PATH,
         help="Scryfall oracle-cards.json bulk dump for text encoder oracle text",
     )
-    parser.add_argument("--text-max-tokens", type=int, default=4096)
+    parser.add_argument("--text-max-tokens", type=int, default=1024)
     parser.add_argument("--text-d-model", type=int, default=128)
     parser.add_argument("--text-layers", type=int, default=2)
     parser.add_argument("--text-heads", type=int, default=4)
@@ -1707,12 +1714,18 @@ def parse_args() -> argparse.Namespace:
         help="number of full passes over the corpus (one pass = each "
         "non-overlapping seq_len-length span seen exactly once)",
     )
-    parser.add_argument("--pretrain-mlm-batch-size", type=int, default=32)
+    parser.add_argument("--pretrain-mlm-batch-size", type=int, default=128)
     parser.add_argument("--pretrain-mlm-seq-len", type=int, default=512)
     parser.add_argument("--pretrain-mlm-mask-prob", type=float, default=0.15)
-    parser.add_argument("--pretrain-mlm-lr", type=float, default=1e-4)
+    parser.add_argument("--pretrain-mlm-lr", type=float, default=2e-4)
     parser.add_argument("--pretrain-mlm-grad-clip", type=float, default=1.0)
     parser.add_argument("--pretrain-mlm-log-every", type=int, default=50)
+    parser.add_argument(
+        "--pretrain-mlm-amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="run the MLM forward+backward under torch.autocast(bf16) on CUDA. No-op on CPU.",
+    )
     parser.add_argument(
         "--native-text-rollout",
         "--native-render-plan",
@@ -1730,10 +1743,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--card-body-dedup",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="emit each unique card body once at the top of the snapshot and "
         "reference it from per-zone occurrences (~3-4x token reduction on "
-        "card-heavy snapshots; default: off)",
+        "card-heavy snapshots; default: on)",
     )
     parser.add_argument(
         "--text-native-assembler",
@@ -1766,7 +1779,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-decision-groups",
         type=int,
-        default=16,
+        default=32,
         help="Cap on per-step decision groups in the replay buffer. Combat "
         "steps (attackers/blockers) emit one group per creature; rows that "
         "would exceed this cap raise at append time.",
