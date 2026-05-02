@@ -30,6 +30,8 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from magic_ai.model_state import is_actor_runtime_state_key
+
 
 @dataclass(frozen=True)
 class RNaDConfig:
@@ -845,22 +847,6 @@ def may_neurd_loss(
 # ---------------------------------------------------------------------------
 
 
-# Buffers that hold per-actor runtime state (env-indexed LSTM cache, rollout
-# storage). They are not part of the trainable model and must NOT be Polyak-
-# averaged or copied between online and target/reg policies; doing so would
-# replace one policy's actor cache with another's (or with a stale snapshot)
-# and silently corrupt sampling for whichever module shares the buffer.
-_ACTOR_RUNTIME_BUFFER_PREFIXES: tuple[str, ...] = (
-    "live_lstm_h",
-    "live_lstm_c",
-    "rollout_buffer.",
-)
-
-
-def _is_actor_runtime_buffer(name: str) -> bool:
-    return any(name == p or name.startswith(p) for p in _ACTOR_RUNTIME_BUFFER_PREFIXES)
-
-
 @torch.no_grad()
 def polyak_update_(target: nn.Module, online: nn.Module, gamma: float) -> None:
     """In-place Polyak averaging: ``target <- gamma * online + (1 - gamma) * target``.
@@ -887,7 +873,7 @@ def polyak_update_(target: nn.Module, online: nn.Module, gamma: float) -> None:
     for name, b_online in online.named_buffers():
         if name not in target_buffers:
             continue
-        if _is_actor_runtime_buffer(name):
+        if is_actor_runtime_state_key(name):
             continue
         b_target = target_buffers[name]
         if b_target.dtype.is_floating_point and b_online.dtype.is_floating_point:

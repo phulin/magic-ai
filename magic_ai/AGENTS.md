@@ -12,6 +12,7 @@ Core training and inference pipeline for a Magic: The Gathering-playing RL agent
 - `actions.py` — encode/decode legal action options; shared policy types (TraceKind, ActionTrace, PolicyStep, ParsedStep, ParsedBatch) and build_decision_layout_rows
 - `game_state.py` — shared TypedDicts (GameStateSnapshot, PlayerState, PendingState, etc.), zone constants, and ParsedGameState/ParsedGameStateBatch
 - `lstm_recompute.py` — four LSTM input-state recompute strategies for R-NaD trajectory loss
+- `model_state.py` — shared state-dict key classification for runtime buffers and snapshot filtering
 - `opponent_pool.py` — opponent pool with TrueSkill ratings and periodic evaluation
 - `ppo.py` — PPO update helpers (advantages, gradient steps, loss computation)
 - `replay_decisions.py` — backend-neutral decision-group scoring for replay policy evaluation
