@@ -278,29 +278,162 @@ def direct_decision_logits_from_forward(
     target_logits = forward.target_logits
     option_idx_clamped = option_idx.clamp(0, option_logits.shape[1] - 1)
     target_idx_clamped = target_idx.clamp(0, target_logits.shape[2] - 1)
+    step_idx_expanded = step_positions.unsqueeze(-1).expand_as(option_idx_clamped)
 
-    option_for_groups = option_logits[step_positions]
-    option_choice_logits = torch.gather(option_for_groups, 1, option_idx_clamped)
-
-    target_for_groups = target_logits[step_positions]
-    option_targets = torch.gather(
-        target_for_groups,
-        dim=1,
-        index=option_idx_clamped.unsqueeze(-1).expand(-1, -1, target_logits.shape[2]),
-    )
-    target_choice_logits = torch.gather(
-        option_targets,
-        dim=2,
-        index=target_idx_clamped.unsqueeze(-1),
-    ).squeeze(-1)
+    option_choice_logits = option_logits[step_idx_expanded, option_idx_clamped]
+    target_choice_logits = target_logits[
+        step_idx_expanded,
+        option_idx_clamped,
+        target_idx_clamped,
+    ]
 
     has_target = target_idx >= 0
     has_option = option_idx >= 0
     logits = torch.where(has_target, target_choice_logits, option_choice_logits)
     logits = torch.where(has_option, logits, torch.full_like(logits, -torch.inf))
-    if uses_none.any():
-        logits[uses_none, 0] = forward.none_logits[step_positions[uses_none]]
+    logits[uses_none, 0] = forward.none_logits[step_positions[uses_none]]
     return logits.masked_fill(~masks, -torch.inf)
+
+
+def direct_flat_decision_distribution_impl(
+    step_positions: Tensor,
+    option_idx: Tensor,
+    target_idx: Tensor,
+    masks: Tensor,
+    uses_none: Tensor,
+    option_logits: Tensor,
+    target_logits: Tensor,
+    none_logits: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Compile-friendly flat valid-choice distribution for direct text logits."""
+
+    valid = masks.nonzero(as_tuple=False)
+    device = masks.device
+    group_idx = valid[:, 0]
+    choice_cols = valid[:, 1]
+    flat_step_positions = step_positions[group_idx]
+
+    is_none = uses_none[group_idx].bool() & (choice_cols == 0)
+    is_scored = ~is_none
+    scored_pos = is_scored.nonzero(as_tuple=False).squeeze(-1)
+    scored_groups = group_idx[scored_pos]
+    scored_cols = choice_cols[scored_pos]
+    scored_steps = flat_step_positions[scored_pos]
+
+    scored_option_idx = option_idx[scored_groups, scored_cols]
+    scored_target_idx = target_idx[scored_groups, scored_cols]
+    option_idx_clamped = scored_option_idx.clamp(0, option_logits.shape[1] - 1)
+    target_idx_clamped = scored_target_idx.clamp(0, target_logits.shape[2] - 1)
+
+    option_values = option_logits[scored_steps, option_idx_clamped]
+    target_values = target_logits[scored_steps, option_idx_clamped, target_idx_clamped]
+    scored_values = torch.where(scored_target_idx >= 0, target_values, option_values)
+    scored_values = torch.where(
+        scored_option_idx >= 0,
+        scored_values,
+        torch.full_like(scored_values, -torch.inf),
+    )
+
+    flat_logits = none_logits[flat_step_positions].scatter(0, scored_pos, scored_values)
+
+    group_count = step_positions.shape[0]
+    group_max = torch.full((group_count,), -torch.inf, dtype=option_logits.dtype, device=device)
+    group_max.scatter_reduce_(0, group_idx, flat_logits, reduce="amax", include_self=True)
+
+    stabilized = flat_logits - group_max[group_idx]
+    exp_logits = stabilized.exp()
+    group_exp_sum = torch.zeros(group_count, dtype=option_logits.dtype, device=device)
+    group_exp_sum.scatter_add_(0, group_idx, exp_logits)
+    flat_log_probs = stabilized - group_exp_sum[group_idx].log()
+
+    probs = flat_log_probs.exp()
+    group_entropies = torch.zeros(group_count, dtype=option_logits.dtype, device=device)
+    group_entropies.scatter_add_(0, group_idx, -(probs * flat_log_probs))
+
+    return group_idx, choice_cols, flat_logits, flat_log_probs, group_entropies
+
+
+def direct_flat_decision_distribution_from_forward(
+    forward: ReplayScoringForward,
+    *,
+    step_positions: Tensor,
+    option_idx: Tensor,
+    target_idx: Tensor,
+    masks: Tensor,
+    uses_none: Tensor,
+    validate: bool = False,
+    compiled_fn: Callable[..., tuple[Tensor, Tensor, Tensor, Tensor, Tensor]] | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Return flat valid-choice logits/log-probs for direct text replay scoring."""
+
+    if forward.option_logits is None or forward.target_logits is None:
+        raise ValueError(
+            "ReplayScoringForward.option_logits and target_logits are required "
+            "for direct replay scoring"
+        )
+    return direct_flat_decision_distribution(
+        step_positions=step_positions,
+        option_idx=option_idx,
+        target_idx=target_idx,
+        masks=masks,
+        uses_none=uses_none,
+        option_logits=forward.option_logits,
+        target_logits=forward.target_logits,
+        none_logits=forward.none_logits,
+        validate=validate,
+        compiled_fn=compiled_fn,
+    )
+
+
+def direct_flat_decision_distribution(
+    *,
+    step_positions: Tensor,
+    option_idx: Tensor,
+    target_idx: Tensor,
+    masks: Tensor,
+    uses_none: Tensor,
+    option_logits: Tensor,
+    target_logits: Tensor,
+    none_logits: Tensor,
+    validate: bool = False,
+    compiled_fn: Callable[..., tuple[Tensor, Tensor, Tensor, Tensor, Tensor]] | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Return flat valid-choice distribution for direct option/target logits."""
+
+    valid = masks.nonzero(as_tuple=False)
+    if valid.numel() == 0:
+        raise ValueError("decision groups must include at least one valid choice")
+
+    if validate:
+        group_idx_v = valid[:, 0]
+        choice_cols_v = valid[:, 1]
+        is_none_v = uses_none[group_idx_v] & (choice_cols_v == 0)
+        is_scored_v = ~is_none_v
+        scored_groups_v = group_idx_v[is_scored_v]
+        scored_cols_v = choice_cols_v[is_scored_v]
+        scored_steps_v = step_positions[group_idx_v][is_scored_v]
+        validate_flat_scored_indices(
+            scored_groups=scored_groups_v,
+            scored_cols=scored_cols_v,
+            scored_steps=scored_steps_v,
+            scored_option_idx=option_idx[scored_groups_v, scored_cols_v],
+            scored_target_idx=target_idx[scored_groups_v, scored_cols_v],
+            max_steps=option_logits.shape[0],
+            max_options=option_logits.shape[1],
+            max_targets=target_logits.shape[2],
+        )
+
+    fn = compiled_fn or direct_flat_decision_distribution_impl
+    return fn(
+        step_positions,
+        option_idx,
+        target_idx,
+        masks,
+        uses_none,
+        option_logits,
+        target_logits,
+        none_logits,
+    )
 
 
 def flat_decision_distribution_impl(

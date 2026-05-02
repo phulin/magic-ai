@@ -5,6 +5,8 @@ from magic_ai.replay_decisions import (
     ReplayScoringForward,
     decision_logits_reference,
     direct_decision_logits_from_forward,
+    direct_flat_decision_distribution,
+    direct_flat_decision_distribution_from_forward,
     flat_decision_distribution,
     flat_decision_distribution_from_forward,
     score_may_decisions,
@@ -130,6 +132,95 @@ class ReplayDecisionHelpersTests(unittest.TestCase):
             ]
         )
         torch.testing.assert_close(logits, expected)
+
+    def test_direct_flat_distribution_matches_dense_text_logits(self) -> None:
+        option_logits = torch.tensor(
+            [
+                [0.1, 0.2, 0.3],
+                [1.0, 1.5, 2.0],
+            ]
+        )
+        target_logits = torch.tensor(
+            [
+                [[0.4, 0.5], [0.6, 0.7], [0.8, 0.9]],
+                [[2.1, 2.2], [2.3, 2.4], [2.5, 2.6]],
+            ]
+        )
+        forward = ReplayScoringForward.direct(
+            values=torch.zeros(2),
+            option_vectors=torch.zeros(2, 3, 2),
+            target_vectors=torch.zeros(2, 3, 2, 2),
+            none_logits=torch.tensor([-1.0, 0.5]),
+            may_logits=torch.zeros(2),
+            hidden=torch.zeros(2, 4),
+            option_logits=option_logits,
+            target_logits=target_logits,
+        )
+        step_positions = torch.tensor([0, 1])
+        option_idx = torch.tensor([[0, 1, -1], [-1, 2, 1]])
+        target_idx = torch.tensor([[-1, 1, -1], [-1, 0, -1]])
+        masks = torch.tensor([[True, True, False], [True, True, True]])
+        uses_none = torch.tensor([False, True])
+
+        dense_logits = direct_decision_logits_from_forward(
+            forward,
+            step_positions=step_positions,
+            option_idx=option_idx,
+            target_idx=target_idx,
+            masks=masks,
+            uses_none=uses_none,
+            validate=True,
+        )
+        group_idx, choice_cols, flat_logits, flat_log_probs, entropies = (
+            direct_flat_decision_distribution(
+                step_positions=step_positions,
+                option_idx=option_idx,
+                target_idx=target_idx,
+                masks=masks,
+                uses_none=uses_none,
+                option_logits=option_logits,
+                target_logits=target_logits,
+                none_logits=forward.none_logits,
+                validate=True,
+            )
+        )
+        via_forward = direct_flat_decision_distribution_from_forward(
+            forward,
+            step_positions=step_positions,
+            option_idx=option_idx,
+            target_idx=target_idx,
+            masks=masks,
+            uses_none=uses_none,
+            validate=True,
+        )
+
+        expected_flat = dense_logits[masks]
+        expected_log_probs = torch.cat(
+            [
+                torch.log_softmax(dense_logits[0, :2], dim=0),
+                torch.log_softmax(dense_logits[1, :3], dim=0),
+            ]
+        )
+        expected_probs_0 = torch.softmax(dense_logits[0, :2], dim=0)
+        expected_probs_1 = torch.softmax(dense_logits[1, :3], dim=0)
+        expected_entropies = torch.stack(
+            [
+                -(expected_probs_0 * torch.log_softmax(dense_logits[0, :2], dim=0)).sum(),
+                -(expected_probs_1 * torch.log_softmax(dense_logits[1, :3], dim=0)).sum(),
+            ]
+        )
+
+        torch.testing.assert_close(group_idx, torch.tensor([0, 0, 1, 1, 1]))
+        torch.testing.assert_close(choice_cols, torch.tensor([0, 1, 0, 1, 2]))
+        torch.testing.assert_close(flat_logits, expected_flat)
+        torch.testing.assert_close(flat_log_probs, expected_log_probs)
+        torch.testing.assert_close(entropies, expected_entropies)
+        for direct_tensor, forward_tensor in zip(
+            (group_idx, choice_cols, flat_logits, flat_log_probs, entropies),
+            via_forward,
+            strict=True,
+        ):
+            torch.testing.assert_close(forward_tensor, direct_tensor)
 
     def test_flat_distribution_matches_manual_logits(self) -> None:
         option_vectors = torch.tensor(
