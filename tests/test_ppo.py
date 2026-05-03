@@ -5,7 +5,7 @@ from collections.abc import Iterator
 from unittest.mock import patch
 
 import torch
-from magic_ai.ppo import RolloutStep, ppo_update
+from magic_ai.ppo import RolloutStep, gae_returns, ppo_update
 from torch import Tensor, nn
 
 
@@ -128,6 +128,40 @@ class PPOUpdateTests(unittest.TestCase):
             )
 
         self.assertEqual(policy.replay_batches, [[0, 1], [2, 3], [4]])
+
+
+class GaeReturnsDrawTest(unittest.TestCase):
+    """A drawn game must hand BOTH players a negative terminal return.
+
+    Regression: an earlier version assigned ``-draw_penalty`` to the last
+    step alone and let the perspective-aware GAE propagation flip its sign
+    across player switches, effectively rewarding one side for stalling
+    on the opponent's turn.
+    """
+
+    @staticmethod
+    def _step(player: int, value: float = 0.0) -> RolloutStep:
+        return RolloutStep(
+            perspective_player_idx=player,
+            old_log_prob=0.0,
+            value=value,
+            replay_idx=None,
+        )
+
+    def test_both_players_get_draw_penalty(self) -> None:
+        steps = [self._step(p) for p in (0, 1, 0, 1, 0, 1)]
+        returns = gae_returns(steps, winner_idx=-1, draw_penalty=1.0)
+        # Every step's return is -draw_penalty regardless of perspective.
+        torch.testing.assert_close(returns, torch.full((6,), -1.0))
+
+    def test_win_loss_unchanged(self) -> None:
+        # Sanity check that the non-draw path is intact: terminal player
+        # gets +1, the other side's perspective steps see propagated -1.
+        steps = [self._step(0), self._step(1), self._step(0)]
+        returns = gae_returns(steps, winner_idx=0, draw_penalty=1.0, gamma=1.0, gae_lambda=0.95)
+        # Last step (player 0, winner) → +1; player 1's prior step → -1.
+        self.assertGreater(float(returns[-1]), 0.0)
+        self.assertLess(float(returns[1]), 0.0)
 
 
 if __name__ == "__main__":

@@ -235,6 +235,17 @@ def gae_returns(
         raise ValueError("cannot compute GAE returns for an empty rollout")
 
     num_steps = len(steps)
+
+    # Draws are a flat outcome both players experience identically. The
+    # perspective-aware GAE below uses zero-sum sign-flipping to propagate the
+    # last step's reward across player switches; that's correct for win/loss
+    # (one side's +1 = other side's -1) but WRONG for draws, where both
+    # sides should see -draw_penalty. Without this short-circuit the
+    # propagation would hand one player +draw_penalty as their terminal
+    # return, incentivizing them to stall on the opponent's turn.
+    if winner_idx < 0:
+        return torch.full((num_steps,), -draw_penalty, dtype=torch.float32)
+
     values_t = torch.tensor([step.value for step in steps], dtype=torch.float32)
     players_t = torch.tensor(
         [step.perspective_player_idx for step in steps],
@@ -243,9 +254,7 @@ def gae_returns(
     rewards_t = torch.zeros(num_steps, dtype=torch.float32)
 
     last_step = steps[-1]
-    if winner_idx < 0:
-        rewards_t[-1] = -draw_penalty
-    elif winner_idx == last_step.perspective_player_idx:
+    if winner_idx == last_step.perspective_player_idx:
         rewards_t[-1] = 1.0
     else:
         rewards_t[-1] = -1.0
