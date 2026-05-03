@@ -1381,7 +1381,10 @@ def run_mlm_pretrain(
         cfg=cfg,
         lr=args.pretrain_mlm_lr,
         grad_clip=args.pretrain_mlm_grad_clip,
+        encoder_cfg=encoder.cfg,
     )
+    if trainer.hf_head_initialized:
+        print("[mlm] LM head warm-initialized from HF checkpoint")
 
     np_rng = np.random.default_rng(args.seed)
     torch_rng = torch.Generator(device=device)

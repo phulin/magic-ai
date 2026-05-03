@@ -8,7 +8,7 @@ import math
 import random
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -247,7 +247,13 @@ def build_text_opponent_policy(
 
     from magic_ai.text_encoder.actor_critic import TextActorCritic
 
+    # Skip the HF warm-init for the opponent: the trained main policy's
+    # state_dict is loaded over it on the next line, so re-downloading and
+    # copying the Ettin weights here would just be thrown away (and would
+    # emit a confusing second LOAD REPORT after MLM/RL boundaries).
     cfg = main_policy.policy.cfg
+    if cfg.encoder.hf_model_name is not None:
+        cfg = replace(cfg, encoder=replace(cfg.encoder, hf_model_name=None))
     opponent = TextActorCritic(cfg).to(device)
 
     # ``live_lstm_h``/``live_lstm_c`` are per-env recurrence buffers sized

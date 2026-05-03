@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from magic_ai.text_encoder.batch import TextEncodedBatch
-from magic_ai.text_encoder.model import TextStateEncoder
+from magic_ai.text_encoder.model import TextEncoderConfig, TextStateEncoder
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 
@@ -224,6 +224,53 @@ class MLMHead(nn.Module):
         return F.linear(h, self._embedding_weight_ref.weight, self.bias)
 
 
+def initialize_mlm_head_from_hf(head: MLMHead, encoder_cfg: TextEncoderConfig) -> bool:
+    """Warm-init ``head`` from the HF MLM head/decoder weights.
+
+    Returns True if HF weights were copied, False if init was skipped (no HF
+    name, or layer truncation requested — the trunk no longer matches the
+    pretraining task, so the user opted to start the head fresh in that case).
+
+    Copies ``head.dense.weight`` (+ bias if present in HF), ``head.norm.weight``
+    (+ bias if present), and ``decoder.bias`` (truncated/padded to local vocab
+    size). The decoder weight is tied to the embedding and is therefore covered
+    by :func:`initialize_text_state_encoder_from_hf`.
+    """
+
+    from transformers import AutoModelForMaskedLM
+
+    if encoder_cfg.hf_model_name is None:
+        return False
+    if encoder_cfg.hf_truncate_layers is not None:
+        return False
+
+    hf = AutoModelForMaskedLM.from_pretrained(
+        encoder_cfg.hf_model_name,
+        revision=encoder_cfg.hf_revision,
+        trust_remote_code=encoder_cfg.hf_trust_remote_code,
+    )
+    hf.resize_token_embeddings(encoder_cfg.vocab_size, pad_to_multiple_of=None)
+    sd = hf.state_dict()
+
+    def _copy(dst: Tensor, src: Tensor) -> None:
+        with torch.no_grad():
+            dst.copy_(src.to(device=dst.device, dtype=dst.dtype))
+
+    if "head.dense.weight" in sd:
+        _copy(head.dense.weight, sd["head.dense.weight"])
+    if "head.dense.bias" in sd:
+        _copy(head.dense.bias, sd["head.dense.bias"])
+    if "head.norm.weight" in sd:
+        _copy(head.layer_norm.weight, sd["head.norm.weight"])
+    if "head.norm.bias" in sd:
+        _copy(head.layer_norm.bias, sd["head.norm.bias"])
+    if "decoder.bias" in sd:
+        n = min(int(head.bias.shape[0]), int(sd["decoder.bias"].shape[0]))
+        with torch.no_grad():
+            head.bias[:n].copy_(sd["decoder.bias"][:n].to(device=head.bias.device))
+    return True
+
+
 class MLMTrainer:
     """Encoder + tied LM head + AdamW; one step computes masked-token CE loss."""
 
@@ -235,10 +282,17 @@ class MLMTrainer:
         weight_decay: float = 0.01,
         betas: tuple[float, float] = (0.9, 0.95),
         grad_clip: float | None = 1.0,
+        encoder_cfg: TextEncoderConfig | None = None,
     ) -> None:
         self.encoder = encoder
         self.cfg = cfg
         self.head = MLMHead(encoder).to(next(encoder.parameters()).device)
+        # Warm-init the LM head from HF when the encoder cfg is supplied (and
+        # has an hf_model_name). Skipped when the encoder was truncated, since
+        # the head was pretrained against the full-depth trunk.
+        self.hf_head_initialized = False
+        if encoder_cfg is not None:
+            self.hf_head_initialized = initialize_mlm_head_from_hf(self.head, encoder_cfg)
         self.grad_clip = grad_clip
         params = list(encoder.parameters()) + [
             p for n, p in self.head.named_parameters() if "_embedding_weight_ref" not in n
@@ -299,5 +353,6 @@ __all__ = [
     "MLMHead",
     "MLMTrainer",
     "apply_mlm_mask",
+    "initialize_mlm_head_from_hf",
     "make_mlm_batch",
 ]

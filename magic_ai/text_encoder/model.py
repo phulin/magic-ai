@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
-from transformers import AutoConfig, AutoModel
+from transformers import AutoConfig, AutoModelForMaskedLM
 
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 
@@ -449,12 +449,19 @@ def initialize_text_state_encoder_from_hf(
 
     if cfg.hf_model_name is None:
         raise ValueError("hf_model_name is required for HF initialization")
-    hf_model = AutoModel.from_pretrained(
+    # Load the ForMaskedLM wrapper (rather than AutoModel) so the head/decoder
+    # weights count as expected when the checkpoint includes them — otherwise
+    # transformers prints a LOAD REPORT flagging head.dense, head.norm, and
+    # decoder.* as unexpected, which is misleading. We only copy trunk weights
+    # here; MLM head init is handled separately in
+    # :func:`magic_ai.text_encoder.mlm.initialize_mlm_head_from_hf`.
+    hf_wrapper = AutoModelForMaskedLM.from_pretrained(
         cfg.hf_model_name,
         revision=cfg.hf_revision,
         trust_remote_code=cfg.hf_trust_remote_code,
     )
-    hf_model.resize_token_embeddings(cfg.vocab_size, pad_to_multiple_of=None)
+    hf_wrapper.resize_token_embeddings(cfg.vocab_size, pad_to_multiple_of=None)
+    hf_model = hf_wrapper.model
     hidden_size = int(getattr(hf_model.config, "hidden_size"))
     if hidden_size != cfg.d_model:
         raise ValueError(
