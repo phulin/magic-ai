@@ -3457,7 +3457,10 @@ def train_text_native_batched_envs(
     pending_returns: list[torch.Tensor] = []
     pending_step_count: int = 0
     pending_episodes: list[EpisodeBatch] = []
-    pending_episode_rows: list[list[int]] = []
+    # PPO-only path: accumulate per-finished-batch device tensors here and
+    # do a single host split at run_update time, instead of one per batch.
+    pending_flat_rows_chunks: list[torch.Tensor] = []
+    pending_episode_step_counts: list[torch.Tensor] = []
     rnad_state: RNaDTrainerState | None = None
     if args.trainer == "rnad":
         rnad_state = build_trainer_state(
@@ -3590,22 +3593,18 @@ def train_text_native_batched_envs(
                 pending_returns.append(flat_returns_dev)
                 pending_step_count += n_new
                 total_generated_rollout_steps += n_new
-                # Per-episode replay-row lists are still consumed by the
-                # LSTM-refresh callback and (when active) R-NaD EpisodeBatch
-                # construction. One ``step_counts.tolist()`` + one
-                # ``flat_rows.cpu()`` covers every finished episode in this
-                # batch, replacing the legacy 3-tolist host-list API.
-                counts_h = step_counts.tolist()
-                per_env_rows_h = torch.split(flat_rows.cpu(), counts_h)
-                for (env, winner_idx), rows_chunk in zip(
-                    finished_with_steps,
-                    per_env_rows_h,
-                    strict=True,
-                ):
-                    ep_rows = [int(r) for r in rows_chunk.tolist()]
-                    if ep_rows:
-                        pending_episode_rows.append(ep_rows)
-                    if rnad_state is not None:
+                if rnad_state is not None:
+                    # R-NaD path: ``env.episode_steps`` is about to be
+                    # discarded with the env, and EpisodeBatch needs the
+                    # replay rows attached now. Sync per finished batch.
+                    counts_h = step_counts.tolist()
+                    per_env_rows_h = torch.split(flat_rows.cpu(), counts_h)
+                    for (env, winner_idx), rows_chunk in zip(
+                        finished_with_steps,
+                        per_env_rows_h,
+                        strict=True,
+                    ):
+                        ep_rows = [int(r) for r in rows_chunk.tolist()]
                         env.episode_steps = [
                             replace(step, replay_idx=replay_idx)
                             for step, replay_idx in zip(env.episode_steps, ep_rows, strict=True)
@@ -3616,6 +3615,13 @@ def train_text_native_batched_envs(
                                 winner_idx=int(winner_idx),
                             )
                         )
+                else:
+                    # PPO-only path: defer per-episode host split to
+                    # run_update. One ``step_counts.tolist()`` + one
+                    # ``flat_rows.cpu()`` over the entire rollout instead
+                    # of one per finished batch.
+                    pending_flat_rows_chunks.append(flat_rows)
+                    pending_episode_step_counts.append(step_counts)
 
         for env, winner_idx in finished:
             try:
@@ -3690,7 +3696,18 @@ def train_text_native_batched_envs(
                     torch.cuda.memory._record_memory_history(enabled=None)
             trainer_label = "rnad,text,native"
         else:
-            ep_rows_snapshot = list(pending_episode_rows)
+            # One host sync over the rollout instead of one per finished
+            # batch: cat the per-batch device tensors, transfer once, split
+            # into per-episode lists for the LSTM-refresh callback.
+            ep_rows_snapshot: list[list[int]] = []
+            if pending_flat_rows_chunks:
+                all_rows_h = torch.cat(pending_flat_rows_chunks).cpu().tolist()
+                all_counts_h = torch.cat(pending_episode_step_counts).tolist()
+                cursor = 0
+                for c in all_counts_h:
+                    if c > 0:
+                        ep_rows_snapshot.append([int(r) for r in all_rows_h[cursor : cursor + c]])
+                        cursor += c
             native_refresh_fn = None
             if ep_rows_snapshot and hasattr(backend.policy, "refresh_lstm_states"):
 
@@ -3799,7 +3816,8 @@ def train_text_native_batched_envs(
         pending_replay_rows.clear()
         pending_returns.clear()
         pending_episodes.clear()
-        pending_episode_rows.clear()
+        pending_flat_rows_chunks.clear()
+        pending_episode_step_counts.clear()
         pending_step_count = 0
         backend.replay_buffer.reset()
         win_stats.reset()
