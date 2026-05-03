@@ -128,3 +128,110 @@ def test_text_encoder_forward_pooling_heads_backward() -> None:
         if p.grad is not None
     ]
     assert any(g > 0 for g in grad_norms)
+
+
+def test_local_window_collapses_to_global_when_oversized() -> None:
+    """A local layer with window >= seq_len must equal a global layer."""
+
+    vocab_size = 200
+    t = 16
+    cfg_global = TextEncoderConfig(
+        vocab_size=vocab_size,
+        d_model=32,
+        n_layers=2,
+        n_heads=4,
+        d_ff=64,
+        max_seq_len=t,
+        rope_theta_global=10000.0,
+        rope_theta_local=10000.0,
+        local_attention_window=2 * t,
+        global_attn_every_n_layers=1,  # all layers global
+    )
+    cfg_local = TextEncoderConfig(
+        vocab_size=vocab_size,
+        d_model=32,
+        n_layers=2,
+        n_heads=4,
+        d_ff=64,
+        max_seq_len=t,
+        rope_theta_global=10000.0,
+        rope_theta_local=10000.0,
+        local_attention_window=2 * t,
+        global_attn_every_n_layers=999,  # all layers local
+    )
+
+    torch.manual_seed(0)
+    enc_global = TextStateEncoder(cfg_global)
+    enc_local = TextStateEncoder(cfg_local)
+    enc_local.load_state_dict(enc_global.state_dict(), strict=False)
+
+    batch = _make_batch(b=2, t=t, vocab_size=vocab_size)
+    enc_global.eval()
+    enc_local.eval()
+    with torch.no_grad():
+        h_g = enc_global(batch)
+        h_l = enc_local(batch)
+    assert torch.allclose(h_g, h_l, atol=1e-5, rtol=1e-5)
+
+
+def test_rope_theta_changes_outputs() -> None:
+    """Different RoPE bases should produce different hidden states."""
+
+    vocab_size = 200
+    t = 16
+    cfg_a = TextEncoderConfig(
+        vocab_size=vocab_size,
+        d_model=32,
+        n_layers=1,
+        n_heads=4,
+        d_ff=64,
+        max_seq_len=t,
+        rope_theta_global=10000.0,
+        rope_theta_local=10000.0,
+        global_attn_every_n_layers=1,
+    )
+    cfg_b = TextEncoderConfig(
+        vocab_size=vocab_size,
+        d_model=32,
+        n_layers=1,
+        n_heads=4,
+        d_ff=64,
+        max_seq_len=t,
+        rope_theta_global=160000.0,
+        rope_theta_local=160000.0,
+        global_attn_every_n_layers=1,
+    )
+
+    torch.manual_seed(0)
+    enc_a = TextStateEncoder(cfg_a)
+    enc_b = TextStateEncoder(cfg_b)
+    enc_b.load_state_dict(enc_a.state_dict(), strict=False)
+    batch = _make_batch(b=2, t=t, vocab_size=vocab_size)
+    enc_a.eval()
+    enc_b.eval()
+    with torch.no_grad():
+        h_a = enc_a(batch)
+        h_b = enc_b(batch)
+    # Same weights, same inputs, but rope theta differs ⇒ outputs differ.
+    assert not torch.allclose(h_a, h_b, atol=1e-4)
+
+
+def test_is_global_layer_pattern() -> None:
+    from typing import cast
+
+    from magic_ai.text_encoder.model import EncoderBlock
+
+    cfg = TextEncoderConfig(
+        vocab_size=100,
+        d_model=32,
+        n_layers=7,
+        n_heads=4,
+        d_ff=64,
+        max_seq_len=32,
+        global_attn_every_n_layers=3,
+    )
+    enc = TextStateEncoder(cfg)
+    assert enc.is_global_layer == [True, False, False, True, False, False, True]
+    # Per-block window is None on global layers, the configured window otherwise.
+    windows = [cast(EncoderBlock, block).attn.window for block in enc.blocks]
+    assert windows == [None, 128, 128, None, 128, 128, None]

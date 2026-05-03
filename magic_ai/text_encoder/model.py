@@ -43,6 +43,13 @@ class TextEncoderConfig:
     max_seq_len: int = 2048
     dropout: float = 0.0
     pad_id: int = 0
+    # ModernBERT-style RoPE + alternating local/global attention. Defaults
+    # match jhu-clsp/ettin-encoder-17m so the from-scratch path stays a
+    # near-drop-in for the HF-initialized path.
+    rope_theta_global: float = 160000.0
+    rope_theta_local: float = 160000.0
+    local_attention_window: int = 128
+    global_attn_every_n_layers: int = 3
     hf_model_name: str | None = None
     hf_revision: str | None = None
     hf_truncate_layers: int | None = None
@@ -62,6 +69,10 @@ def text_encoder_config_from_hf(
     max_seq_len: int | None = None,
     dropout: float = 0.0,
     trust_remote_code: bool = False,
+    local_attention_window: int | None = None,
+    global_attn_every_n_layers: int | None = None,
+    rope_theta_global: float | None = None,
+    rope_theta_local: float | None = None,
 ) -> TextEncoderConfig:
     """Build a :class:`TextEncoderConfig` from a Hugging Face encoder config.
 
@@ -89,6 +100,29 @@ def text_encoder_config_from_hf(
     intermediate = int(getattr(hf_cfg, "intermediate_size", hidden_size * 4))
     if max_seq_len is None:
         max_seq_len = int(getattr(hf_cfg, "max_position_embeddings", 2048))
+    # ModernBERT exposes these directly; fall back to dataclass defaults if
+    # the checkpoint isn't ModernBERT-shaped (e.g. a vanilla BERT config used
+    # for smoke tests). Explicit kwargs override either source.
+    cfg_local_window = (
+        local_attention_window
+        if local_attention_window is not None
+        else int(getattr(hf_cfg, "local_attention", 128))
+    )
+    cfg_every_n = (
+        global_attn_every_n_layers
+        if global_attn_every_n_layers is not None
+        else int(getattr(hf_cfg, "global_attn_every_n_layers", 3))
+    )
+    cfg_rope_global = (
+        rope_theta_global
+        if rope_theta_global is not None
+        else float(getattr(hf_cfg, "global_rope_theta", 160000.0))
+    )
+    cfg_rope_local = (
+        rope_theta_local
+        if rope_theta_local is not None
+        else float(getattr(hf_cfg, "local_rope_theta", cfg_rope_global))
+    )
     return TextEncoderConfig(
         vocab_size=vocab_size,
         d_model=hidden_size,
@@ -98,6 +132,10 @@ def text_encoder_config_from_hf(
         max_seq_len=max_seq_len,
         dropout=dropout,
         pad_id=pad_id,
+        rope_theta_global=cfg_rope_global,
+        rope_theta_local=cfg_rope_local,
+        local_attention_window=cfg_local_window,
+        global_attn_every_n_layers=cfg_every_n,
         hf_model_name=model_name,
         hf_revision=revision,
         hf_truncate_layers=truncate_layers,
@@ -117,11 +155,16 @@ class RMSNorm(nn.Module):
 
 
 def _build_rope_cache(
-    seq_len: int, head_dim: int, device: torch.device, dtype: torch.dtype
+    seq_len: int,
+    head_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    base: float = 10000.0,
 ) -> tuple[Tensor, Tensor]:
     assert head_dim % 2 == 0, "RoPE requires even head_dim"
     half = head_dim // 2
-    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, half, device=device, dtype=torch.float32) / half))
+    inv_freq = 1.0 / (base ** (torch.arange(0, half, device=device, dtype=torch.float32) / half))
     pos = torch.arange(seq_len, device=device, dtype=torch.float32)
     freqs = torch.einsum("i,j->ij", pos, inv_freq)  # [T, half]
     cos = freqs.cos().to(dtype)
@@ -129,33 +172,57 @@ def _build_rope_cache(
     return cos, sin
 
 
-def _key_pad_mask_mod(key_pad: Tensor):
+def _key_pad_mask_mod(key_pad: Tensor, *, window: int | None = None):
     """Build a flex_attention mask_mod for a per-batch key-padding mask.
 
     ``key_pad`` is shape ``[B, T]`` and is True at masked-out (padded) key
-    positions. Returns a closure that captures it; flex_attention compiles
-    the closure into the FA-style kernel.
+    positions. ``window``, if set, additionally restricts attention to keys
+    within ``abs(q - kv) <= window // 2`` (ModernBERT-style sliding window).
+    Returns a closure that captures both; flex_attention compiles the
+    closure into the FA-style kernel.
     """
 
-    def mask_mod(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
-        del h, q_idx
-        return ~key_pad[b, kv_idx]
+    if window is None:
 
-    return mask_mod
+        def mask_mod(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
+            del h, q_idx
+            return ~key_pad[b, kv_idx]
+
+        return mask_mod
+
+    half = window // 2
+
+    def mask_mod_local(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
+        del h
+        return (~key_pad[b, kv_idx]) & ((q_idx - kv_idx).abs() <= half)
+
+    return mask_mod_local
 
 
-def _document_mask_mod(seq_id: Tensor):
-    """flex_attention mask_mod for sequence packing.
+def _document_mask_mod(seq_id: Tensor, *, window: int | None = None):
+    """flex_attention mask_mod for sequence packing (optional sliding window).
 
     ``seq_id`` is [T_packed] int. The kernel allows attention only when
     ``seq_id[q] == seq_id[kv]``, giving a block-diagonal allowed region.
+    With ``window`` set, the band ``abs(q-kv) <= window // 2`` is also
+    enforced.
     """
 
-    def mask_mod(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
-        del b, h
-        return seq_id[q_idx] == seq_id[kv_idx]
+    if window is None:
 
-    return mask_mod
+        def mask_mod(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
+            del b, h
+            return seq_id[q_idx] == seq_id[kv_idx]
+
+        return mask_mod
+
+    half = window // 2
+
+    def mask_mod_local(b: Tensor, h: Tensor, q_idx: Tensor, kv_idx: Tensor) -> Tensor:
+        del b, h
+        return (seq_id[q_idx] == seq_id[kv_idx]) & ((q_idx - kv_idx).abs() <= half)
+
+    return mask_mod_local
 
 
 def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -185,7 +252,7 @@ def _apply_rope_packed(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, cfg: TextEncoderConfig) -> None:
+    def __init__(self, cfg: TextEncoderConfig, *, is_global: bool) -> None:
         super().__init__()
         assert cfg.d_model % cfg.n_heads == 0
         self.n_heads = cfg.n_heads
@@ -194,6 +261,13 @@ class MultiHeadSelfAttention(nn.Module):
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.dropout = cfg.dropout
+        # ModernBERT-style alternation: global layers see the full sequence;
+        # local layers are restricted to a symmetric sliding window around
+        # each query position. ``window`` is the *full* window width — the
+        # mask enforces ``abs(q - kv) <= window // 2`` on each side, matching
+        # the HF implementation.
+        self.is_global = is_global
+        self.window = None if is_global else int(cfg.local_attention_window)
 
     def forward(
         self,
@@ -229,6 +303,14 @@ class MultiHeadSelfAttention(nn.Module):
         if src_dtype == torch.float32:
             q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
         cu = cu_seqlens.to(torch.int32)
+        # flash_attn's window_size argument is (left, right) and -1 means
+        # unbounded. Local layers enforce a symmetric ±W//2 window; document
+        # boundaries are still enforced via cu_seqlens.
+        if self.window is None:
+            window_size: tuple[int, int] = (-1, -1)
+        else:
+            half = self.window // 2
+            window_size = (half, half)
         out = flash_attn_varlen_func(
             q,
             k,
@@ -238,6 +320,7 @@ class MultiHeadSelfAttention(nn.Module):
             self.max_seq_len,
             self.max_seq_len,
             dropout_p=self.dropout if self.training else 0.0,
+            window_size=window_size,
         )  # [T, H, Dh]
         return self.proj(out.flatten(1).to(src_dtype))
 
@@ -281,10 +364,11 @@ class GeGLUFFN(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    def __init__(self, cfg: TextEncoderConfig) -> None:
+    def __init__(self, cfg: TextEncoderConfig, *, is_global: bool) -> None:
         super().__init__()
+        self.is_global = is_global
         self.norm1 = RMSNorm(cfg.d_model)
-        self.attn = MultiHeadSelfAttention(cfg)
+        self.attn = MultiHeadSelfAttention(cfg, is_global=is_global)
         self.norm2 = RMSNorm(cfg.d_model)
         self.ffn = GeGLUFFN(cfg)
 
@@ -303,23 +387,50 @@ class EncoderBlock(nn.Module):
 
 
 class TextStateEncoder(nn.Module):
-    # v1: all-global; alternating local/global is a follow-up.
+    """Bidirectional ModernBERT-style trunk with alternating local/global attn.
+
+    Layer ``i`` is a global-attention layer iff
+    ``i % cfg.global_attn_every_n_layers == 0`` (matches HF ModernBERT).
+    Each layer uses its own RoPE cache so global/local theta can differ.
+    """
+
     def __init__(self, cfg: TextEncoderConfig) -> None:
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model, padding_idx=cfg.pad_id)
-        self.blocks = nn.ModuleList([EncoderBlock(cfg) for _ in range(cfg.n_layers)])
-        self.final_norm = RMSNorm(cfg.d_model)
-        # RoPE table is fixed for a given (max_seq_len, head_dim); rebuilding
-        # it every forward showed up in profiling. Stored float32 and cast to
-        # the activation dtype at use, so .to(dtype=...) on the module body
-        # doesn't desync this from the activations.
-        head_dim = cfg.d_model // cfg.n_heads
-        cos_full, sin_full = _build_rope_cache(
-            cfg.max_seq_len, head_dim, torch.device("cpu"), torch.float32
+        every_n = max(1, int(cfg.global_attn_every_n_layers))
+        self.is_global_layer: list[bool] = [(i % every_n) == 0 for i in range(cfg.n_layers)]
+        self.blocks = nn.ModuleList(
+            [EncoderBlock(cfg, is_global=self.is_global_layer[i]) for i in range(cfg.n_layers)]
         )
-        self.register_buffer("rope_cos", cos_full, persistent=False)
-        self.register_buffer("rope_sin", sin_full, persistent=False)
+        self.final_norm = RMSNorm(cfg.d_model)
+        # RoPE tables are fixed for a given (max_seq_len, head_dim, theta);
+        # rebuilding them every forward showed up in profiling. Stored
+        # float32 and cast to the activation dtype at use, so .to(dtype=...)
+        # on the module body doesn't desync them from the activations.
+        # Two caches: global and local. When the two thetas match (Ettin's
+        # default) the buffers are numerically identical but kept separate
+        # for clarity and so swapping in a checkpoint with split thetas is a
+        # one-line config change.
+        head_dim = cfg.d_model // cfg.n_heads
+        cos_g, sin_g = _build_rope_cache(
+            cfg.max_seq_len,
+            head_dim,
+            torch.device("cpu"),
+            torch.float32,
+            base=float(cfg.rope_theta_global),
+        )
+        cos_l, sin_l = _build_rope_cache(
+            cfg.max_seq_len,
+            head_dim,
+            torch.device("cpu"),
+            torch.float32,
+            base=float(cfg.rope_theta_local),
+        )
+        self.register_buffer("rope_cos_global", cos_g, persistent=False)
+        self.register_buffer("rope_sin_global", sin_g, persistent=False)
+        self.register_buffer("rope_cos_local", cos_l, persistent=False)
+        self.register_buffer("rope_sin_local", sin_l, persistent=False)
         self.apply(self._init_weights)
 
     @staticmethod
@@ -350,10 +461,13 @@ class TextStateEncoder(nn.Module):
         all_masked = key_pad.all(dim=-1, keepdim=True)
         key_pad = key_pad & ~all_masked
         # Two mask formulations — flex_attention's BlockMask for CUDA (FA
-        # kernel) and the additive-bias SDPA fallback for CPU. Building both
-        # is cheap; only the one for the active device is consumed.
+        # kernel) and the additive-bias SDPA fallback for CPU. Built once
+        # per attention pattern (global / local) and reused across layers.
+        local_window = int(self.cfg.local_attention_window)
+        block_mask_global: BlockMask
+        block_mask_local: BlockMask
         if x.device.type == "cuda":
-            block_mask = _create_block_mask(
+            block_mask_global = _create_block_mask(
                 _key_pad_mask_mod(key_pad),
                 B=b,
                 H=None,
@@ -361,17 +475,37 @@ class TextStateEncoder(nn.Module):
                 KV_LEN=t,
                 device=x.device,
             )
-            attn_bias = x.new_zeros(())
+            block_mask_local = _create_block_mask(
+                _key_pad_mask_mod(key_pad, window=local_window),
+                B=b,
+                H=None,
+                Q_LEN=t,
+                KV_LEN=t,
+                device=x.device,
+            )
+            attn_bias_global = x.new_zeros(())
+            attn_bias_local = x.new_zeros(())
         else:
-            block_mask = cast(BlockMask, None)
-            attn_bias = torch.zeros(b, 1, 1, t, device=x.device, dtype=x.dtype)
-            attn_bias = attn_bias.masked_fill(key_pad[:, None, None, :], float("-inf"))
-        rope_cos = cast(Tensor, self.rope_cos)
-        rope_sin = cast(Tensor, self.rope_sin)
-        cos = rope_cos[:t].to(x.dtype)
-        sin = rope_sin[:t].to(x.dtype)
-        for block in self.blocks:
-            x = block(x, block_mask, attn_bias, cos, sin)
+            block_mask_global = cast(BlockMask, None)
+            block_mask_local = cast(BlockMask, None)
+            attn_bias_global = torch.zeros(b, 1, 1, t, device=x.device, dtype=x.dtype)
+            attn_bias_global = attn_bias_global.masked_fill(
+                key_pad[:, None, None, :], float("-inf")
+            )
+            half = local_window // 2
+            arange_t = torch.arange(t, device=x.device)
+            band = (arange_t[:, None] - arange_t[None, :]).abs() > half  # [T, T]
+            attn_bias_local = attn_bias_global.expand(b, 1, t, t).clone()
+            attn_bias_local = attn_bias_local.masked_fill(band[None, None, :, :], float("-inf"))
+        rope_cos_g = cast(Tensor, self.rope_cos_global)[:t].to(x.dtype)
+        rope_sin_g = cast(Tensor, self.rope_sin_global)[:t].to(x.dtype)
+        rope_cos_l = cast(Tensor, self.rope_cos_local)[:t].to(x.dtype)
+        rope_sin_l = cast(Tensor, self.rope_sin_local)[:t].to(x.dtype)
+        for i, block in enumerate(self.blocks):
+            if self.is_global_layer[i]:
+                x = block(x, block_mask_global, attn_bias_global, rope_cos_g, rope_sin_g)
+            else:
+                x = block(x, block_mask_local, attn_bias_local, rope_cos_l, rope_sin_l)
         x = self.final_norm(x)
         return x
 
@@ -389,17 +523,24 @@ class TextStateEncoder(nn.Module):
         t = token_ids.shape[0]
         x = self.tok_emb(token_ids)  # [T, D] — packed path stays rank-2
         pos = batch.pos_in_seq.to(device=x.device)
-        rope_cos = cast(Tensor, self.rope_cos)
-        rope_sin = cast(Tensor, self.rope_sin)
-        cos = rope_cos.index_select(0, pos).to(x.dtype)  # [T, Dh/2]
-        sin = rope_sin.index_select(0, pos).to(x.dtype)
+        rope_cos_g = cast(Tensor, self.rope_cos_global).index_select(0, pos).to(x.dtype)
+        rope_sin_g = cast(Tensor, self.rope_sin_global).index_select(0, pos).to(x.dtype)
+        rope_cos_l = cast(Tensor, self.rope_cos_local).index_select(0, pos).to(x.dtype)
+        rope_sin_l = cast(Tensor, self.rope_sin_local).index_select(0, pos).to(x.dtype)
+        local_window = int(self.cfg.local_attention_window)
 
         if x.device.type == "cuda":
             block_mask = cast(BlockMask, None)
             attn_bias = x.new_zeros(())
             cu_seqlens: Tensor | None = batch.cu_seqlens.to(device=x.device, dtype=torch.int32)
-            for block in self.blocks:
-                x = block(x, block_mask, attn_bias, cos, sin, cu_seqlens)
+            # MultiHeadSelfAttention reads ``self.window`` to drive
+            # flash_attn_varlen_func's window_size; we just route the right
+            # rope cache here.
+            for i, block in enumerate(self.blocks):
+                if self.is_global_layer[i]:
+                    x = block(x, block_mask, attn_bias, rope_cos_g, rope_sin_g, cu_seqlens)
+                else:
+                    x = block(x, block_mask, attn_bias, rope_cos_l, rope_sin_l, cu_seqlens)
             x = self.final_norm(x)
             return x
 
@@ -408,12 +549,21 @@ class TextStateEncoder(nn.Module):
         # leading B=1 here just for the dense attention path's expectations.
         seq_id = batch.seq_id.to(device=x.device)
         same = seq_id[:, None] == seq_id[None, :]  # [T, T] bool
-        attn_bias = torch.zeros(1, 1, t, t, device=x.device, dtype=x.dtype)
-        attn_bias = attn_bias.masked_fill(~same[None, None, :, :], float("-inf"))
+        attn_bias_global = torch.zeros(1, 1, t, t, device=x.device, dtype=x.dtype)
+        attn_bias_global = attn_bias_global.masked_fill(~same[None, None, :, :], float("-inf"))
+        half = local_window // 2
+        # ``pos_in_seq`` is per-document position, not global packed offset,
+        # so the band check uses it rather than the absolute index.
+        band = (pos[:, None] - pos[None, :]).abs() > half  # [T, T]
+        attn_bias_local = attn_bias_global.clone()
+        attn_bias_local = attn_bias_local.masked_fill(band[None, None, :, :], float("-inf"))
         block_mask = cast(BlockMask, None)
         x_dense = x.unsqueeze(0)  # [1, T, D]
-        for block in self.blocks:
-            x_dense = block(x_dense, block_mask, attn_bias, cos, sin, None)
+        for i, block in enumerate(self.blocks):
+            if self.is_global_layer[i]:
+                x_dense = block(x_dense, block_mask, attn_bias_global, rope_cos_g, rope_sin_g, None)
+            else:
+                x_dense = block(x_dense, block_mask, attn_bias_local, rope_cos_l, rope_sin_l, None)
         x_dense = self.final_norm(x_dense)
         return x_dense.squeeze(0)
 
@@ -466,6 +616,34 @@ def initialize_text_state_encoder_from_hf(
     if hidden_size != cfg.d_model:
         raise ValueError(
             f"HF model hidden_size ({hidden_size}) does not match cfg.d_model ({cfg.d_model})"
+        )
+    # Validate rope/attention shape against the HF config so silent drift
+    # (e.g. wrong rope theta or a pattern mismatch under truncate_layers)
+    # surfaces here rather than as quietly-degraded model quality.
+    hf_global_theta = float(getattr(hf_model.config, "global_rope_theta", cfg.rope_theta_global))
+    hf_local_theta = float(getattr(hf_model.config, "local_rope_theta", hf_global_theta))
+    hf_every_n = int(
+        getattr(hf_model.config, "global_attn_every_n_layers", cfg.global_attn_every_n_layers)
+    )
+    hf_local_window = int(getattr(hf_model.config, "local_attention", cfg.local_attention_window))
+    if abs(cfg.rope_theta_global - hf_global_theta) > 1e-6:
+        raise ValueError(
+            f"rope_theta_global mismatch: cfg={cfg.rope_theta_global} vs HF={hf_global_theta}"
+        )
+    if abs(cfg.rope_theta_local - hf_local_theta) > 1e-6:
+        raise ValueError(
+            f"rope_theta_local mismatch: cfg={cfg.rope_theta_local} vs HF={hf_local_theta}"
+        )
+    if cfg.local_attention_window != hf_local_window:
+        raise ValueError(
+            f"local_attention_window mismatch: cfg={cfg.local_attention_window} "
+            f"vs HF={hf_local_window}"
+        )
+    expected_is_global = [(i % max(1, hf_every_n)) == 0 for i in range(cfg.n_layers)]
+    if encoder.is_global_layer != expected_is_global:
+        raise ValueError(
+            "encoder layer pattern does not match HF global_attn_every_n_layers="
+            f"{hf_every_n}: have {encoder.is_global_layer}, expected {expected_is_global}"
         )
     sd = hf_model.state_dict()
     _copy_embedding_param(encoder.tok_emb.weight, sd["embeddings.tok_embeddings.weight"])
