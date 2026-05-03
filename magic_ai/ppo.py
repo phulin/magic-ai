@@ -163,8 +163,24 @@ def ppo_update(
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
-            optimizer.step()
+            grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+            # Skip the optimizer step on non-finite grads. Without this, a
+            # single bad batch (e.g. an all-masked decision row producing NaN
+            # log-probs) propagates NaN into the weights and every subsequent
+            # forward returns NaN logits, which crashes the next sampler call
+            # with the CUDA ``0 <= p <= 1`` multinomial assert.
+            if not torch.isfinite(grad_norm) or not torch.isfinite(loss).item():
+                optimizer.zero_grad(set_to_none=True)
+                print(
+                    f"[ppo] non-finite update skipped: "
+                    f"loss={float(loss.detach()):.4g} "
+                    f"grad_norm={float(grad_norm):.4g} "
+                    f"policy_loss={float(policy_loss.detach()):.4g} "
+                    f"value_loss={float(value_loss.detach()):.4g}",
+                    flush=True,
+                )
+            else:
+                optimizer.step()
 
             with torch.no_grad():
                 approx_kl = (batch_old_log_probs - batch_log_probs).mean()

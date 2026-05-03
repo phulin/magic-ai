@@ -1275,6 +1275,54 @@ def _build_opponent_schedules(
     return opponent_pool, snapshot_schedule, retrospective_schedule
 
 
+class _RLLRWarmup:
+    """Linear LR warmup over the first ``warmup_updates`` RL updates.
+
+    Sets ``param_group['lr']`` to ``base_lr * min(1, count/warmup_updates)``
+    on construction and on every :meth:`step` call. ``warmup_updates == 0``
+    disables warmup (no-op). Counted per RL update (one ``ppo_update`` /
+    ``run_rnad_update`` call), not per minibatch step.
+    """
+
+    def __init__(
+        self, optimizer: torch.optim.Optimizer, base_lr: float, warmup_updates: int
+    ) -> None:
+        self.optimizer = optimizer
+        self.base_lr = float(base_lr)
+        self.warmup_updates = max(0, int(warmup_updates))
+        self.count = 0
+        self._apply()
+
+    def _apply(self) -> None:
+        if self.warmup_updates == 0:
+            return
+        factor = min(1.0, (self.count + 1) / self.warmup_updates)
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = self.base_lr * factor
+
+    def step(self) -> None:
+        if self.warmup_updates == 0 or self.count >= self.warmup_updates:
+            return
+        self.count += 1
+        self._apply()
+
+
+def attach_rl_lr_warmup(
+    optimizer: torch.optim.Optimizer, base_lr: float, warmup_updates: int
+) -> None:
+    """Install a warmup state on ``optimizer`` so call sites can call :func:`rl_lr_warmup_step`."""
+
+    setattr(optimizer, "_rl_lr_warmup", _RLLRWarmup(optimizer, base_lr, warmup_updates))
+
+
+def rl_lr_warmup_step(optimizer: torch.optim.Optimizer) -> None:
+    """Advance the warmup counter if one was attached. No-op otherwise."""
+
+    state: _RLLRWarmup | None = getattr(optimizer, "_rl_lr_warmup", None)
+    if state is not None:
+        state.step()
+
+
 def run_mlm_pretrain(
     args: argparse.Namespace,
     text_backend: TextTrainingBackend,
@@ -1465,6 +1513,11 @@ def main() -> None:
             )
         else:
             optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
+        # Linear LR warmup over the first N RL updates to absorb the
+        # pretrained-encoder × random-RL-heads mismatch. AdamW's first step
+        # bias correction would otherwise land a sign-of-grad sized step that
+        # saturates the LSTM/projections post-MLM.
+        attach_rl_lr_warmup(optimizer, args.learning_rate, args.rl_warmup_updates)
 
     mage = importlib.import_module("mage")
     result = train_selected_backend(
@@ -1719,6 +1772,15 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="number of full passes over the corpus (one pass = each "
         "non-overlapping seq_len-length span seen exactly once)",
+    )
+    parser.add_argument(
+        "--rl-warmup-updates",
+        type=int,
+        default=50,
+        help="number of RL updates over which to linearly ramp the learning "
+        "rate from 0 to --learning-rate. Active only when --pretrain-mlm-dir "
+        "is set; absorbs the pretrained-encoder × random-RL-heads mismatch "
+        "that otherwise overflows on the first PPO step. Set to 0 to disable.",
     )
     parser.add_argument("--pretrain-mlm-batch-size", type=int, default=128)
     parser.add_argument("--pretrain-mlm-seq-len", type=int, default=512)
@@ -2605,6 +2667,7 @@ def train_native_batched_envs(
                     if getattr(args, "encoder", "slots") == "text"
                     else None,
                 )
+            rl_lr_warmup_step(optimizer)
             now = time.monotonic()
             elapsed = now - last_step_time
             last_step_time = now
@@ -2760,6 +2823,7 @@ def train_native_batched_envs(
                 if getattr(args, "encoder", "slots") == "text"
                 else None,
             )
+        rl_lr_warmup_step(optimizer)
         print(
             cli_step_prefix(),
             f"final_update[{args.trainer}]",
@@ -2878,6 +2942,7 @@ def train_text_envs(
             minibatch_token_limit=getattr(args, "minibatch_token_limit", None),
             minibatch_max_tokens_per_row=getattr(args, "text_max_tokens", None),
         )
+        rl_lr_warmup_step(optimizer)
         now = time.monotonic()
         elapsed = now - last_step_time
         last_step_time = now
@@ -3460,6 +3525,7 @@ def train_text_native_batched_envs(
                 if snapshot_armed:
                     torch.cuda.memory._record_memory_history(enabled=None)
             trainer_label = "ppo,text,native"
+        rl_lr_warmup_step(optimizer)
         now = time.monotonic()
         elapsed = now - last_step_time
         last_step_time = now

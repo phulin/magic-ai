@@ -336,6 +336,27 @@ def direct_flat_decision_distribution_impl(
 
     flat_logits = none_logits[flat_step_positions].scatter(0, scored_pos, scored_values)
 
+    # Non-priority trace_kinds (``choice_*`` / ``may`` / ``attackers`` /
+    # ``blockers``) don't render their engine options as ``<option>`` tokens,
+    # so ``option_logits`` at those positions is ``-inf`` from the
+    # PolicyHead's ``torch.where(option_mask, logits, -inf)`` masking. The
+    # flat fallback in ``_evaluate_decision_groups`` substitutes
+    # ``flat_masks`` (engine cols) when there are no rendered cols, which
+    # then gathers those ``-inf`` entries into ``flat_logits``. Without
+    # this guard, ``group_max`` for the affected group is ``-inf``,
+    # ``stabilized = -inf - -inf = NaN``, and the NaN floods through
+    # log_softmax -> exp -> the backward graph, producing NaN gradients on
+    # every PPO minibatch. The priority option/target heads can't
+    # meaningfully score these decisions anyway — they're handled by
+    # specialized heads (``none_head`` / ``may_head``) — so substituting 0
+    # makes the group log-uniform over its engine-valid cols and lets the
+    # autograd ``where`` mask gradients out of the synthesized positions.
+    flat_logits = torch.where(
+        torch.isfinite(flat_logits),
+        flat_logits,
+        flat_logits.new_zeros(()),
+    )
+
     group_count = step_positions.shape[0]
     group_max = torch.full((group_count,), -torch.inf, dtype=option_logits.dtype, device=device)
     group_max.scatter_reduce_(0, group_idx, flat_logits, reduce="amax", include_self=True)

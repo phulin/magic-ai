@@ -22,6 +22,7 @@ top of these primitives in the trainer module. See ``docs/rnad_design.md`` and
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -2048,7 +2049,18 @@ def rnad_update_trajectory(
             max_norm=config.grad_clip,
         )
     )
-    optimizer.step()
+    # Skip optimizer step on non-finite grads/loss to avoid poisoning the
+    # weights — otherwise one bad batch produces NaN logits forever and the
+    # next Categorical sampler call hits a CUDA multinomial assert.
+    if not math.isfinite(grad_norm) or not math.isfinite(float(loss.detach())):
+        optimizer.zero_grad(set_to_none=True)
+        print(
+            f"[rnad] non-finite update skipped: loss={float(loss.detach()):.4g} "
+            f"grad_norm={grad_norm:.4g} cl={float(cl.detach()):.4g} pl={float(pl.detach()):.4g}",
+            flush=True,
+        )
+    else:
+        optimizer.step()
 
     assert isinstance(target, nn.Module)
     assert isinstance(online, nn.Module)

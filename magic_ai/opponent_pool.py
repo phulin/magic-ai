@@ -245,6 +245,8 @@ def build_text_opponent_policy(
     on-disk cache normally.
     """
 
+    from magic_ai.text_encoder.actor_critic import TextActorCritic
+
     cfg = main_policy.policy.cfg
     opponent = TextActorCritic(cfg).to(device)
 
