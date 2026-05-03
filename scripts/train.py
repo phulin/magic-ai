@@ -1478,6 +1478,7 @@ def run_mlm_pretrain(
                         step=global_step,
                     )
             global_step += 1
+    print(f"[mlm] finished epochs={args.pretrain_mlm_epochs} steps={global_step}")
 
 
 def main() -> None:
