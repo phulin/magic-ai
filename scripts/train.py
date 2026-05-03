@@ -624,9 +624,7 @@ class TrainingRunResult:
 
 def build_slot_backend(args: argparse.Namespace, device: torch.device) -> SlotTrainingBackend:
     game_state_encoder = GameStateEncoder.from_embedding_json(args.embeddings, d_model=args.d_model)
-    rollout_capacity = args.rollout_buffer_capacity or max(
-        4096, args.rollout_steps + args.max_steps_per_game * args.num_envs
-    )
+    rollout_capacity = args.rollout_buffer_capacity or max(4096, 2 * args.rollout_steps)
     policy = PPOPolicy(
         game_state_encoder,
         hidden_dim=args.hidden_dim,
@@ -733,9 +731,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
     )
     policy = TextActorCritic(recurrent_cfg).to(device)
     policy.init_lstm_env_states(args.num_envs)
-    rollout_capacity = args.rollout_buffer_capacity or max(
-        4096, args.rollout_steps + args.max_steps_per_game * args.num_envs
-    )
+    rollout_capacity = args.rollout_buffer_capacity or max(4096, 2 * args.rollout_steps)
     replay_buffer = TextReplayBuffer(
         capacity=rollout_capacity,
         max_tokens=args.text_max_tokens,
@@ -1702,7 +1698,7 @@ def parse_args() -> argparse.Namespace:
         "matches --max-steps-per-game so the whole trace is one chunk.",
     )
     parser.add_argument("--episodes", type=int, default=65536)
-    parser.add_argument("--num-envs", type=int, default=412)
+    parser.add_argument("--num-envs", type=int, default=2048)
     parser.add_argument("--rollout-steps", type=int, default=4096)
     parser.add_argument(
         "--rollout-min-ready-batch",
@@ -1723,8 +1719,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "rows in the rollout GPU buffer; default "
-            "max(4096, rollout-steps + max-steps-per-game * num-envs)"
+            "rows in the rollout GPU buffer; default 2 * rollout-steps. "
+            "If a finished env's trajectory would overflow this cap, the "
+            "actor coordinator defers it (keeps its staging slot occupied) "
+            "until the next PPO update resets the buffer, instead of OOMing "
+            "or evicting in-flight data."
         ),
     )
     parser.add_argument(
@@ -3836,6 +3835,7 @@ def train_text_native_batched_envs(
 
         active_actors = num_actors
         actor_done: list[bool] = [False] * num_actors
+        deferred_finishes: list[FinishedEnv] = []
         last_progress_t = time.monotonic()
         last_progress_state = (completed_games, len(pending_steps), next_episode_idx)
         watchdog_threshold_s = float(getattr(args, "actor_watchdog_seconds", 60.0))
@@ -3886,15 +3886,35 @@ def train_text_native_batched_envs(
                     except Empty:
                         break
 
-                if finished_batch:
-                    finish_games([(fe.live_game, fe.winner_idx) for fe in finished_batch])
-                    # Return slots to the *originating* actor's pool.
-                    per_actor_freed: list[list[int]] = [[] for _ in range(num_actors)]
-                    for fe in finished_batch:
-                        per_actor_freed[fe.actor_id].append(fe.slot_idx)
-                    for aid, slots in enumerate(per_actor_freed):
-                        if slots:
-                            actor_free_slots[aid].extend(slots)
+                # Try to commit any previously-deferred finishes first, then
+                # the freshly-arrived batch. Anything that won't fit in the
+                # remaining replay capacity stays deferred — its slot is NOT
+                # returned to the actor's free pool, so the staging buffer
+                # holds the trajectory until the next PPO update resets the
+                # replay buffer.
+                deferred_finishes.extend(finished_batch)
+                if deferred_finishes:
+                    replay_remaining = backend.replay_buffer.capacity - backend.replay_buffer.size
+                    fits: list[FinishedEnv] = []
+                    still_deferred: list[FinishedEnv] = []
+                    for fe in deferred_finishes:
+                        n_steps = len(fe.live_game.episode_steps)
+                        if n_steps == 0 or n_steps <= replay_remaining:
+                            fits.append(fe)
+                            replay_remaining -= n_steps
+                        else:
+                            still_deferred.append(fe)
+                    deferred_finishes = still_deferred
+                    if fits:
+                        finish_games([(fe.live_game, fe.winner_idx) for fe in fits])
+                        # Return slots to the *originating* actor's pool only
+                        # for envs we actually committed.
+                        per_actor_freed: list[list[int]] = [[] for _ in range(num_actors)]
+                        for fe in fits:
+                            per_actor_freed[fe.actor_id].append(fe.slot_idx)
+                        for aid, slots in enumerate(per_actor_freed):
+                            if slots:
+                                actor_free_slots[aid].extend(slots)
 
                 # Service refill requests.
                 refill_now: dict[int, list[int]] = {}
