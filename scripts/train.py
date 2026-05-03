@@ -2468,6 +2468,8 @@ def train_native_batched_envs(
         cast(PPOPolicy, rnad_state.target) if rnad_state is not None else policy
     )
 
+    transcript_capture_count = max(1, args.num_envs // 256)
+
     def start_game(slot_idx: int, episode_idx: int) -> LiveGame:
         staging_buffer.reset_env(slot_idx)
         policy.reset_lstm_env_states([slot_idx])
@@ -2493,7 +2495,7 @@ def train_native_batched_envs(
             episode_idx=episode_idx,
             episode_steps=[],
             transcript=[],
-            transcript_enabled=slot_idx == 0,
+            transcript_enabled=slot_idx < transcript_capture_count,
         )
 
     def maybe_start_games() -> None:
@@ -3502,6 +3504,8 @@ def train_text_native_batched_envs(
     free_slots = list(range(args.num_envs - 1, -1, -1))
     last_step_time = time.monotonic()
     transcript_warning_emitted = False
+    transcript_capture_count = max(1, args.num_envs // 256)
+    num_actors = int(args.num_rollout_actors)
 
     def cli_step_prefix() -> str:
         return f"step={total_wandb_logs}"
@@ -3544,7 +3548,9 @@ def train_text_native_batched_envs(
             episode_idx=episode_idx,
             episode_steps=[],
             transcript=[],
-            transcript_enabled=slot_idx == 0,
+            transcript_enabled=(
+                slot_idx % num_actors == 0 and (slot_idx // num_actors) < transcript_capture_count
+            ),
         )
 
     def maybe_start_games() -> None:
