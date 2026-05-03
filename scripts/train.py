@@ -67,6 +67,7 @@ from magic_ai.ppo import (  # noqa: E402
     gae_returns,
     gae_returns_batched,
     ppo_update,
+    terminal_reward_for_finish,
 )
 from magic_ai.rnad import RNaDConfig  # noqa: E402
 from magic_ai.rnad_trainer import (  # noqa: E402
@@ -171,6 +172,24 @@ class LiveGame:
     action_count: int = 0
 
 
+def _read_life_totals(game: Any) -> tuple[int, int]:
+    """Refresh the engine's state cache and return (life_p0, life_p1).
+
+    Life totals are clamped to ``>= 0`` by the consumer (the tiebreak helper
+    in ``magic_ai.ppo``); this just extracts the raw integers from the
+    snapshot dict.
+    """
+    try:
+        game.refresh_state()
+    except Exception:
+        pass
+    state = getattr(game, "state", None) or {}
+    players = state.get("players", []) or []
+    l0 = int(players[0].get("Life", 0)) if len(players) > 0 else 0
+    l1 = int(players[1].get("Life", 0)) if len(players) > 1 else 0
+    return l0, l1
+
+
 @dataclass(frozen=True)
 class TrainingResumeState:
     completed_games: int = 0
@@ -229,18 +248,21 @@ class WinFractionStats:
     p1_wins: int = 0
     p2_wins: int = 0
     draws: int = 0
+    timeouts: int = 0
 
     def record(self, bucket: str) -> None:
         if bucket == "p1":
             self.p1_wins += 1
         elif bucket == "p2":
             self.p2_wins += 1
+        elif bucket == "timeout":
+            self.timeouts += 1
         else:
             self.draws += 1
 
     @property
     def total_games(self) -> int:
-        return self.p1_wins + self.p2_wins + self.draws
+        return self.p1_wins + self.p2_wins + self.draws + self.timeouts
 
     def as_wandb_metrics(self) -> dict[str, float]:
         total = self.total_games
@@ -251,6 +273,7 @@ class WinFractionStats:
             "p1_win_fraction": self.p1_wins / denom,
             "p2_win_fraction": self.p2_wins / denom,
             "draw_fraction": self.draws / denom,
+            "timeout_fraction": self.timeouts / denom,
             "window_games": float(total),
         }
 
@@ -258,6 +281,7 @@ class WinFractionStats:
         self.p1_wins = 0
         self.p2_wins = 0
         self.draws = 0
+        self.timeouts = 0
 
 
 @dataclass
@@ -2020,16 +2044,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae-lambda", type=float, default=0.97)
-    # Default treats a draw as equivalent to a loss for both players so that
-    # agents don't learn to drag out games (e.g. mill stalls, infinite loops)
-    # to avoid losing.
+    # Engine-declared draws are rare in MTG (true draws); step-cap timeouts
+    # are now resolved by a life-total tiebreak rather than being lumped in
+    # with draws, so the draw branch only fires on genuine simultaneous-loss
+    # / poison / decked-out situations. Default 0.0 ⇒ engine draws contribute
+    # no terminal reward to either player.
     parser.add_argument(
         "--draw-penalty",
         type=float,
-        default=1.0,
+        default=0.0,
         help=(
-            "terminal reward magnitude applied to both players on a draw "
-            "(default 1.0 = treat draw as a loss)"
+            "terminal reward magnitude applied to both players on an engine-"
+            "declared draw (timeouts now use a life-total tiebreak instead)"
         ),
     )
     parser.add_argument("--ppo-epochs", type=int, default=4)
@@ -2538,12 +2564,12 @@ def train_native_batched_envs(
             )
             transcript_warning_emitted = True
 
-    def finish_games(finished: list[tuple[LiveGame, int]]) -> None:
+    def finish_games(finished: list[tuple[LiveGame, int, bool]]) -> None:
         nonlocal completed_games, total_generated_rollout_steps, pending_step_count
         if not finished:
             return
 
-        envs = [env for env, _ in finished]
+        envs = [env for env, _, _ in finished]
 
         # Run GAE on the padded (B, T_max) staging slice in a single kernel
         # chain; flatten by the valid mask to produce per-step replay rows
@@ -2552,16 +2578,33 @@ def train_native_batched_envs(
         # R-NaD branch still needs per-episode ``RolloutStep`` lists for
         # ``EpisodeBatch`` and thus keeps the host transfer below.
         device = staging_buffer.device
-        # Combine slot/winner index lists into one async H2D transfer rather
-        # than two synchronous ``torch.tensor(..., device=cuda)`` calls.
-        slot_winner_h = torch.tensor(
-            [[env.slot_idx for env in envs], [w for _, w in finished]],
-            dtype=torch.long,
-            pin_memory=True,
+
+        # Per-row terminal reward (in p0's perspective) and zero-sum flag.
+        # Engine wins/losses are zero-sum ±1, engine draws are symmetric
+        # (-draw_penalty for both perspectives), step-cap timeouts get a
+        # life-total tiebreak. Life totals are read here so the actor /
+        # learner doesn't need a separate plumbing channel.
+        terminal_p0_h: list[float] = []
+        zero_sum_h: list[bool] = []
+        for env, winner_idx, is_timeout in finished:
+            l0, l1 = _read_life_totals(env.game) if (is_timeout or winner_idx < 0) else (0, 0)
+            tp0, zs = terminal_reward_for_finish(
+                winner_idx=int(winner_idx),
+                is_timeout=bool(is_timeout),
+                life_p0=l0,
+                life_p1=l1,
+                draw_penalty=args.draw_penalty,
+            )
+            terminal_p0_h.append(tp0)
+            zero_sum_h.append(zs)
+        slot_h = torch.tensor([env.slot_idx for env in envs], dtype=torch.long, pin_memory=True)
+        slot_t = slot_h.to(device, non_blocking=True)
+        terminal_p0_t = torch.tensor(terminal_p0_h, dtype=torch.float32, pin_memory=True).to(
+            device, non_blocking=True
         )
-        slot_winner_d = slot_winner_h.to(device, non_blocking=True)
-        slot_t = slot_winner_d[0]
-        winner_t = slot_winner_d[1]
+        zero_sum_t = torch.tensor(zero_sum_h, dtype=torch.bool, pin_memory=True).to(
+            device, non_blocking=True
+        )
         step_counts = staging_buffer.step_count[slot_t]
         max_steps = int(staging_buffer.max_steps_per_trajectory)
         step_arange = torch.arange(max_steps, device=device).unsqueeze(0)
@@ -2572,10 +2615,10 @@ def train_native_batched_envs(
             values_padded,
             players_padded,
             step_counts,
-            winner_t,
+            terminal_reward_p0=terminal_p0_t,
+            zero_sum=zero_sum_t,
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
-            draw_penalty=args.draw_penalty,
         )
         flat_returns_dev = returns_padded[valid_mask]
 
@@ -2620,7 +2663,7 @@ def train_native_batched_envs(
                 pending_step_count += n_new
                 total_generated_rollout_steps += n_new
             cursor = 0
-            for (env, winner_idx), env_rows, step_count in zip(
+            for (env, winner_idx, _is_timeout), env_rows, step_count in zip(
                 finished, replay_rows_by_env, step_counts_h, strict=True
             ):
                 if step_count:
@@ -2645,7 +2688,7 @@ def train_native_batched_envs(
                         EpisodeBatch(steps=episode_steps, winner_idx=int(winner_idx))
                     )
 
-        for env, winner_idx in finished:
+        for env, winner_idx, is_timeout in finished:
             env.game.close()
             if env.slot_idx == 0:
                 append_sample_game_log(
@@ -2663,7 +2706,9 @@ def train_native_batched_envs(
                 )
             staging_buffer.reset_env(env.slot_idx)
             free_slots.append(env.slot_idx)
-            if winner_idx == 0:
+            if is_timeout:
+                win_stats.timeouts += 1
+            elif winner_idx == 0:
                 win_stats.p1_wins += 1
             elif winner_idx == 1:
                 win_stats.p2_wins += 1
@@ -2685,11 +2730,11 @@ def train_native_batched_envs(
         ready_envs: list[LiveGame] = []
         ready_players: list[int] = []
         still_live: list[LiveGame] = []
-        finished_games: list[tuple[LiveGame, int]] = []
+        finished_games: list[tuple[LiveGame, int, bool]] = []
         for idx, env in enumerate(live_games):
             is_over = bool(over_l[idx])
             if is_over or env.action_count >= args.max_steps_per_game:
-                finished_games.append((env, int(winner_l[idx]) if is_over else -1))
+                finished_games.append((env, int(winner_l[idx]) if is_over else -1, not is_over))
                 continue
             still_live.append(env)
             if ready_l[idx]:
@@ -3208,6 +3253,9 @@ def train_text_envs(
         episode_steps: list[RolloutStep] = []
         transcript: list[TranscriptAction] = []
         winner_idx = -1
+        is_timeout = True
+        life_p0 = 0
+        life_p1 = 0
         try:
             for _action_idx in range(args.max_steps_per_game):
                 game.refresh_state()
@@ -3252,8 +3300,10 @@ def train_text_envs(
                     )
                 )
             game.refresh_state()
+            is_timeout = not game.is_over
             if game.is_over:
                 winner_idx = _winner_idx_from_game(game)
+            life_p0, life_p1 = _read_life_totals(game)
         finally:
             try:
                 game.close()
@@ -3269,7 +3319,9 @@ def train_text_envs(
             encoder="text",
         )
         completed_games += 1
-        if winner_idx == 0:
+        if is_timeout:
+            win_stats.timeouts += 1
+        elif winner_idx == 0:
             win_stats.p1_wins += 1
         elif winner_idx == 1:
             win_stats.p2_wins += 1
@@ -3280,13 +3332,20 @@ def train_text_envs(
             if ep_rows:
                 pending_episode_rows.append(ep_rows)
             pending_steps.extend(episode_steps)
+            tp0, zs = terminal_reward_for_finish(
+                winner_idx=int(winner_idx),
+                is_timeout=is_timeout,
+                life_p0=life_p0,
+                life_p1=life_p1,
+                draw_penalty=args.draw_penalty,
+            )
             pending_returns.append(
                 gae_returns(
                     episode_steps,
-                    winner_idx=winner_idx,
+                    terminal_reward_p0=tp0,
+                    zero_sum=zs,
                     gamma=args.gamma,
                     gae_lambda=args.gae_lambda,
-                    draw_penalty=args.draw_penalty,
                 )
             )
             total_generated_rollout_steps += len(episode_steps)
@@ -3583,23 +3642,37 @@ def train_text_native_batched_envs(
             live_games.append(start_game(free_slots.pop(), next_episode_idx))
             next_episode_idx += 1
 
-    def finish_games(finished: list[tuple[LiveGame, int]]) -> None:
+    def finish_games(finished: list[tuple[LiveGame, int, bool]]) -> None:
         nonlocal completed_games, total_generated_rollout_steps, pending_step_count
-        finished_with_steps = [(env, w) for env, w in finished if env.episode_steps]
+        finished_with_steps = [(env, w, t) for env, w, t in finished if env.episode_steps]
         if finished_with_steps:
-            slot_idxs = [env.slot_idx for env, _ in finished_with_steps]
-            winner_idxs = [w for _env, w in finished_with_steps]
+            slot_idxs = [env.slot_idx for env, _, _ in finished_with_steps]
             device = staging_buffer.device
-            # Build slot_t/winner_t on pinned CPU + async H2D copy so the
-            # transfer can overlap with prior CUDA work, instead of issuing
-            # the synchronous ``torch.tensor(..., device=cuda)`` path that
-            # blocks the launching thread.
-            slot_winner_h = torch.tensor(
-                [slot_idxs, winner_idxs], dtype=torch.long, pin_memory=True
+            # Per-row terminal reward (in p0's perspective) and zero-sum flag.
+            # See the slot path's finish_games for the full breakdown of
+            # cases (engine win/loss, engine draw, step-cap timeout).
+            terminal_p0_h: list[float] = []
+            zero_sum_h: list[bool] = []
+            for env, winner_idx, is_timeout in finished_with_steps:
+                l0, l1 = _read_life_totals(env.game) if (is_timeout or winner_idx < 0) else (0, 0)
+                tp0, zs = terminal_reward_for_finish(
+                    winner_idx=int(winner_idx),
+                    is_timeout=bool(is_timeout),
+                    life_p0=l0,
+                    life_p1=l1,
+                    draw_penalty=args.draw_penalty,
+                )
+                terminal_p0_h.append(tp0)
+                zero_sum_h.append(zs)
+            slot_t = torch.tensor(slot_idxs, dtype=torch.long, pin_memory=True).to(
+                device, non_blocking=True
             )
-            slot_winner_d = slot_winner_h.to(device, non_blocking=True)
-            slot_t = slot_winner_d[0]
-            winner_t = slot_winner_d[1]
+            terminal_p0_t = torch.tensor(terminal_p0_h, dtype=torch.float32, pin_memory=True).to(
+                device, non_blocking=True
+            )
+            zero_sum_t = torch.tensor(zero_sum_h, dtype=torch.bool, pin_memory=True).to(
+                device, non_blocking=True
+            )
             # Snapshot step_count BEFORE the buffer-append resets the slots.
             step_counts = staging_buffer.step_count[slot_t].clone()
             max_steps = staging_buffer.max_steps
@@ -3611,10 +3684,10 @@ def train_text_native_batched_envs(
                 values_padded,
                 players_padded,
                 step_counts,
-                winner_t,
+                terminal_reward_p0=terminal_p0_t,
+                zero_sum=zero_sum_t,
                 gamma=args.gamma,
                 gae_lambda=args.gae_lambda,
-                draw_penalty=args.draw_penalty,
             )
             flat_returns_dev = returns_padded[valid_mask]
             flat_rows, _counts = staging_buffer.append_envs_to_replay_returning_tensor(
@@ -3633,7 +3706,7 @@ def train_text_native_batched_envs(
                     # replay rows attached now. Sync per finished batch.
                     counts_h = step_counts.tolist()
                     per_env_rows_h = torch.split(flat_rows.cpu(), counts_h)
-                    for (env, winner_idx), rows_chunk in zip(
+                    for (env, winner_idx, _is_timeout), rows_chunk in zip(
                         finished_with_steps,
                         per_env_rows_h,
                         strict=True,
@@ -3657,7 +3730,7 @@ def train_text_native_batched_envs(
                     pending_flat_rows_chunks.append(flat_rows)
                     pending_episode_step_counts.append(step_counts)
 
-        for env, winner_idx in finished:
+        for env, winner_idx, is_timeout in finished:
             try:
                 env.game.close()
             except Exception:
@@ -3672,7 +3745,9 @@ def train_text_native_batched_envs(
                     encoder="text",
                 )
             free_slots.append(env.slot_idx)
-            if winner_idx == 0:
+            if is_timeout:
+                win_stats.timeouts += 1
+            elif winner_idx == 0:
                 win_stats.p1_wins += 1
             elif winner_idx == 1:
                 win_stats.p2_wins += 1
@@ -4079,7 +4154,7 @@ def train_text_native_batched_envs(
                             still_deferred.append(fe)
                     deferred_finishes = still_deferred
                     if fits:
-                        finish_games([(fe.live_game, fe.winner_idx) for fe in fits])
+                        finish_games([(fe.live_game, fe.winner_idx, fe.is_timeout) for fe in fits])
                         # Return slots to the *originating* actor's pool only
                         # for envs we actually committed.
                         per_actor_freed: list[list[int]] = [[] for _ in range(num_actors)]
@@ -4227,11 +4302,11 @@ def train_text_native_batched_envs(
         ready_envs: list[LiveGame] = []
         ready_players: list[int] = []
         still_live: list[LiveGame] = []
-        finished_games: list[tuple[LiveGame, int]] = []
+        finished_games: list[tuple[LiveGame, int, bool]] = []
         for idx, env in enumerate(live_games):
             is_over = bool(over_l[idx])
             if is_over or env.action_count >= args.max_steps_per_game:
-                finished_games.append((env, int(winner_l[idx]) if is_over else -1))
+                finished_games.append((env, int(winner_l[idx]) if is_over else -1, not is_over))
                 continue
             still_live.append(env)
             if ready_l[idx]:

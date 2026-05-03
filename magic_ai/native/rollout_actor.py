@@ -64,7 +64,8 @@ class FinishedEnv:
 
     actor_id: int
     slot_idx: int
-    winner_idx: int  # -1 if step-capped without winner
+    winner_idx: int  # -1 if step-capped without winner OR engine-declared draw
+    is_timeout: bool  # True if step-capped (game not is_over); distinguishes timeouts from draws
     live_game: Any  # the original LiveGame, with .episode_steps + .transcript filled
 
 
@@ -171,6 +172,7 @@ class TextRolloutActor:
                         actor_id=self.actor_id,
                         slot_idx=int(env.slot_idx),
                         winner_idx=int(winner_l[idx]) if is_over else -1,
+                        is_timeout=not is_over,
                         live_game=env,
                     )
                 )

@@ -200,7 +200,8 @@ class TrainPPOTests(unittest.TestCase):
 
         returns = gae_returns(
             steps,
-            winner_idx=1,
+            terminal_reward_p0=-1.0,  # winner = p1
+            zero_sum=True,
             gamma=1.0,
             gae_lambda=1.0,
         )

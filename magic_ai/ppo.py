@@ -211,19 +211,61 @@ def ppo_update(
     )
 
 
+def life_tiebreak_terminal_reward(life_p0: int, life_p1: int) -> float:
+    """Per-player tiebreak score for step-cap timeouts, p0's perspective.
+
+    Both life totals are clamped at 0 first. Returns 0.0 on a tie or when
+    both players are at 0; otherwise ``(l0 - l1) / (l0 + l1)`` ∈ (-1, 1).
+    """
+
+    l0 = max(0, int(life_p0))
+    l1 = max(0, int(life_p1))
+    if l0 == l1:
+        return 0.0
+    return (l0 - l1) / float(l0 + l1)
+
+
+def terminal_reward_for_finish(
+    *,
+    winner_idx: int,
+    is_timeout: bool,
+    life_p0: int,
+    life_p1: int,
+    draw_penalty: float,
+) -> tuple[float, bool]:
+    """Resolve a finished episode into ``(terminal_reward_p0, zero_sum)``.
+
+    * Engine-declared win/loss → ±1, zero-sum.
+    * Engine-declared draw (``winner_idx < 0`` and not a timeout) →
+      ``-draw_penalty`` for both players; symmetric absorbing state.
+    * Step-cap timeout → life-total tiebreak from p0's perspective; zero-sum.
+    """
+
+    if is_timeout:
+        return life_tiebreak_terminal_reward(life_p0, life_p1), True
+    if winner_idx == 0:
+        return 1.0, True
+    if winner_idx == 1:
+        return -1.0, True
+    return -float(draw_penalty), False
+
+
 def gae_returns(
     steps: Sequence[RolloutStep],
     *,
-    winner_idx: int,
+    terminal_reward_p0: float,
+    zero_sum: bool,
     gamma: float = 1.0,
     gae_lambda: float = 0.95,
-    draw_penalty: float = 1.0,
 ) -> Tensor:
-    """Compute perspective-aware GAE returns for a zero-sum two-player game.
+    """Compute perspective-aware GAE returns for a two-player game.
 
-    ``draw_penalty`` is applied to both players' terminal reward when the game
-    ends in a draw (``winner_idx < 0``); the terminal reward is
-    ``-draw_penalty``.
+    ``terminal_reward_p0`` is the terminal reward in p0's perspective
+    (+1 for a p0 win, -1 for a p1 win, life-tiebreak ∈ (-1, 1) for a
+    timeout, ``-draw_penalty`` for an engine-declared draw). ``zero_sum``
+    selects the cross-player sign: ``True`` flips the sign each time the
+    acting player switches (zero-sum convention), ``False`` keeps it +1
+    throughout (symmetric absorbing state — the engine-draw branch).
     """
 
     if not steps:
@@ -238,26 +280,16 @@ def gae_returns(
     rewards_t = torch.zeros(num_steps, dtype=torch.float32)
 
     last_step = steps[-1]
-    is_draw = winner_idx < 0
-    if is_draw:
-        rewards_t[-1] = -draw_penalty
-    elif winner_idx == last_step.perspective_player_idx:
-        rewards_t[-1] = 1.0
+    last_player = int(last_step.perspective_player_idx)
+    if zero_sum and last_player == 1:
+        rewards_t[-1] = -float(terminal_reward_p0)
     else:
-        rewards_t[-1] = -1.0
+        rewards_t[-1] = float(terminal_reward_p0)
 
     if num_steps == 1:
         return rewards_t
 
-    # The GAE recurrence's cross-player sign is normally -1 (zero-sum: my
-    # value of the next state equals minus the opponent's value). For a
-    # draw, the absorbing state is symmetric — both players value it at
-    # -draw_penalty — so propagation across player switches must NOT flip
-    # sign; the cross-player sign is +1 throughout. This both lets the
-    # discounted -draw_penalty reach every step (so the value head fits a
-    # ramp instead of a constant, breaking the value-collapse local minimum)
-    # and preserves the all-players-penalized invariant.
-    cross_player_sign = 1.0 if is_draw else -1.0
+    cross_player_sign = -1.0 if zero_sum else 1.0
     signs_t = torch.where(
         players_t[1:] == players_t[:-1],
         torch.ones(num_steps - 1, dtype=torch.float32),
@@ -287,10 +319,10 @@ def _gae_returns_batched_compiled(
     values_f: Tensor,
     players_l: Tensor,
     step_count_l: Tensor,
-    winner_l: Tensor,
+    terminal_reward_p0_f: Tensor,
+    zero_sum_b: Tensor,
     gamma: float,
     gae_lambda: float,
-    draw_penalty: float,
 ) -> Tensor:
     dtype = values_f.dtype
     device = values_f.device
@@ -301,18 +333,16 @@ def _gae_returns_batched_compiled(
     valid_f = valid.to(dtype)
 
     nonempty = step_count_l > 0
-    is_draw = winner_l < 0
     safe_terminal = (step_count_l - 1).clamp_min(0)
     last_player = players_l.gather(1, safe_terminal.unsqueeze(1)).squeeze(1)
-    win_loss_terminal = torch.where(
-        winner_l == last_player,
-        values_f.new_ones(batch_size),
-        values_f.new_full((batch_size,), -1.0),
-    )
+    # Terminal reward is given in p0's perspective; flip it on rows whose
+    # last actor is p1 in the zero-sum branch. Symmetric (non-zero-sum)
+    # rows leave it unflipped — both players see the same absorbing reward.
+    flip = zero_sum_b & (last_player == 1)
     terminal_reward = torch.where(
-        is_draw,
-        values_f.new_full((batch_size,), -float(draw_penalty)),
-        win_loss_terminal,
+        flip,
+        -terminal_reward_p0_f.to(dtype),
+        terminal_reward_p0_f.to(dtype),
     )
     terminal_reward = terminal_reward * nonempty.to(dtype)
 
@@ -324,9 +354,9 @@ def _gae_returns_batched_compiled(
     if max_steps > 1:
         same_player = players_l[:, 1:] == players_l[:, :-1]
         cross_sign = torch.where(
-            is_draw,
-            values_f.new_ones(batch_size),
+            zero_sum_b,
             values_f.new_full((batch_size,), -1.0),
+            values_f.new_ones(batch_size),
         )
         signs = torch.where(
             same_player,
@@ -360,33 +390,32 @@ def gae_returns_batched(
     values: Tensor,
     perspective_player_idx: Tensor,
     step_count: Tensor,
-    winner_idx: Tensor,
     *,
+    terminal_reward_p0: Tensor,
+    zero_sum: Tensor,
     gamma: float = 1.0,
     gae_lambda: float = 0.95,
-    draw_penalty: float = 1.0,
 ) -> Tensor:
     """Batched perspective-aware GAE returns for a padded rollout.
 
     Parameters
     ----------
     values:
-        ``(B, T)`` float tensor of value estimates per step. Positions past
-        each row's terminal index are ignored.
+        ``(B, T)`` float tensor of value estimates per step.
     perspective_player_idx:
         ``(B, T)`` integer tensor of the acting player at each step.
     step_count:
         ``(B,)`` integer tensor; row ``b`` uses positions ``[0, step_count[b])``.
-        Rows with ``step_count == 0`` produce an all-zero output row.
-    winner_idx:
-        ``(B,)`` integer tensor. Use ``-1`` for a draw; the row's terminal
-        reward is then ``-draw_penalty`` and propagation across player
-        switches uses ``+1`` (no zero-sum sign-flip), so the discounted
-        draw penalty reaches every step under both perspectives. See the
-        per-episode reference implementation for the rationale.
-
-    The output ``(B, T)`` matches stacking ``gae_returns`` over each row, with
-    zero-padding past ``step_count``.
+    terminal_reward_p0:
+        ``(B,)`` float tensor — terminal reward in p0's perspective. The
+        compiled kernel flips it on rows whose terminal-step actor is p1
+        in the zero-sum branch, and leaves it unflipped (symmetric) when
+        ``zero_sum[b]`` is False.
+    zero_sum:
+        ``(B,)`` bool tensor. ``True`` ⇒ standard zero-sum two-player GAE
+        (cross-player sign-flip is -1). ``False`` ⇒ symmetric absorbing
+        state (no sign-flip across player switches); used for engine-
+        declared draws so both players see the same absorbing reward.
     """
 
     if values.dim() != 2:
@@ -395,20 +424,23 @@ def gae_returns_batched(
         raise ValueError("perspective_player_idx must match values shape")
     if step_count.shape != (values.shape[0],):
         raise ValueError("step_count must have shape (B,)")
-    if winner_idx.shape != (values.shape[0],):
-        raise ValueError("winner_idx must have shape (B,)")
+    if terminal_reward_p0.shape != (values.shape[0],):
+        raise ValueError("terminal_reward_p0 must have shape (B,)")
+    if zero_sum.shape != (values.shape[0],):
+        raise ValueError("zero_sum must have shape (B,)")
 
     device = values.device
     values_f = values.to(torch.float32)
     step_count_l = step_count.to(device=device, dtype=torch.long)
-    winner_l = winner_idx.to(device=device, dtype=torch.long)
     players_l = perspective_player_idx.to(device=device, dtype=torch.long)
+    terminal_f = terminal_reward_p0.to(device=device, dtype=torch.float32)
+    zero_sum_b = zero_sum.to(device=device, dtype=torch.bool)
     return _gae_returns_batched_compiled(
         values_f,
         players_l,
         step_count_l,
-        winner_l,
+        terminal_f,
+        zero_sum_b,
         float(gamma),
         float(gae_lambda),
-        float(draw_penalty),
     )

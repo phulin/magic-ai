@@ -153,18 +153,23 @@ class GaeReturnsDrawTest(unittest.TestCase):
     def test_both_players_get_draw_penalty(self) -> None:
         steps = [self._step(p) for p in (0, 1, 0, 1, 0, 1)]
         gamma, lam, dp = 1.0, 0.95, 1.0
-        returns = gae_returns(steps, winner_idx=-1, gamma=gamma, gae_lambda=lam, draw_penalty=dp)
+        returns = gae_returns(
+            steps,
+            terminal_reward_p0=-dp,
+            zero_sum=False,
+            gamma=gamma,
+            gae_lambda=lam,
+        )
         # Every step's return is negative regardless of perspective —
-        # the cross-player sign for draws is +1, so the discounted
-        # -draw_penalty reaches both players' steps without flipping sign.
+        # the cross-player sign for symmetric draws is +1, so the
+        # discounted -draw_penalty reaches both players' steps without
+        # flipping sign.
         self.assertTrue(bool((returns < 0).all().item()), f"returns={returns!r}")
         # Magnitude should grow monotonically toward the terminal step.
         diffs = returns[1:] - returns[:-1]
         self.assertTrue(bool((diffs <= 0).all().item()), f"diffs={diffs!r}")
         # Terminal reward is exactly -draw_penalty.
         self.assertAlmostEqual(float(returns[-1]), -dp, places=6)
-        # Closed form for V=0 with all-alternating players:
-        # advantage_t = -(gamma*lam)^(T-1-t), and returns = advantages.
         expected = -torch.tensor(
             [(gamma * lam) ** (len(steps) - 1 - t) for t in range(len(steps))],
             dtype=torch.float32,
@@ -172,13 +177,52 @@ class GaeReturnsDrawTest(unittest.TestCase):
         torch.testing.assert_close(returns, expected)
 
     def test_win_loss_unchanged(self) -> None:
-        # Sanity check that the non-draw path is intact: terminal player
+        # Sanity check that the zero-sum path is intact: terminal player
         # gets +1, the other side's perspective steps see propagated -1.
         steps = [self._step(0), self._step(1), self._step(0)]
-        returns = gae_returns(steps, winner_idx=0, draw_penalty=1.0, gamma=1.0, gae_lambda=0.95)
+        returns = gae_returns(
+            steps,
+            terminal_reward_p0=1.0,
+            zero_sum=True,
+            gamma=1.0,
+            gae_lambda=0.95,
+        )
         # Last step (player 0, winner) → +1; player 1's prior step → -1.
         self.assertGreater(float(returns[-1]), 0.0)
         self.assertLess(float(returns[1]), 0.0)
+
+    def test_terminal_p0_flipped_when_last_actor_is_p1(self) -> None:
+        # Zero-sum: terminal_reward_p0 = +1 means p0 wins. If the last
+        # action's perspective is p1, the terminal step's reward (in
+        # p1's perspective) must be -1. Closed form for V=0:
+        steps = [self._step(0), self._step(1)]
+        returns = gae_returns(
+            steps,
+            terminal_reward_p0=1.0,
+            zero_sum=True,
+            gamma=1.0,
+            gae_lambda=0.95,
+        )
+        # Last step is p1 → terminal reward in p1's perspective = -1.
+        self.assertAlmostEqual(float(returns[-1]), -1.0, places=6)
+        # First step (p0) sees +0.95 via cross-player sign-flip.
+        self.assertAlmostEqual(float(returns[0]), 0.95, places=5)
+
+    def test_timeout_life_tiebreak(self) -> None:
+        # A step-cap timeout with p0 ahead in life: zero-sum, terminal_p0
+        # ∈ (0, 1). Last actor is p0, so terminal step gets +tp0.
+        steps = [self._step(0), self._step(1), self._step(0)]
+        tp0 = 0.5  # e.g. life 15 vs 5 → 10/20 = 0.5
+        returns = gae_returns(
+            steps,
+            terminal_reward_p0=tp0,
+            zero_sum=True,
+            gamma=1.0,
+            gae_lambda=0.95,
+        )
+        self.assertAlmostEqual(float(returns[-1]), tp0, places=6)
+        # p1's step sees -tp0 (after one cross-player flip).
+        self.assertAlmostEqual(float(returns[1]), -tp0 * 0.95, places=5)
 
 
 class GaeReturnsBatchedParityTest(unittest.TestCase):
@@ -214,7 +258,8 @@ class GaeReturnsBatchedParityTest(unittest.TestCase):
         values = torch.zeros(batch, max_steps, dtype=torch.float32)
         players = torch.zeros(batch, max_steps, dtype=torch.long)
         step_count = torch.zeros(batch, dtype=torch.long)
-        winner = torch.zeros(batch, dtype=torch.long)
+        terminal_p0 = torch.zeros(batch, dtype=torch.float32)
+        zero_sum = torch.zeros(batch, dtype=torch.bool)
         ref_padded = torch.zeros(batch, max_steps, dtype=torch.float32)
 
         for b, (length, w, ps, vs) in enumerate(cases):
@@ -228,13 +273,21 @@ class GaeReturnsBatchedParityTest(unittest.TestCase):
                 values[b, t] = 999.0
                 players[b, t] = (b + t) % 2
             step_count[b] = length
-            winner[b] = w
+            # Map legacy (winner, draw_penalty) to (terminal_p0, zero_sum).
+            if w == 0:
+                tp0_b, zs_b = 1.0, True
+            elif w == 1:
+                tp0_b, zs_b = -1.0, True
+            else:
+                tp0_b, zs_b = -float(draw_penalty), False
+            terminal_p0[b] = tp0_b
+            zero_sum[b] = zs_b
             ref = gae_returns(
                 steps,
-                winner_idx=w,
+                terminal_reward_p0=tp0_b,
+                zero_sum=zs_b,
                 gamma=gamma,
                 gae_lambda=gae_lambda,
-                draw_penalty=draw_penalty,
             )
             ref_padded[b, :length] = ref
 
@@ -242,10 +295,10 @@ class GaeReturnsBatchedParityTest(unittest.TestCase):
             values,
             players,
             step_count,
-            winner,
+            terminal_reward_p0=terminal_p0,
+            zero_sum=zero_sum,
             gamma=gamma,
             gae_lambda=gae_lambda,
-            draw_penalty=draw_penalty,
         )
         torch.testing.assert_close(got, ref_padded, atol=1e-5, rtol=1e-5)
 
@@ -288,14 +341,22 @@ class GaeReturnsBatchedParityTest(unittest.TestCase):
         values = torch.zeros(2, 4, dtype=torch.float32)
         players = torch.zeros(2, 4, dtype=torch.long)
         step_count = torch.tensor([0, 3], dtype=torch.long)
-        winner = torch.tensor([0, 1], dtype=torch.long)
+        terminal_p0 = torch.tensor([1.0, -1.0], dtype=torch.float32)
+        zero_sum = torch.tensor([True, True], dtype=torch.bool)
         values[1, :3] = torch.tensor([0.1, 0.2, 0.3])
         players[1, :3] = torch.tensor([1, 0, 1])
-        got = gae_returns_batched(values, players, step_count, winner)
+        got = gae_returns_batched(
+            values,
+            players,
+            step_count,
+            terminal_reward_p0=terminal_p0,
+            zero_sum=zero_sum,
+        )
         torch.testing.assert_close(got[0], torch.zeros(4))
         ref = gae_returns(
             GaeReturnsBatchedParityTest._episode(3, [1, 0, 1], [0.1, 0.2, 0.3]),
-            winner_idx=1,
+            terminal_reward_p0=-1.0,
+            zero_sum=True,
         )
         torch.testing.assert_close(got[1, :3], ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(got[1, 3], torch.tensor(0.0))
