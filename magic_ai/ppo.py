@@ -162,8 +162,9 @@ def ppo_update(
             # single bad batch (e.g. an all-masked decision row producing NaN
             # log-probs) propagates NaN into the weights and every subsequent
             # forward returns NaN logits, which crashes the next sampler call
-            # with the CUDA ``0 <= p <= 1`` multinomial assert.
-            if not torch.isfinite(grad_norm) or not torch.isfinite(loss).item():
+            # with the CUDA ``0 <= p <= 1`` multinomial assert. Combine both
+            # checks into one host sync per minibatch.
+            if not bool(torch.isfinite(grad_norm) & torch.isfinite(loss)):
                 optimizer.zero_grad(set_to_none=True)
                 print(
                     f"[ppo] non-finite update skipped: "
