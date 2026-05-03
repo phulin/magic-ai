@@ -1017,6 +1017,12 @@ class TrainPPOTests(unittest.TestCase):
             def reset_lstm_env_states(self, _env_indices: list[int]) -> None:
                 pass
 
+            def gather_replay_old_log_prob_value(
+                self, replay_rows: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                n = int(replay_rows.numel())
+                return torch.zeros(n), torch.zeros(n)
+
             def sample_native_tensor_batch(
                 self,
                 *,
@@ -1037,18 +1043,35 @@ class TrainPPOTests(unittest.TestCase):
                 )
 
         class FakeStaging:
-            def __init__(self, *_args: object, **_kwargs: object) -> None:
-                self.step_counts = [0, 0]
+            def __init__(
+                self,
+                _replay_buffer: object,
+                *,
+                num_envs: int,
+                max_steps: int,
+            ) -> None:
+                self.device = torch.device("cpu")
+                self.num_envs = num_envs
+                self.max_steps = max_steps
+                self.step_count = torch.zeros(num_envs, dtype=torch.long)
+                self.perspective_player_idx = torch.zeros(num_envs, max_steps, dtype=torch.int8)
+                self.value = torch.zeros(num_envs, max_steps, dtype=torch.float32)
+                self._next_row = 0
 
             def stage_batch(self, env_indices: list[int], _payload: object) -> None:
                 for env_idx in env_indices:
-                    self.step_counts[env_idx] += 1
+                    self.step_count[env_idx] += 1
+
+            def reset_env(self, env_idx: int) -> None:
+                self.step_count[int(env_idx)] = 0
 
             def append_env_to_replay(
                 self, env_idx: int, _replay_buffer: FakeReplayBuffer
             ) -> list[int]:
-                rows = list(range(self.step_counts[env_idx]))
-                self.step_counts[env_idx] = 0
+                count = int(self.step_count[env_idx].item())
+                rows = list(range(self._next_row, self._next_row + count))
+                self._next_row += count
+                self.step_count[env_idx] = 0
                 return rows
 
             def append_envs_to_replay(
@@ -1059,6 +1082,19 @@ class TrainPPOTests(unittest.TestCase):
                 return [
                     self.append_env_to_replay(env_idx, replay_buffer) for env_idx in env_indices
                 ]
+
+            def append_envs_to_replay_returning_tensor(
+                self,
+                env_indices: list[int],
+                _replay_buffer: FakeReplayBuffer,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                env_t = torch.tensor(env_indices, dtype=torch.long)
+                counts = self.step_count[env_t].clone()
+                n_total = int(counts.sum().item())
+                rows = torch.arange(self._next_row, self._next_row + n_total, dtype=torch.long)
+                self._next_row += n_total
+                self.step_count[env_t] = 0
+                return rows, counts
 
         with tempfile.TemporaryDirectory() as tmpdir:
             args = Namespace(

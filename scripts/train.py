@@ -495,17 +495,29 @@ class NativeTextTrajectoryBuffer:
             )
         self.step_count[env_t] = step_t + 1
 
-    def append_envs_to_replay(
+    def _append_envs_to_replay_core(
         self,
         env_indices: list[int],
         replay_buffer: TextReplayBuffer,
-    ) -> list[list[int]]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Append finished episodes from the staging buffer to ``replay_buffer``
+        and reset the staging slots. Returns ``(flat_rows, counts_all)``
+        on-device. The internal ``int(... .item())`` syncs are unchanged
+        from :meth:`append_envs_to_replay` — they're needed by the packed
+        text-batch shape — but the per-env host conversions at the end of
+        the legacy method are dropped: callers that don't need host lists
+        get just two device tensors.
+        """
+
+        device = self.device
         if not env_indices:
-            return []
-        env_t_all = torch.tensor(env_indices, dtype=torch.long, device=self.device)
+            empty = torch.zeros(0, dtype=torch.long, device=device)
+            return empty, empty
+
+        env_t_all = torch.tensor(env_indices, dtype=torch.long, device=device)
         counts_all = self.step_count[env_t_all]
         if bool((counts_all == 0).all().item()):
-            return [[] for _ in env_indices]
+            return torch.zeros(0, dtype=torch.long, device=device), counts_all
 
         active_mask = counts_all > 0
         active_env = env_t_all[active_mask]
@@ -600,20 +612,47 @@ class NativeTextTrajectoryBuffer:
         if replay_buffer.projected_state is not None and self.projected_state is not None:
             replay_buffer.write_projected_state(rows, self.projected_state[flat_env, flat_step])
 
+        # Reset all targeted env slots in one scatter (resetting an already-
+        # empty slot to 0 is a no-op).
+        self.step_count[env_t_all] = 0
+        return rows.to(dtype=torch.long), counts_all
+
+    def append_envs_to_replay(
+        self,
+        env_indices: list[int],
+        replay_buffer: TextReplayBuffer,
+    ) -> list[list[int]]:
+        if not env_indices:
+            return []
+        rows, counts_all = self._append_envs_to_replay_core(env_indices, replay_buffer)
+        if rows.numel() == 0:
+            return [[] for _ in env_indices]
+        active_counts = counts_all[counts_all > 0]
         rows_by_active = [
             list(chunk)
             for chunk in torch.split(rows.detach().cpu(), active_counts.detach().cpu().tolist())
         ]
         result: list[list[int]] = []
         active_cursor = 0
-        for env_idx, count in zip(env_indices, counts_all.detach().cpu().tolist(), strict=True):
+        for count in counts_all.detach().cpu().tolist():
             if count > 0:
                 result.append([int(row) for row in rows_by_active[active_cursor]])
                 active_cursor += 1
-                self.reset_env(int(env_idx))
             else:
                 result.append([])
         return result
+
+    def append_envs_to_replay_returning_tensor(
+        self,
+        env_indices: list[int],
+        replay_buffer: TextReplayBuffer,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Like :meth:`append_envs_to_replay` but returns ``(flat_rows,
+        counts_all)`` on-device, skipping the per-env host conversions
+        (``rows.cpu().tolist()``, ``active_counts.cpu().tolist()``,
+        ``counts_all.cpu().tolist()``) that the list-of-lists API does.
+        """
+        return self._append_envs_to_replay_core(env_indices, replay_buffer)
 
     def append_env_to_replay(self, env_idx: int, replay_buffer: TextReplayBuffer) -> list[int]:
         return self.append_envs_to_replay([env_idx], replay_buffer)[0]
@@ -3414,8 +3453,9 @@ def train_text_native_batched_envs(
     if isinstance(run_step, int):
         total_wandb_logs = max(total_wandb_logs, run_step)
 
-    pending_steps: list[RolloutStep] = []
+    pending_replay_rows: list[torch.Tensor] = []
     pending_returns: list[torch.Tensor] = []
+    pending_step_count: int = 0
     pending_episodes: list[EpisodeBatch] = []
     pending_episode_rows: list[list[int]] = []
     rnad_state: RNaDTrainerState | None = None
@@ -3505,26 +3545,78 @@ def train_text_native_batched_envs(
 
     def maybe_start_games() -> None:
         nonlocal next_episode_idx
-        if len(pending_steps) >= args.rollout_steps:
+        if pending_step_count >= args.rollout_steps:
             return
         while free_slots and next_episode_idx < args.episodes:
             live_games.append(start_game(free_slots.pop(), next_episode_idx))
             next_episode_idx += 1
 
     def finish_games(finished: list[tuple[LiveGame, int]]) -> None:
-        nonlocal completed_games, total_generated_rollout_steps
-        replay_rows_by_env = staging_buffer.append_envs_to_replay(
-            [env.slot_idx for env, _winner_idx in finished if env.episode_steps],
-            backend.replay_buffer,
-        )
-        replay_rows_by_slot = {
-            env.slot_idx: replay_rows
-            for (env, _winner_idx), replay_rows in zip(
-                [(env, winner_idx) for env, winner_idx in finished if env.episode_steps],
-                replay_rows_by_env,
-                strict=True,
+        nonlocal completed_games, total_generated_rollout_steps, pending_step_count
+        finished_with_steps = [(env, w) for env, w in finished if env.episode_steps]
+        if finished_with_steps:
+            slot_idxs = [env.slot_idx for env, _ in finished_with_steps]
+            device = staging_buffer.device
+            slot_t = torch.tensor(slot_idxs, dtype=torch.long, device=device)
+            # Snapshot step_count BEFORE the buffer-append resets the slots.
+            step_counts = staging_buffer.step_count[slot_t].clone()
+            max_steps = staging_buffer.max_steps
+            step_arange = torch.arange(max_steps, device=device).unsqueeze(0)
+            valid_mask = step_arange < step_counts.unsqueeze(1)
+            players_padded = staging_buffer.perspective_player_idx[slot_t]
+            values_padded = staging_buffer.value[slot_t]
+            winner_t = torch.tensor(
+                [w for _env, w in finished_with_steps],
+                dtype=torch.long,
+                device=device,
             )
-        }
+            returns_padded = gae_returns_batched(
+                values_padded,
+                players_padded,
+                step_counts,
+                winner_t,
+                gamma=args.gamma,
+                gae_lambda=args.gae_lambda,
+                draw_penalty=args.draw_penalty,
+            )
+            flat_returns_dev = returns_padded[valid_mask]
+            flat_rows, _counts = staging_buffer.append_envs_to_replay_returning_tensor(
+                slot_idxs,
+                backend.replay_buffer,
+            )
+            n_new = int(flat_rows.numel())
+            if n_new > 0:
+                pending_replay_rows.append(flat_rows)
+                pending_returns.append(flat_returns_dev)
+                pending_step_count += n_new
+                total_generated_rollout_steps += n_new
+                # Per-episode replay-row lists are still consumed by the
+                # LSTM-refresh callback and (when active) R-NaD EpisodeBatch
+                # construction. One ``step_counts.tolist()`` + one
+                # ``flat_rows.cpu()`` covers every finished episode in this
+                # batch, replacing the legacy 3-tolist host-list API.
+                counts_h = step_counts.tolist()
+                per_env_rows_h = torch.split(flat_rows.cpu(), counts_h)
+                for (env, winner_idx), rows_chunk in zip(
+                    finished_with_steps,
+                    per_env_rows_h,
+                    strict=True,
+                ):
+                    ep_rows = [int(r) for r in rows_chunk.tolist()]
+                    if ep_rows:
+                        pending_episode_rows.append(ep_rows)
+                    if rnad_state is not None:
+                        env.episode_steps = [
+                            replace(step, replay_idx=replay_idx)
+                            for step, replay_idx in zip(env.episode_steps, ep_rows, strict=True)
+                        ]
+                        pending_episodes.append(
+                            EpisodeBatch(
+                                steps=list(env.episode_steps),
+                                winner_idx=int(winner_idx),
+                            )
+                        )
+
         for env, winner_idx in finished:
             try:
                 env.game.close()
@@ -3539,33 +3631,6 @@ def train_text_native_batched_envs(
                     max_actions=args.sample_actions,
                     encoder="text",
                 )
-            if env.episode_steps:
-                replay_rows = replay_rows_by_slot[env.slot_idx]
-                env.episode_steps = [
-                    replace(step, replay_idx=replay_idx)
-                    for step, replay_idx in zip(env.episode_steps, replay_rows, strict=True)
-                ]
-                ep_rows = [s.replay_idx for s in env.episode_steps if s.replay_idx is not None]
-                if ep_rows:
-                    pending_episode_rows.append(ep_rows)
-                pending_steps.extend(env.episode_steps)
-                pending_returns.append(
-                    gae_returns(
-                        env.episode_steps,
-                        winner_idx=winner_idx,
-                        gamma=args.gamma,
-                        gae_lambda=args.gae_lambda,
-                        draw_penalty=args.draw_penalty,
-                    )
-                )
-                if rnad_state is not None:
-                    pending_episodes.append(
-                        EpisodeBatch(
-                            steps=list(env.episode_steps),
-                            winner_idx=int(winner_idx),
-                        )
-                    )
-                total_generated_rollout_steps += len(env.episode_steps)
             free_slots.append(env.slot_idx)
             if winner_idx == 0:
                 win_stats.p1_wins += 1
@@ -3576,11 +3641,12 @@ def train_text_native_batched_envs(
             completed_games += 1
 
     def run_update(*, final: bool = False) -> None:
-        nonlocal total_rollout_steps, last_step_time
-        if not pending_steps:
+        nonlocal total_rollout_steps, last_step_time, pending_step_count
+        if pending_step_count == 0:
             return
         rollout_returns = torch.cat(pending_returns)
-        rollout_step_count = len(pending_steps)
+        rollout_replay_rows = torch.cat(pending_replay_rows)
+        rollout_step_count = pending_step_count
         snapshot_armed = args.cuda_memory_snapshot is not None and torch.cuda.is_available()
         if snapshot_armed:
             print(
@@ -3632,11 +3698,6 @@ def train_text_native_batched_envs(
                     backend.policy.refresh_lstm_states(ep_rows_snapshot)  # type: ignore[union-attr]
 
             try:
-                rollout_replay_rows = torch.tensor(
-                    [cast(int, step.replay_idx) for step in pending_steps],
-                    dtype=torch.long,
-                    device=next(backend.policy.parameters()).device,
-                )
                 stats = ppo_update(
                     backend.policy,
                     optimizer,
@@ -3703,10 +3764,10 @@ def train_text_native_batched_envs(
             fields.append(f"rnad_m={rnad_state.outer_iteration}")
         print(*fields, flush=True)
         total_rollout_steps += rollout_step_count
-        value_metrics = rollout_value_metrics(
-            torch.tensor([step.value for step in pending_steps], dtype=torch.float32),
-            rollout_returns,
+        _, rollout_predicted_values = backend.policy.gather_replay_old_log_prob_value(
+            rollout_replay_rows
         )
+        value_metrics = rollout_value_metrics(rollout_predicted_values, rollout_returns)
         if rnad_state is not None and rnad_state.last_stats:
             rs = rnad_state.last_stats[0]
             value_metrics.update(
@@ -3735,10 +3796,11 @@ def train_text_native_batched_envs(
             log_fn=tracked_wandb_log,
             run_active=True,
         )
-        pending_steps.clear()
+        pending_replay_rows.clear()
         pending_returns.clear()
         pending_episodes.clear()
         pending_episode_rows.clear()
+        pending_step_count = 0
         backend.replay_buffer.reset()
         win_stats.reset()
 
@@ -3896,7 +3958,7 @@ def train_text_native_batched_envs(
         actor_done: list[bool] = [False] * num_actors
         deferred_finishes: list[FinishedEnv] = []
         last_progress_t = time.monotonic()
-        last_progress_state = (completed_games, len(pending_steps), next_episode_idx)
+        last_progress_state = (completed_games, pending_step_count, next_episode_idx)
         watchdog_threshold_s = float(getattr(args, "actor_watchdog_seconds", 60.0))
 
         try:
@@ -3910,7 +3972,7 @@ def train_text_native_batched_envs(
                 # crashed before resolving the first batch) visible instead
                 # of looking like an unconditional deadlock.
                 now = time.monotonic()
-                cur_state = (completed_games, len(pending_steps), next_episode_idx)
+                cur_state = (completed_games, pending_step_count, next_episode_idx)
                 if cur_state != last_progress_state:
                     last_progress_t = now
                     last_progress_state = cur_state
@@ -3920,7 +3982,7 @@ def train_text_native_batched_envs(
                         f"[watchdog] no rollout progress for "
                         f"{int(now - last_progress_t)}s — "
                         f"completed_games={completed_games} "
-                        f"pending_steps={len(pending_steps)} "
+                        f"pending_steps={pending_step_count} "
                         f"next_ep={next_episode_idx} "
                         f"server_alive={server._thread.is_alive()} "
                         f"server_q={server._queue.qsize()} "
@@ -3989,7 +4051,7 @@ def train_text_native_batched_envs(
                     # actor_free_slots[aid] above. Pull from there.
                     new_games: list[Any] = []
                     no_more = False
-                    if len(pending_steps) < args.rollout_steps:
+                    if pending_step_count < args.rollout_steps:
                         while actor_free_slots[aid] and next_episode_idx < args.episodes:
                             slot_idx = actor_free_slots[aid].pop()
                             new_games.append(start_game(slot_idx, next_episode_idx))
@@ -4005,7 +4067,7 @@ def train_text_native_batched_envs(
                         active_actors -= 1
 
                 # Periodic update: pause the inference server, run, resume.
-                if len(pending_steps) >= args.rollout_steps:
+                if pending_step_count >= args.rollout_steps:
                     server.pause()
                     run_update()
                     server.resume()
@@ -4126,7 +4188,7 @@ def train_text_native_batched_envs(
         live_games = still_live
         finish_games(finished_games)
 
-        if len(pending_steps) >= args.rollout_steps:
+        if pending_step_count >= args.rollout_steps:
             run_update()
             maybe_start_games()
             continue
