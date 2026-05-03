@@ -97,8 +97,11 @@ def test_slice_decodes_to_card_name(small_cache: CardTokenCache, tokenizer) -> N
 def test_missing_raises_lists_name(oracle: dict[str, OracleEntry], tokenizer) -> None:
     bogus = "Definitely Not A Real Magic Card 9999"
     names = [*TEST_NAMES, bogus]
+    # ``oracle_db_path=None`` skips the on-disk Scryfall DB fallback; without
+    # it, each call here re-parses the bulk oracle JSON to look up the bogus
+    # name and adds ~1s.
     with pytest.raises(MissingOracleTextError) as info:
-        build_card_cache(names, oracle, tokenizer, missing_policy="raise")
+        build_card_cache(names, oracle, tokenizer, missing_policy="raise", oracle_db_path=None)
     assert bogus in info.value.missing
     assert bogus in str(info.value)
 
@@ -106,7 +109,7 @@ def test_missing_raises_lists_name(oracle: dict[str, OracleEntry], tokenizer) ->
 def test_missing_skip_emits_empty_body(oracle: dict[str, OracleEntry], tokenizer) -> None:
     bogus = "Definitely Not A Real Magic Card 9999"
     names = [*TEST_NAMES, bogus]
-    cache = build_card_cache(names, oracle, tokenizer, missing_policy="skip")
+    cache = build_card_cache(names, oracle, tokenizer, missing_policy="skip", oracle_db_path=None)
     # Bogus is the last row -> row index = len(names)
     bogus_row = len(names)
     assert cache.row_to_name[bogus_row] == bogus

@@ -102,7 +102,10 @@ def test_mlm_trainer_smoke_trains_loss_down() -> None:
     torch_rng.manual_seed(0)
 
     losses: list[float] = []
-    for _ in range(150):
+    # 40 steps is enough for the synthetic-majority signal to drop the loss
+    # past the 0.75x threshold; the original 150 steps were ~4x slower
+    # without strengthening the assertion.
+    for _ in range(40):
         # Mostly token id 7, with random low-id noise.
         t = np.full((mlm_cfg.batch_size, mlm_cfg.seq_len), 7, dtype=np.int64)
         flip = np_rng.random(t.shape) < 0.1

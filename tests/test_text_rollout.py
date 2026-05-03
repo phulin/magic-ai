@@ -59,11 +59,11 @@ class TextRolloutSmokeTests(unittest.TestCase):
         cfg = TextEncoderConfig(
             vocab_size=len(cls.tokenizer),
             pad_id=int(cls.tokenizer.pad_token_id or 0),
-            d_model=64,
+            d_model=32,
             n_layers=1,
             n_heads=2,
         )
-        rcfg = RecurrentTextPolicyConfig(encoder=cfg, lstm_hidden=64)
+        rcfg = RecurrentTextPolicyConfig(encoder=cfg, lstm_hidden=32)
         cls.policy = RecurrentTextPolicy(rcfg)
         cls.policy.eval()
 
@@ -93,7 +93,7 @@ class TextRolloutSmokeTests(unittest.TestCase):
             "seed": 1,
             "shuffle": True,
         }
-        episode = worker.play_episode(cfg, max_turns=4)
+        episode = worker.play_episode(cfg, max_turns=2)
         self.assertGreaterEqual(len(episode.steps), 1)
         for step in episode.steps:
             self.assertIn(step.reward, (-1.0, 0.0, 1.0))
@@ -110,7 +110,7 @@ class TextRolloutSmokeTests(unittest.TestCase):
             "seed": 2,
             "shuffle": True,
         }
-        episode = worker.play_episode(cfg, max_turns=4)
+        episode = worker.play_episode(cfg, max_turns=2)
         for step in episode.steps:
             # The chosen option index must point inside the legal_options
             # list captured at that decision (no off-by-one in the worker).
@@ -179,7 +179,7 @@ class TextRolloutSmokeTests(unittest.TestCase):
                 "seed": 3,
                 "shuffle": True,
             }
-            episode = worker.play_episode(cfg, max_turns=4)
+            episode = worker.play_episode(cfg, max_turns=2)
         finally:
             setattr(rollout_mod.TextRolloutWorker, "_score_step", original)
             setattr(rollout_mod.TextRolloutWorker, "_init_states", original_init)

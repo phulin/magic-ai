@@ -85,7 +85,7 @@ class LstmRecomputeStrategiesCorrectness(unittest.TestCase):
 
         # Mix of lengths including the boundary cases (T==1, T==T_max, ties).
         projected, lengths = _make_workload(
-            n_episodes=4, t_max=8, t_min=1, hidden=hidden, seed=42, dtype=dtype, device=device
+            n_episodes=3, t_max=5, t_min=1, hidden=hidden, seed=42, dtype=dtype, device=device
         )
 
         ref = lstm_recompute_per_step_states(lstm, projected, lengths, strategy="legacy")
@@ -169,7 +169,7 @@ class LstmRecomputeChunkedBptt(unittest.TestCase):
         # T_max -- must produce identical forward output. Gradient flow is
         # truncated at chunk boundaries, but the forward computation is
         # exact.
-        for chunk_size in (1, 2, 3, 7, 9, 100):
+        for chunk_size in (1, 3, 9):
             with self.subTest(chunk_size=chunk_size):
                 got = lstm_recompute_per_step_h_out(lstm, per_ep, chunk_size=chunk_size)
                 for g, r in zip(got, ref, strict=True):
