@@ -152,9 +152,24 @@ class GaeReturnsDrawTest(unittest.TestCase):
 
     def test_both_players_get_draw_penalty(self) -> None:
         steps = [self._step(p) for p in (0, 1, 0, 1, 0, 1)]
-        returns = gae_returns(steps, winner_idx=-1, draw_penalty=1.0)
-        # Every step's return is -draw_penalty regardless of perspective.
-        torch.testing.assert_close(returns, torch.full((6,), -1.0))
+        gamma, lam, dp = 1.0, 0.95, 1.0
+        returns = gae_returns(steps, winner_idx=-1, gamma=gamma, gae_lambda=lam, draw_penalty=dp)
+        # Every step's return is negative regardless of perspective —
+        # the cross-player sign for draws is +1, so the discounted
+        # -draw_penalty reaches both players' steps without flipping sign.
+        self.assertTrue(bool((returns < 0).all().item()), f"returns={returns!r}")
+        # Magnitude should grow monotonically toward the terminal step.
+        diffs = returns[1:] - returns[:-1]
+        self.assertTrue(bool((diffs <= 0).all().item()), f"diffs={diffs!r}")
+        # Terminal reward is exactly -draw_penalty.
+        self.assertAlmostEqual(float(returns[-1]), -dp, places=6)
+        # Closed form for V=0 with all-alternating players:
+        # advantage_t = -(gamma*lam)^(T-1-t), and returns = advantages.
+        expected = -torch.tensor(
+            [(gamma * lam) ** (len(steps) - 1 - t) for t in range(len(steps))],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(returns, expected)
 
     def test_win_loss_unchanged(self) -> None:
         # Sanity check that the non-draw path is intact: terminal player

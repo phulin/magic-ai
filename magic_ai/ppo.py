@@ -229,17 +229,6 @@ def gae_returns(
         raise ValueError("cannot compute GAE returns for an empty rollout")
 
     num_steps = len(steps)
-
-    # Draws are a flat outcome both players experience identically. The
-    # perspective-aware GAE below uses zero-sum sign-flipping to propagate the
-    # last step's reward across player switches; that's correct for win/loss
-    # (one side's +1 = other side's -1) but WRONG for draws, where both
-    # sides should see -draw_penalty. Without this short-circuit the
-    # propagation would hand one player +draw_penalty as their terminal
-    # return, incentivizing them to stall on the opponent's turn.
-    if winner_idx < 0:
-        return torch.full((num_steps,), -draw_penalty, dtype=torch.float32)
-
     values_t = torch.tensor([step.value for step in steps], dtype=torch.float32)
     players_t = torch.tensor(
         [step.perspective_player_idx for step in steps],
@@ -248,7 +237,10 @@ def gae_returns(
     rewards_t = torch.zeros(num_steps, dtype=torch.float32)
 
     last_step = steps[-1]
-    if winner_idx == last_step.perspective_player_idx:
+    is_draw = winner_idx < 0
+    if is_draw:
+        rewards_t[-1] = -draw_penalty
+    elif winner_idx == last_step.perspective_player_idx:
         rewards_t[-1] = 1.0
     else:
         rewards_t[-1] = -1.0
@@ -256,10 +248,19 @@ def gae_returns(
     if num_steps == 1:
         return rewards_t
 
+    # The GAE recurrence's cross-player sign is normally -1 (zero-sum: my
+    # value of the next state equals minus the opponent's value). For a
+    # draw, the absorbing state is symmetric — both players value it at
+    # -draw_penalty — so propagation across player switches must NOT flip
+    # sign; the cross-player sign is +1 throughout. This both lets the
+    # discounted -draw_penalty reach every step (so the value head fits a
+    # ramp instead of a constant, breaking the value-collapse local minimum)
+    # and preserves the all-players-penalized invariant.
+    cross_player_sign = 1.0 if is_draw else -1.0
     signs_t = torch.where(
         players_t[1:] == players_t[:-1],
         torch.ones(num_steps - 1, dtype=torch.float32),
-        torch.full((num_steps - 1,), -1.0, dtype=torch.float32),
+        torch.full((num_steps - 1,), cross_player_sign, dtype=torch.float32),
     )
     deltas_t = rewards_t - values_t
     deltas_t[:-1] += gamma * signs_t * values_t[1:]
@@ -303,9 +304,11 @@ def gae_returns_batched(
         ``(B,)`` integer tensor; row ``b`` uses positions ``[0, step_count[b])``.
         Rows with ``step_count == 0`` produce an all-zero output row.
     winner_idx:
-        ``(B,)`` integer tensor. Use ``-1`` for a draw; the row is then filled
-        with ``-draw_penalty`` over its valid positions, mirroring the
-        per-episode reference implementation.
+        ``(B,)`` integer tensor. Use ``-1`` for a draw; the row's terminal
+        reward is then ``-draw_penalty`` and propagation across player
+        switches uses ``+1`` (no zero-sum sign-flip), so the discounted
+        draw penalty reaches every step under both perspectives. See the
+        per-episode reference implementation for the rationale.
 
     The output ``(B, T)`` matches stacking ``gae_returns`` over each row, with
     zero-padding past ``step_count``.
@@ -336,10 +339,15 @@ def gae_returns_batched(
     is_draw = winner_l < 0
     safe_terminal = (step_count_l - 1).clamp_min(0)
     last_player = players_l.gather(1, safe_terminal.unsqueeze(1)).squeeze(1)
-    terminal_reward = torch.where(
+    win_loss_terminal = torch.where(
         winner_l == last_player,
         values_f.new_ones(batch_size),
         values_f.new_full((batch_size,), -1.0),
+    )
+    terminal_reward = torch.where(
+        is_draw,
+        values_f.new_full((batch_size,), -float(draw_penalty)),
+        win_loss_terminal,
     )
     terminal_reward = terminal_reward * nonempty.to(dtype)
 
@@ -350,10 +358,18 @@ def gae_returns_batched(
     base_deltas = (rewards - values_f) * valid_f
     if max_steps > 1:
         same_player = players_l[:, 1:] == players_l[:, :-1]
+        # Per-row cross-player sign: +1 for draws (symmetric absorbing state,
+        # do NOT zero-sum-flip), -1 otherwise (zero-sum value bootstrap).
+        # See the docstring on ``gae_returns`` for why draws need this.
+        cross_sign = torch.where(
+            is_draw,
+            values_f.new_ones(batch_size),
+            values_f.new_full((batch_size,), -1.0),
+        )
         signs = torch.where(
             same_player,
             values_f.new_ones(batch_size, max_steps - 1),
-            values_f.new_full((batch_size, max_steps - 1), -1.0),
+            cross_sign.unsqueeze(1).expand(batch_size, max_steps - 1),
         )
         # Bootstrap term only when the *next* step is also valid (t+1 < step_count).
         next_valid = (arange_t[: max_steps - 1].unsqueeze(0) < (step_count_l - 1).unsqueeze(1)).to(
@@ -376,8 +392,4 @@ def gae_returns_batched(
         advantages = (scan_coeffs * torch.cumsum(deltas_rev / scan_coeffs, dim=1)).flip(1)
 
     returns = (advantages + values_f) * valid_f
-
-    draw_row = values_f.new_full((), -float(draw_penalty)) * valid_f
-    returns = torch.where(is_draw.unsqueeze(1), draw_row, returns)
-
     return returns
