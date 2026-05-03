@@ -18,6 +18,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, cast
 
 import numpy as np
@@ -1689,6 +1690,34 @@ def parse_args() -> argparse.Namespace:
             "max(4096, rollout-steps + max-steps-per-game * num-envs)"
         ),
     )
+    parser.add_argument(
+        "--num-rollout-actors",
+        type=int,
+        default=4,
+        help=(
+            "spawn this many CPU rollout actor threads sharing one GPU inference "
+            "server (IMPALA-style). 1 = legacy in-line loop. >1 partitions envs "
+            "across actors and dynamically batches their requests on the GPU. "
+            "Default 4 fits an 8-CPU box (4 actors + 1 server + coordinator)."
+        ),
+    )
+    parser.add_argument(
+        "--inference-batch-wait-ms",
+        type=float,
+        default=2.0,
+        help=(
+            "inference server: max wall-time to wait for additional actor "
+            "requests before launching a forward pass"
+        ),
+    )
+    parser.add_argument(
+        "--inference-max-batch",
+        type=int,
+        default=0,
+        help=(
+            "inference server: cap merged forward-batch row count; 0 = use --num-envs as the cap"
+        ),
+    )
     parser.add_argument("--max-steps-per-game", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--hand-size", type=int, default=7)
@@ -1701,9 +1730,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-workers",
         type=int,
-        default=1,
+        default=4,
         help="parallel worker threads for Go-side engine step/encode batches "
-        "(default: 1 = serial; cgo releases the GIL so N threads run in parallel)",
+        "(default: 4 = one encoder/driver per default rollout actor; cgo "
+        "releases the GIL so N threads run in parallel). Must be >= "
+        "--num-rollout-actors when using the actor path.",
     )
     parser.add_argument(
         "--shard-packed-tokens",
@@ -1978,6 +2009,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--rollout-ready-wait-ms must be non-negative")
     if args.max_steps_per_game < 1:
         raise ValueError("--max-steps-per-game must be at least 1")
+    if getattr(args, "num_rollout_actors", 1) < 1:
+        raise ValueError("--num-rollout-actors must be at least 1")
+    if getattr(args, "inference_batch_wait_ms", 0.0) < 0.0:
+        raise ValueError("--inference-batch-wait-ms must be non-negative")
+    if getattr(args, "inference_max_batch", 0) < 0:
+        raise ValueError("--inference-max-batch must be non-negative")
     if args.minibatch_size < 1:
         raise ValueError("--minibatch-size must be at least 1")
     minibatch_token_limit = getattr(args, "minibatch_token_limit", None)
@@ -3589,6 +3626,295 @@ def train_text_native_batched_envs(
         pending_episode_rows.clear()
         backend.replay_buffer.reset()
         win_stats.reset()
+
+    def run_text_rollouts_actor_loop() -> None:
+        """IMPALA-style coordinator. Spins up N actor threads + 1 GPU server.
+
+        The learner thread (this one) only:
+          * drains the finished-env queue → finish_games(...);
+          * answers refill requests by spawning new games;
+          * runs PPO/R-NaD updates with the inference server paused;
+          * fires periodic save / snapshot / retrospective hooks.
+
+        All env stepping (poll, encode, step_by_choice) runs on the actor
+        threads in parallel; cgo releases the GIL on each native call.
+        """
+
+        from magic_ai.native.inference_server import TextInferenceServer
+        from magic_ai.native.rollout_actor import (
+            ActorEncodeConfig,
+            ActorRuntimeConfig,
+            FinishedEnv,
+            RefillRequest,
+            RefillResponse,
+            TextRolloutActor,
+        )
+
+        if not getattr(args, "text_native_assembler", True):
+            raise SystemExit(
+                "--num-rollout-actors > 1 requires --text-native-assembler "
+                "(the actor path drives the native packed-token assembler)."
+            )
+
+        num_actors = int(args.num_rollout_actors)
+        encoders_pool = native_encoder.encoders
+        drivers_pool = native_rollout.drivers
+        if len(encoders_pool) < num_actors:
+            raise SystemExit(
+                f"native_encoder has {len(encoders_pool)} workers but "
+                f"--num-rollout-actors={num_actors}; rebuild with --batch-workers={num_actors}"
+            )
+        if len(drivers_pool) < num_actors:
+            raise SystemExit(
+                f"native_rollout has {len(drivers_pool)} drivers but "
+                f"--num-rollout-actors={num_actors}; rebuild with --batch-workers={num_actors}"
+            )
+
+        encode_cfg = ActorEncodeConfig(
+            text_max_tokens=int(args.text_max_tokens),
+            max_options=int(args.max_options),
+            max_targets_per_option=int(args.max_targets_per_option),
+            max_card_refs=256,
+        )
+        runtime_cfg = ActorRuntimeConfig(
+            max_steps_per_game=int(args.max_steps_per_game),
+            rollout_ready_wait_ms=float(args.rollout_ready_wait_ms),
+            rollout_min_ready_batch=int(args.rollout_min_ready_batch),
+        )
+
+        max_batch = int(args.inference_max_batch) or int(args.num_envs)
+        server = TextInferenceServer(
+            sampling_policy=sampling_policy,
+            staging_buffer=staging_buffer,
+            max_batch=max_batch,
+            max_wait_ms=float(args.inference_batch_wait_ms),
+            deterministic=bool(args.deterministic_rollout),
+        )
+        server.start()
+
+        finished_q: Queue[FinishedEnv] = Queue()
+        refill_req_q: Queue[RefillRequest] = Queue()
+        refill_resp_qs: list[Queue[RefillResponse]] = [Queue() for _ in range(num_actors)]
+
+        # Partition env slots across actors. We hand each actor a *static*
+        # share of slot ids; refills always come from the same partition so
+        # there is no cross-actor slot contention.
+        all_slots = list(range(args.num_envs))
+        slot_partitions: list[list[int]] = [[] for _ in range(num_actors)]
+        for i, slot in enumerate(all_slots):
+            slot_partitions[i % num_actors].append(slot)
+        # free_slots in the closure is a single shared stack; partition it so
+        # each actor has its own free pool, decoupled from the global free_slots.
+        actor_free_slots: list[list[int]] = [list(reversed(p)) for p in slot_partitions]
+        # Mark every slot as taken from the global free_slots view; the actor
+        # path manages free slots per-actor.
+        free_slots.clear()
+
+        actor_errors: list[tuple[BaseException, str]] = []
+
+        def _actor_error(exc: BaseException, tb: str) -> None:
+            actor_errors.append((exc, tb))
+
+        actors: list[TextRolloutActor] = []
+        for actor_id in range(num_actors):
+            actor = TextRolloutActor(
+                actor_id=actor_id,
+                encoder=encoders_pool[actor_id],
+                rollout_driver=drivers_pool[actor_id],
+                inference_server=server,
+                encode_cfg=encode_cfg,
+                runtime_cfg=runtime_cfg,
+                finished_queue=finished_q,
+                refill_request_queue=refill_req_q,
+                refill_response_queue=refill_resp_qs[actor_id],
+                transcript_snapshot=_current_transcript_snapshot,
+                decode_text_action=_decode_text_action,
+                disable_transcript=disable_transcript,
+                append_transcript_action=lambda env, st, pe, ac: env.transcript.append(
+                    TranscriptAction(state=st, pending=pe, action=copy.deepcopy(ac))
+                ),
+                record_step=lambda env, p, lp, v: env.episode_steps.append(
+                    RolloutStep(
+                        perspective_player_idx=int(p),
+                        old_log_prob=float(lp),
+                        value=float(v),
+                        replay_idx=None,
+                    )
+                ),
+                error_hook=_actor_error,
+            )
+            actors.append(actor)
+
+        nonlocal next_episode_idx, last_saved_games
+
+        def _spawn_initial(actor_id: int) -> list[Any]:
+            # Initial games for actor `actor_id`: pull from its private free
+            # stack, capped by remaining episodes.
+            nonlocal next_episode_idx
+            games: list[Any] = []
+            while actor_free_slots[actor_id] and next_episode_idx < args.episodes:
+                slot_idx = actor_free_slots[actor_id].pop()
+                games.append(start_game(slot_idx, next_episode_idx))
+                next_episode_idx += 1
+            return games
+
+        for actor_id, actor in enumerate(actors):
+            initial = _spawn_initial(actor_id)
+            actor.start(initial)
+
+        active_actors = num_actors
+        actor_done: list[bool] = [False] * num_actors
+
+        try:
+            while active_actors > 0:
+                if actor_errors:
+                    exc, tb = actor_errors[0]
+                    raise RuntimeError(f"rollout actor crashed: {tb}") from exc
+
+                # Drain a batch of finished envs (up to ~num_envs at once).
+                finished_batch: list[FinishedEnv] = []
+                try:
+                    first = finished_q.get(timeout=0.05)
+                    finished_batch.append(first)
+                except Empty:
+                    pass
+                while True:
+                    try:
+                        finished_batch.append(finished_q.get_nowait())
+                    except Empty:
+                        break
+
+                if finished_batch:
+                    finish_games([(fe.live_game, fe.winner_idx) for fe in finished_batch])
+                    # Return slots to the *originating* actor's pool.
+                    per_actor_freed: list[list[int]] = [[] for _ in range(num_actors)]
+                    for fe in finished_batch:
+                        per_actor_freed[fe.actor_id].append(fe.slot_idx)
+                    for aid, slots in enumerate(per_actor_freed):
+                        if slots:
+                            actor_free_slots[aid].extend(slots)
+
+                # Service refill requests.
+                refill_now: dict[int, list[int]] = {}
+                while True:
+                    try:
+                        req = refill_req_q.get_nowait()
+                    except Empty:
+                        break
+                    refill_now.setdefault(req.actor_id, []).extend(req.slot_indices)
+                for aid, requested in refill_now.items():
+                    # Slots requested *back* are slots the actor already
+                    # released via FinishedEnv; they are already back in
+                    # actor_free_slots[aid] above. Pull from there.
+                    new_games: list[Any] = []
+                    no_more = False
+                    if len(pending_steps) < args.rollout_steps:
+                        while actor_free_slots[aid] and next_episode_idx < args.episodes:
+                            slot_idx = actor_free_slots[aid].pop()
+                            new_games.append(start_game(slot_idx, next_episode_idx))
+                            next_episode_idx += 1
+                    if next_episode_idx >= args.episodes and not actor_free_slots[aid]:
+                        no_more = True
+                    refill_resp_qs[aid].put(
+                        RefillResponse(games=new_games, no_more_episodes=no_more)
+                    )
+                    if no_more and not new_games and not actor_done[aid]:
+                        # Actor's slice has truly drained; mark it.
+                        actor_done[aid] = True
+                        active_actors -= 1
+
+                # Periodic update: pause the inference server, run, resume.
+                if len(pending_steps) >= args.rollout_steps:
+                    server.pause()
+                    run_update()
+                    server.resume()
+
+                # Save / snapshot / retrospective (mirrors the legacy loop).
+                if (
+                    args.save_every
+                    and completed_games > 0
+                    and completed_games % args.save_every == 0
+                    and completed_games != last_saved_games
+                ):
+                    save_checkpoint(
+                        args.output,
+                        backend.policy,
+                        optimizer,
+                        args,
+                        opponent_pool=opponent_pool,
+                        snapshot_schedule=snapshot_schedule,
+                        retrospective_schedule=retrospective_schedule,
+                        resume_state=TrainingResumeState(
+                            completed_games=completed_games,
+                            last_saved_games=completed_games,
+                            total_rollout_steps=total_rollout_steps,
+                            total_generated_rollout_steps=total_generated_rollout_steps,
+                            total_wandb_logs=total_wandb_logs,
+                        ),
+                        rnad_state=rnad_state,
+                    )
+                    last_saved_games = completed_games
+
+                if (
+                    opponent_pool is not None
+                    and snapshot_schedule is not None
+                    and opponent_policy is not None
+                ):
+                    pending_thresholds = list(snapshot_schedule.fire(completed_games))
+                    if pending_thresholds:
+                        server.pause()
+                        try:
+                            for threshold in pending_thresholds:
+                                take_snapshot_and_eval(
+                                    args=args,
+                                    threshold=threshold,
+                                    policy=backend.policy,
+                                    opponent_policy=opponent_policy,
+                                    opponent_pool=opponent_pool,
+                                    native_encoder=native_encoder,
+                                    native_rollout=native_rollout,
+                                    mage=mage,
+                                    deck_pool=deck_pool,
+                                    rng=eval_rng,
+                                    step_prefix=cli_step_prefix(),
+                                    log_fn=tracked_wandb_log,
+                                )
+                        finally:
+                            server.resume()
+
+                if opponent_pool is not None and retrospective_schedule is not None:
+                    for horizon_pct, horizon_step_count in retrospective_schedule.fire(
+                        completed_games
+                    ):
+                        if wandb.run is not None:
+                            log_retrospective_table(
+                                wandb.run,
+                                horizon_pct=horizon_pct,
+                                horizon_step_count=horizon_step_count,
+                                ratings=retrospective_rating_rows(
+                                    opponent_pool,
+                                    total_episodes=args.episodes,
+                                ),
+                                log_fn=tracked_wandb_log,
+                            )
+        finally:
+            for actor in actors:
+                actor.stop()
+            server.stop()
+
+    if int(getattr(args, "num_rollout_actors", 1)) > 1:
+        run_text_rollouts_actor_loop()  # nested below; uses surrounding closures
+        run_update(final=True)
+        return (
+            TrainingResumeState(
+                completed_games=completed_games,
+                last_saved_games=last_saved_games,
+                total_rollout_steps=total_rollout_steps,
+                total_generated_rollout_steps=total_generated_rollout_steps,
+                total_wandb_logs=total_wandb_logs,
+            ),
+            rnad_state,
+        )
 
     maybe_start_games()
     while live_games:

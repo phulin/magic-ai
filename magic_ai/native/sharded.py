@@ -179,6 +179,12 @@ class ShardedNativeBatchEncoder:
             encoders
         )
 
+    @property
+    def encoders(self) -> list[NativeBatchEncoder]:
+        """Per-worker encoders (for handing out one to each rollout actor)."""
+
+        return list(self._encoders)
+
     @classmethod
     def for_policy(
         cls,
@@ -502,6 +508,12 @@ class ShardedNativeRolloutDriver:
             raise NativeRolloutUnavailable("failed to load mage native library") from exc
         drivers = [NativeRolloutDriver(lib=lib, ffi=ffi) for _ in range(workers)]
         return cls(drivers, pool=pool if workers > 1 else None)
+
+    @property
+    def drivers(self) -> list[NativeRolloutDriver]:
+        """Per-worker drivers (for handing out one to each rollout actor)."""
+
+        return list(self._drivers)
 
     def poll(
         self, games: list[Any]
