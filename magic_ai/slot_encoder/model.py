@@ -354,6 +354,13 @@ class PPOPolicy(nn.Module):
     def gather_ppo_targets(self, replay_rows: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         return self.rollout_buffer.gather_ppo_targets(replay_rows)
 
+    def gather_replay_old_log_prob_value(
+        self,
+        replay_rows: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        idx = replay_rows.to(device=self.rollout_buffer.device, dtype=torch.long)
+        return self.rollout_buffer.old_log_prob[idx], self.rollout_buffer.value[idx]
+
     def append_staged_episode_to_rollout(
         self,
         staging: NativeTrajectoryBuffer,
@@ -380,6 +387,22 @@ class PPOPolicy(nn.Module):
             grouped_rows[env_idx] = flat_rows[cursor : cursor + count]
             cursor += count
         return [grouped_rows.get(env_idx, []) for env_idx in env_indices]
+
+    def append_staged_episodes_returning_tensor(
+        self,
+        staging: NativeTrajectoryBuffer,
+        env_indices: list[int],
+    ) -> Tensor:
+        """Like :meth:`append_staged_episodes_to_rollout` but returns the
+        on-device flat replay-row tensor produced by the buffer write,
+        skipping the per-row host conversion that the list-of-lists API
+        would do. Empty envs contribute nothing to the result.
+        """
+        active_envs = [env_idx for env_idx in env_indices if staging.active_step_count(env_idx) > 0]
+        if not active_envs:
+            return torch.zeros(0, dtype=torch.long, device=self.rollout_buffer.device)
+        write = self.rollout_buffer.ingest_staged_episodes(staging, active_envs)
+        return write.step_indices.to(dtype=torch.long)
 
     def parse_inputs(
         self,

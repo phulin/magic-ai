@@ -2337,20 +2337,17 @@ def append_sample_game_log(
 
 
 def rollout_value_metrics(
-    steps: list[RolloutStep],
+    predicted_values: torch.Tensor,
     returns: torch.Tensor,
 ) -> dict[str, float]:
     """Summarize rollout return targets and sampled value predictions."""
-    return_values = returns.detach().to(dtype=torch.float32, device="cpu")
-    predicted_values = torch.tensor(
-        [step.value for step in steps],
-        dtype=torch.float32,
-    )
+    return_values = returns.detach().to(dtype=torch.float32)
+    pv = predicted_values.detach().to(dtype=torch.float32)
     return {
         "return_mean": float(return_values.mean().item()),
         "return_std": float(return_values.std(unbiased=False).item()),
-        "value_mean": float(predicted_values.mean().item()),
-        "value_std": float(predicted_values.std(unbiased=False).item()),
+        "value_mean": float(pv.mean().item()),
+        "value_std": float(pv.std(unbiased=False).item()),
     }
 
 
@@ -2375,9 +2372,13 @@ def train_native_batched_envs(
         raise SystemExit("native rollout requires MageEncodeBatch")
     eval_rng = random.Random(args.seed ^ 0x5EED5)
 
-    pending_steps: list[RolloutStep] = []
+    pending_replay_rows: list[torch.Tensor] = []
     pending_returns: list[torch.Tensor] = []
-    pending_episodes: list[EpisodeBatch] = []  # R-NaD: one entry per finished game
+    pending_step_count: int = 0
+    # R-NaD: per-episode RolloutStep lists are still required by EpisodeBatch.
+    # The PPO-only path skips this materialization to keep finish_games off
+    # the host roundtrip.
+    pending_episodes: list[EpisodeBatch] = []
     rnad_state: RNaDTrainerState | None = None
     if args.trainer == "rnad":
         rnad_state = build_trainer_state(
@@ -2483,32 +2484,26 @@ def train_native_batched_envs(
             transcript_warning_emitted = True
 
     def finish_games(finished: list[tuple[LiveGame, int]]) -> None:
-        nonlocal completed_games, total_generated_rollout_steps
+        nonlocal completed_games, total_generated_rollout_steps, pending_step_count
         if not finished:
             return
 
         envs = [env for env, _ in finished]
-        replay_rows_by_env = policy.append_staged_episodes_to_rollout(
-            staging_buffer,
-            [env.slot_idx for env in envs],
-        )
 
-        # Batch the per-episode D2H: previously this issued 3 .cpu().tolist()
-        # calls per finished episode (3*N CUDA syncs). Instead, gather every
-        # field on-device, run GAE on the padded (B, T_max) staging slice in
-        # a single kernel chain, and do one host transfer for all finished
-        # envs combined.
-        slot_idxs = [env.slot_idx for env in envs]
+        # Run GAE on the padded (B, T_max) staging slice in a single kernel
+        # chain; flatten by the valid mask to produce per-step replay rows
+        # and returns directly on-device. The PPO-only path consumes those
+        # tensors without ever building Python ``RolloutStep`` lists. The
+        # R-NaD branch still needs per-episode ``RolloutStep`` lists for
+        # ``EpisodeBatch`` and thus keeps the host transfer below.
         device = staging_buffer.device
-        slot_t = torch.tensor(slot_idxs, dtype=torch.long, device=device)
+        slot_t = torch.tensor([env.slot_idx for env in envs], dtype=torch.long, device=device)
         step_counts = staging_buffer.step_count[slot_t]
-        step_counts_h = step_counts.tolist()
         max_steps = int(staging_buffer.max_steps_per_trajectory)
         step_arange = torch.arange(max_steps, device=device).unsqueeze(0)
         valid_mask = step_arange < step_counts.unsqueeze(1)
         players_padded = staging_buffer.perspective_player_idx[slot_t]
         values_padded = staging_buffer.value[slot_t]
-        log_padded = staging_buffer.old_log_prob[slot_t]
         winner_t = torch.tensor([w for _, w in finished], dtype=torch.long, device=device)
         returns_padded = gae_returns_batched(
             values_padded,
@@ -2519,53 +2514,76 @@ def train_native_batched_envs(
             gae_lambda=args.gae_lambda,
             draw_penalty=args.draw_penalty,
         )
-        flat_player = players_padded[valid_mask]
-        flat_log = log_padded[valid_mask]
-        flat_val = values_padded[valid_mask]
         flat_returns_dev = returns_padded[valid_mask]
-        host = torch.stack(
-            [flat_player.to(torch.float32), flat_log, flat_val, flat_returns_dev],
-            dim=0,
-        ).cpu()
-        host_player = host[0].long().tolist()
-        host_log = host[1].tolist()
-        host_val = host[2].tolist()
-        host_returns = host[3]
 
-        cursor = 0
-        for (env, winner_idx), replay_rows, step_count in zip(
-            finished, replay_rows_by_env, step_counts_h, strict=True
-        ):
-            env.game.close()
-            if step_count:
-                end = cursor + step_count
-                player_indices = host_player[cursor:end]
-                old_log_probs = host_log[cursor:end]
-                values = host_val[cursor:end]
-                env_returns = host_returns[cursor:end].clone()
-                cursor = end
-                env.episode_steps = [
-                    RolloutStep(
-                        perspective_player_idx=int(player_idx),
-                        old_log_prob=float(old_log_prob),
-                        value=float(value),
-                        replay_idx=replay_idx,
+        if rnad_state is None:
+            flat_replay_rows = policy.append_staged_episodes_returning_tensor(
+                staging_buffer,
+                [env.slot_idx for env in envs],
+            )
+            n_new = int(flat_replay_rows.numel())
+            if n_new > 0:
+                pending_replay_rows.append(flat_replay_rows)
+                pending_returns.append(flat_returns_dev)
+                pending_step_count += n_new
+                total_generated_rollout_steps += n_new
+        else:
+            replay_rows_by_env = policy.append_staged_episodes_to_rollout(
+                staging_buffer,
+                [env.slot_idx for env in envs],
+            )
+            log_padded = staging_buffer.old_log_prob[slot_t]
+            flat_player = players_padded[valid_mask]
+            flat_log = log_padded[valid_mask]
+            flat_val = values_padded[valid_mask]
+            host = torch.stack(
+                [flat_player.to(torch.float32), flat_log, flat_val],
+                dim=0,
+            ).cpu()
+            host_player = host[0].long().tolist()
+            host_log = host[1].tolist()
+            host_val = host[2].tolist()
+            step_counts_h = step_counts.tolist()
+            n_new = sum(step_counts_h)
+            if n_new > 0:
+                pending_replay_rows.append(
+                    torch.tensor(
+                        [row for env_rows in replay_rows_by_env for row in env_rows],
+                        dtype=torch.long,
+                        device=device,
                     )
-                    for player_idx, old_log_prob, value, replay_idx in zip(
-                        player_indices, old_log_probs, values, replay_rows, strict=True
-                    )
-                ]
-            if env.episode_steps:
-                pending_steps.extend(env.episode_steps)
-                pending_returns.append(env_returns)
-                if rnad_state is not None:
-                    pending_episodes.append(
-                        EpisodeBatch(
-                            steps=list(env.episode_steps),
-                            winner_idx=int(winner_idx),
+                )
+                pending_returns.append(flat_returns_dev)
+                pending_step_count += n_new
+                total_generated_rollout_steps += n_new
+            cursor = 0
+            for (env, winner_idx), env_rows, step_count in zip(
+                finished, replay_rows_by_env, step_counts_h, strict=True
+            ):
+                if step_count:
+                    end = cursor + step_count
+                    episode_steps = [
+                        RolloutStep(
+                            perspective_player_idx=int(p),
+                            old_log_prob=float(lp),
+                            value=float(v),
+                            replay_idx=r,
                         )
+                        for p, lp, v, r in zip(
+                            host_player[cursor:end],
+                            host_log[cursor:end],
+                            host_val[cursor:end],
+                            env_rows,
+                            strict=True,
+                        )
+                    ]
+                    cursor = end
+                    pending_episodes.append(
+                        EpisodeBatch(steps=episode_steps, winner_idx=int(winner_idx))
                     )
-                total_generated_rollout_steps += len(env.episode_steps)
+
+        for env, winner_idx in finished:
+            env.game.close()
             if env.slot_idx == 0:
                 append_sample_game_log(
                     game_log_path(args),
@@ -2717,9 +2735,10 @@ def train_native_batched_envs(
                 max_targets_per_option=args.max_targets_per_option,
             )
 
-        if len(pending_steps) >= args.rollout_steps:
+        if pending_step_count >= args.rollout_steps:
             rollout_returns = torch.cat(pending_returns)
-            rollout_step_count = len(pending_steps)
+            rollout_replay_rows = torch.cat(pending_replay_rows)
+            rollout_step_count = pending_step_count
             if rnad_state is not None:
                 # If --cuda-memory-snapshot is set, also print live/reserved
                 # before each update and record the allocator history so an
@@ -2768,7 +2787,7 @@ def train_native_batched_envs(
                 stats = ppo_update(
                     policy,
                     optimizer,
-                    pending_steps,
+                    rollout_replay_rows,
                     rollout_returns,
                     epochs=args.ppo_epochs,
                     minibatch_size=args.minibatch_size,
@@ -2809,7 +2828,8 @@ def train_native_batched_envs(
             print(*fields, flush=True)
             total_rollout_steps += rollout_step_count
             _t = time.perf_counter()
-            value_metrics = rollout_value_metrics(pending_steps, rollout_returns)
+            rollout_predicted_values = policy.rollout_buffer.value[rollout_replay_rows]
+            value_metrics = rollout_value_metrics(rollout_predicted_values, rollout_returns)
             if rnad_state is not None and rnad_state.last_stats:
                 rs = rnad_state.last_stats[0]
                 value_metrics.update(
@@ -2839,9 +2859,10 @@ def train_native_batched_envs(
                 run_active=True,
             )
             policy.reset_rollout_buffer()
-            pending_steps.clear()
+            pending_replay_rows.clear()
             pending_returns.clear()
             pending_episodes.clear()
+            pending_step_count = 0
             win_stats.reset()
             _record_phase("post_update", _t)
 
@@ -2910,9 +2931,10 @@ def train_native_batched_envs(
         maybe_start_games()
         _record_phase("maybe_start", _t)
 
-    if pending_steps:
+    if pending_step_count > 0:
         rollout_returns = torch.cat(pending_returns)
-        rollout_step_count = len(pending_steps)
+        rollout_replay_rows = torch.cat(pending_replay_rows)
+        rollout_step_count = pending_step_count
         if rnad_state is not None and pending_episodes:
             stats = run_rnad_update(
                 policy,
@@ -2924,7 +2946,7 @@ def train_native_batched_envs(
             stats = ppo_update(
                 policy,
                 optimizer,
-                pending_steps,
+                rollout_replay_rows,
                 rollout_returns,
                 epochs=args.ppo_epochs,
                 minibatch_size=args.minibatch_size,
@@ -2951,6 +2973,7 @@ def train_native_batched_envs(
             flush=True,
         )
         total_rollout_steps += rollout_step_count
+        rollout_predicted_values = policy.rollout_buffer.value[rollout_replay_rows]
         log_ppo_stats(
             stats,
             games=completed_games,
@@ -2958,7 +2981,7 @@ def train_native_batched_envs(
             total_rollout_steps=total_rollout_steps,
             total_generated_rollout_steps=total_generated_rollout_steps,
             win_stats=win_stats,
-            value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
+            value_metrics=rollout_value_metrics(rollout_predicted_values, rollout_returns),
             log_fn=tracked_wandb_log,
             run_active=True,
         )
@@ -3041,10 +3064,16 @@ def train_text_envs(
             def refresh_fn() -> None:
                 backend.policy.refresh_lstm_states(ep_rows_snapshot)  # type: ignore[union-attr]
 
+        device = next(backend.policy.parameters()).device
+        rollout_replay_rows = torch.tensor(
+            [cast(int, step.replay_idx) for step in pending_steps],
+            dtype=torch.long,
+            device=device,
+        )
         stats = ppo_update(
             backend.policy,
             optimizer,
-            pending_steps,
+            rollout_replay_rows,
             rollout_returns,
             epochs=args.ppo_epochs,
             minibatch_size=args.minibatch_size,
@@ -3083,7 +3112,10 @@ def train_text_envs(
             total_rollout_steps=total_rollout_steps,
             total_generated_rollout_steps=total_generated_rollout_steps,
             win_stats=win_stats,
-            value_metrics=rollout_value_metrics(pending_steps, rollout_returns),
+            value_metrics=rollout_value_metrics(
+                torch.tensor([step.value for step in pending_steps], dtype=torch.float32),
+                rollout_returns,
+            ),
             log_fn=tracked_wandb_log,
             run_active=True,
         )
@@ -3600,10 +3632,15 @@ def train_text_native_batched_envs(
                     backend.policy.refresh_lstm_states(ep_rows_snapshot)  # type: ignore[union-attr]
 
             try:
+                rollout_replay_rows = torch.tensor(
+                    [cast(int, step.replay_idx) for step in pending_steps],
+                    dtype=torch.long,
+                    device=next(backend.policy.parameters()).device,
+                )
                 stats = ppo_update(
                     backend.policy,
                     optimizer,
-                    pending_steps,
+                    rollout_replay_rows,
                     rollout_returns,
                     epochs=args.ppo_epochs,
                     minibatch_size=args.minibatch_size,
@@ -3666,7 +3703,10 @@ def train_text_native_batched_envs(
             fields.append(f"rnad_m={rnad_state.outer_iteration}")
         print(*fields, flush=True)
         total_rollout_steps += rollout_step_count
-        value_metrics = rollout_value_metrics(pending_steps, rollout_returns)
+        value_metrics = rollout_value_metrics(
+            torch.tensor([step.value for step in pending_steps], dtype=torch.float32),
+            rollout_returns,
+        )
         if rnad_state is not None and rnad_state.last_stats:
             rs = rnad_state.last_stats[0]
             value_metrics.update(

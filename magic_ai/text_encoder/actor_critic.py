@@ -799,6 +799,15 @@ class TextActorCritic(nn.Module):
             raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
         return self.rollout_buffer.gather_ppo_targets(replay_rows)
 
+    def gather_replay_old_log_prob_value(
+        self,
+        replay_rows: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+        idx = replay_rows.to(device=self.rollout_buffer.device, dtype=torch.long)
+        return self.rollout_buffer.old_log_prob[idx], self.rollout_buffer.value[idx]
+
     def compute_spr_loss(
         self,
         step_indices: Tensor,

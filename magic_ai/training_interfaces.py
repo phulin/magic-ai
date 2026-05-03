@@ -38,6 +38,17 @@ class PPOReplayPolicy(Protocol):
 
     def gather_ppo_targets(self, replay_rows: Tensor) -> tuple[Tensor, Tensor, Tensor]: ...
 
+    def gather_replay_old_log_prob_value(
+        self,
+        replay_rows: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Return ``(old_log_prob, value)`` already on-device for the given rows.
+
+        Used by :func:`magic_ai.ppo.ppo_update` to skip the per-step host
+        roundtrip that materializing ``RolloutStep`` lists would require.
+        """
+        ...
+
     def compute_spr_loss(
         self,
         step_indices: Tensor,

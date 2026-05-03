@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import cast
 
 import torch
 from torch import Tensor, nn
@@ -57,7 +56,7 @@ def _effective_minibatch_size(
 def ppo_update(
     policy: PPOReplayPolicy,
     optimizer: torch.optim.Optimizer,
-    steps: Sequence[RolloutStep],
+    replay_rows: Tensor,
     returns: Tensor,
     *,
     epochs: int = 4,
@@ -73,30 +72,29 @@ def ppo_update(
 ) -> PPOStats:
     """Run PPO over cached policy inputs.
 
-    Each rollout step must carry a replay row index produced at sample time.
-    The encoder stack is re-run on every minibatch so all encoder, trunk, and
-    head parameters receive gradients.
+    ``replay_rows`` is a 1-D long tensor of buffer rows produced at sample
+    time; ``returns`` is the matching GAE returns tensor. Both are device
+    tensors — the encoder stack is re-run on every minibatch so all encoder,
+    trunk, and head parameters receive gradients, and ``old_log_prob`` /
+    ``value`` are gathered directly from the replay buffer rather than from
+    Python-level rollout-step lists.
     """
 
-    if not steps:
+    if replay_rows.numel() == 0:
         raise ValueError("cannot update PPO with an empty rollout")
-    if returns.numel() != len(steps):
-        raise ValueError("returns length must match rollout length")
-    if any(step.replay_idx is None for step in steps):
-        raise ValueError("all rollout steps must include replay rows")
+    if returns.numel() != replay_rows.numel():
+        raise ValueError("returns length must match replay_rows length")
     if minibatch_token_limit is not None and minibatch_token_limit < 1:
         raise ValueError("minibatch_token_limit must be positive when set")
     if minibatch_max_tokens_per_row is not None and minibatch_max_tokens_per_row < 1:
         raise ValueError("minibatch_max_tokens_per_row must be positive when set")
 
     device = next(policy.parameters()).device
+    replay_rows = replay_rows.to(device=device, dtype=torch.long)
     returns = returns.to(device=device, dtype=torch.float32)
-    old_log_probs = torch.tensor(
-        [step.old_log_prob for step in steps],
-        dtype=torch.float32,
-        device=device,
-    )
-    old_values = torch.tensor([step.value for step in steps], dtype=torch.float32, device=device)
+    old_log_probs, old_values = policy.gather_replay_old_log_prob_value(replay_rows)
+    old_log_probs = old_log_probs.to(device=device, dtype=torch.float32)
+    old_values = old_values.to(device=device, dtype=torch.float32)
     advantages = returns - old_values
     if advantages.numel() > 1:
         advantages = (advantages - advantages.mean()) / advantages.std(
@@ -114,13 +112,9 @@ def ppo_update(
     )
     sums_t = torch.zeros(len(stat_names), dtype=torch.float32, device=device)
     num_minibatches = 0
-    replay_rows_by_step = torch.tensor(
-        [cast(int, step.replay_idx) for step in steps],
-        dtype=torch.long,
-        device=device,
-    )
+    n_steps = int(replay_rows.shape[0])
     policy.write_ppo_targets(
-        replay_rows_by_step,
+        replay_rows,
         old_log_probs,
         returns,
         advantages,
@@ -131,10 +125,10 @@ def ppo_update(
         minibatch_max_tokens_per_row=minibatch_max_tokens_per_row,
     )
     for epoch_idx in range(epochs):
-        permutation = torch.randperm(len(steps), device=device)
-        shuffled_replay_rows = replay_rows_by_step[permutation]
+        permutation = torch.randperm(n_steps, device=device)
+        shuffled_replay_rows = replay_rows[permutation]
         for batch_slice in _iter_minibatch_slices(
-            len(steps),
+            n_steps,
             minibatch_size=effective_minibatch_size,
         ):
             replay_rows = shuffled_replay_rows[batch_slice]

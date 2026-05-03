@@ -64,6 +64,14 @@ class _ReplayPolicy:
             self.advantages[replay_rows],
         )
 
+    def gather_replay_old_log_prob_value(
+        self,
+        replay_rows: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        n = int(replay_rows.numel())
+        zeros = self.param.expand(n).detach().contiguous()
+        return zeros.clone(), zeros.clone()
+
     def compute_spr_loss(
         self,
         step_indices: Tensor,
@@ -81,10 +89,7 @@ class PPOUpdateTests(unittest.TestCase):
     def test_minibatch_token_limit_caps_tensor_slices_by_max_row_width(self) -> None:
         policy = _ReplayPolicy()
         optimizer = torch.optim.SGD(policy.parameters(), lr=0.0)
-        steps = [
-            RolloutStep(perspective_player_idx=0, old_log_prob=0.0, value=0.0, replay_idx=row)
-            for row in range(5)
-        ]
+        replay_rows = torch.arange(5, dtype=torch.long)
 
         with patch(
             "magic_ai.ppo.torch.randperm",
@@ -93,8 +98,8 @@ class PPOUpdateTests(unittest.TestCase):
             ppo_update(
                 policy,
                 optimizer,
-                steps,
-                torch.zeros(len(steps)),
+                replay_rows,
+                torch.zeros(replay_rows.numel()),
                 epochs=1,
                 minibatch_size=10,
                 minibatch_token_limit=120,
@@ -107,10 +112,7 @@ class PPOUpdateTests(unittest.TestCase):
     def test_minibatch_token_limit_still_respects_row_limit(self) -> None:
         policy = _ReplayPolicy()
         optimizer = torch.optim.SGD(policy.parameters(), lr=0.0)
-        steps = [
-            RolloutStep(perspective_player_idx=0, old_log_prob=0.0, value=0.0, replay_idx=row)
-            for row in range(5)
-        ]
+        replay_rows = torch.arange(5, dtype=torch.long)
 
         with patch(
             "magic_ai.ppo.torch.randperm",
@@ -119,8 +121,8 @@ class PPOUpdateTests(unittest.TestCase):
             ppo_update(
                 policy,
                 optimizer,
-                steps,
-                torch.zeros(len(steps)),
+                replay_rows,
+                torch.zeros(replay_rows.numel()),
                 epochs=1,
                 minibatch_size=2,
                 minibatch_token_limit=100,
