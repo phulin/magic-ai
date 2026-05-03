@@ -207,6 +207,7 @@ class MultiHeadSelfAttention(nn.Module):
         cos: Tensor,
         sin: Tensor,
         cu_seqlens: Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> Tensor:
         # Two layouts share this module:
         #   (1) packed varlen [T, D] when cu_seqlens is not None — flash_attn varlen
@@ -214,10 +215,18 @@ class MultiHeadSelfAttention(nn.Module):
         #   (2) padded [B, T, D] otherwise — flex_attention on CUDA,
         #       additive-bias SDPA on CPU.
         if cu_seqlens is not None:
-            return self._forward_packed(x, cu_seqlens, cos, sin)
+            return self._forward_packed(x, cu_seqlens, cos, sin, max_seqlen=max_seqlen)
         return self._forward_dense(x, block_mask, attn_bias, cos, sin)
 
-    def _forward_packed(self, x: Tensor, cu_seqlens: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def _forward_packed(
+        self,
+        x: Tensor,
+        cu_seqlens: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        *,
+        max_seqlen: int | None = None,
+    ) -> Tensor:
         # x: [T, D]; cos/sin: [T, Dh/2]
         # flash_attn_varlen_func takes packed [T, H, Dh] q/k/v directly — no NJT
         # construction, no Python subclass dispatch, one kernel launch per block.
@@ -233,14 +242,15 @@ class MultiHeadSelfAttention(nn.Module):
         if src_dtype == torch.float32:
             q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
         cu = cu_seqlens.to(torch.int32)
+        eff_max_seqlen = self.max_seq_len if max_seqlen is None else int(max_seqlen)
         out = flash_attn_varlen_func(
             q,
             k,
             v,
             cu,
             cu,
-            self.max_seq_len,
-            self.max_seq_len,
+            eff_max_seqlen,
+            eff_max_seqlen,
             dropout_p=self.dropout if self.training else 0.0,
         )  # [T, H, Dh]
         return self.proj(out.flatten(1).to(src_dtype))
@@ -300,8 +310,9 @@ class EncoderBlock(nn.Module):
         cos: Tensor,
         sin: Tensor,
         cu_seqlens: Tensor | None = None,
+        max_seqlen: int | None = None,
     ) -> Tensor:
-        x = x + self.attn(self.norm1(x), block_mask, attn_bias, cos, sin, cu_seqlens)
+        x = x + self.attn(self.norm1(x), block_mask, attn_bias, cos, sin, cu_seqlens, max_seqlen)
         x = x + self.ffn(self.norm2(x))
         return x
 
@@ -402,8 +413,9 @@ class TextStateEncoder(nn.Module):
             block_mask = cast(BlockMask, None)
             attn_bias = x.new_zeros(())
             cu_seqlens: Tensor | None = batch.cu_seqlens.to(device=x.device, dtype=torch.int32)
+            max_seqlen = batch.max_seqlen
             for block in self.blocks:
-                x = block(x, block_mask, attn_bias, cos, sin, cu_seqlens)
+                x = block(x, block_mask, attn_bias, cos, sin, cu_seqlens, max_seqlen)
             x = self.final_norm(x)
             return x
 

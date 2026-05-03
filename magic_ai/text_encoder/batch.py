@@ -84,6 +84,11 @@ class PackedTextBatch:
     option_mask: Tensor  # [B, max_opts] bool
     target_positions: Tensor  # [B, max_opts, max_targets] int32
     target_mask: Tensor  # [B, max_opts, max_targets] bool
+    # Optional host-side upper bound on per-row sequence length, used to size
+    # flash_attn_varlen tiling. None falls back to the encoder's static config
+    # max. Producers that know the batch's true max (the native assembler does)
+    # should set this to give the kernel a tighter bound.
+    max_seqlen: int | None = None
 
 
 def packed_sequence_layout(seq_lengths: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:

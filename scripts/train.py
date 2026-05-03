@@ -1575,15 +1575,17 @@ def main() -> None:
     # directional drift across batches, which combined with NeuRD's raw-logit
     # gradient and the [-beta, beta] gate causes logit saturation and
     # frozen policies. PPO keeps the standard b1=0.9 default.
+    fused_optim = device.type == "cuda"
     if args.trainer == "rnad":
         optimizer = torch.optim.Adam(
             policy.parameters(),
             lr=args.learning_rate,
             betas=(0.0, 0.999),
             eps=1e-8,
+            fused=fused_optim,
         )
     else:
-        optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate, fused=fused_optim)
     checkpoint = load_training_checkpoint(args.checkpoint, map_location=device)
     if checkpoint is not None:
         policy.load_state_dict(checkpoint["policy"])

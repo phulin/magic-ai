@@ -173,6 +173,9 @@ class NativePackedAssemblerOutputs:
             target_positions = target_positions_full
             target_mask = target_mask_full
 
+        # seq_lengths is on pinned CPU memory; .max() here is a host-only op
+        # (no GPU sync) and gives flash_attn_varlen a tight per-batch tile bound.
+        max_seqlen = int(seq_lengths.max().item()) if seq_lengths.numel() else 0
         return PackedTextBatch(
             token_ids=token_ids,
             seq_id=seq_id,
@@ -185,6 +188,7 @@ class NativePackedAssemblerOutputs:
             option_mask=option_mask.bool(),
             target_positions=target_positions,
             target_mask=target_mask.bool(),
+            max_seqlen=max_seqlen,
         )
 
 

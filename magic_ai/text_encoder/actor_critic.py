@@ -50,7 +50,6 @@ from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
     RecurrentTextPolicyConfig,
     RecurrentTextPolicyOutput,
-    _cast_encoded,
 )
 from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 
@@ -963,17 +962,14 @@ class TextActorCritic(nn.Module):
             device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
         ):
             encoded = self.policy.text_policy.encode_packed_only(batch.encoded)
-        target_dtype = self.policy.in_proj.weight.dtype
-        encoded = _cast_encoded(encoded, target_dtype)
-
-        state = self.policy.in_proj(encoded.state_vector)
-        perspective = batch.perspective_player_idx.to(device=state.device)
-        h_concat = lstm_recompute_per_step_h_out_per_player(
-            self.policy.lstm,
-            state,
-            perspective,
-            ep_lens,
-        )
+            state = self.policy.in_proj(encoded.state_vector)
+            perspective = batch.perspective_player_idx.to(device=state.device)
+            h_concat = lstm_recompute_per_step_h_out_per_player(
+                self.policy.lstm,
+                state,
+                perspective,
+                ep_lens,
+            )
 
         return CachedReplayForward(
             flat_rows=tuple(flat_rows),
