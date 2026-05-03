@@ -527,19 +527,41 @@ def _two_player_vtrace_batched(
     A = pre_c - c * v_next_own_vec
     B = c
 
-    A_h = A.detach().cpu().tolist()
-    B_h = B.detach().cpu().tolist()
-    own_ep_h = own_ep_idx.detach().cpu().tolist()
-    v_h = [0.0] * K
-    next_val = 0.0
-    last_ep = -1
-    for k in range(K - 1, -1, -1):
-        if own_ep_h[k] != last_ep:
-            next_val = 0.0
-            last_ep = own_ep_h[k]
-        next_val = A_h[k] + B_h[k] * next_val
-        v_h[k] = next_val
-    v_hat_own = torch.tensor(v_h, dtype=dtype, device=device)
+    # Vectorized reverse scan: ``v[k] = A[k] + B[k] * v[k+1]`` per episode,
+    # resetting at episode boundaries. The host-side Python loop this
+    # replaced forced three ``.cpu().tolist()`` syncs per call (A, B,
+    # own_ep_idx). Same flip + cumprod + cumsum trick as
+    # :func:`magic_ai.ppo.gae_returns_batched`: pad to (n_eps, max_own_per_ep)
+    # with A=0 / B=1 outside each episode's valid prefix, do a single
+    # reverse scan along dim=1, then gather per own-turn step.
+    K_per_ep = torch.zeros(n_eps, dtype=torch.long, device=device)
+    K_per_ep.scatter_add_(0, own_ep_idx, torch.ones_like(own_ep_idx))
+    max_own_per_ep = int(K_per_ep.max().item())
+    cumlen_before_ep = torch.cat([K_per_ep.new_zeros(1), K_per_ep.cumsum(0)[:-1]])
+    own_pos_in_ep = torch.arange(K, device=device) - cumlen_before_ep[own_ep_idx]
+
+    A_pad = torch.zeros(n_eps, max_own_per_ep, dtype=dtype, device=device)
+    B_pad = torch.ones(n_eps, max_own_per_ep, dtype=dtype, device=device)
+    A_pad[own_ep_idx, own_pos_in_ep] = A
+    B_pad[own_ep_idx, own_pos_in_ep] = B
+
+    if max_own_per_ep == 1:
+        v_pad = A_pad
+    else:
+        # ``c`` is the recurrence coefficient *between* positions k and k+1.
+        # B at the last column never multiplies a real ``v[k+1]`` (terminal),
+        # so we drop it and run the scan over (max_own_per_ep - 1) coefficients
+        # — same convention as gae_returns_batched. Padded positions have
+        # B=1, so the cumprod stays positive and the division below is safe
+        # (real B values come from clamp(rho_arg, max=c_bar) > 0).
+        c_pad = B_pad[:, :-1]
+        c_pad_rev = c_pad.flip(1)
+        A_pad_rev = A_pad.flip(1)
+        ones_col = A_pad.new_ones(n_eps, 1)
+        scan_coeffs = torch.cat([ones_col, c_pad_rev.cumprod(dim=1)], dim=1)
+        v_pad = (scan_coeffs * torch.cumsum(A_pad_rev / scan_coeffs, dim=1)).flip(1)
+
+    v_hat_own = v_pad[own_ep_idx, own_pos_in_ep]
 
     v_hat.index_copy_(0, own_idx, v_hat_own)
     q_hat.index_copy_(0, own_idx, pre_c)
