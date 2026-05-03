@@ -131,13 +131,13 @@ def ppo_update(
             n_steps,
             minibatch_size=effective_minibatch_size,
         ):
-            replay_rows = shuffled_replay_rows[batch_slice]
+            mb_replay_rows = shuffled_replay_rows[batch_slice]
             spr_active = spr_coef > 0.0 and policy.spr_enabled
             batch_log_probs, batch_entropies, batch_values, extras = policy.evaluate_replay_batch(
-                replay_rows, return_extras=spr_active
+                mb_replay_rows, return_extras=spr_active
             )
             batch_old_log_probs, batch_returns, batch_advantages = policy.gather_ppo_targets(
-                replay_rows
+                mb_replay_rows
             )
 
             ratio = (batch_log_probs - batch_old_log_probs).exp()
