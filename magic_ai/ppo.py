@@ -281,6 +281,80 @@ def gae_returns(
     return advantages_t + values_t
 
 
+@torch.compile(dynamic=True, fullgraph=False)
+def _gae_returns_batched_compiled(
+    values_f: Tensor,
+    players_l: Tensor,
+    step_count_l: Tensor,
+    winner_l: Tensor,
+    gamma: float,
+    gae_lambda: float,
+    draw_penalty: float,
+) -> Tensor:
+    dtype = values_f.dtype
+    device = values_f.device
+    batch_size, max_steps = values_f.shape
+
+    arange_t = torch.arange(max_steps, device=device)
+    valid = arange_t.unsqueeze(0) < step_count_l.unsqueeze(1)
+    valid_f = valid.to(dtype)
+
+    nonempty = step_count_l > 0
+    is_draw = winner_l < 0
+    safe_terminal = (step_count_l - 1).clamp_min(0)
+    last_player = players_l.gather(1, safe_terminal.unsqueeze(1)).squeeze(1)
+    win_loss_terminal = torch.where(
+        winner_l == last_player,
+        values_f.new_ones(batch_size),
+        values_f.new_full((batch_size,), -1.0),
+    )
+    terminal_reward = torch.where(
+        is_draw,
+        values_f.new_full((batch_size,), -float(draw_penalty)),
+        win_loss_terminal,
+    )
+    terminal_reward = terminal_reward * nonempty.to(dtype)
+
+    rewards = torch.zeros_like(values_f)
+    rewards.scatter_(1, safe_terminal.unsqueeze(1), terminal_reward.unsqueeze(1))
+    rewards = rewards * valid_f
+
+    base_deltas = (rewards - values_f) * valid_f
+    if max_steps > 1:
+        same_player = players_l[:, 1:] == players_l[:, :-1]
+        cross_sign = torch.where(
+            is_draw,
+            values_f.new_ones(batch_size),
+            values_f.new_full((batch_size,), -1.0),
+        )
+        signs = torch.where(
+            same_player,
+            values_f.new_ones(batch_size, max_steps - 1),
+            cross_sign.unsqueeze(1).expand(batch_size, max_steps - 1),
+        )
+        next_valid = (arange_t[: max_steps - 1].unsqueeze(0) < (step_count_l - 1).unsqueeze(1)).to(
+            dtype
+        )
+        bootstrap = gamma * signs * values_f[:, 1:] * next_valid
+        bootstrap_padded = F.pad(bootstrap, (0, 1))
+        deltas = base_deltas + bootstrap_padded
+    else:
+        deltas = base_deltas
+        signs = values_f.new_zeros(batch_size, 0)
+
+    if max_steps == 1 or gamma == 0.0 or gae_lambda == 0.0:
+        advantages = deltas
+    else:
+        coeffs_rev = (gamma * gae_lambda * signs).flip(1)
+        deltas_rev = deltas.flip(1)
+        ones_col = values_f.new_ones(batch_size, 1)
+        scan_coeffs = torch.cat((ones_col, coeffs_rev.cumprod(dim=1)), dim=1)
+        advantages = (scan_coeffs * torch.cumsum(deltas_rev / scan_coeffs, dim=1)).flip(1)
+
+    returns = (advantages + values_f) * valid_f
+    return returns
+
+
 def gae_returns_batched(
     values: Tensor,
     perspective_player_idx: Tensor,
@@ -324,72 +398,16 @@ def gae_returns_batched(
         raise ValueError("winner_idx must have shape (B,)")
 
     device = values.device
-    dtype = torch.float32
-    values_f = values.to(dtype)
-    batch_size, max_steps = values_f.shape
+    values_f = values.to(torch.float32)
     step_count_l = step_count.to(device=device, dtype=torch.long)
     winner_l = winner_idx.to(device=device, dtype=torch.long)
     players_l = perspective_player_idx.to(device=device, dtype=torch.long)
-
-    arange_t = torch.arange(max_steps, device=device)
-    valid = arange_t.unsqueeze(0) < step_count_l.unsqueeze(1)  # (B, T)
-    valid_f = valid.to(dtype)
-
-    nonempty = step_count_l > 0
-    is_draw = winner_l < 0
-    safe_terminal = (step_count_l - 1).clamp_min(0)
-    last_player = players_l.gather(1, safe_terminal.unsqueeze(1)).squeeze(1)
-    win_loss_terminal = torch.where(
-        winner_l == last_player,
-        values_f.new_ones(batch_size),
-        values_f.new_full((batch_size,), -1.0),
+    return _gae_returns_batched_compiled(
+        values_f,
+        players_l,
+        step_count_l,
+        winner_l,
+        float(gamma),
+        float(gae_lambda),
+        float(draw_penalty),
     )
-    terminal_reward = torch.where(
-        is_draw,
-        values_f.new_full((batch_size,), -float(draw_penalty)),
-        win_loss_terminal,
-    )
-    terminal_reward = terminal_reward * nonempty.to(dtype)
-
-    rewards = torch.zeros_like(values_f)
-    rewards.scatter_(1, safe_terminal.unsqueeze(1), terminal_reward.unsqueeze(1))
-    rewards = rewards * valid_f  # zero out scatter into row 0 of empty rows
-
-    base_deltas = (rewards - values_f) * valid_f
-    if max_steps > 1:
-        same_player = players_l[:, 1:] == players_l[:, :-1]
-        # Per-row cross-player sign: +1 for draws (symmetric absorbing state,
-        # do NOT zero-sum-flip), -1 otherwise (zero-sum value bootstrap).
-        # See the docstring on ``gae_returns`` for why draws need this.
-        cross_sign = torch.where(
-            is_draw,
-            values_f.new_ones(batch_size),
-            values_f.new_full((batch_size,), -1.0),
-        )
-        signs = torch.where(
-            same_player,
-            values_f.new_ones(batch_size, max_steps - 1),
-            cross_sign.unsqueeze(1).expand(batch_size, max_steps - 1),
-        )
-        # Bootstrap term only when the *next* step is also valid (t+1 < step_count).
-        next_valid = (arange_t[: max_steps - 1].unsqueeze(0) < (step_count_l - 1).unsqueeze(1)).to(
-            dtype
-        )
-        bootstrap = gamma * signs * values_f[:, 1:] * next_valid
-        bootstrap_padded = F.pad(bootstrap, (0, 1))
-        deltas = base_deltas + bootstrap_padded
-    else:
-        deltas = base_deltas
-        signs = values_f.new_zeros(batch_size, 0)
-
-    if max_steps == 1 or gamma == 0.0 or gae_lambda == 0.0:
-        advantages = deltas
-    else:
-        coeffs_rev = (gamma * gae_lambda * signs).flip(1)
-        deltas_rev = deltas.flip(1)
-        ones_col = values_f.new_ones(batch_size, 1)
-        scan_coeffs = torch.cat((ones_col, coeffs_rev.cumprod(dim=1)), dim=1)
-        advantages = (scan_coeffs * torch.cumsum(deltas_rev / scan_coeffs, dim=1)).flip(1)
-
-    returns = (advantages + values_f) * valid_f
-    return returns

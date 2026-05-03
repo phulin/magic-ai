@@ -289,9 +289,17 @@ class TextTrainingBackend:
 class NativeTextTrajectoryBuffer:
     """Fixed-width per-env staging for native text rollouts before replay commit."""
 
-    def __init__(self, replay_buffer: TextReplayBuffer, *, num_envs: int, max_steps: int) -> None:
+    def __init__(
+        self,
+        replay_buffer: TextReplayBuffer,
+        *,
+        num_envs: int,
+        max_steps: int,
+        validate: bool = True,
+    ) -> None:
         self.num_envs = int(num_envs)
         self.max_steps = int(max_steps)
+        self.validate = bool(validate)
         self.device = replay_buffer.device
         self.max_tokens = replay_buffer.max_tokens
         self.max_options = replay_buffer.max_options
@@ -381,13 +389,13 @@ class NativeTextTrajectoryBuffer:
         batch_size = len(env_indices)
         env_t = torch.tensor(env_indices, dtype=torch.long, device=self.device)
         step_t = self.step_count[env_t]
-        if bool((step_t >= self.max_steps).any().item()):
+        if self.validate and bool((step_t >= self.max_steps).any().item()):
             env_idx = int(env_t[step_t >= self.max_steps][0].item())
             raise RuntimeError(f"native text staging buffer is full for env {env_idx}")
 
         encoded = payload.encoded
         seq_lengths = encoded.seq_lengths.to(device=self.device, dtype=torch.long)
-        if int(seq_lengths.max().item()) > self.max_tokens:
+        if self.validate and int(seq_lengths.max().item()) > self.max_tokens:
             raise ValueError("encoded packed row token width exceeds staging max_tokens")
         row_tokens = torch.zeros(batch_size, self.max_tokens, dtype=torch.int32, device=self.device)
         row_tokens[
@@ -443,34 +451,37 @@ class NativeTextTrajectoryBuffer:
         self.decision_mask[env_t, step_t].zero_()
         self.uses_none_head[env_t, step_t].zero_()
         self.selected_indices[env_t, step_t].fill_(-1)
-        g_total = int(decision_count.sum().item())
-        if g_total > 0:
-            step_for_group = torch.repeat_interleave(
-                torch.arange(batch_size, device=self.device), decision_count
-            )
-            group_starts = torch.cumsum(decision_count, dim=0) - decision_count
-            group_in_step = torch.arange(g_total, device=self.device) - group_starts[step_for_group]
-            keep = group_in_step < self.max_decision_groups
-            flat_keep = keep.nonzero(as_tuple=False).squeeze(-1)
-            kept_steps = step_for_group[keep]
-            replay_env = env_t[kept_steps]
-            replay_step = step_t[kept_steps]
-            replay_group = group_in_step[keep]
-            self.decision_option_idx[replay_env, replay_step, replay_group] = (
-                payload.decision_option_idx[flat_keep].to(device=self.device, dtype=torch.int16)
-            )
-            self.decision_target_idx[replay_env, replay_step, replay_group] = (
-                payload.decision_target_idx[flat_keep].to(device=self.device, dtype=torch.int16)
-            )
-            self.decision_mask[replay_env, replay_step, replay_group] = payload.decision_mask[
-                flat_keep
-            ].to(device=self.device, dtype=torch.bool)
-            self.uses_none_head[replay_env, replay_step, replay_group] = payload.uses_none_head[
-                flat_keep
-            ].to(device=self.device, dtype=torch.bool)
-            self.selected_indices[replay_env, replay_step, replay_group] = payload.selected_indices[
-                flat_keep
-            ].to(device=self.device, dtype=torch.int16)
+        # Always run the scatter path; empty intermediates make every op a
+        # no-op and avoid the host sync that ``int(decision_count.sum().item())``
+        # would force per inference batch.
+        step_for_group = torch.repeat_interleave(
+            torch.arange(batch_size, device=self.device), decision_count
+        )
+        group_starts = torch.cumsum(decision_count, dim=0) - decision_count
+        group_in_step = (
+            torch.arange(step_for_group.shape[0], device=self.device) - group_starts[step_for_group]
+        )
+        keep = group_in_step < self.max_decision_groups
+        flat_keep = keep.nonzero(as_tuple=False).squeeze(-1)
+        kept_steps = step_for_group[keep]
+        replay_env = env_t[kept_steps]
+        replay_step = step_t[kept_steps]
+        replay_group = group_in_step[keep]
+        self.decision_option_idx[replay_env, replay_step, replay_group] = (
+            payload.decision_option_idx[flat_keep].to(device=self.device, dtype=torch.int16)
+        )
+        self.decision_target_idx[replay_env, replay_step, replay_group] = (
+            payload.decision_target_idx[flat_keep].to(device=self.device, dtype=torch.int16)
+        )
+        self.decision_mask[replay_env, replay_step, replay_group] = payload.decision_mask[
+            flat_keep
+        ].to(device=self.device, dtype=torch.bool)
+        self.uses_none_head[replay_env, replay_step, replay_group] = payload.uses_none_head[
+            flat_keep
+        ].to(device=self.device, dtype=torch.bool)
+        self.selected_indices[replay_env, replay_step, replay_group] = payload.selected_indices[
+            flat_keep
+        ].to(device=self.device, dtype=torch.int16)
 
         self.may_selected[env_t, step_t] = payload.may_selected.to(
             device=self.device, dtype=torch.float32
@@ -516,8 +527,9 @@ class NativeTextTrajectoryBuffer:
 
         env_t_all = torch.tensor(env_indices, dtype=torch.long, device=device)
         counts_all = self.step_count[env_t_all]
-        if bool((counts_all == 0).all().item()):
-            return torch.zeros(0, dtype=torch.long, device=device), counts_all
+        # Skip the early-exit ``all-zero`` short-circuit: the active_mask path
+        # below produces correct empty outputs for that case without forcing
+        # a host sync per call.
 
         active_mask = counts_all > 0
         active_env = env_t_all[active_mask]
@@ -531,7 +543,6 @@ class NativeTextTrajectoryBuffer:
         state_positions = torch.cat([seq_lengths.new_zeros(1), seq_lengths.cumsum(0)[:-1]]).to(
             dtype=torch.int32
         )
-        total_tokens = int(seq_lengths.sum().item())
         token_mask = (
             torch.arange(self.max_tokens, device=self.device).unsqueeze(0) < seq_lengths[:, None]
         )
@@ -540,8 +551,10 @@ class NativeTextTrajectoryBuffer:
         seq_id = torch.repeat_interleave(
             torch.arange(row_count, dtype=torch.int32, device=self.device), seq_lengths
         )
-        pos_in_seq = torch.arange(total_tokens, dtype=torch.int32, device=self.device) - (
-            torch.repeat_interleave(state_positions, seq_lengths)
+        repeated_state_positions = torch.repeat_interleave(state_positions, seq_lengths)
+        pos_in_seq = (
+            torch.arange(repeated_state_positions.shape[0], dtype=torch.int32, device=self.device)
+            - repeated_state_positions
         )
         cu_seqlens = torch.zeros(row_count + 1, dtype=torch.int32, device=self.device)
         cu_seqlens[1:] = seq_lengths.cumsum(0).to(dtype=torch.int32)
@@ -587,7 +600,7 @@ class NativeTextTrajectoryBuffer:
         )
         rows = replay_buffer.append_batch(
             encoded=encoded,
-            trace_kind_id=self.trace_kind_id[flat_env, flat_step].to(dtype=torch.long),
+            trace_kind_id=self.trace_kind_id[flat_env, flat_step],
             decision_count=decision_count,
             decision_option_idx=self.decision_option_idx[flat_env, flat_step][group_mask].to(
                 dtype=torch.long
@@ -615,7 +628,7 @@ class NativeTextTrajectoryBuffer:
         # Reset all targeted env slots in one scatter (resetting an already-
         # empty slot to 0 is a no-op).
         self.step_count[env_t_all] = 0
-        return rows.to(dtype=torch.long), counts_all
+        return rows, counts_all
 
     def append_envs_to_replay(
         self,
@@ -2537,14 +2550,22 @@ def train_native_batched_envs(
         # R-NaD branch still needs per-episode ``RolloutStep`` lists for
         # ``EpisodeBatch`` and thus keeps the host transfer below.
         device = staging_buffer.device
-        slot_t = torch.tensor([env.slot_idx for env in envs], dtype=torch.long, device=device)
+        # Combine slot/winner index lists into one async H2D transfer rather
+        # than two synchronous ``torch.tensor(..., device=cuda)`` calls.
+        slot_winner_h = torch.tensor(
+            [[env.slot_idx for env in envs], [w for _, w in finished]],
+            dtype=torch.long,
+            pin_memory=True,
+        )
+        slot_winner_d = slot_winner_h.to(device, non_blocking=True)
+        slot_t = slot_winner_d[0]
+        winner_t = slot_winner_d[1]
         step_counts = staging_buffer.step_count[slot_t]
         max_steps = int(staging_buffer.max_steps_per_trajectory)
         step_arange = torch.arange(max_steps, device=device).unsqueeze(0)
         valid_mask = step_arange < step_counts.unsqueeze(1)
         players_padded = staging_buffer.perspective_player_idx[slot_t]
         values_padded = staging_buffer.value[slot_t]
-        winner_t = torch.tensor([w for _, w in finished], dtype=torch.long, device=device)
         returns_padded = gae_returns_batched(
             values_padded,
             players_padded,
@@ -3492,6 +3513,7 @@ def train_text_native_batched_envs(
         backend.replay_buffer,
         num_envs=args.num_envs,
         max_steps=args.max_steps_per_game,
+        validate=not getattr(args, "no_validate", False),
     )
     backend.policy.init_lstm_env_states(args.num_envs)
     sampling_policy: TextActorCritic = (
@@ -3560,8 +3582,18 @@ def train_text_native_batched_envs(
         finished_with_steps = [(env, w) for env, w in finished if env.episode_steps]
         if finished_with_steps:
             slot_idxs = [env.slot_idx for env, _ in finished_with_steps]
+            winner_idxs = [w for _env, w in finished_with_steps]
             device = staging_buffer.device
-            slot_t = torch.tensor(slot_idxs, dtype=torch.long, device=device)
+            # Build slot_t/winner_t on pinned CPU + async H2D copy so the
+            # transfer can overlap with prior CUDA work, instead of issuing
+            # the synchronous ``torch.tensor(..., device=cuda)`` path that
+            # blocks the launching thread.
+            slot_winner_h = torch.tensor(
+                [slot_idxs, winner_idxs], dtype=torch.long, pin_memory=True
+            )
+            slot_winner_d = slot_winner_h.to(device, non_blocking=True)
+            slot_t = slot_winner_d[0]
+            winner_t = slot_winner_d[1]
             # Snapshot step_count BEFORE the buffer-append resets the slots.
             step_counts = staging_buffer.step_count[slot_t].clone()
             max_steps = staging_buffer.max_steps
@@ -3569,11 +3601,6 @@ def train_text_native_batched_envs(
             valid_mask = step_arange < step_counts.unsqueeze(1)
             players_padded = staging_buffer.perspective_player_idx[slot_t]
             values_padded = staging_buffer.value[slot_t]
-            winner_t = torch.tensor(
-                [w for _env, w in finished_with_steps],
-                dtype=torch.long,
-                device=device,
-            )
             returns_padded = gae_returns_batched(
                 values_padded,
                 players_padded,
