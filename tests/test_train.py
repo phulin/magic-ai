@@ -1049,7 +1049,9 @@ class TrainPPOTests(unittest.TestCase):
                 *,
                 num_envs: int,
                 max_steps: int,
+                validate: bool = True,
             ) -> None:
+                del validate
                 self.device = torch.device("cpu")
                 self.num_envs = num_envs
                 self.max_steps = max_steps

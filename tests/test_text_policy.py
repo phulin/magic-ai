@@ -328,16 +328,26 @@ def test_hf_text_policy_copies_checkpoint_into_local_encoder(monkeypatch) -> Non
             del args, kwargs
             return self._state
 
+    class DummyHfWrapper:
+        def __init__(self) -> None:
+            self.model = DummyHfModel()
+
+        def resize_token_embeddings(
+            self, vocab_size: int, pad_to_multiple_of: int | None = None
+        ) -> None:
+            self.model.resize_token_embeddings(vocab_size, pad_to_multiple_of=pad_to_multiple_of)
+
     class DummyAutoModel:
         last_model: DummyHfModel | None = None
 
         @classmethod
-        def from_pretrained(cls, *args: object, **kwargs: object) -> DummyHfModel:
-            cls.last_model = DummyHfModel()
-            return cls.last_model
+        def from_pretrained(cls, *args: object, **kwargs: object) -> DummyHfWrapper:
+            wrapper = DummyHfWrapper()
+            cls.last_model = wrapper.model
+            return wrapper
 
     monkeypatch.setattr(text_model, "AutoConfig", DummyAutoConfig)
-    monkeypatch.setattr(text_model, "AutoModel", DummyAutoModel)
+    monkeypatch.setattr(text_model, "AutoModelForMaskedLM", DummyAutoModel)
 
     cfg = text_model.text_encoder_config_from_hf(
         model_name="dummy/checkpoint",

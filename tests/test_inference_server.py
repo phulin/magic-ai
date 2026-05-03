@@ -224,17 +224,21 @@ class InferenceServerBatchingTest(unittest.TestCase):
             max_batch=64,
             max_wait_ms=20.0,
         )
+        # Pre-build requests so the submit loop is purely queue puts; otherwise
+        # tensor construction between submits can outrun ``max_wait_ms`` on a
+        # contended host and split the batch across two forwards.
+        reqs = [
+            TextInferenceRequest(
+                native_batch=_make_native(2),
+                packed_batch=_make_packed_batch([2, 3]),
+                env_indices=[i * 2, i * 2 + 1],
+                perspective_player_indices=[0, 1],
+            )
+            for i in range(4)
+        ]
         server.start()
         try:
-            futs = []
-            for i in range(4):
-                req = TextInferenceRequest(
-                    native_batch=_make_native(2),
-                    packed_batch=_make_packed_batch([2, 3]),
-                    env_indices=[i * 2, i * 2 + 1],
-                    perspective_player_indices=[0, 1],
-                )
-                futs.append(server.submit(req))
+            futs = [server.submit(req) for req in reqs]
             replies = [f.result(timeout=5.0) for f in futs]
         finally:
             server.stop()

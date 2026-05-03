@@ -138,8 +138,13 @@ class NativePackedAssemblerOutputs:
         total = int(cu_seqlens[-1].item()) if cu_seqlens.numel() else 0
         token_ids = self.token_ids[:total]
         if derive_token_metadata:
-            seq_id = self.seq_id[:total]
-            pos_in_seq = self.pos_in_seq[:total]
+            seq_id = torch.repeat_interleave(
+                torch.arange(active_n, dtype=torch.int32, device=seq_lengths.device),
+                seq_lengths,
+            )
+            pos_in_seq = torch.arange(total, dtype=torch.int32, device=seq_lengths.device) - (
+                cu_seqlens[:-1].repeat_interleave(seq_lengths)
+            )
         else:
             seq_id = self.token_ids[:0]
             pos_in_seq = self.token_ids[:0]
