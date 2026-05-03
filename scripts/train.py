@@ -3588,7 +3588,7 @@ def train_text_native_batched_envs(
     last_step_time = time.monotonic()
     transcript_warning_emitted = False
     transcript_capture_count = max(1, args.num_envs // 256)
-    num_actors = int(args.num_rollout_actors)
+    num_actors = int(getattr(args, "num_rollout_actors", 1))
 
     def cli_step_prefix() -> str:
         return f"step={total_wandb_logs}"
@@ -3962,7 +3962,7 @@ def train_text_native_batched_envs(
                 "(the actor path drives the native packed-token assembler)."
             )
 
-        num_actors = int(args.num_rollout_actors)
+        num_actors = int(getattr(args, "num_rollout_actors", 1))
         encoders_pool = native_encoder.encoders
         drivers_pool = native_rollout.drivers
         # Carve off the last encoder/driver as a dedicated snapshot-eval pair
