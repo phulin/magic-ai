@@ -51,6 +51,7 @@ from magic_ai.ppo import (
     PPOStats,
     RolloutStep,
     gae_returns,
+    gae_returns_batched,
     ppo_update,
 )
 from magic_ai.slot_encoder.buffer import NativeTrajectoryBuffer, RolloutBuffer
@@ -99,6 +100,7 @@ __all__ = [
     "action_from_priority_candidate",
     "build_priority_candidates",
     "gae_returns",
+    "gae_returns_batched",
     "ppo_update",
     "selected_priority_candidate_index",
 ]

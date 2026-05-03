@@ -284,3 +284,106 @@ def gae_returns(
         advantages_t = (scan_coeffs * torch.cumsum(deltas_rev / scan_coeffs, dim=0)).flip(0)
 
     return advantages_t + values_t
+
+
+def gae_returns_batched(
+    values: Tensor,
+    perspective_player_idx: Tensor,
+    step_count: Tensor,
+    winner_idx: Tensor,
+    *,
+    gamma: float = 1.0,
+    gae_lambda: float = 0.95,
+    draw_penalty: float = 1.0,
+) -> Tensor:
+    """Batched perspective-aware GAE returns for a padded rollout.
+
+    Parameters
+    ----------
+    values:
+        ``(B, T)`` float tensor of value estimates per step. Positions past
+        each row's terminal index are ignored.
+    perspective_player_idx:
+        ``(B, T)`` integer tensor of the acting player at each step.
+    step_count:
+        ``(B,)`` integer tensor; row ``b`` uses positions ``[0, step_count[b])``.
+        Rows with ``step_count == 0`` produce an all-zero output row.
+    winner_idx:
+        ``(B,)`` integer tensor. Use ``-1`` for a draw; the row is then filled
+        with ``-draw_penalty`` over its valid positions, mirroring the
+        per-episode reference implementation.
+
+    The output ``(B, T)`` matches stacking ``gae_returns`` over each row, with
+    zero-padding past ``step_count``.
+    """
+
+    if values.dim() != 2:
+        raise ValueError("values must have shape (B, T)")
+    if perspective_player_idx.shape != values.shape:
+        raise ValueError("perspective_player_idx must match values shape")
+    if step_count.shape != (values.shape[0],):
+        raise ValueError("step_count must have shape (B,)")
+    if winner_idx.shape != (values.shape[0],):
+        raise ValueError("winner_idx must have shape (B,)")
+
+    device = values.device
+    dtype = torch.float32
+    values_f = values.to(dtype)
+    batch_size, max_steps = values_f.shape
+    step_count_l = step_count.to(device=device, dtype=torch.long)
+    winner_l = winner_idx.to(device=device, dtype=torch.long)
+    players_l = perspective_player_idx.to(device=device, dtype=torch.long)
+
+    arange_t = torch.arange(max_steps, device=device)
+    valid = arange_t.unsqueeze(0) < step_count_l.unsqueeze(1)  # (B, T)
+    valid_f = valid.to(dtype)
+
+    nonempty = step_count_l > 0
+    is_draw = winner_l < 0
+    safe_terminal = (step_count_l - 1).clamp_min(0)
+    last_player = players_l.gather(1, safe_terminal.unsqueeze(1)).squeeze(1)
+    terminal_reward = torch.where(
+        winner_l == last_player,
+        values_f.new_ones(batch_size),
+        values_f.new_full((batch_size,), -1.0),
+    )
+    terminal_reward = terminal_reward * nonempty.to(dtype)
+
+    rewards = torch.zeros_like(values_f)
+    rewards.scatter_(1, safe_terminal.unsqueeze(1), terminal_reward.unsqueeze(1))
+    rewards = rewards * valid_f  # zero out scatter into row 0 of empty rows
+
+    base_deltas = (rewards - values_f) * valid_f
+    if max_steps > 1:
+        same_player = players_l[:, 1:] == players_l[:, :-1]
+        signs = torch.where(
+            same_player,
+            values_f.new_ones(batch_size, max_steps - 1),
+            values_f.new_full((batch_size, max_steps - 1), -1.0),
+        )
+        # Bootstrap term only when the *next* step is also valid (t+1 < step_count).
+        next_valid = (arange_t[: max_steps - 1].unsqueeze(0) < (step_count_l - 1).unsqueeze(1)).to(
+            dtype
+        )
+        bootstrap = gamma * signs * values_f[:, 1:] * next_valid
+        bootstrap_padded = F.pad(bootstrap, (0, 1))
+        deltas = base_deltas + bootstrap_padded
+    else:
+        deltas = base_deltas
+        signs = values_f.new_zeros(batch_size, 0)
+
+    if max_steps == 1 or gamma == 0.0 or gae_lambda == 0.0:
+        advantages = deltas
+    else:
+        coeffs_rev = (gamma * gae_lambda * signs).flip(1)
+        deltas_rev = deltas.flip(1)
+        ones_col = values_f.new_ones(batch_size, 1)
+        scan_coeffs = torch.cat((ones_col, coeffs_rev.cumprod(dim=1)), dim=1)
+        advantages = (scan_coeffs * torch.cumsum(deltas_rev / scan_coeffs, dim=1)).flip(1)
+
+    returns = (advantages + values_f) * valid_f
+
+    draw_row = values_f.new_full((), -float(draw_penalty)) * valid_f
+    returns = torch.where(is_draw.unsqueeze(1), draw_row, returns)
+
+    return returns

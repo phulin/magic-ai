@@ -61,7 +61,13 @@ from magic_ai.opponent_pool import (  # noqa: E402
     save_snapshot,
     snapshot_tag,
 )
-from magic_ai.ppo import PPOStats, RolloutStep, gae_returns, ppo_update  # noqa: E402
+from magic_ai.ppo import (  # noqa: E402
+    PPOStats,
+    RolloutStep,
+    gae_returns,
+    gae_returns_batched,
+    ppo_update,
+)
 from magic_ai.rnad import RNaDConfig  # noqa: E402
 from magic_ai.rnad_trainer import (  # noqa: E402
     EpisodeBatch,
@@ -2488,9 +2494,10 @@ def train_native_batched_envs(
         )
 
         # Batch the per-episode D2H: previously this issued 3 .cpu().tolist()
-        # calls per finished episode (3*N CUDA syncs). Instead, gather the
-        # three fields across every finished env on-device, stack them once,
-        # and do a single host transfer.
+        # calls per finished episode (3*N CUDA syncs). Instead, gather every
+        # field on-device, run GAE on the padded (B, T_max) staging slice in
+        # a single kernel chain, and do one host transfer for all finished
+        # envs combined.
         slot_idxs = [env.slot_idx for env in envs]
         device = staging_buffer.device
         slot_t = torch.tensor(slot_idxs, dtype=torch.long, device=device)
@@ -2499,13 +2506,31 @@ def train_native_batched_envs(
         max_steps = int(staging_buffer.max_steps_per_trajectory)
         step_arange = torch.arange(max_steps, device=device).unsqueeze(0)
         valid_mask = step_arange < step_counts.unsqueeze(1)
-        flat_player = staging_buffer.perspective_player_idx[slot_t][valid_mask]
-        flat_log = staging_buffer.old_log_prob[slot_t][valid_mask]
-        flat_val = staging_buffer.value[slot_t][valid_mask]
-        host = torch.stack([flat_player.to(torch.float32), flat_log, flat_val], dim=0).cpu()
+        players_padded = staging_buffer.perspective_player_idx[slot_t]
+        values_padded = staging_buffer.value[slot_t]
+        log_padded = staging_buffer.old_log_prob[slot_t]
+        winner_t = torch.tensor([w for _, w in finished], dtype=torch.long, device=device)
+        returns_padded = gae_returns_batched(
+            values_padded,
+            players_padded,
+            step_counts,
+            winner_t,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            draw_penalty=args.draw_penalty,
+        )
+        flat_player = players_padded[valid_mask]
+        flat_log = log_padded[valid_mask]
+        flat_val = values_padded[valid_mask]
+        flat_returns_dev = returns_padded[valid_mask]
+        host = torch.stack(
+            [flat_player.to(torch.float32), flat_log, flat_val, flat_returns_dev],
+            dim=0,
+        ).cpu()
         host_player = host[0].long().tolist()
         host_log = host[1].tolist()
         host_val = host[2].tolist()
+        host_returns = host[3]
 
         cursor = 0
         for (env, winner_idx), replay_rows, step_count in zip(
@@ -2517,6 +2542,7 @@ def train_native_batched_envs(
                 player_indices = host_player[cursor:end]
                 old_log_probs = host_log[cursor:end]
                 values = host_val[cursor:end]
+                env_returns = host_returns[cursor:end].clone()
                 cursor = end
                 env.episode_steps = [
                     RolloutStep(
@@ -2530,15 +2556,8 @@ def train_native_batched_envs(
                     )
                 ]
             if env.episode_steps:
-                returns = gae_returns(
-                    env.episode_steps,
-                    winner_idx=winner_idx,
-                    gamma=args.gamma,
-                    gae_lambda=args.gae_lambda,
-                    draw_penalty=args.draw_penalty,
-                )
                 pending_steps.extend(env.episode_steps)
-                pending_returns.append(returns)
+                pending_returns.append(env_returns)
                 if rnad_state is not None:
                     pending_episodes.append(
                         EpisodeBatch(
