@@ -2587,7 +2587,7 @@ def train_native_batched_envs(
         terminal_p0_h: list[float] = []
         zero_sum_h: list[bool] = []
         for env, winner_idx, is_timeout in finished:
-            l0, l1 = _read_life_totals(env.game) if (is_timeout or winner_idx < 0) else (0, 0)
+            l0, l1 = _read_life_totals(env.game) if is_timeout else (0, 0)
             tp0, zs = terminal_reward_for_finish(
                 winner_idx=int(winner_idx),
                 is_timeout=bool(is_timeout),
@@ -3654,7 +3654,7 @@ def train_text_native_batched_envs(
             terminal_p0_h: list[float] = []
             zero_sum_h: list[bool] = []
             for env, winner_idx, is_timeout in finished_with_steps:
-                l0, l1 = _read_life_totals(env.game) if (is_timeout or winner_idx < 0) else (0, 0)
+                l0, l1 = _read_life_totals(env.game) if is_timeout else (0, 0)
                 tp0, zs = terminal_reward_for_finish(
                     winner_idx=int(winner_idx),
                     is_timeout=bool(is_timeout),
