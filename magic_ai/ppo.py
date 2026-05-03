@@ -158,7 +158,7 @@ def ppo_update(
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+            grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm, foreach=True)
             # Neutralize non-finite grads in-place so the optimizer step is a
             # no-op for the bad batch without forcing a host sync. Without this,
             # a single bad batch (e.g. an all-masked decision row producing NaN

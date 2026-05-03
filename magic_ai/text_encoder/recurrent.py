@@ -27,28 +27,12 @@ from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.policy import EncodedSnapshots, TextPolicy
 
 
-def _cast_encoded(encoded: EncodedSnapshots, dtype: torch.dtype) -> EncodedSnapshots:
-    """Cast the float vectors of ``encoded`` to ``dtype`` (boolean masks
-    are left untouched). Used to bring autocast'd encoder outputs back to
-    the LSTM/head parameter dtype."""
-
-    return EncodedSnapshots(
-        card_vectors=encoded.card_vectors.to(dtype),
-        card_mask=encoded.card_mask,
-        option_vectors=encoded.option_vectors.to(dtype),
-        option_mask=encoded.option_mask,
-        target_vectors=encoded.target_vectors.to(dtype),
-        target_mask=encoded.target_mask,
-        state_vector=encoded.state_vector.to(dtype),
-    )
-
-
 @dataclass
 class RecurrentTextPolicyConfig:
     encoder: TextEncoderConfig
     lstm_hidden: int = 384  # match d_model by default
     lstm_layers: int = 1
-    compile_forward: bool = False
+    compile_forward: bool = True
 
 
 @dataclass
@@ -104,18 +88,11 @@ class RecurrentTextPolicy(nn.Module):
             ]
             | None
         ) = None
-        if cfg.compile_forward:
-            # Only compile the packed (rollout-only) path. The non-packed
-            # forward runs during PPO training with .backward(), and AOT
-            # autograd currently mismatches NJT subclass metadata on the
-            # backward pass when compiled.
-            self._compiled_forward_packed = cast(
-                Callable[
-                    [PackedTextBatch, Tensor | None, Tensor | None, Tensor | None],
-                    tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]],
-                ],
-                torch.compile(self._forward_packed_impl, dynamic=True),
-            )
+        # Compile is wired up lazily on the first CUDA forward (see
+        # ``forward_packed``). flash_attn_varlen replaced the old NJT-subclass
+        # attention so the historical AOT-autograd backward mismatch no longer
+        # applies; CPU compile, however, hits an unrelated inductor bug, so we
+        # only compile when we actually see a CUDA tensor.
 
     def init_state(self, batch_size: int, device: torch.device) -> tuple[Tensor, Tensor]:
         shape = (self.lstm_layers, batch_size, self.lstm_hidden)
@@ -131,29 +108,23 @@ class RecurrentTextPolicy(nn.Module):
         *,
         state_hidden_override: Tensor | None = None,
     ) -> tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]]:
-        # bf16 autocast on CUDA scoped to the encoder: cuts attention memory
-        # ~2x and lets SDPA dispatch to the mem-efficient kernel (it skips
-        # the math-backend full [B, H, T, T] score tensor when inputs are
-        # bf16/fp16). bf16 has fp32's exponent range so no grad scaler is
-        # needed. We narrow the cm to the encoder block because the LSTM
-        # below holds fp32 state buffers and mixing dtypes through it is a
-        # pile of compatibility issues for marginal additional savings.
+        # bf16 autocast wraps the entire forward (encoder + LSTM + heads).
+        # bf16 has fp32's exponent range so no grad scaler is needed. autocast
+        # is responsible for promoting any op that's not bf16-safe (cuDNN's
+        # LSTM is on the eligible list); skipping the explicit fp32 round-trip
+        # avoids six per-forward .to(fp32) copies of the encoded vectors.
         device_type = batch.token_ids.device.type
         autocast_enabled = device_type == "cuda"
         with torch.autocast(
             device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
         ):
             encoded = self.text_policy.encode_only(batch)
-        # Cast encoder outputs back to the LSTM's parameter dtype so the
-        # downstream LSTM + heads run in fp32.
-        target_dtype = self.in_proj.weight.dtype
-        encoded = _cast_encoded(encoded, target_dtype)
-        return self._forward_encoded(
-            encoded,
-            h_in=h_in,
-            c_in=c_in,
-            state_hidden_override=state_hidden_override,
-        )
+            return self._forward_encoded(
+                encoded,
+                h_in=h_in,
+                c_in=c_in,
+                state_hidden_override=state_hidden_override,
+            )
 
     def forward_packed(
         self,
@@ -163,6 +134,18 @@ class RecurrentTextPolicy(nn.Module):
         *,
         state_hidden_override: Tensor | None = None,
     ) -> tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]]:
+        if (
+            self.cfg.compile_forward
+            and self._compiled_forward_packed is None
+            and batch.token_ids.device.type == "cuda"
+        ):
+            self._compiled_forward_packed = cast(
+                Callable[
+                    [PackedTextBatch, Tensor | None, Tensor | None, Tensor | None],
+                    tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]],
+                ],
+                torch.compile(self._forward_packed_impl, dynamic=True),
+            )
         if self._compiled_forward_packed is not None:
             return self._compiled_forward_packed(batch, h_in, c_in, state_hidden_override)
         return self._forward_packed_impl(batch, h_in, c_in, state_hidden_override)
@@ -180,14 +163,12 @@ class RecurrentTextPolicy(nn.Module):
             device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
         ):
             encoded = self.text_policy.encode_packed_only(batch)
-        target_dtype = self.in_proj.weight.dtype
-        encoded = _cast_encoded(encoded, target_dtype)
-        return self._forward_encoded(
-            encoded,
-            h_in=h_in,
-            c_in=c_in,
-            state_hidden_override=state_hidden_override,
-        )
+            return self._forward_encoded(
+                encoded,
+                h_in=h_in,
+                c_in=c_in,
+                state_hidden_override=state_hidden_override,
+            )
 
     def _forward_encoded(
         self,
@@ -248,14 +229,19 @@ class RecurrentTextPolicy(nn.Module):
         per-episode LSTM scan are run once per policy via
         ``TextActorCritic.precompute_replay_forward``; the resulting ``encoded``
         and ``state_hidden`` are then fed here directly so the per-choice scoring
-        forward does not re-run the encoder. Caller is responsible for casting
-        ``encoded`` to the head-parameter dtype.
+        forward does not re-run the encoder. Wraps the head pass in bf16
+        autocast on CUDA so callers can hand in bf16 ``encoded`` directly.
         """
 
-        state_for_heads = self.out_proj(state_hidden)
-        policy_logits, target_logits, values = self.text_policy.run_heads(
-            encoded, state_vec=state_for_heads
-        )
+        device_type = encoded.state_vector.device.type
+        autocast_enabled = device_type == "cuda"
+        with torch.autocast(
+            device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+        ):
+            state_for_heads = self.out_proj(state_hidden)
+            policy_logits, target_logits, values = self.text_policy.run_heads(
+                encoded, state_vec=state_for_heads
+            )
         return RecurrentTextPolicyOutput(
             policy_logits=policy_logits,
             target_logits=target_logits,
