@@ -1767,11 +1767,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-workers",
         type=int,
-        default=4,
+        default=5,
         help="parallel worker threads for Go-side engine step/encode batches "
-        "(default: 4 = one encoder/driver per default rollout actor; cgo "
+        "(default: 5 = 4 actors + 1 dedicated snapshot-eval encoder; cgo "
         "releases the GIL so N threads run in parallel). Must be >= "
-        "--num-rollout-actors when using the actor path.",
+        "--num-rollout-actors + 1 when using the actor path so snapshot eval "
+        "owns its own encoder/driver and never aliases an actor's scratch pool.",
     )
     parser.add_argument(
         "--shard-packed-tokens",
@@ -3705,16 +3706,31 @@ def train_text_native_batched_envs(
         num_actors = int(args.num_rollout_actors)
         encoders_pool = native_encoder.encoders
         drivers_pool = native_rollout.drivers
-        if len(encoders_pool) < num_actors:
+        # Carve off the last encoder/driver as a dedicated snapshot-eval pair
+        # so snapshot eval never aliases an actor's scratch (the Go-side
+        # scratchPool is keyed by output-buffer address; per-actor encoders
+        # have distinct buffers, so a separate snapshot encoder is fully
+        # lock-free against the actors).
+        needed = num_actors + 1
+        if len(encoders_pool) < needed:
             raise SystemExit(
                 f"native_encoder has {len(encoders_pool)} workers but "
-                f"--num-rollout-actors={num_actors}; rebuild with --batch-workers={num_actors}"
+                f"--num-rollout-actors={num_actors} requires {needed} "
+                f"(N actors + 1 dedicated snapshot encoder); "
+                f"rebuild with --batch-workers={needed}"
             )
-        if len(drivers_pool) < num_actors:
+        if len(drivers_pool) < needed:
             raise SystemExit(
                 f"native_rollout has {len(drivers_pool)} drivers but "
-                f"--num-rollout-actors={num_actors}; rebuild with --batch-workers={num_actors}"
+                f"--num-rollout-actors={num_actors} requires {needed} "
+                f"(N actors + 1 dedicated snapshot driver); "
+                f"rebuild with --batch-workers={needed}"
             )
+
+        snapshot_encoder = ShardedNativeBatchEncoder(
+            [encoders_pool[num_actors]], pool=None, shard_packed_tokens=False
+        )
+        snapshot_rollout = ShardedNativeRolloutDriver([drivers_pool[num_actors]], pool=None)
 
         encode_cfg = ActorEncodeConfig(
             text_max_tokens=int(args.text_max_tokens),
@@ -3908,6 +3924,12 @@ def train_text_native_batched_envs(
                 ):
                     pending_thresholds = list(snapshot_schedule.fire(completed_games))
                     if pending_thresholds:
+                        # GPU is shared, so pause the inference server to
+                        # serialize forward passes; actors keep running their
+                        # CPU poll/encode/step loop and will block at most one
+                        # batch deep on the server queue. The dedicated
+                        # snapshot encoder/driver means snapshot eval cannot
+                        # race actors on Go-side scratch pools either.
                         server.pause()
                         try:
                             for threshold in pending_thresholds:
@@ -3917,8 +3939,8 @@ def train_text_native_batched_envs(
                                     policy=backend.policy,
                                     opponent_policy=opponent_policy,
                                     opponent_pool=opponent_pool,
-                                    native_encoder=native_encoder,
-                                    native_rollout=native_rollout,
+                                    native_encoder=snapshot_encoder,
+                                    native_rollout=snapshot_rollout,
                                     mage=mage,
                                     deck_pool=deck_pool,
                                     rng=eval_rng,
