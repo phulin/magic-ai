@@ -955,6 +955,10 @@ def _training_state_dict(checkpoint: dict[str, Any] | None) -> dict[str, Any]:
     return training_state if isinstance(training_state, dict) else {}
 
 
+def _is_post_mlm_checkpoint(checkpoint: dict[str, Any] | None) -> bool:
+    return bool(_checkpoint_metadata(checkpoint).get("post_mlm", False))
+
+
 def _checkpoint_wandb_run_id(checkpoint: dict[str, Any] | None) -> str | None:
     run_id = _checkpoint_metadata(checkpoint).get("wandb_run_id")
     return str(run_id) if isinstance(run_id, str) and run_id else None
@@ -1261,7 +1265,13 @@ def _build_opponent_schedules(
 ) -> tuple[OpponentPool | None, SnapshotSchedule | None, RetrospectiveLogSchedule | None]:
     if getattr(args, "disable_opponent_pool", False):
         return None, None, None
-    opponent_pool = _restore_opponent_pool(checkpoint_cpu, args.opponent_pool_dir)
+    if _is_post_mlm_checkpoint(checkpoint_cpu):
+        # Resuming from a post-MLM checkpoint: no RL games have happened yet,
+        # so start the opponent pool fresh and ignore any pre-existing
+        # snapshots in args.opponent_pool_dir.
+        opponent_pool = OpponentPool()
+    else:
+        opponent_pool = _restore_opponent_pool(checkpoint_cpu, args.opponent_pool_dir)
     snapshot_schedule = SnapshotSchedule.build(args.episodes)
     retrospective_schedule = RetrospectiveLogSchedule.build(args.episodes)
     training_state = _training_state_dict(checkpoint_cpu)
@@ -1501,10 +1511,18 @@ def main() -> None:
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
 
-    if getattr(args, "pretrain_mlm_dir", None) is not None:
+    resumed_post_mlm = _is_post_mlm_checkpoint(checkpoint_cpu)
+    if resumed_post_mlm:
+        print(
+            "[mlm] resuming from post-MLM checkpoint "
+            f"{args.checkpoint}: skipping MLM pretraining, opponent pool starts empty"
+        )
+    run_mlm_now = getattr(args, "pretrain_mlm_dir", None) is not None and not resumed_post_mlm
+    if run_mlm_now:
         if encoder_kind != "text" or text_backend is None:
             raise ValueError("--pretrain-mlm-dir requires --encoder text")
         run_mlm_pretrain(args, text_backend, device)
+    if run_mlm_now or resumed_post_mlm:
         # Reset optimizer state: MLM used a separate AdamW; the RL optimizer
         # tracks the still-randomly-initialized policy heads alongside the
         # pretrained encoder, so its moments must start fresh.
@@ -1517,6 +1535,25 @@ def main() -> None:
             )
         else:
             optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
+        if run_mlm_now and getattr(args, "post_mlm_checkpoint", None) is not None:
+            save_checkpoint(
+                args.post_mlm_checkpoint,
+                policy,
+                optimizer,
+                args,
+                opponent_pool=None,
+                snapshot_schedule=None,
+                retrospective_schedule=None,
+                resume_state=None,
+                wandb_run_id=active_wandb_run_id,
+                run_artifact_dir=run_artifact_dir,
+                rnad_state=None,
+                post_mlm=True,
+            )
+            print(
+                f"[mlm] saved post-MLM checkpoint -> {args.post_mlm_checkpoint} "
+                f"(resume RL with --checkpoint {args.post_mlm_checkpoint})"
+            )
         # Linear LR warmup over the first N RL updates to absorb the
         # pretrained-encoder × random-RL-heads mismatch. AdamW's first step
         # bias correction would otherwise land a sign-of-grad sized step that
@@ -1815,6 +1852,15 @@ def parse_args() -> argparse.Namespace:
         "rate from 0 to --learning-rate. Active only when --pretrain-mlm-dir "
         "is set; absorbs the pretrained-encoder × random-RL-heads mismatch "
         "that otherwise overflows on the first PPO step. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--post-mlm-checkpoint",
+        type=Path,
+        default=None,
+        help="if set, after MLM pretraining completes, save a checkpoint with "
+        "post-MLM weights (and a `post_mlm` metadata flag) to this path before "
+        "starting RL. Pass this path back as --checkpoint to skip MLM and "
+        "start RL from the pretrained encoder; opponent pool will start empty.",
     )
     parser.add_argument("--pretrain-mlm-batch-size", type=int, default=128)
     parser.add_argument("--pretrain-mlm-seq-len", type=int, default=512)
@@ -4381,6 +4427,7 @@ def save_checkpoint(
     wandb_run_id: str | None = None,
     run_artifact_dir: Path | None = None,
     rnad_state: RNaDTrainerState | None = None,
+    post_mlm: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     effective_run_artifact_dir = run_artifact_dir or args.opponent_pool_dir.parent
@@ -4418,6 +4465,8 @@ def save_checkpoint(
         "wandb_run_id": effective_wandb_run_id,
         "run_artifact_dir": str(effective_run_artifact_dir),
     }
+    if post_mlm:
+        metadata["post_mlm"] = True
     if getattr(args, "encoder", "slots") == "text":
         cache_path = Path(getattr(args, "card_token_cache", ""))
         actual_text_cfg = getattr(
