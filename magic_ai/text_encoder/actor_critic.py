@@ -317,9 +317,13 @@ class TextActorCritic(nn.Module):
                 mask_dev = layout.decision_mask.to(self.device, non_blocking=nb)
                 if mask_dev.dtype != torch.bool:
                     mask_dev = mask_dev.to(dtype=torch.bool)
-                # ``layout.uses_none_head`` is already CPU; just materialize
-                # to a Python list without going through the device.
-                uses_none_flags = layout.uses_none_head.bool().tolist()
+                # ``layout.uses_none_head`` is already CPU; we still need
+                # per-group Python flags for the per-group dispatch in
+                # ``_direct_live_decision_logits``, but the visibility col-0
+                # patch below is applied vectorized on-device.
+                uses_none_cpu_bool = layout.uses_none_head.bool()
+                uses_none_flags = uses_none_cpu_bool.tolist()
+                uses_none_dev = uses_none_cpu_bool.to(self.device, non_blocking=nb)
                 num_groups = int(layout.decision_option_idx.shape[0])
                 # Vectorize visibility across ALL groups for this step instead
                 # of computing per-group inside the loop.
@@ -355,9 +359,7 @@ class TextActorCritic(nn.Module):
                 visible_all = opt_visible_all & (~target_required_all | tgt_visible_all)
                 if any(uses_none_flags):
                     col0 = torch.zeros_like(visible_all)
-                    for gi, uses in enumerate(uses_none_flags):
-                        if uses:
-                            col0[gi, 0] = True
+                    col0[:, 0] = uses_none_dev
                     visible_all = visible_all | col0
                 mask_all = mask_dev & visible_all  # [G, C]
 
