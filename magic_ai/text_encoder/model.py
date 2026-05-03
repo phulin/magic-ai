@@ -160,15 +160,18 @@ def _document_mask_mod(seq_id: Tensor):
 
 def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     # x: [B, H, T, D]; cos/sin: [T, D/2]
+    # Write the two rotated halves directly into a single output buffer to
+    # skip the [B, H, T, D] cat allocation that runs on every block × forward.
     d = x.shape[-1]
     half = d // 2
     x1 = x[..., :half]
     x2 = x[..., half:]
     cos_b = cos[None, None, :, :]
     sin_b = sin[None, None, :, :]
-    rx1 = x1 * cos_b - x2 * sin_b
-    rx2 = x2 * cos_b + x1 * sin_b
-    return torch.cat((rx1, rx2), dim=-1)
+    out = torch.empty_like(x)
+    out[..., :half] = x1 * cos_b - x2 * sin_b
+    out[..., half:] = x2 * cos_b + x1 * sin_b
+    return out
 
 
 def _apply_rope_packed(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -179,9 +182,10 @@ def _apply_rope_packed(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     x2 = x[..., half:]
     cos_b = cos[:, None, :]
     sin_b = sin[:, None, :]
-    rx1 = x1 * cos_b - x2 * sin_b
-    rx2 = x2 * cos_b + x1 * sin_b
-    return torch.cat((rx1, rx2), dim=-1)
+    out = torch.empty_like(x)
+    out[..., :half] = x1 * cos_b - x2 * sin_b
+    out[..., half:] = x2 * cos_b + x1 * sin_b
+    return out
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -600,6 +604,7 @@ class _MLP(nn.Module):
 class PolicyHead(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
+        self.d_model = d_model
         self.mlp = _MLP(2 * d_model, d_model, 1)
 
     def forward(
@@ -608,10 +613,15 @@ class PolicyHead(nn.Module):
         state_vec: Tensor,  # [B, D]
         option_mask: Tensor,  # [B, O] bool
     ) -> Tensor:
-        b, o, _ = option_vecs.shape
-        state_b = state_vec.unsqueeze(1).expand(b, o, -1)
-        x = torch.cat([option_vecs, state_b], dim=-1)
-        logits = self.mlp(x).squeeze(-1)  # [B, O]
+        # Math-equivalent to ``fc1(cat([option_vecs, state_b], -1))`` where
+        # state_b is state_vec broadcast over O. Splitting fc1 across the two
+        # input chunks avoids the [B, O, 2D] cat allocation and the per-call
+        # broadcast of state through the GEMM.
+        d = self.d_model
+        w = self.mlp.fc1.weight  # [D, 2D]
+        b1 = self.mlp.fc1.bias  # [D]
+        h = F.linear(option_vecs, w[:, :d]) + F.linear(state_vec, w[:, d:], b1).unsqueeze(1)
+        logits = self.mlp.fc2(F.gelu(h)).squeeze(-1)  # [B, O]
         neg_inf = torch.full_like(logits, float("-inf"))
         return torch.where(option_mask, logits, neg_inf)
 
@@ -619,6 +629,7 @@ class PolicyHead(nn.Module):
 class TargetHead(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
+        self.d_model = d_model
         self.mlp = _MLP(3 * d_model, d_model, 1)
 
     def forward(
@@ -628,11 +639,15 @@ class TargetHead(nn.Module):
         state_vec: Tensor,  # [B, D]
         target_mask: Tensor,  # [B, O, M] bool
     ) -> Tensor:
-        b, o, m, _ = target_vecs.shape
-        opt_b = option_vecs.unsqueeze(2).expand(b, o, m, -1)
-        state_b = state_vec[:, None, None, :].expand(b, o, m, -1)
-        x = torch.cat([target_vecs, opt_b, state_b], dim=-1)
-        logits = self.mlp(x).squeeze(-1)  # [B, O, M]
+        # Same trick as PolicyHead, three-way split. Avoids the [B, O, M, 3D]
+        # cat allocation and the broadcasts of option/state through the GEMM.
+        d = self.d_model
+        w = self.mlp.fc1.weight  # [D, 3D]
+        b1 = self.mlp.fc1.bias  # [D]
+        h_tgt = F.linear(target_vecs, w[:, :d])  # [B, O, M, D]
+        h_opt = F.linear(option_vecs, w[:, d : 2 * d]).unsqueeze(2)  # [B, O, 1, D]
+        h_state = F.linear(state_vec, w[:, 2 * d :], b1)[:, None, None, :]  # [B, 1, 1, D]
+        logits = self.mlp.fc2(F.gelu(h_tgt + h_opt + h_state)).squeeze(-1)
         neg_inf = torch.full_like(logits, float("-inf"))
         return torch.where(target_mask, logits, neg_inf)
 

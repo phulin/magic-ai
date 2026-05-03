@@ -111,6 +111,7 @@ def ppo_update(
         "spr_loss",
     )
     sums_t = torch.zeros(len(stat_names), dtype=torch.float32, device=device)
+    nonfinite_count_t = torch.zeros((), dtype=torch.int64, device=device)
     num_minibatches = 0
     n_steps = int(replay_rows.shape[0])
     policy.write_ppo_targets(
@@ -158,23 +159,19 @@ def ppo_update(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
-            # Skip the optimizer step on non-finite grads. Without this, a
-            # single bad batch (e.g. an all-masked decision row producing NaN
+            # Neutralize non-finite grads in-place so the optimizer step is a
+            # no-op for the bad batch without forcing a host sync. Without this,
+            # a single bad batch (e.g. an all-masked decision row producing NaN
             # log-probs) propagates NaN into the weights and every subsequent
             # forward returns NaN logits, which crashes the next sampler call
-            # with the CUDA ``0 <= p <= 1`` multinomial assert.
-            if not torch.isfinite(grad_norm) or not torch.isfinite(loss).item():
-                optimizer.zero_grad(set_to_none=True)
-                print(
-                    f"[ppo] non-finite update skipped: "
-                    f"loss={float(loss.detach()):.4g} "
-                    f"grad_norm={float(grad_norm):.4g} "
-                    f"policy_loss={float(policy_loss.detach()):.4g} "
-                    f"value_loss={float(value_loss.detach()):.4g}",
-                    flush=True,
-                )
-            else:
-                optimizer.step()
+            # with the CUDA ``0 <= p <= 1`` multinomial assert. Track the count
+            # on-device and sync once at the end of the update for diagnostics.
+            mb_nonfinite = (~torch.isfinite(grad_norm)) | (~torch.isfinite(loss.detach()))
+            nonfinite_count_t += mb_nonfinite.to(torch.int64)
+            for p in policy.parameters():
+                if p.grad is not None:
+                    torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+            optimizer.step()
 
             with torch.no_grad():
                 approx_kl = (batch_old_log_probs - batch_log_probs).mean()
@@ -198,6 +195,13 @@ def ppo_update(
         raise RuntimeError("PPO update did not run any minibatches")
     if spr_coef > 0.0 and policy.spr_enabled:
         policy.update_spr_target()
+    nonfinite_count = int(nonfinite_count_t.item())
+    if nonfinite_count > 0:
+        print(
+            f"[ppo] non-finite grads neutralized in "
+            f"{nonfinite_count}/{num_minibatches} minibatches",
+            flush=True,
+        )
     sums = dict(zip(stat_names, (sums_t / num_minibatches).cpu().tolist(), strict=True))
     return PPOStats(
         loss=sums["loss"],
