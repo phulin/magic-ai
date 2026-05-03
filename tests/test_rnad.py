@@ -256,6 +256,69 @@ class TwoPlayerVTraceTests(unittest.TestCase):
         self.assertTrue(torch.allclose(out.r_hat_next, expected_r_next, atol=1e-6))
         self.assertTrue(torch.allclose(out.v_hat_next, expected_v_next, atol=1e-6))
 
+    def test_batched_handles_ragged_own_turn_counts(self) -> None:
+        """Multi-episode batches with very different own-turn counts and a
+        single-own-turn episode — exercises the padded reverse-scan path."""
+        from magic_ai.rnad import _two_player_vtrace_batched
+
+        torch.manual_seed(13)
+        eps = []
+        # Mixed: long with even own-turns, short with one own-turn,
+        # one episode with no own-turns at all (all opponent steps),
+        # one with a streak of own-turns at the end.
+        configs = [
+            ([t % 2 == 0 for t in range(11)], 11),
+            ([True], 1),
+            ([False, False, False], 3),
+            ([False, False, True, True, True, True], 6),
+            ([t % 3 == 0 for t in range(8)], 8),
+        ]
+        for is_own_pattern, t_len in configs:
+            rewards = torch.zeros(t_len)
+            rewards[-1] = 1.0 if torch.rand(()) > 0.5 else -1.0
+            values = torch.randn(t_len) * 0.3
+            logp_theta = -torch.rand(t_len) * 0.5
+            logp_mu = -torch.rand(t_len) * 0.5
+            is_own = torch.tensor(is_own_pattern)
+            eps.append((rewards, values, logp_theta, logp_mu, is_own))
+
+        per_ep = [
+            two_player_vtrace(
+                rewards=r,
+                values=v,
+                logp_theta=lt,
+                logp_mu=lm,
+                perspective_is_player_i=io,
+            )
+            for r, v, lt, lm, io in eps
+        ]
+
+        flat_rewards = torch.cat([e[0] for e in eps])
+        flat_values = torch.cat([e[1] for e in eps])
+        flat_lt = torch.cat([e[2] for e in eps])
+        flat_lm = torch.cat([e[3] for e in eps])
+        flat_io = torch.cat([e[4] for e in eps])
+        offsets = torch.tensor(
+            [0, *torch.cumsum(torch.tensor([e[0].numel() for e in eps]), 0).tolist()],
+            dtype=torch.long,
+        )
+        out = _two_player_vtrace_batched(
+            rewards=flat_rewards,
+            values=flat_values,
+            logp_theta=flat_lt,
+            logp_mu=flat_lm,
+            perspective_is_player_i=flat_io,
+            ep_offsets=offsets,
+        )
+        expected_v_hat = torch.cat([p.v_hat for p in per_ep])
+        expected_q_hat = torch.cat([p.q_hat for p in per_ep])
+        expected_r_next = torch.cat([p.r_hat_next for p in per_ep])
+        expected_v_next = torch.cat([p.v_hat_next for p in per_ep])
+        self.assertTrue(torch.allclose(out.v_hat, expected_v_hat, atol=1e-5))
+        self.assertTrue(torch.allclose(out.q_hat, expected_q_hat, atol=1e-5))
+        self.assertTrue(torch.allclose(out.r_hat_next, expected_r_next, atol=1e-5))
+        self.assertTrue(torch.allclose(out.v_hat_next, expected_v_next, atol=1e-5))
+
 
 class NeuRDLossTests(unittest.TestCase):
     def test_gradient_matches_expected_in_range(self) -> None:
