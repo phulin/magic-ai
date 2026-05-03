@@ -177,12 +177,25 @@ class TextInferenceServer:
             self._thread.start()
 
     def submit(self, request: TextInferenceRequest) -> Future[TextInferenceReply]:
-        """Submit one actor's encoded batch; returns a future for host scalars."""
+        """Submit one actor's encoded batch; returns a future for host scalars.
+
+        Fails fast if the server thread has died — without this, actors would
+        block forever on the future.
+        """
+
         if not request.env_indices:
             raise ValueError("submit() requires a non-empty request")
-        fut: Future[TextInferenceReply] = Future()
-        self._queue.put(_PendingItem(request=request, future=fut))
-        return fut
+        if self._stop_event.is_set() or not self._thread.is_alive():
+            fut: Future[TextInferenceReply] = Future()
+            fut.set_exception(
+                self._exc
+                if self._exc is not None
+                else RuntimeError("inference server is not running")
+            )
+            return fut
+        fut2: Future[TextInferenceReply] = Future()
+        self._queue.put(_PendingItem(request=request, future=fut2))
+        return fut2
 
     def pause(self) -> None:
         """Block new batches from running. Waits for the in-flight batch."""
@@ -210,43 +223,67 @@ class TextInferenceServer:
     # --------------------------------------------------------------- internal
 
     def _run(self) -> None:
-        try:
-            while not self._stop_event.is_set():
+        # Catch *per-batch* failures and propagate to that batch's futures
+        # only; the server keeps running so other actors aren't deadlocked
+        # by one bad batch. A batch failure still records ``self._exc`` so
+        # ``stop()`` re-raises it on the learner thread.
+        while not self._stop_event.is_set():
+            try:
                 batch = self._collect_batch()
-                if batch is None:  # stop sentinel
+            except BaseException as exc:  # noqa: BLE001
+                self._exc = exc
+                self._fail_pending(exc)
+                return
+            if batch is None:  # stop sentinel
+                return
+            if not batch:
+                continue
+            # Gate: if paused was requested between the queue.get() above
+            # and now, hold the items here (not yet processing) until
+            # resume. ``idle`` stays True throughout the wait so pause()
+            # can return immediately.
+            with self._cond:
+                while self._paused and not self._stop_event.is_set():
+                    self._cond.wait()
+                if self._stop_event.is_set():
+                    # Re-queue items so they get a clean exception below.
+                    self._fail_items(batch, RuntimeError("inference server stopped"))
                     return
-                if not batch:
-                    continue
-                # Gate: if paused was requested between the queue.get() above
-                # and now, hold the items here (not yet processing) until
-                # resume. ``idle`` stays True throughout the wait so pause()
-                # can return immediately.
-                with self._cond:
-                    while self._paused and not self._stop_event.is_set():
-                        self._cond.wait()
-                    if self._stop_event.is_set():
-                        return
-                    self._idle = False
+                self._idle = False
+            try:
                 try:
                     self._process(batch)
-                finally:
-                    with self._cond:
-                        self._idle = True
-                        self._cond.notify_all()
-        except BaseException as exc:  # noqa: BLE001
-            self._exc = exc
-            try:
-                while True:
-                    item = self._queue.get_nowait()
-                    if item is None:
-                        continue
-                    if not item.future.done():
-                        item.future.set_exception(exc)
-            except Empty:
-                pass
-            with self._cond:
-                self._idle = True
-                self._cond.notify_all()
+                except BaseException as exc:  # noqa: BLE001
+                    self._exc = exc
+                    # Resolve only the in-flight batch's futures; do NOT
+                    # tear down the server. Pending submits are independent.
+                    self._fail_items(batch, exc)
+            finally:
+                with self._cond:
+                    self._idle = True
+                    self._cond.notify_all()
+
+    @staticmethod
+    def _fail_items(items: list[_PendingItem], exc: BaseException) -> None:
+        for it in items:
+            if not it.future.done():
+                it.future.set_exception(exc)
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        """Drain remaining queued items and reject their futures."""
+
+        try:
+            while True:
+                item = self._queue.get_nowait()
+                if item is None:
+                    continue
+                if not item.future.done():
+                    item.future.set_exception(exc)
+        except Empty:
+            pass
+        with self._cond:
+            self._idle = True
+            self._cond.notify_all()
 
     def _collect_batch(self) -> list[_PendingItem] | None:
         """Block until at least one item is available, then opportunistically

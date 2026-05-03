@@ -1755,6 +1755,16 @@ def parse_args() -> argparse.Namespace:
             "inference server: cap merged forward-batch row count; 0 = use --num-envs as the cap"
         ),
     )
+    parser.add_argument(
+        "--actor-watchdog-seconds",
+        type=float,
+        default=60.0,
+        help=(
+            "in actor mode, print server/queue/actor diagnostic state if no "
+            "rollout progress is observed for this many seconds; helps catch "
+            "hangs at startup instead of leaving them silent"
+        ),
+    )
     parser.add_argument("--max-steps-per-game", type=int, default=200)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--hand-size", type=int, default=7)
@@ -3826,12 +3836,42 @@ def train_text_native_batched_envs(
 
         active_actors = num_actors
         actor_done: list[bool] = [False] * num_actors
+        last_progress_t = time.monotonic()
+        last_progress_state = (completed_games, len(pending_steps), next_episode_idx)
+        watchdog_threshold_s = float(getattr(args, "actor_watchdog_seconds", 60.0))
 
         try:
             while active_actors > 0:
                 if actor_errors:
                     exc, tb = actor_errors[0]
                     raise RuntimeError(f"rollout actor crashed: {tb}") from exc
+
+                # Watchdog: if nothing has changed for a while, dump diagnostic
+                # state. This makes startup-time hangs (e.g. server thread
+                # crashed before resolving the first batch) visible instead
+                # of looking like an unconditional deadlock.
+                now = time.monotonic()
+                cur_state = (completed_games, len(pending_steps), next_episode_idx)
+                if cur_state != last_progress_state:
+                    last_progress_t = now
+                    last_progress_state = cur_state
+                elif now - last_progress_t > watchdog_threshold_s:
+                    print(
+                        cli_step_prefix(),
+                        f"[watchdog] no rollout progress for "
+                        f"{int(now - last_progress_t)}s — "
+                        f"completed_games={completed_games} "
+                        f"pending_steps={len(pending_steps)} "
+                        f"next_ep={next_episode_idx} "
+                        f"server_alive={server._thread.is_alive()} "
+                        f"server_q={server._queue.qsize()} "
+                        f"finished_q={finished_q.qsize()} "
+                        f"refill_req_q={refill_req_q.qsize()} "
+                        f"actor_free_slots={[len(s) for s in actor_free_slots]} "
+                        f"actor_done={actor_done}",
+                        flush=True,
+                    )
+                    last_progress_t = now
 
                 # Drain a batch of finished envs (up to ~num_envs at once).
                 finished_batch: list[FinishedEnv] = []
