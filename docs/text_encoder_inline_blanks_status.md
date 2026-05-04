@@ -347,3 +347,6 @@ without treating the accuracy gate as a blocker.
 - `magic_ai/text_encoder/training.py`, `magic_ai/text_encoder/rollout.py`,
   `scripts/inline_blank_bc_parity.py` — legacy option/target-logit training
   and rollout paths now fail closed instead of consuming removed logits.
+- `magic_ai/text_encoder/policy.py`, `magic_ai/text_encoder/recurrent.py` —
+  policy outputs no longer pool or expose legacy option/target vectors or
+  masks; actor-critic replay scoring uses inline blanks plus value/may heads.

@@ -39,10 +39,6 @@ class RecurrentTextPolicyConfig:
 class RecurrentTextPolicyOutput:
     values: Tensor  # [B]
     state_hidden: Tensor  # [B, lstm_hidden]
-    option_vectors: Tensor  # [B, max_opts, d_model]
-    option_mask: Tensor
-    target_vectors: Tensor
-    target_mask: Tensor
     card_vectors: Tensor
     card_mask: Tensor
     blank_logits: Tensor | None = None
@@ -203,10 +199,6 @@ class RecurrentTextPolicy(nn.Module):
         out = RecurrentTextPolicyOutput(
             values=values,
             state_hidden=state_hidden,
-            option_vectors=encoded.option_vectors,
-            option_mask=encoded.option_mask,
-            target_vectors=encoded.target_vectors,
-            target_mask=encoded.target_mask,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,
             blank_logits=encoded.blank_logits,
@@ -239,10 +231,6 @@ class RecurrentTextPolicy(nn.Module):
         return RecurrentTextPolicyOutput(
             values=values,
             state_hidden=state_hidden,
-            option_vectors=encoded.option_vectors,
-            option_mask=encoded.option_mask,
-            target_vectors=encoded.target_vectors,
-            target_mask=encoded.target_mask,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,
             blank_logits=encoded.blank_logits,

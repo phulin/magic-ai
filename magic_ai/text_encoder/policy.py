@@ -2,7 +2,7 @@
 
 This module is the integration target for the eventual ``policy.encoder =
 "text"`` branch in ``magic_ai/model.py``. It owns one ``TextStateEncoder`` and
-the three heads (policy / target / value), exposes a single ``forward`` that
+the value / inline-blank heads, exposes a single ``forward`` that
 takes a :class:`TextEncodedBatch` and returns every tensor downstream code is
 likely to need, and provides a ``encode_snapshots`` convenience that runs the
 render -> tokenize -> collate pipeline so callers do not have to import four
@@ -36,9 +36,7 @@ from magic_ai.text_encoder.model import (
     TextStateEncoder,
     ValueHead,
     gather_card_vectors_packed,
-    gather_option_vectors_packed,
     gather_state_vector_packed,
-    gather_target_vectors_packed,
     initialize_text_state_encoder_from_hf,
 )
 from magic_ai.text_encoder.render import OracleEntry, render_snapshot
@@ -57,10 +55,6 @@ class EncodedSnapshots:
 
     card_vectors: Tensor
     card_mask: Tensor
-    option_vectors: Tensor
-    option_mask: Tensor
-    target_vectors: Tensor
-    target_mask: Tensor
     state_vector: Tensor
     blank_logits: Tensor | None = None
 
@@ -69,28 +63,18 @@ class EncodedSnapshots:
 class TextPolicyOutput:
     """Bundle of tensors produced by :meth:`TextPolicy.forward`.
 
-    Shapes (B = batch, O = max options, M = max targets, K = ``MAX_CARD_REFS``,
-    D = ``cfg.d_model``):
+    Shapes (B = batch, K = ``MAX_CARD_REFS``, D = ``cfg.d_model``):
 
     * ``values``: ``[B]``.
     * ``card_vectors``: ``[B, K, D]``, zero rows where ``card_mask`` is False.
     * ``card_mask``: ``[B, K]`` bool.
-    * ``option_vectors``: ``[B, O, D]``.
-    * ``option_mask``: ``[B, O]`` bool.
-    * ``target_vectors``: ``[B, O, M, D]``.
-    * ``target_mask``: ``[B, O, M]`` bool.
     * ``state_vector``: ``[B, D]`` — pooled at position 0 (``<bos>``).
-    * ``blank_logits``: ``[B, K, V_max]`` when inline blanks are enabled,
-      otherwise ``None``.
+    * ``blank_logits``: ``[B, K_blank, V_max]``.
     """
 
     values: Tensor
     card_vectors: Tensor
     card_mask: Tensor
-    option_vectors: Tensor
-    option_mask: Tensor
-    target_vectors: Tensor
-    target_mask: Tensor
     state_vector: Tensor
     blank_logits: Tensor | None = None
     blank_positions: Tensor | None = None
@@ -141,8 +125,6 @@ class TextPolicy(nn.Module):
 
         hidden = self.encoder.forward_packed(batch)
         card_vecs, card_mask = gather_card_vectors_packed(hidden, batch)
-        option_vecs, option_mask = gather_option_vectors_packed(hidden, batch)
-        target_vecs, target_mask = gather_target_vectors_packed(hidden, batch)
         state_vec = gather_state_vector_packed(hidden, batch)
         blank_logits = self.inline_blank_policy(
             hidden,
@@ -154,10 +136,6 @@ class TextPolicy(nn.Module):
         return EncodedSnapshots(
             card_vectors=card_vecs,
             card_mask=card_mask,
-            option_vectors=option_vecs,
-            option_mask=option_mask,
-            target_vectors=target_vecs,
-            target_mask=target_mask,
             state_vector=state_vec,
             blank_logits=blank_logits,
         )
@@ -178,10 +156,6 @@ class TextPolicy(nn.Module):
             values=values,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,
-            option_vectors=encoded.option_vectors,
-            option_mask=encoded.option_mask,
-            target_vectors=encoded.target_vectors,
-            target_mask=encoded.target_mask,
             state_vector=encoded.state_vector,
             blank_logits=encoded.blank_logits,
             blank_positions=batch.blank_positions,

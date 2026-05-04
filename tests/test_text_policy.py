@@ -348,8 +348,6 @@ def test_text_policy_end_to_end(
     out: TextPolicyOutput = policy(batch)
 
     b_size = batch.token_ids.shape[0]
-    max_opts = batch.option_positions.shape[1]
-    max_targets = batch.target_positions.shape[2]
     d = cfg.d_model
     k = batch.card_ref_positions.shape[1]
 
@@ -357,10 +355,6 @@ def test_text_policy_end_to_end(
     assert out.values.shape == (b_size,)
     assert out.card_vectors.shape == (b_size, k, d)
     assert out.card_mask.shape == (b_size, k)
-    assert out.option_vectors.shape == (b_size, max_opts, d)
-    assert out.option_mask.shape == (b_size, max_opts)
-    assert out.target_vectors.shape == (b_size, max_opts, max_targets, d)
-    assert out.target_mask.shape == (b_size, max_opts, max_targets)
     assert out.state_vector.shape == (b_size, d)
 
     # Finiteness on valid slots; -inf on masked-out logits.
@@ -658,4 +652,4 @@ def test_hf_text_policy_copies_checkpoint_into_local_encoder(monkeypatch) -> Non
     )
     out = policy(batch)
     assert out.state_vector.shape == (2, 16)
-    assert out.option_vectors.shape == (2, 1, 16)
+    assert out.values.shape == (2,)

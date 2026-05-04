@@ -75,16 +75,10 @@ def test_recurrent_forward_and_state_shape() -> None:
     out, (h_out, c_out) = policy(batch, h_in=None, c_in=None)
 
     b = batch.token_ids.shape[0]
-    max_opts = batch.option_positions.shape[1]
-    max_targets = batch.target_positions.shape[2]
     d = policy.cfg.encoder.d_model
 
     assert out.values.shape == (b,)
     assert out.state_hidden.shape == (b, lstm_hidden)
-    assert out.option_vectors.shape == (b, max_opts, d)
-    assert out.option_mask.shape == (b, max_opts)
-    assert out.target_vectors.shape == (b, max_opts, max_targets, d)
-    assert out.target_mask.shape == (b, max_opts, max_targets)
     assert out.card_vectors.shape == (b, MAX_CARD_REFS, d)
     assert out.card_mask.shape == (b, MAX_CARD_REFS)
 
