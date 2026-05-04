@@ -330,6 +330,26 @@ class TextActorCritic(nn.Module):
                 inline_batch = (
                     moved_packed if moved_packed is not None else cast(TextEncodedBatch, moved)
                 )
+                inline_choice_index_sample = (
+                    _sample_inline_choice_index_for_step(
+                        output,
+                        inline_batch,
+                        step_idx=step_idx,
+                        deterministic=deterministic,
+                    )
+                    if trace_kind == "choice_index"
+                    else None
+                )
+                if inline_choice_index_sample is not None:
+                    selected_tensors, log_prob, entropy = inline_choice_index_sample
+                    per_step_log_prob.append(log_prob)
+                    per_step_entropy.append(entropy)
+                    per_step_value.append(value)
+                    per_step_may_sample.append(may_sample_t)
+                    per_step_trace_kind.append(trace_kind)
+                    per_step_layout.append(layout)
+                    per_step_selected_tensors.append(selected_tensors)
+                    continue
                 inline_priority_sample = (
                     _sample_inline_priority_for_step(
                         output,
@@ -1250,11 +1270,19 @@ class TextActorCritic(nn.Module):
                 ),
             )
 
+        choice_log_probs, choice_entropies, choice_group_mask, choice_per_choice = (
+            _evaluate_inline_choice_index_replay_groups(
+                output,
+                batch,
+                return_per_choice=return_per_choice,
+            )
+        )
         priority_log_probs, priority_entropies, priority_group_mask, priority_per_choice = (
             _evaluate_inline_priority_replay_groups(
                 output,
                 batch,
                 return_per_choice=return_per_choice,
+                group_skip_mask=choice_group_mask,
             )
         )
         blocker_log_probs, blocker_entropies, blocker_group_mask, blocker_per_choice = (
@@ -1262,17 +1290,21 @@ class TextActorCritic(nn.Module):
                 output,
                 batch,
                 return_per_choice=return_per_choice,
-                group_skip_mask=priority_group_mask,
+                group_skip_mask=choice_group_mask | priority_group_mask,
             )
         )
-        log_probs = log_probs + priority_log_probs + blocker_log_probs
-        entropies = entropies + priority_entropies + blocker_entropies
+        log_probs = log_probs + choice_log_probs + priority_log_probs + blocker_log_probs
+        entropies = entropies + choice_entropies + priority_entropies + blocker_entropies
 
-        inline_group_mask = priority_group_mask | blocker_group_mask
+        inline_group_mask = choice_group_mask | priority_group_mask | blocker_group_mask
         if return_per_choice:
+            assert choice_per_choice is not None
             assert priority_per_choice is not None
             assert blocker_per_choice is not None
-            inline_per_choice = _concat_replay_per_choice(priority_per_choice, blocker_per_choice)
+            inline_per_choice = _concat_replay_per_choice(
+                _concat_replay_per_choice(choice_per_choice, priority_per_choice),
+                blocker_per_choice,
+            )
         else:
             inline_per_choice = None
         legacy_group_mask = ~inline_group_mask
@@ -1763,6 +1795,45 @@ def _sample_inline_may_for_step(
     return may_selected, dist.log_prob(selected), dist.entropy()
 
 
+def _sample_inline_choice_index_for_step(
+    output: RecurrentTextPolicyOutput,
+    batch: TextEncodedBatch | PackedTextBatch,
+    *,
+    step_idx: int,
+    deterministic: bool,
+) -> tuple[list[Tensor], Tensor, Tensor] | None:
+    blank_logits = output.blank_logits
+    if blank_logits is None or blank_logits.numel() == 0:
+        return None
+    if batch.blank_option_index.numel() == 0:
+        return None
+    row_group_kind = batch.blank_group_kind[step_idx].to(device=blank_logits.device)
+    row_option_index = batch.blank_option_index[step_idx].to(device=blank_logits.device)
+    row_legal_mask = batch.blank_legal_mask[step_idx].to(
+        device=blank_logits.device, dtype=torch.bool
+    )
+    support = (
+        (row_group_kind == BLANK_GROUP_PER_BLANK)
+        & (row_option_index < 0)
+        & row_legal_mask.any(dim=-1)
+    )
+    blanks = support.nonzero(as_tuple=False).squeeze(-1)
+    if blanks.numel() != 1:
+        return None
+    blank_idx = blanks[0]
+    legal_slots = row_legal_mask[blank_idx].nonzero(as_tuple=False).squeeze(-1)
+    if legal_slots.numel() == 0:
+        return None
+    logits = blank_logits[step_idx, blank_idx, legal_slots]
+    dist = Categorical(logits=logits)
+    chosen_in_legal = torch.argmax(logits) if deterministic else dist.sample()
+    return (
+        [legal_slots[chosen_in_legal].to(dtype=torch.long)],
+        dist.log_prob(chosen_in_legal),
+        dist.entropy(),
+    )
+
+
 def _score_inline_may_decisions(
     output: RecurrentTextPolicyOutput,
     batch: TextReplayBatch,
@@ -1957,6 +2028,7 @@ def _evaluate_inline_priority_replay_groups(
     batch: TextReplayBatch,
     *,
     return_per_choice: bool,
+    group_skip_mask: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice | None]:
     decision_count = batch.decision_count
     n = int(decision_count.shape[0])
@@ -2071,6 +2143,8 @@ def _evaluate_inline_priority_replay_groups(
         & (cross_count == 1)
         & target_group_valid
     )
+    if group_skip_mask is not None:
+        group_mask = group_mask & ~group_skip_mask.to(device=device, dtype=torch.bool)
 
     row_target_logits = blank_logits[
         steps_t,
@@ -2160,6 +2234,129 @@ def _evaluate_inline_priority_replay_groups(
         per_choice = ReplayPerChoice(
             flat_logits=flat_logits,
             flat_log_probs=flat_log_probs,
+            group_idx=steps_t[group_ids],
+            choice_cols=choice_cols,
+            is_sampled_flat=choice_cols == selected[group_ids],
+            may_is_active=torch.zeros(n, dtype=torch.bool, device=device),
+            may_logits_per_step=output.values.new_zeros(n),
+            may_selected_per_step=output.values.new_zeros(n),
+            decision_group_id_flat=group_ids,
+            step_for_decision_group=steps_t[group_mask],
+        )
+    return log_probs, entropies, group_mask, per_choice
+
+
+def _evaluate_inline_choice_index_replay_groups(
+    output: RecurrentTextPolicyOutput,
+    batch: TextReplayBatch,
+    *,
+    return_per_choice: bool,
+) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice | None]:
+    decision_count = batch.decision_count
+    n = int(decision_count.shape[0])
+    g_total = int(batch.step_for_decision_group.shape[0])
+    log_probs = output.values.new_zeros(n)
+    entropies = output.values.new_zeros(n)
+    device = output.values.device
+    group_mask = torch.zeros(g_total, dtype=torch.bool, device=device)
+
+    blank_logits = output.blank_logits
+    if (
+        g_total == 0
+        or blank_logits is None
+        or blank_logits.numel() == 0
+        or batch.encoded.blank_option_index.numel() == 0
+    ):
+        per_choice = _empty_replay_per_choice(output, n, device) if return_per_choice else None
+        return log_probs, entropies, group_mask, per_choice
+
+    steps_t = batch.step_for_decision_group.to(device=device, dtype=torch.long)
+    selected = batch.selected_indices.to(device=device, dtype=torch.long)
+    trace_kind = batch.trace_kind_id.to(device=device, dtype=torch.long)
+    decision_mask = batch.decision_mask.to(device=device, dtype=torch.bool)
+
+    blank_group_kind = batch.encoded.blank_group_kind.to(device=device, dtype=torch.long)
+    blank_option_index = batch.encoded.blank_option_index.to(device=device, dtype=torch.long)
+    blank_legal_mask = batch.encoded.blank_legal_mask.to(device=device, dtype=torch.bool)
+    if int(blank_group_kind.shape[1]) == 0 or int(blank_legal_mask.shape[2]) == 0:
+        per_choice = _empty_replay_per_choice(output, n, device) if return_per_choice else None
+        return log_probs, entropies, group_mask, per_choice
+
+    row_group_kind = blank_group_kind[steps_t]
+    row_option_index = blank_option_index[steps_t]
+    row_legal_mask = blank_legal_mask[steps_t]
+    support = (
+        (row_group_kind == BLANK_GROUP_PER_BLANK)
+        & (row_option_index < 0)
+        & row_legal_mask.any(dim=-1)
+    )
+    match_count = support.sum(dim=-1)
+    blank_idx = support.to(dtype=torch.long).argmax(dim=-1)
+    row_mask = row_legal_mask[
+        torch.arange(g_total, dtype=torch.long, device=device),
+        blank_idx,
+    ]
+    legal_width = int(row_mask.shape[1])
+    choice_width = int(decision_mask.shape[1])
+    selected_in_range = (selected >= 0) & (selected < legal_width)
+    selected_in_decision_range = (selected >= 0) & (selected < choice_width)
+    safe_selected = selected.clamp(min=0, max=legal_width - 1)
+    selected_legal = row_mask.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
+    safe_decision_selected = selected.clamp(min=0, max=max(choice_width - 1, 0))
+    selected_engine_valid = (
+        decision_mask.gather(1, safe_decision_selected.unsqueeze(1)).squeeze(1)
+        if choice_width > 0
+        else torch.zeros_like(selected_legal)
+    )
+    group_mask = (
+        (trace_kind[steps_t] == TRACE_KIND_TO_ID["choice_index"])
+        & (match_count == 1)
+        & selected_in_range
+        & selected_in_decision_range
+        & selected_legal
+        & selected_engine_valid
+    )
+
+    row_logits = blank_logits[steps_t, blank_idx]
+    dummy_mask = torch.zeros_like(row_mask)
+    dummy_mask[:, 0] = True
+    effective_mask = torch.where(group_mask.unsqueeze(1), row_mask, dummy_mask)
+    safe_logits = torch.where(group_mask.unsqueeze(1), row_logits, torch.zeros_like(row_logits))
+    log_probs_dense = torch.log_softmax(
+        safe_logits.masked_fill(~effective_mask, float("-inf")),
+        dim=-1,
+    )
+    probs = log_probs_dense.exp()
+    safe_log_probs = torch.where(effective_mask, log_probs_dense, log_probs_dense.new_zeros(()))
+    per_group_log_prob = log_probs_dense.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
+    per_group_entropy = -(probs * safe_log_probs).sum(dim=-1)
+    per_group_log_prob = torch.where(
+        group_mask,
+        per_group_log_prob,
+        per_group_log_prob.new_zeros(()),
+    )
+    per_group_entropy = torch.where(
+        group_mask,
+        per_group_entropy,
+        per_group_entropy.new_zeros(()),
+    )
+    log_probs = log_probs.scatter_add(0, steps_t, per_group_log_prob)
+    entropies = entropies.scatter_add(0, steps_t, per_group_entropy)
+
+    if not return_per_choice:
+        return log_probs, entropies, group_mask, None
+
+    flat_width = min(choice_width, legal_width)
+    flat_valid = group_mask.unsqueeze(1) & decision_mask[:, :flat_width] & row_mask[:, :flat_width]
+    flat_indices = flat_valid.nonzero(as_tuple=False)
+    if int(flat_indices.numel()) == 0:
+        per_choice = _empty_replay_per_choice(output, n, device)
+    else:
+        group_ids = flat_indices[:, 0]
+        choice_cols = flat_indices[:, 1]
+        per_choice = ReplayPerChoice(
+            flat_logits=row_logits[group_ids, choice_cols],
+            flat_log_probs=log_probs_dense[group_ids, choice_cols],
             group_idx=steps_t[group_ids],
             choice_cols=choice_cols,
             is_sampled_flat=choice_cols == selected[group_ids],

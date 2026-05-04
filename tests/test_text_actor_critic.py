@@ -9,8 +9,10 @@ from magic_ai.text_encoder.actor_critic import (
     TextActorCritic,
     TextDecisionLayout,
     _evaluate_inline_blocker_replay_groups,
+    _evaluate_inline_choice_index_replay_groups,
     _evaluate_inline_priority_replay_groups,
     _sample_inline_blockers_for_step,
+    _sample_inline_choice_index_for_step,
     _sample_inline_may_for_step,
     _sample_inline_priority_for_step,
     _score_inline_may_decisions,
@@ -348,6 +350,47 @@ class TextActorCriticTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(log_prob))
         self.assertTrue(torch.isfinite(entropy))
 
+    def test_inline_choice_index_sampler_uses_mode_blank(self) -> None:
+        output = RecurrentTextPolicyOutput(
+            policy_logits=torch.empty(1, 0),
+            target_logits=torch.empty(1, 0, 0),
+            values=torch.zeros(1),
+            state_hidden=torch.zeros(1, 8),
+            option_vectors=torch.empty(1, 0, 8),
+            option_mask=torch.zeros(1, 0, dtype=torch.bool),
+            target_vectors=torch.empty(1, 0, 0, 8),
+            target_mask=torch.zeros(1, 0, 0, dtype=torch.bool),
+            card_vectors=torch.empty(1, MAX_CARD_REFS, 8),
+            card_mask=torch.zeros(1, MAX_CARD_REFS, dtype=torch.bool),
+            blank_logits=torch.tensor([[[0.0, 4.0, 1.0]]]),
+        )
+        batch = TextEncodedBatch(
+            token_ids=torch.tensor([[1]]),
+            attention_mask=torch.ones(1, 1, dtype=torch.long),
+            card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
+            option_positions=torch.empty(1, 0, dtype=torch.long),
+            option_mask=torch.zeros(1, 0, dtype=torch.bool),
+            target_positions=torch.empty(1, 0, 0, dtype=torch.long),
+            target_mask=torch.zeros(1, 0, 0, dtype=torch.bool),
+            seq_lengths=torch.tensor([1]),
+            blank_group_kind=torch.tensor([[BLANK_GROUP_PER_BLANK]], dtype=torch.int32),
+            blank_option_index=torch.tensor([[-1]], dtype=torch.int32),
+            blank_legal_mask=torch.tensor([[[True, True, True]]]),
+        )
+
+        sampled = _sample_inline_choice_index_for_step(
+            output,
+            batch,
+            step_idx=0,
+            deterministic=True,
+        )
+
+        assert sampled is not None
+        selected, log_prob, entropy = sampled
+        self.assertEqual([int(t.item()) for t in selected], [1])
+        self.assertTrue(torch.isfinite(log_prob))
+        self.assertTrue(torch.isfinite(entropy))
+
     def test_inline_blocker_replay_scoring_uses_blank_logits(self) -> None:
         output = RecurrentTextPolicyOutput(
             policy_logits=torch.empty(1, 0),
@@ -556,6 +599,75 @@ class TextActorCriticTests(unittest.TestCase):
         torch.testing.assert_close(active, torch.tensor([True]))
         torch.testing.assert_close(logits_per_step, torch.tensor([3.0]))
         torch.testing.assert_close(selected_per_step, torch.tensor([1.0]))
+
+    def test_inline_choice_index_replay_scoring_uses_mode_blank(self) -> None:
+        output = RecurrentTextPolicyOutput(
+            policy_logits=torch.empty(1, 0),
+            target_logits=torch.empty(1, 0, 0),
+            values=torch.zeros(1),
+            state_hidden=torch.zeros(1, 8),
+            option_vectors=torch.empty(1, 0, 8),
+            option_mask=torch.zeros(1, 0, dtype=torch.bool),
+            target_vectors=torch.empty(1, 0, 0, 8),
+            target_mask=torch.zeros(1, 0, 0, dtype=torch.bool),
+            card_vectors=torch.empty(1, MAX_CARD_REFS, 8),
+            card_mask=torch.zeros(1, MAX_CARD_REFS, dtype=torch.bool),
+            blank_logits=torch.tensor([[[0.0, 4.0, 1.0]]]),
+        )
+        encoded = PackedTextBatch(
+            token_ids=torch.tensor([1], dtype=torch.int32),
+            seq_id=torch.tensor([0], dtype=torch.int32),
+            pos_in_seq=torch.tensor([0], dtype=torch.int32),
+            cu_seqlens=torch.tensor([0, 1], dtype=torch.int32),
+            seq_lengths=torch.tensor([1], dtype=torch.int32),
+            state_positions=torch.tensor([0], dtype=torch.int32),
+            card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.int32),
+            option_positions=torch.empty(1, 0, dtype=torch.int32),
+            option_mask=torch.zeros(1, 0, dtype=torch.bool),
+            target_positions=torch.empty(1, 0, 0, dtype=torch.int32),
+            target_mask=torch.zeros(1, 0, 0, dtype=torch.bool),
+            blank_positions=torch.tensor([[0]], dtype=torch.int32),
+            blank_kind=torch.ones(1, 1, dtype=torch.int32),
+            blank_group=torch.zeros(1, 1, dtype=torch.int32),
+            blank_group_kind=torch.tensor([[BLANK_GROUP_PER_BLANK]], dtype=torch.int32),
+            blank_option_index=torch.tensor([[-1]], dtype=torch.int32),
+            blank_legal_ids=torch.ones(1, 1, 3, dtype=torch.int32),
+            blank_legal_mask=torch.tensor([[[True, True, True]]]),
+        )
+        batch = TextReplayBatch(
+            encoded=encoded,
+            trace_kind_id=torch.tensor([TRACE_KIND_TO_ID["choice_index"]]),
+            decision_start=torch.tensor([0]),
+            decision_count=torch.tensor([1]),
+            decision_option_idx=torch.tensor([[0, 1, 2, -1]]),
+            decision_target_idx=torch.tensor([[-1, -1, -1, -1]]),
+            decision_mask=torch.tensor([[True, True, True, False]]),
+            uses_none_head=torch.zeros(1, dtype=torch.bool),
+            selected_indices=torch.tensor([1]),
+            step_for_decision_group=torch.tensor([0]),
+            may_selected=torch.zeros(1),
+            old_log_prob=torch.zeros(1),
+            value=torch.zeros(1),
+            perspective_player_idx=torch.zeros(1, dtype=torch.long),
+            lstm_h_in=None,
+            lstm_c_in=None,
+        )
+
+        log_probs, entropies, group_mask, per_choice = _evaluate_inline_choice_index_replay_groups(
+            output,
+            batch,
+            return_per_choice=True,
+        )
+
+        blank_logits = output.blank_logits
+        assert blank_logits is not None
+        expected = torch.log_softmax(blank_logits[0, 0], dim=0)[1]
+        torch.testing.assert_close(log_probs[0], expected)
+        self.assertTrue(torch.isfinite(entropies).all())
+        torch.testing.assert_close(group_mask, torch.tensor([True]))
+        assert per_choice is not None
+        self.assertEqual(tuple(per_choice.flat_logits.shape), (3,))
+        self.assertEqual(int(per_choice.is_sampled_flat.sum()), 1)
 
     def test_sample_native_tensor_batch_appends_replay_rows(self) -> None:
         torch.manual_seed(0)
