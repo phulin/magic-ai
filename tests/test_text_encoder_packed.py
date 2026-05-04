@@ -36,28 +36,10 @@ def _make_batch(vocab_size: int = 1000) -> TextEncodedBatch:
     card_ref_positions[1, :2] = torch.tensor([3, 6])
     card_ref_positions[2, :1] = torch.tensor([4])
 
-    max_opts, max_targets = 4, 3
-    option_positions = torch.full((b, max_opts), -1, dtype=torch.int64)
-    option_positions[0, :3] = torch.tensor([10, 13, 16])
-    option_positions[1, :2] = torch.tensor([7, 10])
-    option_positions[2, :1] = torch.tensor([5])
-    option_mask = option_positions >= 0
-
-    target_positions = torch.full((b, max_opts, max_targets), -1, dtype=torch.int64)
-    target_positions[0, 0, :2] = torch.tensor([11, 12])
-    target_positions[0, 1, :1] = torch.tensor([14])
-    target_positions[1, 0, :3] = torch.tensor([8, 9, 10])
-    target_positions[2, 0, :2] = torch.tensor([6, 7])
-    target_mask = target_positions >= 0
-
     return TextEncodedBatch(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=seq_lens,
     )
 
@@ -83,13 +65,13 @@ def test_pack_batch_shapes_and_anchors() -> None:
         assert torch.equal(seg, torch.arange(end - start, dtype=torch.int64))
         assert (packed.seq_id[start:end] == i).all()
 
-    # Anchors get rebased; -1s stay -1.
+    # Card anchors get rebased; -1s stay -1.
     base = expected_cu[:-1]
-    valid = padded.option_positions >= 0
-    expected_opts = torch.where(
-        valid, padded.option_positions + base.unsqueeze(-1), padded.option_positions
+    valid = padded.card_ref_positions >= 0
+    expected_cards = torch.where(
+        valid, padded.card_ref_positions + base.unsqueeze(-1), padded.card_ref_positions
     )
-    assert torch.equal(packed.option_positions, expected_opts)
+    assert torch.equal(packed.card_ref_positions, expected_cards)
 
 
 def test_padded_vs_packed_parity() -> None:

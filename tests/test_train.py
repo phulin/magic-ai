@@ -660,19 +660,11 @@ class TrainPPOTests(unittest.TestCase):
             token_ids = torch.tensor([[1, 4, 5, 2]], dtype=torch.long)
             attention_mask = torch.ones_like(token_ids)
             card_ref_positions = torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long)
-            option_positions = torch.tensor([[1, 2]], dtype=torch.long)
-            option_mask = torch.tensor([[True, True]])
-            target_positions = torch.full((1, 2, 1), -1, dtype=torch.long)
-            target_mask = torch.zeros((1, 2, 1), dtype=torch.bool)
             seq_lengths = torch.tensor([4], dtype=torch.long)
             return TextEncodedBatch(
                 token_ids=token_ids,
                 attention_mask=attention_mask,
                 card_ref_positions=card_ref_positions,
-                option_positions=option_positions,
-                option_mask=option_mask,
-                target_positions=target_positions,
-                target_mask=target_mask,
                 seq_lengths=seq_lengths,
             )
 
@@ -952,10 +944,6 @@ class TrainPPOTests(unittest.TestCase):
             token_ids=torch.tensor([[101, 102, 103, 0, 0], [201, 202, 0, 0, 0]]),
             attention_mask=torch.tensor([[1, 1, 1, 0, 0], [1, 1, 0, 0, 0]]),
             card_ref_positions=torch.full((2, MAX_CARD_REFS), -1, dtype=torch.long),
-            option_positions=torch.tensor([[1, -1, -1], [0, -1, -1]]),
-            option_mask=torch.tensor([[True, False, False], [True, False, False]]),
-            target_positions=torch.full((2, 3, 2), -1, dtype=torch.long),
-            target_mask=torch.zeros((2, 3, 2), dtype=torch.bool),
             seq_lengths=torch.tensor([3, 2]),
         )
         payload = NativeTextReplayPayload(

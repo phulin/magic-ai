@@ -16,11 +16,9 @@ from magic_ai.text_encoder.batch import (
     subtract_packed_offsets,
 )
 from magic_ai.text_encoder.replay_triton import (
-    append_batch_encoded_triton,
     gather_decisions_triton,
     gather_encoded_triton,
     gather_sequence_layout_triton,
-    gather_text_fields_triton,
 )
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -134,29 +132,6 @@ class TextReplayBuffer:
         self._token_cursor = 0
         self.card_ref_positions = torch.full(
             (self.capacity, self.max_card_refs), -1, dtype=torch.int32, device=self.device
-        )
-        self.option_positions = torch.full(
-            (self.capacity, self.max_options), -1, dtype=torch.int32, device=self.device
-        )
-        self.option_mask = torch.zeros(
-            self.capacity, self.max_options, dtype=torch.bool, device=self.device
-        )
-        self.target_positions = torch.full(
-            (
-                self.capacity,
-                self.max_options,
-                self.max_targets_per_option,
-            ),
-            -1,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.target_mask = torch.zeros(
-            self.capacity,
-            self.max_options,
-            self.max_targets_per_option,
-            dtype=torch.bool,
-            device=self.device,
         )
         self.blank_positions = torch.full(
             (self.capacity, self.max_blanks_per_row),
@@ -366,10 +341,6 @@ class TextReplayBuffer:
             max_seq_length = int(seq_lengths.max().item()) if batch_size > 0 else 0
             if max_seq_length > self.max_tokens:
                 raise ValueError("encoded packed row token width exceeds buffer max_tokens")
-            if encoded.option_positions.shape[1] > self.max_options:
-                raise ValueError("encoded option width exceeds buffer max_options")
-            if encoded.target_positions.shape[2] > self.max_targets_per_option:
-                raise ValueError("encoded target width exceeds buffer max_targets_per_option")
             self._validate_packed_blank_widths(encoded)
         total_tokens = int(encoded.token_ids.numel())
         token_start = self._token_cursor
@@ -407,44 +378,13 @@ class TextReplayBuffer:
         except RuntimeError as exc:
             raise RuntimeError("TextReplayBuffer is full") from exc
 
-        wrote_encoded_with_triton = False
-        if self.use_triton_append:
-            wrote_encoded_with_triton = append_batch_encoded_triton(
-                token_ids=encoded.token_ids,
-                cu_seqlens=encoded.cu_seqlens,
-                seq_lengths=seq_lengths,
-                state_positions=encoded.state_positions,
-                card_ref_positions=encoded.card_ref_positions,
-                option_positions=encoded.option_positions,
-                option_mask=encoded.option_mask,
-                target_positions=encoded.target_positions,
-                target_mask=encoded.target_mask,
-                rows=rows,
-                packed_token_ids=self.packed_token_ids,
-                row_token_start=self.row_token_start,
-                row_token_length=self.row_token_length,
-                dst_card_ref_positions=self.card_ref_positions,
-                dst_option_positions=self.option_positions,
-                dst_option_mask=self.option_mask,
-                dst_target_positions=self.target_positions,
-                dst_target_mask=self.target_mask,
-                dst_seq_lengths=self.seq_lengths,
-                token_start=token_start,
-            )
-        option_width = min(int(encoded.option_positions.shape[1]), self.max_options)
-        target_width = min(int(encoded.target_positions.shape[2]), self.max_targets_per_option)
         blank_width = min(int(encoded.blank_positions.shape[1]), self.max_blanks_per_row)
         blank_legal_width = min(int(encoded.blank_legal_ids.shape[2]), self.max_legal_per_blank)
         seq_lengths_i32 = seq_lengths.to(dtype=torch.int32)
-        if not wrote_encoded_with_triton:
-            self.row_token_start[rows] = -1
-            self.row_token_length[rows] = 0
-            self.card_ref_positions.index_fill_(0, rows, -1)
-            self.option_positions.index_fill_(0, rows, -1)
-            self.option_mask.index_fill_(0, rows, 0)
-            self.target_positions.index_fill_(0, rows, -1)
-            self.target_mask.index_fill_(0, rows, 0)
-            self.seq_lengths[rows] = seq_lengths_i32
+        self.row_token_start[rows] = -1
+        self.row_token_length[rows] = 0
+        self.card_ref_positions.index_fill_(0, rows, -1)
+        self.seq_lengths[rows] = seq_lengths_i32
 
         self.blank_positions.index_fill_(0, rows, -1)
         self.blank_kind.index_fill_(0, rows, 0)
@@ -453,39 +393,20 @@ class TextReplayBuffer:
         self.blank_option_index.index_fill_(0, rows, -1)
         self.blank_legal_ids.index_fill_(0, rows, 0)
         self.blank_legal_mask.index_fill_(0, rows, 0)
-        if not wrote_encoded_with_triton:
-            token_ids = encoded.token_ids.to(device=self.device, dtype=torch.int32)
-            if total_tokens > 0:
-                self.packed_token_ids[token_start:token_end] = token_ids
-            self.row_token_start[rows] = token_start + encoded.cu_seqlens[:-1].to(
-                device=self.device, dtype=torch.int32
-            )
-            self.row_token_length[rows] = seq_lengths_i32
+        token_ids = encoded.token_ids.to(device=self.device, dtype=torch.int32)
+        if total_tokens > 0:
+            self.packed_token_ids[token_start:token_end] = token_ids
+        self.row_token_start[rows] = token_start + encoded.cu_seqlens[:-1].to(
+            device=self.device, dtype=torch.int32
+        )
+        self.row_token_length[rows] = seq_lengths_i32
 
-            state_positions = encoded.state_positions.to(device=self.device, dtype=torch.int32)
+        state_positions = encoded.state_positions.to(device=self.device, dtype=torch.int32)
 
-            self.card_ref_positions[rows] = subtract_packed_offsets(
-                encoded.card_ref_positions.to(device=self.device),
-                state_positions,
-            )
-            if option_width > 0:
-                self.option_positions[rows, :option_width] = subtract_packed_offsets(
-                    encoded.option_positions[:, :option_width].to(device=self.device),
-                    state_positions,
-                )
-                self.option_mask[rows, :option_width] = encoded.option_mask[:, :option_width].to(
-                    device=self.device, dtype=torch.bool
-                )
-            if option_width > 0 and target_width > 0:
-                self.target_positions[rows, :option_width, :target_width] = subtract_packed_offsets(
-                    encoded.target_positions[:, :option_width, :target_width].to(
-                        device=self.device
-                    ),
-                    state_positions,
-                )
-                self.target_mask[rows, :option_width, :target_width] = encoded.target_mask[
-                    :, :option_width, :target_width
-                ].to(device=self.device, dtype=torch.bool)
+        self.card_ref_positions[rows] = subtract_packed_offsets(
+            encoded.card_ref_positions.to(device=self.device),
+            state_positions,
+        )
         if blank_width > 0:
             state_positions = encoded.state_positions.to(device=self.device, dtype=torch.int32)
             self.blank_positions[rows, :blank_width] = subtract_packed_offsets(
@@ -584,53 +505,15 @@ class TextReplayBuffer:
         else:
             token_ids, seq_id, pos_in_seq = gathered_encoded
 
-        gathered_fields = None
-        if self.use_triton_gather:
-            gathered_fields = gather_text_fields_triton(
-                rows=idx,
-                state_positions=state_positions,
-                card_ref_positions=self.card_ref_positions,
-                option_positions=self.option_positions,
-                option_mask=self.option_mask,
-                target_positions=self.target_positions,
-                target_mask=self.target_mask,
-                trace_kind_id=self.trace_kind_id,
-                may_selected=self.may_selected,
-                old_log_prob=self.old_log_prob,
-                value=self.value,
-                perspective_player_idx=self.perspective_player_idx,
-                lstm_h_in=self.lstm_h_in,
-                lstm_c_in=self.lstm_c_in,
-            )
-        if gathered_fields is None:
-            card_ref_positions = add_packed_offsets(self.card_ref_positions[idx], state_positions)
-            option_positions = add_packed_offsets(self.option_positions[idx], state_positions)
-            option_mask = self.option_mask[idx]
-            target_positions = add_packed_offsets(self.target_positions[idx], state_positions)
-            target_mask = self.target_mask[idx]
-            common = self.core.gather_common(idx)
-            trace_kind_id = common.trace_kind_id
-            may_selected = common.may_selected
-            old_log_prob = common.old_log_prob
-            value = common.value
-            perspective_player_idx = common.perspective_player_idx
-            h_in = common.lstm_h_in
-            c_in = common.lstm_c_in
-        else:
-            (
-                card_ref_positions,
-                option_positions,
-                option_mask,
-                target_positions,
-                target_mask,
-                trace_kind_id,
-                may_selected,
-                old_log_prob,
-                value,
-                perspective_player_idx,
-                h_in,
-                c_in,
-            ) = gathered_fields
+        card_ref_positions = add_packed_offsets(self.card_ref_positions[idx], state_positions)
+        common = self.core.gather_common(idx)
+        trace_kind_id = common.trace_kind_id
+        may_selected = common.may_selected
+        old_log_prob = common.old_log_prob
+        value = common.value
+        perspective_player_idx = common.perspective_player_idx
+        h_in = common.lstm_h_in
+        c_in = common.lstm_c_in
         blank_positions = add_packed_offsets(self.blank_positions[idx], state_positions)
         blank_kind = self.blank_kind[idx]
         blank_group = self.blank_group[idx]
@@ -681,10 +564,6 @@ class TextReplayBuffer:
             seq_lengths=seq_lengths,
             state_positions=state_positions,
             card_ref_positions=card_ref_positions,
-            option_positions=option_positions,
-            option_mask=option_mask,
-            target_positions=target_positions,
-            target_mask=target_mask,
             blank_positions=blank_positions,
             blank_kind=blank_kind,
             blank_group=blank_group,
@@ -733,10 +612,6 @@ class TextReplayBuffer:
         self._validate_batch_index(encoded, batch_index)
         seq_length = int(encoded.seq_lengths[batch_index].item())
         self.card_ref_positions[row].fill_(-1)
-        self.option_positions[row].fill_(-1)
-        self.option_mask[row].zero_()
-        self.target_positions[row].fill_(-1)
-        self.target_mask[row].zero_()
         self._clear_blank_row(row)
         self._write_row_packed_tokens(
             row,
@@ -745,26 +620,8 @@ class TextReplayBuffer:
         self.card_ref_positions[row].copy_(
             encoded.card_ref_positions[batch_index].to(device=self.device, dtype=torch.int32)
         )
-        option_width = min(encoded.option_positions.shape[1], self.max_options)
-        target_width = min(encoded.target_positions.shape[2], self.max_targets_per_option)
         blank_width = min(encoded.blank_positions.shape[1], self.max_blanks_per_row)
         blank_legal_width = min(encoded.blank_legal_ids.shape[2], self.max_legal_per_blank)
-        self.option_positions[row, :option_width].copy_(
-            encoded.option_positions[batch_index, :option_width].to(
-                device=self.device, dtype=torch.int32
-            )
-        )
-        self.option_mask[row, :option_width].copy_(
-            encoded.option_mask[batch_index, :option_width].to(device=self.device)
-        )
-        self.target_positions[row, :option_width, :target_width].copy_(
-            encoded.target_positions[batch_index, :option_width, :target_width].to(
-                device=self.device, dtype=torch.int32
-            )
-        )
-        self.target_mask[row, :option_width, :target_width].copy_(
-            encoded.target_mask[batch_index, :option_width, :target_width].to(device=self.device)
-        )
         self._copy_padded_blank_row(
             row,
             encoded,
@@ -789,10 +646,6 @@ class TextReplayBuffer:
             raise ValueError("encoded packed row token width exceeds buffer max_tokens")
 
         self.card_ref_positions[row].fill_(-1)
-        self.option_positions[row].fill_(-1)
-        self.option_mask[row].zero_()
-        self.target_positions[row].fill_(-1)
-        self.target_mask[row].zero_()
         self._clear_blank_row(row)
 
         self._write_row_packed_tokens(
@@ -812,36 +665,8 @@ class TextReplayBuffer:
             .squeeze(0)
             .to(device=self.device, dtype=torch.int32)
         )
-        option_width = min(encoded.option_positions.shape[1], self.max_options)
-        target_width = min(encoded.target_positions.shape[2], self.max_targets_per_option)
         blank_width = min(encoded.blank_positions.shape[1], self.max_blanks_per_row)
         blank_legal_width = min(encoded.blank_legal_ids.shape[2], self.max_legal_per_blank)
-        self.option_positions[row, :option_width].copy_(
-            subtract_packed_offsets(
-                encoded.option_positions[batch_index : batch_index + 1, :option_width].to(
-                    device=self.device
-                ),
-                state_positions,
-            )
-            .squeeze(0)
-            .to(device=self.device, dtype=torch.int32)
-        )
-        self.option_mask[row, :option_width].copy_(
-            encoded.option_mask[batch_index, :option_width].to(device=self.device)
-        )
-        self.target_positions[row, :option_width, :target_width].copy_(
-            subtract_packed_offsets(
-                encoded.target_positions[
-                    batch_index : batch_index + 1, :option_width, :target_width
-                ].to(device=self.device),
-                state_positions,
-            )
-            .squeeze(0)
-            .to(device=self.device, dtype=torch.int32)
-        )
-        self.target_mask[row, :option_width, :target_width].copy_(
-            encoded.target_mask[batch_index, :option_width, :target_width].to(device=self.device)
-        )
         self._copy_packed_blank_row(
             row,
             encoded,
@@ -967,10 +792,6 @@ class TextReplayBuffer:
             raise ValueError("encoded batch token width exceeds buffer max_tokens")
         if encoded.card_ref_positions.shape[1] != self.max_card_refs:
             raise ValueError("encoded card_ref_positions width does not match buffer")
-        if encoded.option_positions.shape[1] > self.max_options:
-            raise ValueError("encoded option width exceeds buffer max_options")
-        if encoded.target_positions.shape[2] > self.max_targets_per_option:
-            raise ValueError("encoded target width exceeds buffer max_targets_per_option")
         self._validate_blank_widths(encoded)
 
     def _validate_packed_batch_index(self, encoded: PackedTextBatch, batch_index: int) -> None:
@@ -979,10 +800,6 @@ class TextReplayBuffer:
             raise IndexError("batch_index out of range")
         if encoded.card_ref_positions.shape[1] != self.max_card_refs:
             raise ValueError("encoded card_ref_positions width does not match buffer")
-        if encoded.option_positions.shape[1] > self.max_options:
-            raise ValueError("encoded option width exceeds buffer max_options")
-        if encoded.target_positions.shape[2] > self.max_targets_per_option:
-            raise ValueError("encoded target width exceeds buffer max_targets_per_option")
         self._validate_packed_blank_widths(encoded)
 
     def _validate_blank_widths(self, encoded: TextEncodedBatch) -> None:

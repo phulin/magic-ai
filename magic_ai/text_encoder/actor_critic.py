@@ -2240,10 +2240,6 @@ def _dense_from_packed_batch(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=subtract_packed_offsets(batch.card_ref_positions, batch.state_positions),
-        option_positions=subtract_packed_offsets(batch.option_positions, batch.state_positions),
-        option_mask=batch.option_mask,
-        target_positions=subtract_packed_offsets(batch.target_positions, batch.state_positions),
-        target_mask=batch.target_mask,
         seq_lengths=batch.seq_lengths,
         blank_positions=subtract_packed_offsets(batch.blank_positions, batch.state_positions),
         blank_kind=batch.blank_kind,
@@ -2262,20 +2258,10 @@ def _move_text_batch(batch: TextEncodedBatch, device: torch.device) -> TextEncod
     # the H2D transfer happens on the actual storage (uint8) rather than
     # an unpinned bool intermediate.
     nb = device.type == "cuda"
-    option_mask = batch.option_mask.to(device, non_blocking=nb)
-    target_mask = batch.target_mask.to(device, non_blocking=nb)
-    if option_mask.dtype != torch.bool:
-        option_mask = option_mask.to(dtype=torch.bool)
-    if target_mask.dtype != torch.bool:
-        target_mask = target_mask.to(dtype=torch.bool)
     return TextEncodedBatch(
         token_ids=batch.token_ids.to(device, non_blocking=nb),
         attention_mask=batch.attention_mask.to(device, non_blocking=nb),
         card_ref_positions=batch.card_ref_positions.to(device, non_blocking=nb),
-        option_positions=batch.option_positions.to(device, non_blocking=nb),
-        option_mask=option_mask,
-        target_positions=batch.target_positions.to(device, non_blocking=nb),
-        target_mask=target_mask,
         seq_lengths=batch.seq_lengths.to(device, non_blocking=nb),
         blank_positions=batch.blank_positions.to(device, non_blocking=nb),
         blank_kind=batch.blank_kind.to(device, non_blocking=nb),
@@ -2289,12 +2275,6 @@ def _move_text_batch(batch: TextEncodedBatch, device: torch.device) -> TextEncod
 
 def _move_packed_text_batch(batch: PackedTextBatch, device: torch.device) -> PackedTextBatch:
     nb = device.type == "cuda"
-    option_mask = batch.option_mask.to(device, non_blocking=nb)
-    target_mask = batch.target_mask.to(device, non_blocking=nb)
-    if option_mask.dtype != torch.bool:
-        option_mask = option_mask.to(dtype=torch.bool)
-    if target_mask.dtype != torch.bool:
-        target_mask = target_mask.to(dtype=torch.bool)
     seq_lengths = batch.seq_lengths.to(device, non_blocking=nb)
     cu_seqlens = batch.cu_seqlens.to(device, non_blocking=nb)
     if batch.seq_id.numel() == 0 and batch.pos_in_seq.numel() == 0:
@@ -2310,10 +2290,6 @@ def _move_packed_text_batch(batch: PackedTextBatch, device: torch.device) -> Pac
         seq_lengths=seq_lengths,
         state_positions=batch.state_positions.to(device, non_blocking=nb),
         card_ref_positions=batch.card_ref_positions.to(device, non_blocking=nb),
-        option_positions=batch.option_positions.to(device, non_blocking=nb),
-        option_mask=option_mask,
-        target_positions=batch.target_positions.to(device, non_blocking=nb),
-        target_mask=target_mask,
         blank_positions=batch.blank_positions.to(device, non_blocking=nb),
         blank_kind=batch.blank_kind.to(device, non_blocking=nb),
         blank_group=batch.blank_group.to(device, non_blocking=nb),

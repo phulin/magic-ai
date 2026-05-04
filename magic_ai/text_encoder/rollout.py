@@ -414,10 +414,6 @@ class TextRolloutWorker:
             token_ids=batch.token_ids.to(self.device),
             attention_mask=batch.attention_mask.to(self.device),
             card_ref_positions=batch.card_ref_positions.to(self.device),
-            option_positions=batch.option_positions.to(self.device),
-            option_mask=batch.option_mask.to(self.device),
-            target_positions=batch.target_positions.to(self.device),
-            target_mask=batch.target_mask.to(self.device),
             seq_lengths=batch.seq_lengths.to(self.device),
         )
 

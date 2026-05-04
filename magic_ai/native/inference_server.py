@@ -111,10 +111,6 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
         seq_lengths=seq_lengths,
         state_positions=state_positions,
         card_ref_positions=_shift_anchor("card_ref_positions"),
-        option_positions=_shift_anchor("option_positions"),
-        option_mask=torch.cat([b.option_mask for b in batches], dim=0),
-        target_positions=_shift_anchor("target_positions"),
-        target_mask=torch.cat([b.target_mask for b in batches], dim=0),
     )
 
 

@@ -121,10 +121,6 @@ def encode_card_batch(
         token_ids=batch.token_ids.to(device),
         attention_mask=batch.attention_mask.to(device),
         card_ref_positions=batch.card_ref_positions.to(device),
-        option_positions=batch.option_positions.to(device),
-        option_mask=batch.option_mask.to(device),
-        target_positions=batch.target_positions.to(device),
-        target_mask=batch.target_mask.to(device),
         seq_lengths=batch.seq_lengths.to(device),
     )
 

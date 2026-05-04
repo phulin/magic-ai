@@ -366,10 +366,6 @@ class NativeAssemblerParityTests(unittest.TestCase):
                     seq_lengths=expected.seq_lengths.clone(),
                     state_positions=expected.state_positions.clone(),
                     card_ref_positions=expected.card_ref_positions.clone(),
-                    option_positions=expected.option_positions.clone(),
-                    option_mask=expected.option_mask.clone(),
-                    target_positions=expected.target_positions.clone(),
-                    target_mask=expected.target_mask.clone(),
                 )
                 _, packed_outputs = self._encode_native_packed(game, player_idx)
                 captures.append((expected_clone, packed_outputs, None))
@@ -393,10 +389,6 @@ class NativeAssemblerParityTests(unittest.TestCase):
             self.assertTrue(torch.equal(packed.cu_seqlens, expected.cu_seqlens))
             self.assertTrue(torch.equal(packed.seq_lengths, expected.seq_lengths))
             self.assertTrue(torch.equal(packed.state_positions, expected.state_positions))
-            self.assertTrue(torch.equal(packed.option_positions, expected.option_positions))
-            self.assertTrue(torch.equal(packed.option_mask, expected.option_mask))
-            self.assertTrue(torch.equal(packed.target_positions, expected.target_positions))
-            self.assertTrue(torch.equal(packed.target_mask, expected.target_mask))
             self.assertTrue(torch.equal(packed.card_ref_positions, expected.card_ref_positions))
 
     def test_packed_native_output_reuse_matches_pack_batch_of_dense(self) -> None:
@@ -454,10 +446,6 @@ class NativeAssemblerParityTests(unittest.TestCase):
                             seq_lengths=expected.seq_lengths.clone(),
                             state_positions=expected.state_positions.clone(),
                             card_ref_positions=expected.card_ref_positions.clone(),
-                            option_positions=expected.option_positions.clone(),
-                            option_mask=expected.option_mask.clone(),
-                            target_positions=expected.target_positions.clone(),
-                            target_mask=expected.target_mask.clone(),
                         ),
                         type(packed)(
                             token_ids=packed.token_ids.clone(),
@@ -467,10 +455,6 @@ class NativeAssemblerParityTests(unittest.TestCase):
                             seq_lengths=packed.seq_lengths.clone(),
                             state_positions=packed.state_positions.clone(),
                             card_ref_positions=packed.card_ref_positions.clone(),
-                            option_positions=packed.option_positions.clone(),
-                            option_mask=packed.option_mask.clone(),
-                            target_positions=packed.target_positions.clone(),
-                            target_mask=packed.target_mask.clone(),
                         ),
                     )
                 )
@@ -491,10 +475,7 @@ class NativeAssemblerParityTests(unittest.TestCase):
             self.assertTrue(torch.equal(packed.seq_id, expected.seq_id))
             self.assertTrue(torch.equal(packed.pos_in_seq, expected.pos_in_seq))
             self.assertTrue(torch.equal(packed.cu_seqlens, expected.cu_seqlens))
-            self.assertTrue(torch.equal(packed.option_positions, expected.option_positions))
-            self.assertTrue(torch.equal(packed.option_mask, expected.option_mask))
-            self.assertTrue(torch.equal(packed.target_positions, expected.target_positions))
-            self.assertTrue(torch.equal(packed.target_mask, expected.target_mask))
+            self.assertTrue(torch.equal(packed.card_ref_positions, expected.card_ref_positions))
 
     def test_packed_native_inline_blank_outputs(self) -> None:
         """Inline mode should surface CROSS_BLANK priority anchors natively."""

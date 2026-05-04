@@ -126,10 +126,10 @@ class NativePackedAssemblerOutputs:
     cu_seqlens: torch.Tensor  # (B+1,) int32
     seq_lengths: torch.Tensor  # (B,) int32
     state_positions: torch.Tensor  # (B,) int32
-    option_positions: torch.Tensor  # (B, max_options) int32 (-1 absent)
-    option_mask: torch.Tensor  # (B, max_options) uint8
-    target_positions: torch.Tensor  # (B, max_options, max_targets) int32
-    target_mask: torch.Tensor  # (B, max_options, max_targets) uint8
+    option_positions: torch.Tensor  # ABI scratch only; not returned in PackedTextBatch.
+    option_mask: torch.Tensor  # ABI scratch only; not returned in PackedTextBatch.
+    target_positions: torch.Tensor  # ABI scratch only; not returned in PackedTextBatch.
+    target_mask: torch.Tensor  # ABI scratch only; not returned in PackedTextBatch.
     card_ref_positions: torch.Tensor  # (B, max_card_refs) int32
     token_overflow: torch.Tensor  # (B,) int32
     blank_positions: torch.Tensor  # (B, max_blanks) int32
@@ -164,10 +164,6 @@ class NativePackedAssemblerOutputs:
         seq_lengths = self.seq_lengths[:active_n]
         state_positions = self.state_positions[:active_n]
         card_ref_positions = self.card_ref_positions[:active_n]
-        option_positions_full = self.option_positions[:active_n]
-        option_mask_full = self.option_mask[:active_n]
-        target_positions_full = self.target_positions[:active_n]
-        target_mask_full = self.target_mask[:active_n]
         blank_positions_full = self.blank_positions[:active_n]
         blank_kind_full = self.blank_kind[:active_n]
         blank_group_full = self.blank_group[:active_n]
@@ -190,23 +186,6 @@ class NativePackedAssemblerOutputs:
             pos_in_seq = self.token_ids[:0]
 
         if trim:
-            opt_any = option_mask_full.any(dim=0)
-            max_opts = int(opt_any.sum().item()) if opt_any.numel() else 0
-            if max_opts > 0:
-                tgt_any = target_mask_full[:, :max_opts].any(dim=0).any(dim=0)
-                max_tgts = int(tgt_any.sum().item()) if tgt_any.numel() else 0
-            else:
-                max_tgts = 0
-            option_positions = (
-                option_positions_full[:, :max_opts]
-                if max_opts > 0
-                else option_positions_full[:, :0]
-            )
-            option_mask = (
-                option_mask_full[:, :max_opts] if max_opts > 0 else option_mask_full[:, :0]
-            )
-            target_positions = target_positions_full[:, :max_opts, :max_tgts]
-            target_mask = target_mask_full[:, :max_opts, :max_tgts]
             blank_any = blank_positions_full >= 0
             blank_cols = blank_any.any(dim=0)
             max_blanks = int(blank_cols.sum().item()) if blank_cols.numel() else 0
@@ -234,10 +213,6 @@ class NativePackedAssemblerOutputs:
             blank_legal_ids = blank_legal_ids_full[:, :max_blanks, :max_legal]
             blank_legal_mask = blank_legal_mask_full[:, :max_blanks, :max_legal].bool()
         else:
-            option_positions = option_positions_full
-            option_mask = option_mask_full
-            target_positions = target_positions_full
-            target_mask = target_mask_full
             blank_positions = blank_positions_full
             blank_kind = blank_kind_full
             blank_group = blank_group_full
@@ -256,10 +231,6 @@ class NativePackedAssemblerOutputs:
             seq_lengths=seq_lengths,
             state_positions=state_positions,
             card_ref_positions=card_ref_positions,
-            option_positions=option_positions,
-            option_mask=option_mask.bool(),
-            target_positions=target_positions,
-            target_mask=target_mask.bool(),
             blank_positions=blank_positions,
             blank_kind=blank_kind,
             blank_group=blank_group,

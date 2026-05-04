@@ -4,7 +4,7 @@ PR #3/#4 of the text-encoder plan in ``docs/text_encoder_plan.md`` (§5). The
 renderer (``magic_ai.text_encoder.render``) emits a string plus anchor
 metadata at the *string* level. The model wants per-example token-id tensors
 plus *token-position* anchors so it can gather hidden states at every
-``<card-ref:K>``, ``<option>``, and ``<target>`` location.
+``<card-ref:K>`` and inline decision blank location.
 
 This module owns the tokenize-and-collate path:
 
@@ -50,8 +50,6 @@ class TextEncodedExample:
     token_ids: list[int]
     attention_mask: list[int]
     card_ref_positions: dict[int, int]
-    option_positions: list[int]
-    target_positions: list[list[int]]
     card_ref_engine_ids: dict[int, str] = field(default_factory=dict)
     blank_positions: list[int] = field(default_factory=list)
     blank_kind_ids: list[int] = field(default_factory=list)  # token id of the blank kind
@@ -66,19 +64,13 @@ class TextEncodedBatch:
     """Padded batch of :class:`TextEncodedExample` ready for the encoder.
 
     ``blank_*`` fields carry the inline-blank tensors introduced in Step 3 of
-    ``docs/text_encoder_inline_blanks_plan.md``. When the inline-blank flag
-    is off these are zero-shape ``[B, 0]`` / ``[B, 0, 0]`` tensors so that
-    existing call sites that ignore them are unaffected. ``option_*`` /
-    ``target_*`` remain in use until step 8 deletes the legacy heads.
+    ``docs/text_encoder_inline_blanks_plan.md``. Rows without decisions use
+    zero-shape ``[B, 0]`` / ``[B, 0, 0]`` tensors.
     """
 
     token_ids: Tensor  # [B, T] int64, padded with pad_id
     attention_mask: Tensor  # [B, T] int64
     card_ref_positions: Tensor  # [B, MAX_CARD_REFS] int64, -1 = absent
-    option_positions: Tensor  # [B, max_opts] int64, -1 = absent
-    option_mask: Tensor  # [B, max_opts] bool
-    target_positions: Tensor  # [B, max_opts, max_targets] int64, -1 = absent
-    target_mask: Tensor  # [B, max_opts, max_targets] bool
     seq_lengths: Tensor  # [B] int64
     # Inline-blank tensors. ``K`` is the per-batch maximum blank count and
     # ``V_max`` the per-batch maximum legal-id count across blanks.
@@ -111,8 +103,7 @@ class PackedTextBatch:
 
     Anchor positions are absolute offsets into the packed row (i.e. they
     have already been shifted by ``cu_seqlens[:-1]``). ``-1`` is preserved
-    as the absent-slot sentinel so downstream gather logic is unchanged
-    versus the padded path.
+    as the absent-slot sentinel for inline blanks.
     """
 
     token_ids: Tensor  # [T_packed] int32
@@ -123,10 +114,6 @@ class PackedTextBatch:
 
     state_positions: Tensor  # [B] int32, packed-offset of each row's first token
     card_ref_positions: Tensor  # [B, MAX_CARD_REFS] int32, -1 = absent
-    option_positions: Tensor  # [B, max_opts] int32
-    option_mask: Tensor  # [B, max_opts] bool
-    target_positions: Tensor  # [B, max_opts, max_targets] int32
-    target_mask: Tensor  # [B, max_opts, max_targets] bool
     # Inline-blank tensors (Step 3 of inline-blanks plan). Same shapes /
     # sentinels as :class:`TextEncodedBatch`, but ``blank_positions`` are
     # absolute packed-row offsets (rebased by ``state_positions``).
@@ -226,10 +213,6 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
         seq_lengths=seq_lens,
         state_positions=state_positions.clone(),
         card_ref_positions=add_packed_offsets(padded.card_ref_positions, state_positions),
-        option_positions=add_packed_offsets(padded.option_positions, state_positions),
-        target_positions=add_packed_offsets(padded.target_positions, state_positions),
-        option_mask=padded.option_mask.to(torch.bool),
-        target_mask=padded.target_mask.to(torch.bool),
         blank_positions=blank_positions,
         blank_kind=padded.blank_kind,
         blank_group=padded.blank_group,
@@ -275,9 +258,6 @@ def tokenize_snapshot(
             raise TypeError(f"convert_tokens_to_ids({token!r}) returned a list")
         return int(tid)
 
-    option_token_id = _single_id("<option>")
-    target_token_id = _single_id("<target>")
-
     # ----- card-ref positions -------------------------------------------------
     # Map every <card-ref:K> token id to its K. We look up via the tokenizer's
     # added-tokens map so we don't have to allocate 64 individual lookups.
@@ -316,21 +296,6 @@ def tokenize_snapshot(
         assert card_ref_id_to_k.get(int(tid)) == k_parsed, (
             f"card-ref id mismatch at pos={pos}: id={tid} parsed={k_parsed}"
         )
-
-    # ----- option / target positions -----------------------------------------
-    option_positions: list[int] = [
-        pos for pos, tid in enumerate(token_ids) if tid == option_token_id
-    ]
-    target_positions: list[list[int]] = [[] for _ in option_positions]
-    if option_positions:
-        # Walk left-to-right and bucket each <target> into the most recent
-        # <option> seen so far.
-        opt_idx = -1
-        for pos, tid in enumerate(token_ids):
-            if tid == option_token_id:
-                opt_idx += 1
-            elif tid == target_token_id and opt_idx >= 0:
-                target_positions[opt_idx].append(pos)
 
     # ----- engine-id mapping (K -> engine card id) ---------------------------
     card_ref_engine_ids: dict[int, str] = {}
@@ -390,8 +355,6 @@ def tokenize_snapshot(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        target_positions=target_positions,
         card_ref_engine_ids=card_ref_engine_ids,
         blank_positions=blank_positions,
         blank_kind_ids=blank_kind_ids,
@@ -415,8 +378,8 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
     * ``card_ref_positions`` is shaped ``[B, MAX_CARD_REFS]`` with ``-1`` for
       absent ref indices (no separate mask: ``-1`` is the sentinel and downstream
       gathers should clamp).
-    * ``option_positions`` / ``target_positions`` are padded to the per-batch
-      maxima with ``-1`` and accompanied by boolean masks.
+    * ``blank_*`` fields are padded to the per-batch maxima with ``-1`` / ``0``
+      sentinels and accompanied by boolean legal masks.
     """
 
     if len(examples) == 0:
@@ -425,11 +388,6 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
     batch_size = len(examples)
     seq_lengths = [len(ex.token_ids) for ex in examples]
     max_t = max(seq_lengths)
-    max_opts = max((len(ex.option_positions) for ex in examples), default=0)
-    max_targets = max(
-        (len(targets) for ex in examples for targets in ex.target_positions),
-        default=0,
-    )
     max_blanks = max((len(ex.blank_positions) for ex in examples), default=0)
     max_legal = max(
         (len(legal) for ex in examples for legal in ex.blank_legal_ids),
@@ -439,10 +397,6 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
     token_ids = torch.full((batch_size, max_t), pad_id, dtype=torch.int64)
     attention_mask = torch.zeros((batch_size, max_t), dtype=torch.int64)
     card_ref_positions = torch.full((batch_size, MAX_CARD_REFS), -1, dtype=torch.int64)
-    option_positions = torch.full((batch_size, max_opts), -1, dtype=torch.int64)
-    option_mask = torch.zeros((batch_size, max_opts), dtype=torch.bool)
-    target_positions = torch.full((batch_size, max_opts, max_targets), -1, dtype=torch.int64)
-    target_mask = torch.zeros((batch_size, max_opts, max_targets), dtype=torch.bool)
 
     blank_positions = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
     blank_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
@@ -461,13 +415,6 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
             if 0 <= k < MAX_CARD_REFS:
                 card_ref_positions[b, k] = int(pos)
 
-        for o, pos in enumerate(ex.option_positions):
-            option_positions[b, o] = int(pos)
-            option_mask[b, o] = True
-            for t, tpos in enumerate(ex.target_positions[o]):
-                target_positions[b, o, t] = int(tpos)
-                target_mask[b, o, t] = True
-
         for k_idx, pos in enumerate(ex.blank_positions):
             blank_positions[b, k_idx] = int(pos)
             blank_kind[b, k_idx] = int(ex.blank_kind_ids[k_idx])
@@ -482,10 +429,6 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=torch.as_tensor(seq_lengths, dtype=torch.int64),
         blank_positions=blank_positions,
         blank_kind=blank_kind,

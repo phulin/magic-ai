@@ -348,25 +348,6 @@ class NativeTextTrajectoryBuffer:
         self.card_ref_positions = torch.full(
             (*shape, self.max_card_refs), -1, dtype=torch.int32, device=self.device
         )
-        self.option_positions = torch.full(
-            (*shape, self.max_options), -1, dtype=torch.int32, device=self.device
-        )
-        self.option_mask = torch.zeros(
-            *shape, self.max_options, dtype=torch.bool, device=self.device
-        )
-        self.target_positions = torch.full(
-            (*shape, self.max_options, self.max_targets_per_option),
-            -1,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.target_mask = torch.zeros(
-            *shape,
-            self.max_options,
-            self.max_targets_per_option,
-            dtype=torch.bool,
-            device=self.device,
-        )
         self.trace_kind_id = torch.zeros(*shape, dtype=torch.int8, device=self.device)
         self.decision_count = torch.zeros(*shape, dtype=torch.int16, device=self.device)
         decision_shape = (*shape, self.max_decision_groups, self.max_cached_choices)
@@ -447,28 +428,6 @@ class NativeTextTrajectoryBuffer:
             encoded.card_ref_positions,
             (batch_size, 1),
         )
-        option_width = min(int(encoded.option_positions.shape[1]), self.max_options)
-        target_width = min(int(encoded.target_positions.shape[2]), self.max_targets_per_option)
-        self.option_positions[env_t, step_t].fill_(-1)
-        self.option_mask[env_t, step_t].zero_()
-        self.target_positions[env_t, step_t].fill_(-1)
-        self.target_mask[env_t, step_t].zero_()
-        if option_width > 0:
-            self.option_positions[env_t, step_t, :option_width] = rebase_positions(
-                encoded.option_positions[:, :option_width],
-                (batch_size, 1),
-            )
-            self.option_mask[env_t, step_t, :option_width] = encoded.option_mask[
-                :, :option_width
-            ].to(device=self.device, dtype=torch.bool)
-        if option_width > 0 and target_width > 0:
-            self.target_positions[env_t, step_t, :option_width, :target_width] = rebase_positions(
-                encoded.target_positions[:, :option_width, :target_width],
-                (batch_size, 1, 1),
-            )
-            self.target_mask[env_t, step_t, :option_width, :target_width] = encoded.target_mask[
-                :, :option_width, :target_width
-            ].to(device=self.device, dtype=torch.bool)
 
         decision_count = payload.decision_count.to(device=self.device, dtype=torch.long)
         stored_count = decision_count.clamp(max=self.max_decision_groups)
@@ -604,14 +563,6 @@ class NativeTextTrajectoryBuffer:
             card_ref_positions=pack_positions(
                 self.card_ref_positions[flat_env, flat_step], (row_count, 1)
             ),
-            option_positions=pack_positions(
-                self.option_positions[flat_env, flat_step], (row_count, 1)
-            ),
-            option_mask=self.option_mask[flat_env, flat_step],
-            target_positions=pack_positions(
-                self.target_positions[flat_env, flat_step], (row_count, 1, 1)
-            ),
-            target_mask=self.target_mask[flat_env, flat_step],
         )
         decision_count = self.decision_count[flat_env, flat_step].to(dtype=torch.long)
         group_mask = (

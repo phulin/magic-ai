@@ -505,20 +505,5 @@ def test_render_plan_parity(
     assert torch.equal(actual.token_ids[0, :actual_len], expected.token_ids[0, :expected_len]), (
         "token_ids divergence"
     )
-    # card_ref_positions / option_positions / target_positions / masks.
+    # card_ref_positions.
     assert torch.equal(actual.card_ref_positions[0], expected.card_ref_positions[0])
-    # option / target shapes may differ in width; compare valid prefix.
-    n_opts = int(expected.option_mask[0].sum())
-    assert int(actual.option_mask[0].sum()) == n_opts
-    assert torch.equal(actual.option_positions[0, :n_opts], expected.option_positions[0, :n_opts])
-    if n_opts and expected.target_positions.shape[2]:
-        n_tgts = int(expected.target_mask[0].sum())
-        assert int(actual.target_mask[0].sum()) == n_tgts
-        for o in range(n_opts):
-            cnt = int(expected.target_mask[0, o].sum())
-            assert int(actual.target_mask[0, o].sum()) == cnt
-            if cnt:
-                assert torch.equal(
-                    actual.target_positions[0, o, :cnt],
-                    expected.target_positions[0, o, :cnt],
-                )

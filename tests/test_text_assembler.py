@@ -209,7 +209,6 @@ def test_structured_go_plan_decodes_without_literal_tokens(cache, tokenizer, nam
     assert "<pt>2/2</pt>" in decoded
     assert "<cast>" in decoded
     assert int(batch.card_ref_positions[0, 0]) >= 0
-    assert int(batch.option_positions[0, 0]) >= 0
 
 
 # ---------------------------------------------------------------------------

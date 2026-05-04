@@ -644,10 +644,6 @@ def test_hf_text_policy_copies_checkpoint_into_local_encoder(monkeypatch) -> Non
         token_ids=torch.tensor([[1, 2, 0], [3, 0, 0]], dtype=torch.int64),
         attention_mask=torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.int64),
         card_ref_positions=torch.full((2, 256), -1, dtype=torch.int64),
-        option_positions=torch.tensor([[0], [0]], dtype=torch.int64),
-        option_mask=torch.ones((2, 1), dtype=torch.bool),
-        target_positions=torch.full((2, 1, 0), -1, dtype=torch.int64),
-        target_mask=torch.zeros((2, 1, 0), dtype=torch.bool),
         seq_lengths=torch.tensor([2, 1], dtype=torch.int64),
     )
     out = policy(batch)

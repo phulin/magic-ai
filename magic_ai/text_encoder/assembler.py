@@ -4,7 +4,7 @@ PR 13-C from ``docs/text_encoder_plan.md`` §13. Walks the int32 render-plan
 stream produced by either the Python parity emitter or the structured Go
 emitter, memcpys card-body token slices from the :class:`CardTokenCache`,
 and writes the result into a preallocated ``[B, max_tokens]`` token buffer
-alongside ``card_ref_positions`` / ``option_positions`` / ``target_positions``.
+alongside ``card_ref_positions`` and inline-blank metadata.
 
 The Python parity route carries pre-tokenized literal slices. The structured
 Go route tokenizes small scalar/tag fragments in Python until the Go side
@@ -326,8 +326,6 @@ def _fragment(toks: AssemblerTokens, text: str) -> list[int]:
 class _AssembledExample:
     token_ids: list[int]
     card_ref_positions: dict[int, int]
-    option_positions: list[int]
-    target_positions: list[list[int]]
     # Inline-blank metadata (Step 3 of inline-blanks plan). Populated when the
     # render plan contains OP_EMIT_BLANK opcodes; otherwise these stay empty.
     blank_positions: list[int] = field(default_factory=list)
@@ -362,10 +360,7 @@ def _assemble_one(
     ability_table = tables.ability
     out: list[int] = []
     card_ref_positions: dict[int, int] = {}
-    option_positions: list[int] = []
-    target_positions: list[list[int]] = []
 
-    cur_target_bucket: list[int] | None = None
     scalar_owner_open: int | None = None
     option_open = False
     blank_positions: list[int] = []
@@ -441,21 +436,13 @@ def _assemble_one(
                 tid = plan_list[j]
                 pos = len(out)
                 out.append(tid)
-                # Anchor recovery while walking literal slices.
-                if tid == toks.option_id:
-                    option_positions.append(pos)
-                    cur_target_bucket = []
-                    target_positions.append(cur_target_bucket)
-                elif tid == toks.target_open_id and cur_target_bucket is not None:
-                    cur_target_bucket.append(pos)
-                else:
-                    # card-ref ids: record first-occurrence position per K.
-                    # O(1) reverse-map lookup; the linear scan over
-                    # MAX_CARD_REFS=256 here used to dominate literal-heavy
-                    # plans.
-                    k = ref_id_to_k.get(tid)
-                    if k is not None and k not in card_ref_positions:
-                        card_ref_positions[k] = pos
+                # card-ref ids: record first-occurrence position per K.
+                # O(1) reverse-map lookup; the linear scan over
+                # MAX_CARD_REFS=256 here used to dominate literal-heavy
+                # plans.
+                k = ref_id_to_k.get(tid)
+                if k is not None and k not in card_ref_positions:
+                    card_ref_positions[k] = pos
             i = slice_end
             continue
 
@@ -556,11 +543,7 @@ def _assemble_one(
                 source_uuid_idx = plan_list[i + 3]
                 _mana_cost_id = plan_list[i + 4]
                 ability_idx = plan_list[i + 5]
-                pos = len(out)
                 out.append(toks.option_id)
-                option_positions.append(pos)
-                cur_target_bucket = []
-                target_positions.append(cur_target_bucket)
                 option_open = True
                 # ``action_verb_table`` already folds in the leading space, so
                 # the dispatch is one ``out.extend`` per action verb. An
@@ -592,10 +575,7 @@ def _assemble_one(
                 target_row = plan_list[i + 1]
                 target_uuid_idx = plan_list[i + 2]
                 target_kind = plan_list[i + 3]
-                pos = len(out)
                 out.append(toks.target_open_id)
-                if cur_target_bucket is not None:
-                    cur_target_bucket.append(pos)
                 # target_kind 0 = player target. target_row is the owner index
                 # (0=self, 1=opp). Other kinds resolve to a card-ref or a
                 # cached display-name span.
@@ -792,8 +772,6 @@ def _assemble_one(
     return _AssembledExample(
         token_ids=out,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        target_positions=target_positions,
         blank_positions=blank_positions,
         blank_kind_ids=blank_kind_ids,
         blank_group_ids=blank_group_ids,
@@ -875,15 +853,10 @@ def assemble_batch(
     if actual_max > max_tokens:
         if on_overflow == "raise":
             raise ValueError(f"assembled token length {actual_max} exceeds max_tokens={max_tokens}")
-        # Truncate but preserve the option/target index space. Setting
-        # truncated positions to -1 (instead of dropping the entries) keeps
-        # the K↔K invariant the upstream layout relies on: a layout col that
-        # references "the K'th option" still finds slot K — option_mask just
-        # ends up False there, so the model can't score it but the indexing
-        # contract holds. card_ref_positions is keyed by K so it can stay a
-        # filtered dict.
-        truncated_options = 0
-        truncated_targets = 0
+        # Truncate card-ref and blank positions that fall outside the retained
+        # prefix. card_ref_positions is keyed by K so it can stay a filtered
+        # dict; blank tensor shapes preserve the original blank ordinal space.
+        truncated_blanks = 0
         truncated_examples = 0
         for ex in assembled:
             if len(ex.token_ids) > max_tokens:
@@ -891,41 +864,21 @@ def assemble_batch(
                 ex.card_ref_positions = {
                     k: p for k, p in ex.card_ref_positions.items() if p < max_tokens
                 }
-                new_options: list[int] = []
-                new_targets: list[list[int]] = []
-                ex_truncated_opts = 0
-                ex_truncated_tgts = 0
-                for opt_pos, tp in zip(ex.option_positions, ex.target_positions, strict=True):
-                    if opt_pos < max_tokens:
-                        new_options.append(opt_pos)
-                    else:
-                        new_options.append(-1)
-                        ex_truncated_opts += 1
-                    new_targets.append([tpos if tpos < max_tokens else -1 for tpos in tp])
-                    ex_truncated_tgts += sum(1 for tpos in tp if tpos >= max_tokens)
-                ex.option_positions = new_options
-                ex.target_positions = new_targets
-                truncated_options += ex_truncated_opts
-                truncated_targets += ex_truncated_tgts
+                ex.blank_positions = [pos if pos < max_tokens else -1 for pos in ex.blank_positions]
+                truncated_blanks += sum(1 for pos in ex.blank_positions if pos < 0)
                 truncated_examples += 1
         seq_lengths = [len(ex.token_ids) for ex in assembled]
         logger.warning(
             "assemble_batch: truncated %d/%d example(s) to max_tokens=%d "
-            "(masked %d option(s) and %d target(s) past the budget)",
+            "(masked %d blank(s) past the budget)",
             truncated_examples,
             len(assembled),
             max_tokens,
-            truncated_options,
-            truncated_targets,
+            truncated_blanks,
         )
 
     batch_size = len(assembled)
     width = max(seq_lengths)
-    max_opts = max((len(ex.option_positions) for ex in assembled), default=0)
-    max_targets = max(
-        (len(t) for ex in assembled for t in ex.target_positions),
-        default=0,
-    )
     max_blanks = max((len(ex.blank_positions) for ex in assembled), default=0)
     max_legal = max(
         (len(legal) for ex in assembled for legal in ex.blank_legal_ids),
@@ -935,10 +888,6 @@ def assemble_batch(
     token_ids = torch.full((batch_size, width), toks.pad_id, dtype=torch.int64)
     attention_mask = torch.zeros((batch_size, width), dtype=torch.int64)
     card_ref_positions = torch.full((batch_size, MAX_CARD_REFS), -1, dtype=torch.int64)
-    option_positions = torch.full((batch_size, max_opts), -1, dtype=torch.int64)
-    option_mask = torch.zeros((batch_size, max_opts), dtype=torch.bool)
-    target_positions = torch.full((batch_size, max_opts, max_targets), -1, dtype=torch.int64)
-    target_mask = torch.zeros((batch_size, max_opts, max_targets), dtype=torch.bool)
     blank_positions = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
     blank_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
     blank_group = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
@@ -954,14 +903,6 @@ def assemble_batch(
         for k, pos in ex.card_ref_positions.items():
             if 0 <= k < MAX_CARD_REFS:
                 card_ref_positions[b, k] = int(pos)
-        for o, pos in enumerate(ex.option_positions):
-            if pos >= 0:
-                option_positions[b, o] = int(pos)
-                option_mask[b, o] = True
-            for t, tpos in enumerate(ex.target_positions[o]):
-                if tpos >= 0:
-                    target_positions[b, o, t] = int(tpos)
-                    target_mask[b, o, t] = True
         for k_idx, pos in enumerate(ex.blank_positions):
             blank_positions[b, k_idx] = int(pos)
             blank_kind[b, k_idx] = int(ex.blank_kind_ids[k_idx])
@@ -975,10 +916,6 @@ def assemble_batch(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=torch.as_tensor(seq_lengths, dtype=torch.int64),
         blank_positions=blank_positions,
         blank_kind=blank_kind,

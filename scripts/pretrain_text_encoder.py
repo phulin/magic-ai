@@ -147,10 +147,6 @@ def make_synthetic_batch(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=seq_lengths,
     )
 

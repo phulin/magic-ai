@@ -66,20 +66,6 @@ def _make_packed_batch(
         seq_lengths=seq_lengths,
         absent_p=0.70,
     )
-    option_positions = _random_abs_positions(
-        (batch_size, max_options),
-        state_positions=state_positions,
-        seq_lengths=seq_lengths,
-        absent_p=0.20,
-    )
-    option_mask = option_positions >= 0
-    target_positions = _random_abs_positions(
-        (batch_size, max_options, max_targets_per_option),
-        state_positions=state_positions,
-        seq_lengths=seq_lengths,
-        absent_p=0.55,
-    )
-    target_mask = target_positions >= 0
     return PackedTextBatch(
         token_ids=token_ids,
         seq_id=seq_id,
@@ -88,10 +74,6 @@ def _make_packed_batch(
         seq_lengths=seq_lengths,
         state_positions=state_positions,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
     )
 
 

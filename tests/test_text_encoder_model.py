@@ -18,8 +18,6 @@ from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 def _make_batch(
     b: int = 2,
     t: int = 24,
-    max_opts: int = 4,
-    max_targets: int = 3,
     vocab_size: int = 1000,
 ) -> TextEncodedBatch:
     torch.manual_seed(0)
@@ -36,27 +34,10 @@ def _make_batch(
     card_ref_positions[0, :3] = torch.tensor([2, 5, 8])
     card_ref_positions[1, :2] = torch.tensor([3, 6])
 
-    # Options: 3 valid in row 0, 2 valid in row 1.
-    option_positions = torch.full((b, max_opts), -1, dtype=torch.int64)
-    option_positions[0, :3] = torch.tensor([10, 14, 18])
-    option_positions[1, :2] = torch.tensor([9, 13])
-    option_mask = option_positions >= 0
-
-    # Targets per option.
-    target_positions = torch.full((b, max_opts, max_targets), -1, dtype=torch.int64)
-    target_positions[0, 0, :2] = torch.tensor([11, 12])
-    target_positions[0, 1, :1] = torch.tensor([15])
-    target_positions[1, 0, :3] = torch.tensor([10, 11, 12])
-    target_mask = target_positions >= 0
-
     return TextEncodedBatch(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=seq_lens,
     )
 

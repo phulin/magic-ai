@@ -178,25 +178,19 @@ def make_mlm_batch(
 ) -> TextEncodedBatch:
     """Wrap ``[B, T]`` token ids in a :class:`TextEncodedBatch` for the encoder.
 
-    The option / target / card-ref anchors are unused under the MLM objective;
-    we pass empty (``-1``-filled) placeholders. ``attention_mask`` is set from
-    ``pad_id`` so the encoder ignores padded positions if any are present
-    (random-span sampling never produces padded positions, but the field is
-    required by :class:`TextEncodedBatch`).
+    Card-ref and blank anchors are unused under the MLM objective. The
+    ``attention_mask`` is set from ``pad_id`` so the encoder ignores padded
+    positions if any are present (random-span sampling never produces padded
+    positions, but the field is required by :class:`TextEncodedBatch`).
     """
 
     b, t = inputs.shape
     attention_mask = (inputs != pad_id).to(torch.int64)
     seq_lengths = attention_mask.sum(dim=-1).to(torch.int64)
-    minus_one = torch.full((b, 1), -1, dtype=torch.int64, device=device)
     return TextEncodedBatch(
         token_ids=inputs.to(torch.long),
         attention_mask=attention_mask,
         card_ref_positions=torch.full((b, MAX_CARD_REFS), -1, dtype=torch.int64, device=device),
-        option_positions=minus_one,
-        option_mask=torch.zeros((b, 1), dtype=torch.bool, device=device),
-        target_positions=torch.full((b, 1, 1), -1, dtype=torch.int64, device=device),
-        target_mask=torch.zeros((b, 1, 1), dtype=torch.bool, device=device),
         seq_lengths=seq_lengths,
     )
 

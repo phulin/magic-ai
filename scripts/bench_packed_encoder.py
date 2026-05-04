@@ -38,16 +38,10 @@ def _build_padded(seq_lengths: list[int], vocab_size: int) -> TextEncodedBatch:
         attention_mask[i, :n] = 1
         token_ids[i, n:] = 0
     card_ref_positions = torch.full((b, MAX_CARD_REFS), -1, dtype=torch.int64)
-    option_positions = torch.full((b, 1), -1, dtype=torch.int64)
-    target_positions = torch.full((b, 1, 1), -1, dtype=torch.int64)
     return TextEncodedBatch(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_positions >= 0,
-        target_positions=target_positions,
-        target_mask=target_positions >= 0,
         seq_lengths=torch.as_tensor(seq_lengths, dtype=torch.int64),
     )
 
@@ -60,10 +54,6 @@ def _move_padded(batch: TextEncodedBatch, device: torch.device) -> TextEncodedBa
         token_ids=to(batch.token_ids),
         attention_mask=to(batch.attention_mask),
         card_ref_positions=to(batch.card_ref_positions),
-        option_positions=to(batch.option_positions),
-        option_mask=to(batch.option_mask),
-        target_positions=to(batch.target_positions),
-        target_mask=to(batch.target_mask),
         seq_lengths=to(batch.seq_lengths),
     )
 
@@ -82,10 +72,6 @@ def _move_packed(batch, device):  # type: ignore[no-untyped-def]
         seq_lengths=to(batch.seq_lengths),
         state_positions=to(batch.state_positions),
         card_ref_positions=to(batch.card_ref_positions),
-        option_positions=to(batch.option_positions),
-        option_mask=to(batch.option_mask),
-        target_positions=to(batch.target_positions),
-        target_mask=to(batch.target_mask),
     )
 
 

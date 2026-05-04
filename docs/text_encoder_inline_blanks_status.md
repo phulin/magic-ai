@@ -352,3 +352,12 @@ without treating the accuracy gate as a blocker.
   masks; actor-critic replay scoring uses inline blanks plus value/may heads.
 - `magic_ai/text_encoder/model.py` — removed public option/target gather
   helpers; only card/state pools remain exposed.
+- `magic_ai/text_encoder/batch.py`, `magic_ai/text_encoder/assembler.py`,
+  `magic_ai/text_encoder/native_assembler.py` — encoded text batches no
+  longer expose legacy `option_positions`, `option_mask`, `target_positions`,
+  or `target_mask`. Tokenization and render-plan assembly now preserve only
+  card refs plus inline blank metadata; native assembler legacy ABI buffers are
+  scratch-only until the Go ABI drops them.
+- `magic_ai/text_encoder/replay_buffer.py`, `scripts/train.py` — text replay
+  storage and native rollout staging no longer allocate, copy, gather, or
+  rebase legacy option/target position columns.

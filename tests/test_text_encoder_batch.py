@@ -183,32 +183,6 @@ def test_tokenize_recovers_anchor_positions(
             f"card-ref pos {pos} decoded to {tok_str!r}, expected {card_ref_token(k)!r}"
         )
 
-    # Option positions decode to <option>.
-    option_id = tokenizer.convert_tokens_to_ids("<option>")
-    assert example.option_positions, "expected option positions"
-    for pos in example.option_positions:
-        assert example.token_ids[pos] == option_id
-
-    # Target positions decode to <target>, and each one falls between its
-    # owning option and the next option.
-    target_id = tokenizer.convert_tokens_to_ids("<target>")
-    for opt_idx, opt_pos in enumerate(example.option_positions):
-        next_opt_pos = (
-            example.option_positions[opt_idx + 1]
-            if opt_idx + 1 < len(example.option_positions)
-            else len(example.token_ids)
-        )
-        for tpos in example.target_positions[opt_idx]:
-            assert example.token_ids[tpos] == target_id
-            assert opt_pos < tpos < next_opt_pos, (
-                f"target {tpos} not between option {opt_pos} and next {next_opt_pos}"
-            )
-
-    # The cast option should have at least one target, the pass option none.
-    target_counts = [len(t) for t in example.target_positions]
-    assert any(c > 0 for c in target_counts)
-    assert any(c == 0 for c in target_counts)
-
     # Engine-id mapping survives.
     assert example.card_ref_engine_ids, "expected engine-id mapping"
     for k, engine_id in example.card_ref_engine_ids.items():
@@ -265,30 +239,17 @@ def test_collate_shapes_and_masks(
     batch: TextEncodedBatch = collate(examples, pad_id=pad_id)
     b = len(examples)
     max_t = max(seq_lens)
-    max_opts = max(len(ex.option_positions) for ex in examples)
-    max_targets = max(
-        (len(t) for ex in examples for t in ex.target_positions),
-        default=0,
-    )
 
     # Shapes.
     assert batch.token_ids.shape == (b, max_t)
     assert batch.attention_mask.shape == (b, max_t)
     assert batch.card_ref_positions.shape == (b, MAX_CARD_REFS)
-    assert batch.option_positions.shape == (b, max_opts)
-    assert batch.option_mask.shape == (b, max_opts)
-    assert batch.target_positions.shape == (b, max_opts, max_targets)
-    assert batch.target_mask.shape == (b, max_opts, max_targets)
     assert batch.seq_lengths.shape == (b,)
 
     # dtypes.
     assert batch.token_ids.dtype == torch.int64
     assert batch.attention_mask.dtype == torch.int64
     assert batch.card_ref_positions.dtype == torch.int64
-    assert batch.option_positions.dtype == torch.int64
-    assert batch.option_mask.dtype == torch.bool
-    assert batch.target_positions.dtype == torch.int64
-    assert batch.target_mask.dtype == torch.bool
 
     # Per-row content + masks.
     for i, ex in enumerate(examples):
@@ -308,26 +269,6 @@ def test_collate_shapes_and_masks(
         for k in range(MAX_CARD_REFS):
             expected = ex.card_ref_positions.get(k, -1)
             assert int(batch.card_ref_positions[i, k]) == expected
-
-        # option_positions / option_mask.
-        for o in range(max_opts):
-            if o < len(ex.option_positions):
-                assert int(batch.option_positions[i, o]) == ex.option_positions[o]
-                assert bool(batch.option_mask[i, o]) is True
-            else:
-                assert int(batch.option_positions[i, o]) == -1
-                assert bool(batch.option_mask[i, o]) is False
-
-        # target_positions / target_mask.
-        for o in range(max_opts):
-            opt_targets = ex.target_positions[o] if o < len(ex.target_positions) else []
-            for t in range(max_targets):
-                if t < len(opt_targets):
-                    assert int(batch.target_positions[i, o, t]) == opt_targets[t]
-                    assert bool(batch.target_mask[i, o, t]) is True
-                else:
-                    assert int(batch.target_positions[i, o, t]) == -1
-                    assert bool(batch.target_mask[i, o, t]) is False
 
 
 def test_collate_empty_raises(tokenizer) -> None:

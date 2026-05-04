@@ -350,10 +350,6 @@ def _make_batch(
         token_ids=token_ids,
         attention_mask=torch.ones_like(token_ids, dtype=torch.int64),
         card_ref_positions=torch.full((batch_size, MAX_CARD_REFS), -1, dtype=torch.int64),
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=torch.full((batch_size,), seq_len, dtype=torch.int64),
     )
 

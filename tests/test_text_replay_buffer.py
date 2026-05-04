@@ -14,11 +14,6 @@ def _encoded_batch() -> TextEncodedBatch:
     card_ref_positions = torch.full((2, MAX_CARD_REFS), -1, dtype=torch.long)
     card_ref_positions[0, 0] = 1
     card_ref_positions[1, 2] = 0
-    option_positions = torch.tensor([[1, 2, -1], [0, -1, -1]])
-    option_mask = option_positions >= 0
-    target_positions = torch.full((2, 3, 2), -1, dtype=torch.long)
-    target_positions[0, 0, 0] = 2
-    target_mask = target_positions >= 0
     seq_lengths = torch.tensor([3, 2])
     blank_positions = torch.tensor([[1, 2, -1], [0, -1, -1]], dtype=torch.int32)
     blank_kind = torch.tensor([[901, 902, 0], [901, 0, 0]], dtype=torch.int32)
@@ -37,10 +32,6 @@ def _encoded_batch() -> TextEncodedBatch:
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=seq_lengths,
         blank_positions=blank_positions,
         blank_kind=blank_kind,
@@ -82,10 +73,6 @@ def _unpack(batch: PackedTextBatch, *, max_tokens: int, pad_id: int = 0) -> Text
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=rebase(batch.card_ref_positions, (b, 1)),
-        option_positions=rebase(batch.option_positions, (b, 1)),
-        option_mask=batch.option_mask,
-        target_positions=rebase(batch.target_positions, (b, 1, 1)),
-        target_mask=batch.target_mask,
         seq_lengths=batch.seq_lengths,
         blank_positions=rebase(batch.blank_positions, (b, 1)),
         blank_kind=batch.blank_kind,
@@ -106,10 +93,6 @@ def _packed_to_device(batch: PackedTextBatch, device: torch.device) -> PackedTex
         seq_lengths=batch.seq_lengths.to(device),
         state_positions=batch.state_positions.to(device),
         card_ref_positions=batch.card_ref_positions.to(device),
-        option_positions=batch.option_positions.to(device),
-        option_mask=batch.option_mask.to(device),
-        target_positions=batch.target_positions.to(device),
-        target_mask=batch.target_mask.to(device),
         blank_positions=batch.blank_positions.to(device),
         blank_kind=batch.blank_kind.to(device),
         blank_group=batch.blank_group.to(device),
@@ -133,10 +116,6 @@ def _assert_replay_batch_close(
     torch.testing.assert_close(
         actual.encoded.card_ref_positions, expected.encoded.card_ref_positions
     )
-    torch.testing.assert_close(actual.encoded.option_positions, expected.encoded.option_positions)
-    torch.testing.assert_close(actual.encoded.option_mask, expected.encoded.option_mask)
-    torch.testing.assert_close(actual.encoded.target_positions, expected.encoded.target_positions)
-    torch.testing.assert_close(actual.encoded.target_mask, expected.encoded.target_mask)
     torch.testing.assert_close(actual.encoded.blank_positions, expected.encoded.blank_positions)
     torch.testing.assert_close(actual.encoded.blank_kind, expected.encoded.blank_kind)
     torch.testing.assert_close(actual.encoded.blank_group, expected.encoded.blank_group)
@@ -309,16 +288,6 @@ class TextReplayBufferTests(unittest.TestCase):
             check_dtype=False,
         )
         torch.testing.assert_close(
-            gathered_encoded.option_positions[0],
-            encoded.option_positions[0],
-            check_dtype=False,
-        )
-        torch.testing.assert_close(
-            gathered_encoded.target_positions[0],
-            encoded.target_positions[0],
-            check_dtype=False,
-        )
-        torch.testing.assert_close(
             gathered_encoded.blank_positions[0],
             encoded.blank_positions[0],
             check_dtype=False,
@@ -350,17 +319,6 @@ class TextReplayBufferTests(unittest.TestCase):
             token_ids=torch.tensor([[101, 102, 103, 104, 0, 0], [201, 202, 0, 0, 0, 0]]),
             attention_mask=torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 0, 0, 0, 0]]),
             card_ref_positions=torch.full((2, MAX_CARD_REFS), -1, dtype=torch.long),
-            option_positions=torch.tensor([[1, 2, -1], [0, -1, -1]]),
-            option_mask=torch.tensor([[True, True, False], [True, False, False]]),
-            target_positions=torch.tensor(
-                [[[3, -1], [-1, -1], [-1, -1]], [[1, -1], [-1, -1], [-1, -1]]]
-            ),
-            target_mask=torch.tensor(
-                [
-                    [[True, False], [False, False], [False, False]],
-                    [[True, False], [False, False], [False, False]],
-                ]
-            ),
             seq_lengths=torch.tensor([4, 2]),
         )
         encoded_a.card_ref_positions[0, 4] = 2
@@ -369,17 +327,6 @@ class TextReplayBufferTests(unittest.TestCase):
             token_ids=torch.tensor([[301, 302, 303, 0, 0, 0], [401, 402, 403, 404, 405, 0]]),
             attention_mask=torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 0]]),
             card_ref_positions=torch.full((2, MAX_CARD_REFS), -1, dtype=torch.long),
-            option_positions=torch.tensor([[1, -1, -1], [2, 3, -1]]),
-            option_mask=torch.tensor([[True, False, False], [True, True, False]]),
-            target_positions=torch.tensor(
-                [[[2, -1], [-1, -1], [-1, -1]], [[4, -1], [1, -1], [-1, -1]]]
-            ),
-            target_mask=torch.tensor(
-                [
-                    [[True, False], [False, False], [False, False]],
-                    [[True, False], [True, False], [False, False]],
-                ]
-            ),
             seq_lengths=torch.tensor([3, 5]),
         )
         encoded_b.card_ref_positions[0, 6] = 0
@@ -440,12 +387,6 @@ class TextReplayBufferTests(unittest.TestCase):
             gathered_encoded.card_ref_positions[0],
             encoded_b.card_ref_positions[1],
             check_dtype=False,
-        )
-        torch.testing.assert_close(
-            gathered_encoded.option_positions[1], encoded_a.option_positions[0], check_dtype=False
-        )
-        torch.testing.assert_close(
-            gathered_encoded.target_positions[2], encoded_b.target_positions[0], check_dtype=False
         )
         torch.testing.assert_close(
             gathered.trace_kind_id, torch.tensor([4, 1, 3]), check_dtype=False
