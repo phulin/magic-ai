@@ -22,7 +22,7 @@ the eight-step migration. Update at every step boundary.
 | 3 | Batch + native assembler plumbing          | ✅ done       | Python + native paths tested; mage-go exposes `MagePackedBlankOutputs` and regenerated cffi. |
 | 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired behind `TextEncoderConfig.use_inline_blanks`. |
 | 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
-| 6 | Combat blocks                               | 🚧 renderer slice | `<choose-block>` render/batch/model path started; sampler/action adapter still pending. |
+| 6 | Combat blocks                               | 🚧 replay scoring | `<choose-block>` render/batch/model path, live sampler/action adapter, and replay storage landed. |
 | 7 | Targets / modes / mays / X / mana sources  | ⏳ blocked-by 6 |  |
 | 8 | Delete legacy option/target heads          | ⏳ blocked-by 7 |  |
 
@@ -182,14 +182,19 @@ without treating the accuracy gate as a blocker.
 - `magic_ai/text_encoder/actor_critic.py` — live Python text sampling can use
   inline `<choose-block>` logits for blocker decisions, returning the same
   selected-column semantics as the legacy blocker layout.
+- `magic_ai/text_encoder/replay_buffer.py` — replay rows now store and gather
+  inline blank positions, legal ids/masks, group metadata, and
+  `blank_option_index`; packed append keeps Triton token/legacy-field writes
+  while copying blank columns through the Torch path.
 - `magic_ai/text_encoder/training.py` — added
   `inline_blank_per_blank_loss(...)` and
   `inline_blank_per_blank_accuracy(...)` for `PER_BLANK` and `CONSTRAINED`
   groups; block blanks use this target shape (`0=<none>`, `1..N=attackers`).
 - `tests/test_text_render.py`, `tests/test_text_policy.py`,
-  `tests/test_text_actor_critic.py` — coverage for block anchor placement,
-  legal ids, blank option provenance, recurrent logits, and live sampler
-  option-index mapping.
+  `tests/test_text_actor_critic.py`, `tests/test_text_replay_buffer.py` —
+  coverage for block anchor placement, legal ids, blank option provenance,
+  recurrent logits, live sampler option-index mapping, and replay
+  append/gather round trips.
 - `tests/test_text_encoder_training.py` — coverage for constrained
   per-blank loss/accuracy and masking.
 - `magic_ai/actions.py` — added `action_from_inline_block_choices(...)` to
@@ -199,8 +204,8 @@ without treating the accuracy gate as a blocker.
 
 ## Next steps
 
-1. **Step 6 — Combat blocks.** Store inline blank tensors in text replay and
-   use them for replay scoring of block decisions.
+1. **Step 6 — Combat blocks.** Use replayed inline blank tensors for PPO/BC
+   scoring of block decisions.
 2. **Step 7** — targets/modes/mays/X-cost/mana sources.
 3. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
    `target_*` batch fields, the legacy renderer branch, and the

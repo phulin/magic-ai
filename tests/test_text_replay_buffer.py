@@ -20,6 +20,19 @@ def _encoded_batch() -> TextEncodedBatch:
     target_positions[0, 0, 0] = 2
     target_mask = target_positions >= 0
     seq_lengths = torch.tensor([3, 2])
+    blank_positions = torch.tensor([[1, 2, -1], [0, -1, -1]], dtype=torch.int32)
+    blank_kind = torch.tensor([[901, 902, 0], [901, 0, 0]], dtype=torch.int32)
+    blank_group = torch.tensor([[0, 0, -1], [1, -1, -1]], dtype=torch.int32)
+    blank_group_kind = torch.tensor([[3, 3, 0], [2, 0, 0]], dtype=torch.int32)
+    blank_option_index = torch.tensor([[1, 0, -1], [2, -1, -1]], dtype=torch.int32)
+    blank_legal_ids = torch.tensor(
+        [
+            [[100, 101, 0], [100, 102, 103], [0, 0, 0]],
+            [[100, 201, 0], [0, 0, 0], [0, 0, 0]],
+        ],
+        dtype=torch.int32,
+    )
+    blank_legal_mask = blank_legal_ids > 0
     return TextEncodedBatch(
         token_ids=token_ids,
         attention_mask=attention_mask,
@@ -29,6 +42,13 @@ def _encoded_batch() -> TextEncodedBatch:
         target_positions=target_positions,
         target_mask=target_mask,
         seq_lengths=seq_lengths,
+        blank_positions=blank_positions,
+        blank_kind=blank_kind,
+        blank_group=blank_group,
+        blank_group_kind=blank_group_kind,
+        blank_option_index=blank_option_index,
+        blank_legal_ids=blank_legal_ids,
+        blank_legal_mask=blank_legal_mask,
     )
 
 
@@ -67,6 +87,13 @@ def _unpack(batch: PackedTextBatch, *, max_tokens: int, pad_id: int = 0) -> Text
         target_positions=rebase(batch.target_positions, (b, 1, 1)),
         target_mask=batch.target_mask,
         seq_lengths=batch.seq_lengths,
+        blank_positions=rebase(batch.blank_positions, (b, 1)),
+        blank_kind=batch.blank_kind,
+        blank_group=batch.blank_group,
+        blank_group_kind=batch.blank_group_kind,
+        blank_option_index=batch.blank_option_index,
+        blank_legal_ids=batch.blank_legal_ids,
+        blank_legal_mask=batch.blank_legal_mask,
     )
 
 
@@ -83,6 +110,13 @@ def _packed_to_device(batch: PackedTextBatch, device: torch.device) -> PackedTex
         option_mask=batch.option_mask.to(device),
         target_positions=batch.target_positions.to(device),
         target_mask=batch.target_mask.to(device),
+        blank_positions=batch.blank_positions.to(device),
+        blank_kind=batch.blank_kind.to(device),
+        blank_group=batch.blank_group.to(device),
+        blank_group_kind=batch.blank_group_kind.to(device),
+        blank_option_index=batch.blank_option_index.to(device),
+        blank_legal_ids=batch.blank_legal_ids.to(device),
+        blank_legal_mask=batch.blank_legal_mask.to(device),
     )
 
 
@@ -103,6 +137,15 @@ def _assert_replay_batch_close(
     torch.testing.assert_close(actual.encoded.option_mask, expected.encoded.option_mask)
     torch.testing.assert_close(actual.encoded.target_positions, expected.encoded.target_positions)
     torch.testing.assert_close(actual.encoded.target_mask, expected.encoded.target_mask)
+    torch.testing.assert_close(actual.encoded.blank_positions, expected.encoded.blank_positions)
+    torch.testing.assert_close(actual.encoded.blank_kind, expected.encoded.blank_kind)
+    torch.testing.assert_close(actual.encoded.blank_group, expected.encoded.blank_group)
+    torch.testing.assert_close(actual.encoded.blank_group_kind, expected.encoded.blank_group_kind)
+    torch.testing.assert_close(
+        actual.encoded.blank_option_index, expected.encoded.blank_option_index
+    )
+    torch.testing.assert_close(actual.encoded.blank_legal_ids, expected.encoded.blank_legal_ids)
+    torch.testing.assert_close(actual.encoded.blank_legal_mask, expected.encoded.blank_legal_mask)
     torch.testing.assert_close(actual.trace_kind_id, expected.trace_kind_id)
     torch.testing.assert_close(actual.decision_start, expected.decision_start)
     torch.testing.assert_close(actual.decision_count, expected.decision_count)
@@ -168,6 +211,39 @@ class TextReplayBufferTests(unittest.TestCase):
             gathered_encoded.card_ref_positions[0],
             encoded.card_ref_positions[0],
             check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered_encoded.blank_positions[0],
+            encoded.blank_positions[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered_encoded.blank_kind[0],
+            encoded.blank_kind[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered_encoded.blank_group[0],
+            encoded.blank_group[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered_encoded.blank_group_kind[0],
+            encoded.blank_group_kind[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered_encoded.blank_option_index[0],
+            encoded.blank_option_index[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered_encoded.blank_legal_ids[0],
+            encoded.blank_legal_ids[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered_encoded.blank_legal_mask[0], encoded.blank_legal_mask[0]
         )
         torch.testing.assert_close(
             gathered.decision_option_idx, decision_option_idx, check_dtype=False
@@ -241,6 +317,19 @@ class TextReplayBufferTests(unittest.TestCase):
             gathered_encoded.target_positions[0],
             encoded.target_positions[0],
             check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered_encoded.blank_positions[0],
+            encoded.blank_positions[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered_encoded.blank_legal_ids[0],
+            encoded.blank_legal_ids[0],
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            gathered_encoded.blank_legal_mask[0], encoded.blank_legal_mask[0]
         )
         torch.testing.assert_close(gathered.decision_mask, decision_mask)
         self.assertEqual(int(gathered.decision_count[0]), 1)

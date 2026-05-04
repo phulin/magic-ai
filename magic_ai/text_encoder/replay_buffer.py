@@ -57,6 +57,8 @@ class TextReplayBuffer:
         max_targets_per_option: int,
         max_decision_groups: int,
         max_cached_choices: int,
+        max_blanks_per_row: int | None = None,
+        max_legal_per_blank: int | None = None,
         recurrent_layers: int = 0,
         recurrent_hidden_dim: int = 0,
         lstm_proj_hidden: int = 0,
@@ -79,6 +81,14 @@ class TextReplayBuffer:
             raise ValueError("max_decision_groups must be at least 1")
         if max_cached_choices < 1:
             raise ValueError("max_cached_choices must be at least 1")
+        if max_blanks_per_row is None:
+            max_blanks_per_row = max_options
+        if max_legal_per_blank is None:
+            max_legal_per_blank = max_targets_per_option + 1
+        if max_blanks_per_row < 0:
+            raise ValueError("max_blanks_per_row must be >= 0")
+        if max_legal_per_blank < 0:
+            raise ValueError("max_legal_per_blank must be >= 0")
         if (recurrent_layers == 0) != (recurrent_hidden_dim == 0):
             raise ValueError(
                 "recurrent_layers and recurrent_hidden_dim must both be zero or nonzero"
@@ -92,6 +102,8 @@ class TextReplayBuffer:
         self.max_targets_per_option = int(max_targets_per_option)
         self.max_decision_groups = int(max_decision_groups)
         self.max_cached_choices = int(max_cached_choices)
+        self.max_blanks_per_row = int(max_blanks_per_row)
+        self.max_legal_per_blank = int(max_legal_per_blank)
         self.recurrent_layers = int(recurrent_layers)
         self.recurrent_hidden_dim = int(recurrent_hidden_dim)
         self.lstm_proj_hidden = int(lstm_proj_hidden)
@@ -146,6 +158,44 @@ class TextReplayBuffer:
             dtype=torch.bool,
             device=self.device,
         )
+        self.blank_positions = torch.full(
+            (self.capacity, self.max_blanks_per_row),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.blank_kind = torch.zeros(
+            self.capacity, self.max_blanks_per_row, dtype=torch.int32, device=self.device
+        )
+        self.blank_group = torch.full(
+            (self.capacity, self.max_blanks_per_row),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.blank_group_kind = torch.zeros(
+            self.capacity, self.max_blanks_per_row, dtype=torch.int32, device=self.device
+        )
+        self.blank_option_index = torch.full(
+            (self.capacity, self.max_blanks_per_row),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.blank_legal_ids = torch.zeros(
+            self.capacity,
+            self.max_blanks_per_row,
+            self.max_legal_per_blank,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.blank_legal_mask = torch.zeros(
+            self.capacity,
+            self.max_blanks_per_row,
+            self.max_legal_per_blank,
+            dtype=torch.bool,
+            device=self.device,
+        )
         self.seq_lengths = torch.zeros(self.capacity, dtype=torch.int32, device=self.device)
         self.projected_state: Tensor | None = None
         if self.lstm_proj_hidden > 0:
@@ -189,6 +239,13 @@ class TextReplayBuffer:
         self.core.reset()
         self.row_token_start.fill_(-1)
         self.row_token_length.zero_()
+        self.blank_positions.fill_(-1)
+        self.blank_kind.zero_()
+        self.blank_group.fill_(-1)
+        self.blank_group_kind.zero_()
+        self.blank_option_index.fill_(-1)
+        self.blank_legal_ids.zero_()
+        self.blank_legal_mask.zero_()
         self._token_cursor = 0
 
     def write_ppo_targets(
@@ -309,6 +366,11 @@ class TextReplayBuffer:
             max_seq_length = int(seq_lengths.max().item()) if batch_size > 0 else 0
             if max_seq_length > self.max_tokens:
                 raise ValueError("encoded packed row token width exceeds buffer max_tokens")
+            if encoded.option_positions.shape[1] > self.max_options:
+                raise ValueError("encoded option width exceeds buffer max_options")
+            if encoded.target_positions.shape[2] > self.max_targets_per_option:
+                raise ValueError("encoded target width exceeds buffer max_targets_per_option")
+            self._validate_packed_blank_widths(encoded)
         total_tokens = int(encoded.token_ids.numel())
         token_start = self._token_cursor
         token_end = token_start + total_tokens
@@ -371,6 +433,9 @@ class TextReplayBuffer:
             )
         option_width = min(int(encoded.option_positions.shape[1]), self.max_options)
         target_width = min(int(encoded.target_positions.shape[2]), self.max_targets_per_option)
+        blank_width = min(int(encoded.blank_positions.shape[1]), self.max_blanks_per_row)
+        blank_legal_width = min(int(encoded.blank_legal_ids.shape[2]), self.max_legal_per_blank)
+        seq_lengths_i32 = seq_lengths.to(dtype=torch.int32)
         if not wrote_encoded_with_triton:
             self.row_token_start[rows] = -1
             self.row_token_length[rows] = 0
@@ -379,13 +444,22 @@ class TextReplayBuffer:
             self.option_mask.index_fill_(0, rows, 0)
             self.target_positions.index_fill_(0, rows, -1)
             self.target_mask.index_fill_(0, rows, 0)
+            self.seq_lengths[rows] = seq_lengths_i32
+
+        self.blank_positions.index_fill_(0, rows, -1)
+        self.blank_kind.index_fill_(0, rows, 0)
+        self.blank_group.index_fill_(0, rows, -1)
+        self.blank_group_kind.index_fill_(0, rows, 0)
+        self.blank_option_index.index_fill_(0, rows, -1)
+        self.blank_legal_ids.index_fill_(0, rows, 0)
+        self.blank_legal_mask.index_fill_(0, rows, 0)
+        if not wrote_encoded_with_triton:
             token_ids = encoded.token_ids.to(device=self.device, dtype=torch.int32)
             if total_tokens > 0:
                 self.packed_token_ids[token_start:token_end] = token_ids
             self.row_token_start[rows] = token_start + encoded.cu_seqlens[:-1].to(
                 device=self.device, dtype=torch.int32
             )
-            seq_lengths_i32 = seq_lengths.to(dtype=torch.int32)
             self.row_token_length[rows] = seq_lengths_i32
 
             state_positions = encoded.state_positions.to(device=self.device, dtype=torch.int32)
@@ -412,7 +486,35 @@ class TextReplayBuffer:
                 self.target_mask[rows, :option_width, :target_width] = encoded.target_mask[
                     :, :option_width, :target_width
                 ].to(device=self.device, dtype=torch.bool)
-            self.seq_lengths[rows] = seq_lengths_i32
+        if blank_width > 0:
+            state_positions = encoded.state_positions.to(device=self.device, dtype=torch.int32)
+            self.blank_positions[rows, :blank_width] = subtract_packed_offsets(
+                encoded.blank_positions[:, :blank_width].to(device=self.device),
+                state_positions,
+            )
+            self.blank_kind[rows, :blank_width] = encoded.blank_kind[:, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+            self.blank_group[rows, :blank_width] = encoded.blank_group[:, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+            self.blank_group_kind[rows, :blank_width] = encoded.blank_group_kind[
+                :, :blank_width
+            ].to(device=self.device, dtype=torch.int32)
+            self.blank_option_index[rows, :blank_width] = encoded.blank_option_index[
+                :, :blank_width
+            ].to(device=self.device, dtype=torch.int32)
+            if blank_legal_width > 0:
+                self.blank_legal_ids[rows, :blank_width, :blank_legal_width] = (
+                    encoded.blank_legal_ids[:, :blank_width, :blank_legal_width].to(
+                        device=self.device, dtype=torch.int32
+                    )
+                )
+                self.blank_legal_mask[rows, :blank_width, :blank_legal_width] = (
+                    encoded.blank_legal_mask[:, :blank_width, :blank_legal_width].to(
+                        device=self.device, dtype=torch.bool
+                    )
+                )
 
         return rows
 
@@ -529,6 +631,13 @@ class TextReplayBuffer:
                 h_in,
                 c_in,
             ) = gathered_fields
+        blank_positions = add_packed_offsets(self.blank_positions[idx], state_positions)
+        blank_kind = self.blank_kind[idx]
+        blank_group = self.blank_group[idx]
+        blank_group_kind = self.blank_group_kind[idx]
+        blank_option_index = self.blank_option_index[idx]
+        blank_legal_ids = self.blank_legal_ids[idx]
+        blank_legal_mask = self.blank_legal_mask[idx]
 
         gathered_decisions = None
         if self.use_triton_gather:
@@ -576,6 +685,13 @@ class TextReplayBuffer:
             option_mask=option_mask,
             target_positions=target_positions,
             target_mask=target_mask,
+            blank_positions=blank_positions,
+            blank_kind=blank_kind,
+            blank_group=blank_group,
+            blank_group_kind=blank_group_kind,
+            blank_option_index=blank_option_index,
+            blank_legal_ids=blank_legal_ids,
+            blank_legal_mask=blank_legal_mask,
         )
         return TextReplayBatch(
             encoded=encoded,
@@ -621,6 +737,7 @@ class TextReplayBuffer:
         self.option_mask[row].zero_()
         self.target_positions[row].fill_(-1)
         self.target_mask[row].zero_()
+        self._clear_blank_row(row)
         self._write_row_packed_tokens(
             row,
             encoded.token_ids[batch_index, :seq_length].to(device=self.device, dtype=torch.int32),
@@ -630,6 +747,8 @@ class TextReplayBuffer:
         )
         option_width = min(encoded.option_positions.shape[1], self.max_options)
         target_width = min(encoded.target_positions.shape[2], self.max_targets_per_option)
+        blank_width = min(encoded.blank_positions.shape[1], self.max_blanks_per_row)
+        blank_legal_width = min(encoded.blank_legal_ids.shape[2], self.max_legal_per_blank)
         self.option_positions[row, :option_width].copy_(
             encoded.option_positions[batch_index, :option_width].to(
                 device=self.device, dtype=torch.int32
@@ -645,6 +764,13 @@ class TextReplayBuffer:
         )
         self.target_mask[row, :option_width, :target_width].copy_(
             encoded.target_mask[batch_index, :option_width, :target_width].to(device=self.device)
+        )
+        self._copy_padded_blank_row(
+            row,
+            encoded,
+            batch_index,
+            blank_width=blank_width,
+            blank_legal_width=blank_legal_width,
         )
         # Device-side copy: no .item() sync, just a 0-d tensor write.
         self.seq_lengths[row] = encoded.seq_lengths[batch_index]
@@ -667,6 +793,7 @@ class TextReplayBuffer:
         self.option_mask[row].zero_()
         self.target_positions[row].fill_(-1)
         self.target_mask[row].zero_()
+        self._clear_blank_row(row)
 
         self._write_row_packed_tokens(
             row,
@@ -687,6 +814,8 @@ class TextReplayBuffer:
         )
         option_width = min(encoded.option_positions.shape[1], self.max_options)
         target_width = min(encoded.target_positions.shape[2], self.max_targets_per_option)
+        blank_width = min(encoded.blank_positions.shape[1], self.max_blanks_per_row)
+        blank_legal_width = min(encoded.blank_legal_ids.shape[2], self.max_legal_per_blank)
         self.option_positions[row, :option_width].copy_(
             subtract_packed_offsets(
                 encoded.option_positions[batch_index : batch_index + 1, :option_width].to(
@@ -713,8 +842,121 @@ class TextReplayBuffer:
         self.target_mask[row, :option_width, :target_width].copy_(
             encoded.target_mask[batch_index, :option_width, :target_width].to(device=self.device)
         )
+        self._copy_packed_blank_row(
+            row,
+            encoded,
+            batch_index,
+            state_positions,
+            blank_width=blank_width,
+            blank_legal_width=blank_legal_width,
+        )
         self.seq_lengths[row] = encoded.seq_lengths[batch_index].to(
             device=self.device, dtype=torch.int32
+        )
+
+    def _clear_blank_row(self, row: int) -> None:
+        self.blank_positions[row].fill_(-1)
+        self.blank_kind[row].zero_()
+        self.blank_group[row].fill_(-1)
+        self.blank_group_kind[row].zero_()
+        self.blank_option_index[row].fill_(-1)
+        self.blank_legal_ids[row].zero_()
+        self.blank_legal_mask[row].zero_()
+
+    def _copy_padded_blank_row(
+        self,
+        row: int,
+        encoded: TextEncodedBatch,
+        batch_index: int,
+        *,
+        blank_width: int,
+        blank_legal_width: int,
+    ) -> None:
+        if blank_width == 0:
+            return
+        self.blank_positions[row, :blank_width].copy_(
+            encoded.blank_positions[batch_index, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+        )
+        self.blank_kind[row, :blank_width].copy_(
+            encoded.blank_kind[batch_index, :blank_width].to(device=self.device, dtype=torch.int32)
+        )
+        self.blank_group[row, :blank_width].copy_(
+            encoded.blank_group[batch_index, :blank_width].to(device=self.device, dtype=torch.int32)
+        )
+        self.blank_group_kind[row, :blank_width].copy_(
+            encoded.blank_group_kind[batch_index, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+        )
+        self.blank_option_index[row, :blank_width].copy_(
+            encoded.blank_option_index[batch_index, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+        )
+        if blank_legal_width == 0:
+            return
+        self.blank_legal_ids[row, :blank_width, :blank_legal_width].copy_(
+            encoded.blank_legal_ids[batch_index, :blank_width, :blank_legal_width].to(
+                device=self.device, dtype=torch.int32
+            )
+        )
+        self.blank_legal_mask[row, :blank_width, :blank_legal_width].copy_(
+            encoded.blank_legal_mask[batch_index, :blank_width, :blank_legal_width].to(
+                device=self.device
+            )
+        )
+
+    def _copy_packed_blank_row(
+        self,
+        row: int,
+        encoded: PackedTextBatch,
+        batch_index: int,
+        state_positions: Tensor,
+        *,
+        blank_width: int,
+        blank_legal_width: int,
+    ) -> None:
+        if blank_width == 0:
+            return
+        self.blank_positions[row, :blank_width].copy_(
+            subtract_packed_offsets(
+                encoded.blank_positions[batch_index : batch_index + 1, :blank_width].to(
+                    device=self.device
+                ),
+                state_positions,
+            )
+            .squeeze(0)
+            .to(device=self.device, dtype=torch.int32)
+        )
+        self.blank_kind[row, :blank_width].copy_(
+            encoded.blank_kind[batch_index, :blank_width].to(device=self.device, dtype=torch.int32)
+        )
+        self.blank_group[row, :blank_width].copy_(
+            encoded.blank_group[batch_index, :blank_width].to(device=self.device, dtype=torch.int32)
+        )
+        self.blank_group_kind[row, :blank_width].copy_(
+            encoded.blank_group_kind[batch_index, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+        )
+        self.blank_option_index[row, :blank_width].copy_(
+            encoded.blank_option_index[batch_index, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+        )
+        if blank_legal_width == 0:
+            return
+        self.blank_legal_ids[row, :blank_width, :blank_legal_width].copy_(
+            encoded.blank_legal_ids[batch_index, :blank_width, :blank_legal_width].to(
+                device=self.device, dtype=torch.int32
+            )
+        )
+        self.blank_legal_mask[row, :blank_width, :blank_legal_width].copy_(
+            encoded.blank_legal_mask[batch_index, :blank_width, :blank_legal_width].to(
+                device=self.device
+            )
         )
 
     def _validate_batch_index(self, encoded: TextEncodedBatch, batch_index: int) -> None:
@@ -729,6 +971,7 @@ class TextReplayBuffer:
             raise ValueError("encoded option width exceeds buffer max_options")
         if encoded.target_positions.shape[2] > self.max_targets_per_option:
             raise ValueError("encoded target width exceeds buffer max_targets_per_option")
+        self._validate_blank_widths(encoded)
 
     def _validate_packed_batch_index(self, encoded: PackedTextBatch, batch_index: int) -> None:
         batch_size = int(encoded.seq_lengths.shape[0])
@@ -740,6 +983,19 @@ class TextReplayBuffer:
             raise ValueError("encoded option width exceeds buffer max_options")
         if encoded.target_positions.shape[2] > self.max_targets_per_option:
             raise ValueError("encoded target width exceeds buffer max_targets_per_option")
+        self._validate_packed_blank_widths(encoded)
+
+    def _validate_blank_widths(self, encoded: TextEncodedBatch) -> None:
+        if encoded.blank_positions.shape[1] > self.max_blanks_per_row:
+            raise ValueError("encoded blank width exceeds buffer max_blanks_per_row")
+        if encoded.blank_legal_ids.shape[2] > self.max_legal_per_blank:
+            raise ValueError("encoded blank legal width exceeds buffer max_legal_per_blank")
+
+    def _validate_packed_blank_widths(self, encoded: PackedTextBatch) -> None:
+        if encoded.blank_positions.shape[1] > self.max_blanks_per_row:
+            raise ValueError("encoded blank width exceeds buffer max_blanks_per_row")
+        if encoded.blank_legal_ids.shape[2] > self.max_legal_per_blank:
+            raise ValueError("encoded blank legal width exceeds buffer max_legal_per_blank")
 
     def _validate_row(self, row: int) -> None:
         if row < 0 or row >= self.capacity:
