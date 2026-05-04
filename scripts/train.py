@@ -1552,6 +1552,9 @@ def run_mlm_pretrain(
         amp_ctx: Any = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     else:
         amp_ctx = contextlib.nullcontext()
+    if not args.no_wandb and wandb.run is not None:
+        wandb.define_metric("pretrain_mlm/step")
+        wandb.define_metric("pretrain_mlm/*", step_metric="pretrain_mlm/step")
     global_step = 0
     for epoch in range(args.pretrain_mlm_epochs):
         for batch_np in dataset.iter_epoch(cfg.batch_size, np_rng):
@@ -1566,8 +1569,10 @@ def run_mlm_pretrain(
                 )
                 if not args.no_wandb and wandb.run is not None:
                     wandb.log(
-                        {f"pretrain_mlm/{k}": v for k, v in stats.items()},
-                        step=global_step,
+                        {
+                            **{f"pretrain_mlm/{k}": v for k, v in stats.items()},
+                            "pretrain_mlm/step": global_step,
+                        }
                     )
             global_step += 1
     print(f"[mlm] finished epochs={args.pretrain_mlm_epochs} steps={global_step}")
@@ -1670,6 +1675,9 @@ def run_value_pretrain(
         amp_ctx: Any = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     else:
         amp_ctx = contextlib.nullcontext()
+    if not args.no_wandb and wandb.run is not None:
+        wandb.define_metric("pretrain_value/step")
+        wandb.define_metric("pretrain_value/*", step_metric="pretrain_value/step")
     global_step = 0
     for epoch in range(args.pretrain_value_epochs):
         for tokens_np, labels_np in train_ds.iter_epoch(cfg.batch_size, np_rng):
@@ -1687,8 +1695,10 @@ def run_value_pretrain(
                 )
                 if not args.no_wandb and wandb.run is not None:
                     wandb.log(
-                        {f"pretrain_value/{k}": v for k, v in stats.items()},
-                        step=global_step,
+                        {
+                            **{f"pretrain_value/{k}": v for k, v in stats.items()},
+                            "pretrain_value/step": global_step,
+                        }
                     )
             if (
                 eval_ds is not None
@@ -1705,8 +1715,10 @@ def run_value_pretrain(
                 )
                 if not args.no_wandb and wandb.run is not None:
                     wandb.log(
-                        {f"pretrain_value/{k}": v for k, v in eval_stats.items()},
-                        step=global_step,
+                        {
+                            **{f"pretrain_value/{k}": v for k, v in eval_stats.items()},
+                            "pretrain_value/step": global_step,
+                        }
                     )
             global_step += 1
     print(f"[value] finished epochs={args.pretrain_value_epochs} steps={global_step}")
