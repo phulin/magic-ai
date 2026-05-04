@@ -358,18 +358,19 @@ def direct_flat_decision_distribution_impl(
     )
 
     group_count = step_positions.shape[0]
-    group_max = torch.full((group_count,), -torch.inf, dtype=option_logits.dtype, device=device)
+    softmax_dtype = flat_logits.dtype
+    group_max = torch.full((group_count,), -torch.inf, dtype=softmax_dtype, device=device)
     group_max.scatter_reduce_(0, group_idx, flat_logits, reduce="amax", include_self=True)
 
     stabilized = flat_logits - group_max[group_idx]
-    exp_logits = stabilized.exp()
-    group_exp_sum = torch.zeros(group_count, dtype=option_logits.dtype, device=device)
+    exp_logits = stabilized.exp().to(softmax_dtype)
+    group_exp_sum = torch.zeros(group_count, dtype=softmax_dtype, device=device)
     group_exp_sum.scatter_add_(0, group_idx, exp_logits)
-    flat_log_probs = stabilized - group_exp_sum[group_idx].log()
+    flat_log_probs = (stabilized - group_exp_sum[group_idx].log()).to(softmax_dtype)
 
-    probs = flat_log_probs.exp()
-    group_entropies = torch.zeros(group_count, dtype=option_logits.dtype, device=device)
-    group_entropies.scatter_add_(0, group_idx, -(probs * flat_log_probs))
+    probs = flat_log_probs.exp().to(softmax_dtype)
+    group_entropies = torch.zeros(group_count, dtype=softmax_dtype, device=device)
+    group_entropies.scatter_add_(0, group_idx, -(probs * flat_log_probs).to(softmax_dtype))
 
     return group_idx, choice_cols, flat_logits, flat_log_probs, group_entropies
 
