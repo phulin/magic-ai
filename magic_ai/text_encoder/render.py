@@ -30,6 +30,7 @@ from magic_ai.game_state import (
 from magic_ai.text_encoder.tokenizer import (
     _CARD_TYPE_WORDS,
     MAX_CARD_REFS,
+    MAX_NUM,
     card_ref_token,
     step_token,
 )
@@ -551,6 +552,7 @@ class SnapshotRenderer:
         none_token_id: int | None = None,
         yes_token_id: int | None = None,
         no_token_id: int | None = None,
+        num_token_ids: Sequence[int] | None = None,
         card_ref_token_ids: Sequence[int] | None = None,
     ) -> None:
         self._oracle = oracle if oracle is not None else {}
@@ -560,6 +562,7 @@ class SnapshotRenderer:
         self._none_token_id = none_token_id
         self._yes_token_id = yes_token_id
         self._no_token_id = no_token_id
+        self._num_token_ids = tuple(int(tid) for tid in num_token_ids or ())
         self._card_ref_token_ids = tuple(int(tid) for tid in card_ref_token_ids or ())
         self._cur_self_id: str = ""
         self._cur_opp_id: str = ""
@@ -1146,7 +1149,6 @@ class SnapshotRenderer:
         ``<choose-x>`` groups whose blanks live here too.
         """
 
-        del actions  # _classify_inline_options already split everything we need
         buf.append("<choices>")
         chosen_id = self._chosen_token_id
         if chosen_id is None:
@@ -1174,6 +1176,22 @@ class SnapshotRenderer:
                 legal_token_ids=(int(no_id), int(yes_id)),
                 group_kind="PER_BLANK",
             )
+        if self._pending_kind == "mode":
+            mode_count = len(actions)
+            if mode_count < 1:
+                raise RenderError("inline mode blanks require at least one option")
+            if mode_count > MAX_NUM:
+                raise RenderError(f"inline mode option count {mode_count} exceeds MAX_NUM")
+            if len(self._num_token_ids) < mode_count:
+                raise RenderError("inline mode blanks require num_token_ids")
+            self._emit_blank(
+                buf,
+                result,
+                "<choose-mode>",
+                -1,
+                legal_token_ids=tuple(self._num_token_ids[:mode_count]),
+                group_kind="PER_BLANK",
+            )
         buf.append("</choices>")
 
 
@@ -1193,6 +1211,7 @@ def render_snapshot(
     none_token_id: int | None = None,
     yes_token_id: int | None = None,
     no_token_id: int | None = None,
+    num_token_ids: Sequence[int] | None = None,
     card_ref_token_ids: Sequence[int] | None = None,
 ) -> RenderedSnapshot:
     """Render ``snapshot`` (and optional ``actions``) to text + anchor metadata.
@@ -1218,5 +1237,6 @@ def render_snapshot(
         none_token_id=none_token_id,
         yes_token_id=yes_token_id,
         no_token_id=no_token_id,
+        num_token_ids=num_token_ids,
         card_ref_token_ids=card_ref_token_ids,
     ).render(snapshot, actions)

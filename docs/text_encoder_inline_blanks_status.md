@@ -23,7 +23,7 @@ the eight-step migration. Update at every step boundary.
 | 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired behind `TextEncoderConfig.use_inline_blanks`. |
 | 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ✅ done       | `<choose-block>` render/batch/model path, live sampler/action adapter, replay storage, and replay scoring landed. |
-| 7 | Targets / modes / mays / X / mana sources  | 🚧 may wired | Targets and may decisions are wired through render, live sampling, and replay scoring. |
+| 7 | Targets / modes / mays / X / mana sources  | 🚧 mode renderer | Targets and may decisions are wired; mode choices render `<choose-mode>` blanks. |
 | 8 | Delete legacy option/target heads          | ⏳ blocked-by 7 |  |
 
 ## What landed in each completed step
@@ -207,7 +207,8 @@ without treating the accuracy gate as a blocker.
 
 ## Next steps
 
-1. **Step 7** — continue with modes/X-cost/mana sources.
+1. **Step 7** — wire mode blanks into live/replay scoring, then continue with
+   X-cost/mana sources.
 2. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
    `target_*` batch fields, the legacy renderer branch, and the
    `use_inline_blanks` flag. Bump replay-buffer on-disk version.
@@ -262,3 +263,13 @@ without treating the accuracy gate as a blocker.
   inline yes-minus-no logit in the existing may scalar slot.
 - `tests/test_text_actor_critic.py` — coverage for deterministic live may
   blank sampling and replay log-prob reconstruction.
+
+### Step 7 — Mode renderer slice (`/home/user/magic-ai-inline-blanks`)
+
+- `magic_ai/text_encoder/render.py` — inline `mode` pending states now emit
+  one `<choose-mode>` blank in the trailing `<choices>` block with legal ids
+  `<num:0>...<num:N-1>` for the available mode options.
+- `magic_ai/text_encoder/policy.py` — `encode_snapshots(use_inline_blanks=True)`
+  now resolves and passes the `<num:k>` token ids to the renderer.
+- `tests/test_text_render.py`, `tests/test_text_policy.py` — coverage for
+  render placement, legal id order, batch propagation, and forward logits.

@@ -44,7 +44,7 @@ from magic_ai.text_encoder.model import (
     initialize_text_state_encoder_from_hf,
 )
 from magic_ai.text_encoder.render import OracleEntry, render_snapshot
-from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, MAX_NUM
 
 
 @dataclass
@@ -248,6 +248,7 @@ class TextPolicy(nn.Module):
         none_token_id: int | None = None
         yes_token_id: int | None = None
         no_token_id: int | None = None
+        num_token_ids: list[int] | None = None
         card_ref_token_ids: list[int] | None = None
         if use_inline_blanks and chosen_token_id is None:
             tid = tokenizer.convert_tokens_to_ids("<chosen>")
@@ -267,6 +268,12 @@ class TextPolicy(nn.Module):
             if isinstance(no_tid, list):
                 raise TypeError("convert_tokens_to_ids('<no>') returned a list")
             no_token_id = int(no_tid)
+            num_token_ids = []
+            for k in range(MAX_NUM):
+                tid = tokenizer.convert_tokens_to_ids(f"<num:{k}>")
+                if isinstance(tid, list):
+                    raise TypeError(f"convert_tokens_to_ids('<num:{k}>') returned a list")
+                num_token_ids.append(int(tid))
             card_ref_token_ids = []
             for k in range(MAX_CARD_REFS):
                 tid = tokenizer.convert_tokens_to_ids(f"<card-ref:{k}>")
@@ -283,6 +290,7 @@ class TextPolicy(nn.Module):
                 none_token_id=none_token_id,
                 yes_token_id=yes_token_id,
                 no_token_id=no_token_id,
+                num_token_ids=num_token_ids,
                 card_ref_token_ids=card_ref_token_ids,
             )
             examples.append(tokenize_snapshot(rendered, tokenizer))
