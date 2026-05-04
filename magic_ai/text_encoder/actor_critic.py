@@ -18,11 +18,11 @@ from magic_ai.actions import (
     PolicyStep,
     TraceKind,
     action_from_attackers,
-    action_from_blockers,
     action_from_choice_accepted,
     action_from_choice_color,
     action_from_choice_ids,
     action_from_choice_index,
+    action_from_inline_block_choices,
     action_from_priority_candidate,
     build_decision_layout_rows,
     build_priority_candidates,
@@ -51,6 +51,7 @@ from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicyConfig,
     RecurrentTextPolicyOutput,
 )
+from magic_ai.text_encoder.render_plan import BLANK_GROUP_CONSTRAINED
 from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 
 
@@ -310,6 +311,30 @@ class TextActorCritic(nn.Module):
             else:
                 log_prob = output.values.new_zeros(())
                 entropy = output.values.new_zeros(())
+                inline_batch = (
+                    moved_packed if moved_packed is not None else cast(TextEncodedBatch, moved)
+                )
+                inline_block_sample = (
+                    _sample_inline_blockers_for_step(
+                        output,
+                        inline_batch,
+                        layout,
+                        step_idx=step_idx,
+                        deterministic=deterministic,
+                    )
+                    if trace_kind == "blockers"
+                    else None
+                )
+                if inline_block_sample is not None:
+                    selected_tensors, log_prob, entropy = inline_block_sample
+                    per_step_log_prob.append(log_prob)
+                    per_step_entropy.append(entropy)
+                    per_step_value.append(value)
+                    per_step_may_sample.append(may_sample_t)
+                    per_step_trace_kind.append(trace_kind)
+                    per_step_layout.append(layout)
+                    per_step_selected_tensors.append(selected_tensors)
+                    continue
                 nb = self.device.type == "cuda"
                 option_idx_dev = layout.decision_option_idx.to(self.device, non_blocking=nb)
                 target_idx_dev = layout.decision_target_idx.to(self.device, non_blocking=nb)
@@ -1509,9 +1534,10 @@ def _decode_text_action(
         )
     if trace_kind == "blockers":
         indices = tuple(value - 1 for value in selected)
-        return ActionTrace("blockers", indices=indices), action_from_blockers(
+        return ActionTrace("blockers", indices=indices), action_from_inline_block_choices(
             pending,
-            list(indices),
+            list(range(len(selected))),
+            selected,
         )
     if trace_kind == "choice_ids":
         target_id = selected_option_id(pending, selected_idx)
@@ -1610,6 +1636,60 @@ def _visible_decision_mask(
     return decision_mask & visible
 
 
+def _sample_inline_blockers_for_step(
+    output: RecurrentTextPolicyOutput,
+    batch: TextEncodedBatch | PackedTextBatch,
+    layout: TextDecisionLayout,
+    *,
+    step_idx: int,
+    deterministic: bool,
+) -> tuple[list[Tensor], Tensor, Tensor] | None:
+    blank_logits = output.blank_logits
+    if blank_logits is None or blank_logits.numel() == 0:
+        return None
+    if batch.blank_option_index.numel() == 0:
+        return None
+
+    row_group_kind = batch.blank_group_kind[step_idx].to(device=blank_logits.device)
+    row_option_index = batch.blank_option_index[step_idx].to(device=blank_logits.device)
+    row_legal_mask = batch.blank_legal_mask[step_idx].to(
+        device=blank_logits.device, dtype=torch.bool
+    )
+    row_logits = blank_logits[step_idx]
+    blank_support = (row_group_kind == BLANK_GROUP_CONSTRAINED) & (row_option_index >= 0)
+
+    group_option_indices: list[int] = []
+    for group_idx in range(int(layout.decision_option_idx.shape[0])):
+        row = layout.decision_option_idx[group_idx]
+        valid = row[row >= 0]
+        if int(valid.numel()) == 0:
+            group_option_indices.append(-1)
+        else:
+            group_option_indices.append(int(valid[0].item()))
+
+    selected: list[Tensor] = []
+    log_prob = output.values.new_zeros(())
+    entropy = output.values.new_zeros(())
+    for option_idx in group_option_indices:
+        if option_idx < 0:
+            return None
+        matches = (row_option_index == option_idx) & blank_support
+        match_idx = matches.nonzero(as_tuple=False).squeeze(-1)
+        if int(match_idx.numel()) != 1:
+            return None
+        blank_idx = match_idx[0]
+        legal_slots = row_legal_mask[blank_idx].nonzero(as_tuple=False).squeeze(-1)
+        if legal_slots.numel() == 0:
+            return None
+        logits = row_logits[blank_idx, legal_slots]
+        dist = Categorical(logits=logits)
+        chosen_in_legal = torch.argmax(logits) if deterministic else dist.sample()
+        log_prob = log_prob + dist.log_prob(chosen_in_legal)
+        entropy = entropy + dist.entropy()
+        selected.append(legal_slots[chosen_in_legal].to(dtype=torch.long))
+    return selected, log_prob, entropy
+
+
 def _dense_from_packed_batch(
     batch: PackedTextBatch,
     *,
@@ -1638,6 +1718,13 @@ def _dense_from_packed_batch(
         target_positions=subtract_packed_offsets(batch.target_positions, batch.state_positions),
         target_mask=batch.target_mask,
         seq_lengths=batch.seq_lengths,
+        blank_positions=subtract_packed_offsets(batch.blank_positions, batch.state_positions),
+        blank_kind=batch.blank_kind,
+        blank_group=batch.blank_group,
+        blank_group_kind=batch.blank_group_kind,
+        blank_option_index=batch.blank_option_index,
+        blank_legal_ids=batch.blank_legal_ids,
+        blank_legal_mask=batch.blank_legal_mask,
     )
 
 
@@ -1663,6 +1750,13 @@ def _move_text_batch(batch: TextEncodedBatch, device: torch.device) -> TextEncod
         target_positions=batch.target_positions.to(device, non_blocking=nb),
         target_mask=target_mask,
         seq_lengths=batch.seq_lengths.to(device, non_blocking=nb),
+        blank_positions=batch.blank_positions.to(device, non_blocking=nb),
+        blank_kind=batch.blank_kind.to(device, non_blocking=nb),
+        blank_group=batch.blank_group.to(device, non_blocking=nb),
+        blank_group_kind=batch.blank_group_kind.to(device, non_blocking=nb),
+        blank_option_index=batch.blank_option_index.to(device, non_blocking=nb),
+        blank_legal_ids=batch.blank_legal_ids.to(device, non_blocking=nb),
+        blank_legal_mask=batch.blank_legal_mask.to(device, non_blocking=nb),
     )
 
 
@@ -1693,6 +1787,13 @@ def _move_packed_text_batch(batch: PackedTextBatch, device: torch.device) -> Pac
         option_mask=option_mask,
         target_positions=batch.target_positions.to(device, non_blocking=nb),
         target_mask=target_mask,
+        blank_positions=batch.blank_positions.to(device, non_blocking=nb),
+        blank_kind=batch.blank_kind.to(device, non_blocking=nb),
+        blank_group=batch.blank_group.to(device, non_blocking=nb),
+        blank_group_kind=batch.blank_group_kind.to(device, non_blocking=nb),
+        blank_option_index=batch.blank_option_index.to(device, non_blocking=nb),
+        blank_legal_ids=batch.blank_legal_ids.to(device, non_blocking=nb),
+        blank_legal_mask=batch.blank_legal_mask.to(device, non_blocking=nb),
     )
 
 

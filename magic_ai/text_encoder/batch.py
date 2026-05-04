@@ -58,6 +58,7 @@ class TextEncodedExample:
     blank_group_ids: list[int] = field(default_factory=list)
     blank_group_kinds: list[int] = field(default_factory=list)  # int enum
     blank_legal_ids: list[list[int]] = field(default_factory=list)
+    blank_option_indices: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -91,6 +92,9 @@ class TextEncodedBatch:
         default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
     )
     blank_group_kind: Tensor = field(  # [B, K] int32, see render_plan.BLANK_GROUP_*
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    blank_option_index: Tensor = field(  # [B, K] int32, -1 = absent / not engine-option-backed
         default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
     )
     blank_legal_ids: Tensor = field(  # [B, K, V_max] int32, 0 = pad
@@ -130,6 +134,9 @@ class PackedTextBatch:
     blank_kind: Tensor = field(default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32))
     blank_group: Tensor = field(default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32))
     blank_group_kind: Tensor = field(default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32))
+    blank_option_index: Tensor = field(
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
     blank_legal_ids: Tensor = field(
         default_factory=lambda: torch.zeros((0, 0, 0), dtype=torch.int32)
     )
@@ -227,6 +234,7 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
         blank_kind=padded.blank_kind,
         blank_group=padded.blank_group,
         blank_group_kind=padded.blank_group_kind,
+        blank_option_index=padded.blank_option_index,
         blank_legal_ids=padded.blank_legal_ids,
         blank_legal_mask=padded.blank_legal_mask,
     )
@@ -341,6 +349,7 @@ def tokenize_snapshot(
     blank_group_ids: list[int] = []
     blank_group_kinds: list[int] = []
     blank_legal_ids: list[list[int]] = []
+    blank_option_indices: list[int] = []
     if rendered.blank_anchors:
         # Pre-resolve each anchor's kind-token id and bucket the anchors by
         # kind so we don't repeatedly scan the full anchor list per token.
@@ -370,6 +379,7 @@ def tokenize_snapshot(
             blank_group_ids.append(int(anchor.group_id))
             blank_group_kinds.append(blank_group_kind_id(anchor.group_kind))
             blank_legal_ids.append([int(t) for t in anchor.legal_token_ids])
+            blank_option_indices.append(int(anchor.option_index))
             cursor += 1
         if cursor != len(anchors):
             raise RuntimeError(
@@ -388,6 +398,7 @@ def tokenize_snapshot(
         blank_group_ids=blank_group_ids,
         blank_group_kinds=blank_group_kinds,
         blank_legal_ids=blank_legal_ids,
+        blank_option_indices=blank_option_indices,
     )
 
 
@@ -437,6 +448,7 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
     blank_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
     blank_group = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
     blank_group_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
+    blank_option_index = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
     blank_legal_ids = torch.zeros((batch_size, max_blanks, max_legal), dtype=torch.int32)
     blank_legal_mask = torch.zeros((batch_size, max_blanks, max_legal), dtype=torch.bool)
 
@@ -461,6 +473,7 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
             blank_kind[b, k_idx] = int(ex.blank_kind_ids[k_idx])
             blank_group[b, k_idx] = int(ex.blank_group_ids[k_idx])
             blank_group_kind[b, k_idx] = int(ex.blank_group_kinds[k_idx])
+            blank_option_index[b, k_idx] = int(ex.blank_option_indices[k_idx])
             for v_idx, tid in enumerate(ex.blank_legal_ids[k_idx]):
                 blank_legal_ids[b, k_idx, v_idx] = int(tid)
                 blank_legal_mask[b, k_idx, v_idx] = True
@@ -478,6 +491,7 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
         blank_kind=blank_kind,
         blank_group=blank_group,
         blank_group_kind=blank_group_kind,
+        blank_option_index=blank_option_index,
         blank_legal_ids=blank_legal_ids,
         blank_legal_mask=blank_legal_mask,
     )

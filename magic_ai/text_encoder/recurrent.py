@@ -47,6 +47,7 @@ class RecurrentTextPolicyOutput:
     target_mask: Tensor
     card_vectors: Tensor
     card_mask: Tensor
+    blank_logits: Tensor | None = None
     lstm_input: Tensor | None = None  # [B, lstm_hidden] in_proj(state_vector); None when bypassed
 
 
@@ -214,6 +215,7 @@ class RecurrentTextPolicy(nn.Module):
             target_mask=encoded.target_mask,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,
+            blank_logits=encoded.blank_logits,
             lstm_input=lstm_input,
         )
         return out, (h_out, c_out)

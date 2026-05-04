@@ -324,6 +324,7 @@ def test_text_policy_inline_block_blank_forward(
 
     assert batch.blank_positions.shape == (1, 1)
     assert batch.blank_legal_ids.shape == (1, 1, 2)
+    assert int(batch.blank_option_index[0, 0]) == 0
     none_id = tokenizer.convert_tokens_to_ids("<none>")
     assert int(batch.blank_legal_ids[0, 0, 0]) == int(none_id)
 
@@ -331,6 +332,7 @@ def test_text_policy_inline_block_blank_forward(
 
     assert out.blank_logits is not None
     assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert out.blank_option_index is batch.blank_option_index
     assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
 
 

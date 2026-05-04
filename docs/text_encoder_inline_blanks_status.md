@@ -172,15 +172,24 @@ without treating the accuracy gate as a blocker.
   options into `<choose-block>` blanks next to each defender. Legal ids are
   `<none>` followed by the legal attacker `<card-ref:K>` ids in target order;
   anchors use `group_kind="CONSTRAINED"`.
+- `magic_ai/text_encoder/batch.py` / `policy.py` / `recurrent.py` — blank
+  tensors now preserve `blank_option_index` and recurrent forwards expose
+  `blank_logits`, so live sampling can map blank choices back to engine
+  options.
 - `magic_ai/text_encoder/policy.py` — `TextPolicy.encode_snapshots(...)`
   supplies `<none>` and `<card-ref:K>` token ids to the renderer for block
   blank legal vocabularies.
+- `magic_ai/text_encoder/actor_critic.py` — live Python text sampling can use
+  inline `<choose-block>` logits for blocker decisions, returning the same
+  selected-column semantics as the legacy blocker layout.
 - `magic_ai/text_encoder/training.py` — added
   `inline_blank_per_blank_loss(...)` and
   `inline_blank_per_blank_accuracy(...)` for `PER_BLANK` and `CONSTRAINED`
   groups; block blanks use this target shape (`0=<none>`, `1..N=attackers`).
-- `tests/test_text_render.py`, `tests/test_text_policy.py` — coverage for
-  block anchor placement/legal ids and end-to-end inline block blank forward.
+- `tests/test_text_render.py`, `tests/test_text_policy.py`,
+  `tests/test_text_actor_critic.py` — coverage for block anchor placement,
+  legal ids, blank option provenance, recurrent logits, and live sampler
+  option-index mapping.
 - `tests/test_text_encoder_training.py` — coverage for constrained
   per-blank loss/accuracy and masking.
 - `magic_ai/actions.py` — added `action_from_inline_block_choices(...)` to
@@ -190,8 +199,8 @@ without treating the accuracy gate as a blocker.
 
 ## Next steps
 
-1. **Step 6 — Combat blocks.** Wire inline-block sampling into the live text
-   actor path and replay scoring path.
+1. **Step 6 — Combat blocks.** Store inline blank tensors in text replay and
+   use them for replay scoring of block decisions.
 2. **Step 7** — targets/modes/mays/X-cost/mana sources.
 3. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
    `target_*` batch fields, the legacy renderer branch, and the

@@ -103,6 +103,7 @@ class TextPolicyOutput:
     blank_kind: Tensor | None = None
     blank_group: Tensor | None = None
     blank_group_kind: Tensor | None = None
+    blank_option_index: Tensor | None = None
     blank_legal_ids: Tensor | None = None
     blank_legal_mask: Tensor | None = None
 
@@ -207,6 +208,7 @@ class TextPolicy(nn.Module):
             blank_kind=batch.blank_kind,
             blank_group=batch.blank_group,
             blank_group_kind=batch.blank_group_kind,
+            blank_option_index=batch.blank_option_index,
             blank_legal_ids=batch.blank_legal_ids,
             blank_legal_mask=batch.blank_legal_mask,
         )
