@@ -1728,6 +1728,9 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
     initialize_game_log(game_log_path(args))
+    trace_path = priority_trace_jsonl_path(args)
+    if trace_path is not None:
+        initialize_game_log(trace_path)
     if args.learning_rate is None:
         args.learning_rate = 5e-5 if args.trainer == "rnad" else 3e-4
     deck_pool = load_deck_pool(args.deck_json, args.deck_dir, args.jumpstart_dir)
@@ -2380,6 +2383,15 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GAME_LOG_PATH,
         help="path for sampled game transcripts; rewritten at the start of training",
     )
+    parser.add_argument(
+        "--priority-trace-jsonl-path",
+        type=Path,
+        default=None,
+        help=(
+            "optional JSONL path for sampled priority transcript rows; suitable for "
+            "scripts/inline_blank_bc_parity.py --trace-jsonl"
+        ),
+    )
     parser.add_argument("--wandb-project", default="magic-ai")
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
@@ -2691,6 +2703,11 @@ def game_log_path(args: argparse.Namespace) -> Path:
     return Path(getattr(args, "game_log_path", DEFAULT_GAME_LOG_PATH))
 
 
+def priority_trace_jsonl_path(args: argparse.Namespace) -> Path | None:
+    path = getattr(args, "priority_trace_jsonl_path", None)
+    return None if path is None else Path(path)
+
+
 def append_sample_game_log(
     path: Path,
     transcript: list[TranscriptAction],
@@ -2712,6 +2729,40 @@ def append_sample_game_log(
         )
         handle.write("\n".join(lines))
         handle.write("\n\n")
+
+
+def append_priority_trace_jsonl(
+    path: Path | None,
+    transcript: list[TranscriptAction],
+    *,
+    episode_idx: int,
+    winner_idx: int,
+    encoder: str,
+) -> None:
+    """Append gate-ready priority transcript rows for inline-blank BC parity."""
+
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for action_idx, item in enumerate(transcript):
+            if item.pending.get("kind") != "priority":
+                continue
+            handle.write(
+                json.dumps(
+                    {
+                        "episode_idx": int(episode_idx),
+                        "action_idx": int(action_idx),
+                        "winner_idx": int(winner_idx),
+                        "encoder": encoder,
+                        "state": item.state,
+                        "pending": item.pending,
+                        "action": item.action,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
 
 
 def rollout_value_metrics(
@@ -3011,6 +3062,13 @@ def train_native_batched_envs(
                     episode_idx=env.episode_idx,
                     winner_idx=winner_idx,
                     max_actions=args.sample_actions,
+                    encoder="slots",
+                )
+                append_priority_trace_jsonl(
+                    priority_trace_jsonl_path(args),
+                    env.transcript,
+                    episode_idx=env.episode_idx,
+                    winner_idx=winner_idx,
                     encoder="slots",
                 )
                 print_sample_game(
@@ -3630,6 +3688,13 @@ def train_text_envs(
             max_actions=args.sample_actions,
             encoder="text",
         )
+        append_priority_trace_jsonl(
+            priority_trace_jsonl_path(args),
+            transcript,
+            episode_idx=episode_idx,
+            winner_idx=winner_idx,
+            encoder="text",
+        )
         completed_games += 1
         if is_timeout:
             win_stats.timeouts += 1
@@ -4063,6 +4128,13 @@ def train_text_native_batched_envs(
                     episode_idx=env.episode_idx,
                     winner_idx=winner_idx,
                     max_actions=args.sample_actions,
+                    encoder="text",
+                )
+                append_priority_trace_jsonl(
+                    priority_trace_jsonl_path(args),
+                    env.transcript,
+                    episode_idx=env.episode_idx,
+                    winner_idx=winner_idx,
                     encoder="text",
                 )
             free_slots.append(env.slot_idx)

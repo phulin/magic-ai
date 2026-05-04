@@ -143,6 +143,12 @@ the eight-step migration. Update at every step boundary.
 - `tests/test_inline_blank_bc_parity.py` — coverage for synthetic fixture
   generation, trace loading, selected option-id/action/trace resolution, and
   render-order target mapping for legacy vs inline rows.
+- `scripts/train.py` — added `--priority-trace-jsonl-path`; sampled game
+  transcripts now optionally append gate-ready priority JSONL rows with
+  `state`, `pending`, and `action` fields while leaving the human-readable
+  `--game-log-path` output unchanged.
+- `tests/test_train.py` — coverage for JSONL trace append behavior and path
+  defaulting.
 - Smoke:
   `uv run python scripts/inline_blank_bc_parity.py --synthetic-fixture 8 --epochs 1 --batch-size 4 --d-model 32 --n-layers 1 --n-heads 4 --d-ff 64 --max-seq-len 512 --seed 0`
   → **passed**.
@@ -155,9 +161,10 @@ available for it.
 
 ## Next steps
 
-1. **Step 5 — BC parity gate.** Run `scripts/inline_blank_bc_parity.py` on a
-   fixed real trace set. Require ≤ 0.5 pp accuracy regression before
-   extending. Record the gate decision in this status file.
+1. **Step 5 — BC parity gate.** Generate a fixed real trace set with
+   `scripts/train.py --priority-trace-jsonl-path ...`, then run
+   `scripts/inline_blank_bc_parity.py --trace-jsonl ...`. Require ≤ 0.5 pp
+   accuracy regression before extending. Record the gate decision here.
 2. **Steps 6-7** — combat blocks, then targets/modes/mays/X-cost/
    mana sources. Re-gate at each step.
 3. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /

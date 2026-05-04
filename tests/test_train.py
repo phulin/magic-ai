@@ -29,6 +29,7 @@ from scripts.train import (
     _current_transcript_snapshot,
     _prune_pool_to_schedule,
     _restore_opponent_pool,
+    append_priority_trace_jsonl,
     append_sample_game_log,
     build_slot_backend,
     build_text_backend,
@@ -40,6 +41,7 @@ from scripts.train import (
     log_ppo_stats,
     log_retrospective_table,
     main,
+    priority_trace_jsonl_path,
     retrospective_rating_rows,
     sample_decks,
     sample_text_policy_batch,
@@ -192,6 +194,70 @@ class TrainPPOTests(unittest.TestCase):
         self.assertNotIn("stale", text)
         self.assertIn("encoder=text episode=7 winner=0", text)
         self.assertIn("pass", text)
+
+    def test_priority_trace_jsonl_appends_only_priority_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "priority.jsonl"
+            transcript = [
+                train_mod.TranscriptAction(
+                    state=cast(
+                        GameStateSnapshot,
+                        {
+                            "players": [
+                                {"ID": "A", "Name": "A", "Life": 20},
+                                {"ID": "B", "Name": "B", "Life": 20},
+                            ],
+                            "active_player": "A",
+                            "turn": 1,
+                            "step": "Precombat Main",
+                        },
+                    ),
+                    pending=cast(
+                        PendingState,
+                        {"kind": "priority", "player_idx": 0, "options": []},
+                    ),
+                    action={"kind": "pass"},
+                ),
+                train_mod.TranscriptAction(
+                    state=cast(
+                        GameStateSnapshot,
+                        {
+                            "players": [],
+                            "active_player": "A",
+                            "turn": 1,
+                            "step": "Declare Attackers",
+                        },
+                    ),
+                    pending=cast(
+                        PendingState,
+                        {"kind": "attackers", "player_idx": 0, "options": []},
+                    ),
+                    action={"attackers": []},
+                ),
+            ]
+
+            append_priority_trace_jsonl(
+                path,
+                transcript,
+                episode_idx=3,
+                winner_idx=1,
+                encoder="text",
+            )
+
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["episode_idx"], 3)
+        self.assertEqual(rows[0]["action_idx"], 0)
+        self.assertEqual(rows[0]["winner_idx"], 1)
+        self.assertEqual(rows[0]["encoder"], "text")
+        self.assertEqual(rows[0]["pending"]["kind"], "priority")
+        self.assertEqual(rows[0]["action"], {"kind": "pass"})
+
+    def test_priority_trace_jsonl_path_defaults_to_none(self) -> None:
+        self.assertIsNone(priority_trace_jsonl_path(Namespace()))
+        path = Path("/tmp/priority.jsonl")
+        self.assertEqual(priority_trace_jsonl_path(Namespace(priority_trace_jsonl_path=path)), path)
 
     def test_gae_returns_flips_bootstrap_sign_for_opponent_steps(self) -> None:
         steps = [
