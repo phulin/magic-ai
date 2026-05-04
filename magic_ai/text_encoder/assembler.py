@@ -36,6 +36,8 @@ from magic_ai.text_encoder.render_plan import (
     OP_COUNT,
     OP_COUNTER,
     OP_DICT_ENTRY,
+    OP_EMIT_BLANK,
+    OP_EMIT_BLANK_LEGAL,
     OP_END_CARD,
     OP_LIFE,
     OP_LITERAL_TOKENS,
@@ -326,6 +328,13 @@ class _AssembledExample:
     card_ref_positions: dict[int, int]
     option_positions: list[int]
     target_positions: list[list[int]]
+    # Inline-blank metadata (Step 3 of inline-blanks plan). Populated when the
+    # render plan contains OP_EMIT_BLANK opcodes; otherwise these stay empty.
+    blank_positions: list[int] = field(default_factory=list)
+    blank_kind_ids: list[int] = field(default_factory=list)
+    blank_group_ids: list[int] = field(default_factory=list)
+    blank_group_kinds: list[int] = field(default_factory=list)
+    blank_legal_ids: list[list[int]] = field(default_factory=list)
 
 
 def _assemble_one(
@@ -359,6 +368,11 @@ def _assemble_one(
     cur_target_bucket: list[int] | None = None
     scalar_owner_open: int | None = None
     option_open = False
+    blank_positions: list[int] = []
+    blank_kind_ids: list[int] = []
+    blank_group_ids: list[int] = []
+    blank_group_kinds: list[int] = []
+    blank_legal: list[list[int]] = []
     # (zone_id, owner) pushed on OPEN_ZONE / popped on CLOSE_ZONE so we can
     # recover the matching open in O(1) instead of rescanning the plan.
     zone_stack: list[tuple[int, int]] = []
@@ -708,6 +722,38 @@ def _assemble_one(
             i += 1 + arity
             continue
 
+        if op == OP_EMIT_BLANK:
+            kind_id = plan_list[i + 1]
+            group_id = plan_list[i + 2]
+            group_kind = plan_list[i + 3]
+            legal_count = plan_list[i + 4]
+            pos = len(out)
+            out.append(int(kind_id))
+            blank_positions.append(pos)
+            blank_kind_ids.append(int(kind_id))
+            blank_group_ids.append(int(group_id))
+            blank_group_kinds.append(int(group_kind))
+            legal: list[int] = []
+            i += 1 + arity
+            for _ in range(legal_count):
+                if i >= n or plan_list[i] != OP_EMIT_BLANK_LEGAL:
+                    raise ValueError(
+                        f"OP_EMIT_BLANK legal_count={legal_count} but "
+                        f"OP_EMIT_BLANK_LEGAL stream truncated at i={i}"
+                    )
+                legal.append(int(plan_list[i + 1]))
+                i += 1 + OPCODE_ARITY[OP_EMIT_BLANK_LEGAL]
+            blank_legal.append(legal)
+            continue
+
+        if op == OP_EMIT_BLANK_LEGAL:
+            # Stray OP_EMIT_BLANK_LEGAL (without a preceding OP_EMIT_BLANK):
+            # treat as a wire-format error.
+            raise ValueError(
+                f"unexpected OP_EMIT_BLANK_LEGAL at position {i}; "
+                "must follow an OP_EMIT_BLANK header"
+            )
+
         if op == OP_END_CARD:
             out.extend(toks.card_closer_ids)
             i += 1
@@ -748,6 +794,11 @@ def _assemble_one(
         card_ref_positions=card_ref_positions,
         option_positions=option_positions,
         target_positions=target_positions,
+        blank_positions=blank_positions,
+        blank_kind_ids=blank_kind_ids,
+        blank_group_ids=blank_group_ids,
+        blank_group_kinds=blank_group_kinds,
+        blank_legal_ids=blank_legal,
     )
 
 
@@ -875,6 +926,11 @@ def assemble_batch(
         (len(t) for ex in assembled for t in ex.target_positions),
         default=0,
     )
+    max_blanks = max((len(ex.blank_positions) for ex in assembled), default=0)
+    max_legal = max(
+        (len(legal) for ex in assembled for legal in ex.blank_legal_ids),
+        default=0,
+    )
 
     token_ids = torch.full((batch_size, width), toks.pad_id, dtype=torch.int64)
     attention_mask = torch.zeros((batch_size, width), dtype=torch.int64)
@@ -883,6 +939,12 @@ def assemble_batch(
     option_mask = torch.zeros((batch_size, max_opts), dtype=torch.bool)
     target_positions = torch.full((batch_size, max_opts, max_targets), -1, dtype=torch.int64)
     target_mask = torch.zeros((batch_size, max_opts, max_targets), dtype=torch.bool)
+    blank_positions = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
+    blank_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
+    blank_group = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
+    blank_group_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
+    blank_legal_ids = torch.zeros((batch_size, max_blanks, max_legal), dtype=torch.int32)
+    blank_legal_mask = torch.zeros((batch_size, max_blanks, max_legal), dtype=torch.bool)
 
     for b, ex in enumerate(assembled):
         t_i = len(ex.token_ids)
@@ -900,6 +962,14 @@ def assemble_batch(
                 if tpos >= 0:
                     target_positions[b, o, t] = int(tpos)
                     target_mask[b, o, t] = True
+        for k_idx, pos in enumerate(ex.blank_positions):
+            blank_positions[b, k_idx] = int(pos)
+            blank_kind[b, k_idx] = int(ex.blank_kind_ids[k_idx])
+            blank_group[b, k_idx] = int(ex.blank_group_ids[k_idx])
+            blank_group_kind[b, k_idx] = int(ex.blank_group_kinds[k_idx])
+            for v_idx, tid in enumerate(ex.blank_legal_ids[k_idx]):
+                blank_legal_ids[b, k_idx, v_idx] = int(tid)
+                blank_legal_mask[b, k_idx, v_idx] = True
 
     return TextEncodedBatch(
         token_ids=token_ids,
@@ -910,4 +980,10 @@ def assemble_batch(
         target_positions=target_positions,
         target_mask=target_mask,
         seq_lengths=torch.as_tensor(seq_lengths, dtype=torch.int64),
+        blank_positions=blank_positions,
+        blank_kind=blank_kind,
+        blank_group=blank_group,
+        blank_group_kind=blank_group_kind,
+        blank_legal_ids=blank_legal_ids,
+        blank_legal_mask=blank_legal_mask,
     )

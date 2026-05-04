@@ -290,6 +290,22 @@ class NativeAssemblerParityTests(unittest.TestCase):
             max_card_refs=self.max_card_refs_native,
         )
 
+    def _encode_native_packed_inline(self, game: Any, perspective: int) -> tuple[Any, Any]:
+        from magic_ai.text_encoder.native_assembler import encode_tokens_packed
+
+        return encode_tokens_packed(
+            self.encoder,
+            [game],
+            perspective_player_indices=[perspective],
+            max_tokens=self.max_tokens_native,
+            max_options=self.max_options_native,
+            max_targets=self.max_targets_native,
+            max_card_refs=self.max_card_refs_native,
+            max_blanks=32,
+            max_legal_per_blank=4,
+            use_inline_blanks=True,
+        )
+
     def _encode_native_packed_reuse(
         self, game: Any, perspective: int, outputs: Any
     ) -> tuple[Any, Any]:
@@ -479,6 +495,74 @@ class NativeAssemblerParityTests(unittest.TestCase):
             self.assertTrue(torch.equal(packed.option_mask, expected.option_mask))
             self.assertTrue(torch.equal(packed.target_positions, expected.target_positions))
             self.assertTrue(torch.equal(packed.target_mask, expected.target_mask))
+
+    def test_packed_native_inline_blank_outputs(self) -> None:
+        """Inline mode should surface CROSS_BLANK priority anchors natively."""
+
+        from magic_ai.text_encoder.rollout import (
+            _default_action_for,
+            _translate_action,
+        )
+
+        game = self.mage.new_game(self.deck_a, self.deck_b, seed=6, shuffle=True, hand_size=7)
+        captures = 0
+        steps = 0
+        while steps < 200 and captures < 1:
+            steps += 1
+            game.refresh_state()
+            if game.is_over:
+                break
+            pending = cast(dict[str, Any] | None, game.pending or game.legal())
+            if pending is None:
+                try:
+                    game.step({"kind": "pass"})
+                except Exception:
+                    break
+                continue
+            kind = pending.get("kind", "") or ""
+            options = list(pending.get("options", []) or [])
+            player_idx = int(pending.get("player_idx", 0) or 0)
+            if player_idx not in (0, 1):
+                player_idx = 0
+            if kind == "priority" and options:
+                _, outputs = self._encode_native_packed_inline(game, player_idx)
+                packed = outputs.to_packed_text_batch()
+                self.assertGreater(int(packed.blank_positions.numel()), 0)
+                self.assertGreater(int((packed.blank_positions >= 0).sum().item()), 0)
+                self.assertTrue(
+                    torch.equal(packed.blank_group, torch.zeros_like(packed.blank_group))
+                )
+                self.assertTrue(
+                    torch.equal(packed.blank_group_kind, torch.ones_like(packed.blank_group_kind))
+                )
+                self.assertTrue(packed.blank_legal_mask.all())
+                self.assertTrue(
+                    torch.equal(
+                        packed.blank_legal_ids,
+                        torch.full_like(packed.blank_legal_ids, self.token_tables_py.chosen_id),
+                    )
+                )
+                for pos, kind_id in zip(
+                    packed.blank_positions[0].tolist(),
+                    packed.blank_kind[0].tolist(),
+                    strict=True,
+                ):
+                    if pos >= 0:
+                        self.assertEqual(int(packed.token_ids[pos]), int(kind_id))
+                captures += 1
+                break
+            if not options:
+                action = _default_action_for(cast(Any, pending))
+            elif kind == "priority":
+                action = _translate_action(cast(Any, pending), 0, None)
+            else:
+                action = _default_action_for(cast(Any, pending))
+            try:
+                game.step(dict(action))
+            except Exception:
+                break
+
+        self.assertGreater(captures, 0, "no inline blank capture collected")
 
     def test_drive_is_deterministic_for_fixed_seed(self) -> None:
         """Two drives with the same seed produce identical encoded batches."""

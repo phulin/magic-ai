@@ -45,6 +45,27 @@ class _MagePackedTokenAssemblerOutputsC(ctypes.Structure):
     ]
 
 
+class _MageBlankAssemblerConfigC(ctypes.Structure):
+    _fields_ = [
+        ("max_blanks", ctypes.c_int32),
+        ("max_legal_per_blank", ctypes.c_int32),
+    ]
+
+
+class _MagePackedBlankOutputsC(ctypes.Structure):
+    _fields_ = [
+        ("k_max", ctypes.c_int32),
+        ("v_max", ctypes.c_int32),
+        ("blank_positions", ctypes.POINTER(ctypes.c_int32)),
+        ("blank_kind", ctypes.POINTER(ctypes.c_int32)),
+        ("blank_group", ctypes.POINTER(ctypes.c_int32)),
+        ("blank_group_kind", ctypes.POINTER(ctypes.c_int32)),
+        ("blank_legal_ids", ctypes.POINTER(ctypes.c_int32)),
+        ("blank_legal_mask", ctypes.POINTER(ctypes.c_uint8)),
+        ("blank_overflow", ctypes.POINTER(ctypes.c_int32)),
+    ]
+
+
 _packed_ctypes_lib: ctypes.CDLL | None = None
 
 
@@ -77,6 +98,8 @@ def _load_packed_ctypes_lib() -> ctypes.CDLL | None:
             ctypes.POINTER(_MageEncodeOutputs),
             ctypes.POINTER(_MageTokenAssemblerConfigC),
             ctypes.POINTER(_MagePackedTokenAssemblerOutputsC),
+            ctypes.POINTER(_MageBlankAssemblerConfigC),
+            ctypes.POINTER(_MagePackedBlankOutputsC),
         ]
         lib.MageEncodeTokensPacked.restype = _MageEncodeResult
         lib.MageFreeString.argtypes = [ctypes.c_void_p]
@@ -109,11 +132,22 @@ class NativePackedAssemblerOutputs:
     target_mask: torch.Tensor  # (B, max_options, max_targets) uint8
     card_ref_positions: torch.Tensor  # (B, max_card_refs) int32
     token_overflow: torch.Tensor  # (B,) int32
+    blank_positions: torch.Tensor  # (B, max_blanks) int32
+    blank_kind: torch.Tensor  # (B, max_blanks) int32
+    blank_group: torch.Tensor  # (B, max_blanks) int32
+    blank_group_kind: torch.Tensor  # (B, max_blanks) int32
+    blank_legal_ids: torch.Tensor  # (B, max_blanks, max_legal_per_blank) int32
+    blank_legal_mask: torch.Tensor  # (B, max_blanks, max_legal_per_blank) uint8
+    blank_overflow: torch.Tensor  # (B,) int32
     active_batch_size: int = 0
     _packed_out_cffi: Any = None
     _tok_cfg_cffi: Any = None
+    _blank_cfg_cffi: Any = None
+    _blank_out_cffi: Any = None
     _packed_out_ctypes: _MagePackedTokenAssemblerOutputsC | None = None
     _tok_cfg_ctypes: _MageTokenAssemblerConfigC | None = None
+    _blank_cfg_ctypes: _MageBlankAssemblerConfigC | None = None
+    _blank_out_ctypes: _MagePackedBlankOutputsC | None = None
 
     def to_packed_text_batch(
         self, *, trim: bool = True, derive_token_metadata: bool = True
@@ -134,6 +168,12 @@ class NativePackedAssemblerOutputs:
         option_mask_full = self.option_mask[:active_n]
         target_positions_full = self.target_positions[:active_n]
         target_mask_full = self.target_mask[:active_n]
+        blank_positions_full = self.blank_positions[:active_n]
+        blank_kind_full = self.blank_kind[:active_n]
+        blank_group_full = self.blank_group[:active_n]
+        blank_group_kind_full = self.blank_group_kind[:active_n]
+        blank_legal_ids_full = self.blank_legal_ids[:active_n]
+        blank_legal_mask_full = self.blank_legal_mask[:active_n]
 
         total = int(cu_seqlens[-1].item()) if cu_seqlens.numel() else 0
         token_ids = self.token_ids[:total]
@@ -167,11 +207,43 @@ class NativePackedAssemblerOutputs:
             )
             target_positions = target_positions_full[:, :max_opts, :max_tgts]
             target_mask = target_mask_full[:, :max_opts, :max_tgts]
+            blank_any = blank_positions_full >= 0
+            blank_cols = blank_any.any(dim=0)
+            max_blanks = int(blank_cols.sum().item()) if blank_cols.numel() else 0
+            if max_blanks > 0:
+                legal_cols = blank_legal_mask_full[:, :max_blanks].bool().any(dim=0).any(dim=0)
+                max_legal = int(legal_cols.sum().item()) if legal_cols.numel() else 0
+            else:
+                max_legal = 0
+            blank_positions = (
+                blank_positions_full[:, :max_blanks]
+                if max_blanks > 0
+                else blank_positions_full[:, :0]
+            )
+            blank_kind = (
+                blank_kind_full[:, :max_blanks] if max_blanks > 0 else blank_kind_full[:, :0]
+            )
+            blank_group = (
+                blank_group_full[:, :max_blanks] if max_blanks > 0 else blank_group_full[:, :0]
+            )
+            blank_group_kind = (
+                blank_group_kind_full[:, :max_blanks]
+                if max_blanks > 0
+                else blank_group_kind_full[:, :0]
+            )
+            blank_legal_ids = blank_legal_ids_full[:, :max_blanks, :max_legal]
+            blank_legal_mask = blank_legal_mask_full[:, :max_blanks, :max_legal].bool()
         else:
             option_positions = option_positions_full
             option_mask = option_mask_full
             target_positions = target_positions_full
             target_mask = target_mask_full
+            blank_positions = blank_positions_full
+            blank_kind = blank_kind_full
+            blank_group = blank_group_full
+            blank_group_kind = blank_group_kind_full
+            blank_legal_ids = blank_legal_ids_full
+            blank_legal_mask = blank_legal_mask_full.bool()
 
         # seq_lengths is on pinned CPU memory; .max() here is a host-only op
         # (no GPU sync) and gives flash_attn_varlen a tight per-batch tile bound.
@@ -188,6 +260,12 @@ class NativePackedAssemblerOutputs:
             option_mask=option_mask.bool(),
             target_positions=target_positions,
             target_mask=target_mask.bool(),
+            blank_positions=blank_positions,
+            blank_kind=blank_kind,
+            blank_group=blank_group,
+            blank_group_kind=blank_group_kind,
+            blank_legal_ids=blank_legal_ids,
+            blank_legal_mask=blank_legal_mask,
             max_seqlen=max_seqlen,
         )
 
@@ -199,6 +277,8 @@ def allocate_packed_outputs(
     max_options: int,
     max_targets: int,
     max_card_refs: int,
+    max_blanks: int = 0,
+    max_legal_per_blank: int = 0,
 ) -> NativePackedAssemblerOutputs:
     pin = torch.cuda.is_available()
     cap = batch_size * max_tokens
@@ -223,6 +303,17 @@ def allocate_packed_outputs(
             (batch_size, max_card_refs), -1, dtype=torch.int32, pin_memory=pin
         ),
         token_overflow=torch.zeros((batch_size,), dtype=torch.int32),
+        blank_positions=torch.full((batch_size, max_blanks), -1, dtype=torch.int32, pin_memory=pin),
+        blank_kind=torch.zeros((batch_size, max_blanks), dtype=torch.int32, pin_memory=pin),
+        blank_group=torch.full((batch_size, max_blanks), -1, dtype=torch.int32, pin_memory=pin),
+        blank_group_kind=torch.zeros((batch_size, max_blanks), dtype=torch.int32, pin_memory=pin),
+        blank_legal_ids=torch.zeros(
+            (batch_size, max_blanks, max_legal_per_blank), dtype=torch.int32, pin_memory=pin
+        ),
+        blank_legal_mask=torch.zeros(
+            (batch_size, max_blanks, max_legal_per_blank), dtype=torch.uint8, pin_memory=pin
+        ),
+        blank_overflow=torch.zeros((batch_size,), dtype=torch.int32),
     )
 
 
@@ -235,8 +326,11 @@ def encode_tokens_packed(
     max_options: int,
     max_targets: int,
     max_card_refs: int,
+    max_blanks: int = 64,
+    max_legal_per_blank: int = 64,
     outputs: NativePackedAssemblerOutputs | None = None,
     include_trace_kinds: bool = True,
+    use_inline_blanks: bool = False,
 ) -> tuple[Any, NativePackedAssemblerOutputs]:
     """Run ``MageEncodeTokensPacked`` for a batch of games.
 
@@ -262,6 +356,17 @@ def encode_tokens_packed(
             max_options=max_options,
             max_targets=max_targets,
             max_card_refs=max_card_refs,
+            max_blanks=max_blanks if use_inline_blanks else 0,
+            max_legal_per_blank=max_legal_per_blank if use_inline_blanks else 0,
+        )
+    elif use_inline_blanks and (
+        outputs.blank_positions.shape[1] < max_blanks
+        or outputs.blank_legal_ids.shape[2] < max_legal_per_blank
+    ):
+        raise ValueError(
+            "provided outputs do not have enough blank capacity: "
+            f"K={outputs.blank_positions.shape[1]} V={outputs.blank_legal_ids.shape[2]}, "
+            f"requested K={max_blanks} V={max_legal_per_blank}"
         )
     outputs.active_batch_size = batch_size
 
@@ -313,6 +418,34 @@ def encode_tokens_packed(
         )
     tok_cfg = outputs._tok_cfg_cffi
     packed_out = outputs._packed_out_cffi
+    blank_cfg: Any = ffi.NULL
+    blank_out: Any = ffi.NULL
+    if use_inline_blanks:
+        if outputs._blank_cfg_cffi is None:
+            outputs._blank_cfg_cffi = ffi.new(
+                "MageBlankAssemblerConfig *",
+                {
+                    "max_blanks": max_blanks,
+                    "max_legal_per_blank": max_legal_per_blank,
+                },
+            )
+        if outputs._blank_out_cffi is None:
+            outputs._blank_out_cffi = ffi.new(
+                "MagePackedBlankOutputs *",
+                {
+                    "k_max": max_blanks,
+                    "v_max": max_legal_per_blank,
+                    "blank_positions": ffi.cast("int32_t *", outputs.blank_positions.data_ptr()),
+                    "blank_kind": ffi.cast("int32_t *", outputs.blank_kind.data_ptr()),
+                    "blank_group": ffi.cast("int32_t *", outputs.blank_group.data_ptr()),
+                    "blank_group_kind": ffi.cast("int32_t *", outputs.blank_group_kind.data_ptr()),
+                    "blank_legal_ids": ffi.cast("int32_t *", outputs.blank_legal_ids.data_ptr()),
+                    "blank_legal_mask": ffi.cast("uint8_t *", outputs.blank_legal_mask.data_ptr()),
+                    "blank_overflow": ffi.cast("int32_t *", outputs.blank_overflow.data_ptr()),
+                },
+            )
+        blank_cfg = outputs._blank_cfg_cffi
+        blank_out = outputs._blank_out_cffi
 
     buffers = scratch.buffers
     assert buffers is not None
@@ -352,6 +485,28 @@ def encode_tokens_packed(
                     )
                 tok_cfg_c = outputs._tok_cfg_ctypes
                 packed_out_c = outputs._packed_out_ctypes
+                blank_cfg_c: _MageBlankAssemblerConfigC | None = None
+                blank_out_c: _MagePackedBlankOutputsC | None = None
+                if use_inline_blanks:
+                    if outputs._blank_cfg_ctypes is None:
+                        outputs._blank_cfg_ctypes = _MageBlankAssemblerConfigC(
+                            max_blanks=max_blanks,
+                            max_legal_per_blank=max_legal_per_blank,
+                        )
+                    if outputs._blank_out_ctypes is None:
+                        outputs._blank_out_ctypes = _MagePackedBlankOutputsC(
+                            k_max=max_blanks,
+                            v_max=max_legal_per_blank,
+                            blank_positions=_tensor_ptr(outputs.blank_positions, ctypes.c_int32),
+                            blank_kind=_tensor_ptr(outputs.blank_kind, ctypes.c_int32),
+                            blank_group=_tensor_ptr(outputs.blank_group, ctypes.c_int32),
+                            blank_group_kind=_tensor_ptr(outputs.blank_group_kind, ctypes.c_int32),
+                            blank_legal_ids=_tensor_ptr(outputs.blank_legal_ids, ctypes.c_int32),
+                            blank_legal_mask=_tensor_ptr(outputs.blank_legal_mask, ctypes.c_uint8),
+                            blank_overflow=_tensor_ptr(outputs.blank_overflow, ctypes.c_int32),
+                        )
+                    blank_cfg_c = outputs._blank_cfg_ctypes
+                    blank_out_c = outputs._blank_out_ctypes
                 assert tok_cfg_c is not None and packed_out_c is not None
                 result = ctypes_lib.MageEncodeTokensPacked(
                     ctypes.byref(req_c),
@@ -359,6 +514,8 @@ def encode_tokens_packed(
                     ctypes.byref(enc_out_c),
                     ctypes.byref(tok_cfg_c),
                     ctypes.byref(packed_out_c),
+                    ctypes.byref(blank_cfg_c) if blank_cfg_c is not None else None,
+                    ctypes.byref(blank_out_c) if blank_out_c is not None else None,
                 )
                 if result.error_code != 0:
                     message = "MageEncodeTokensPacked failed"
@@ -378,6 +535,8 @@ def encode_tokens_packed(
                             ctypes.byref(enc_out_c),
                             ctypes.byref(tok_cfg_c),
                             ctypes.byref(packed_out_c),
+                            ctypes.byref(blank_cfg_c) if blank_cfg_c is not None else None,
+                            ctypes.byref(blank_out_c) if blank_out_c is not None else None,
                         )
                         if result.error_code == 0:
                             message = ""
@@ -389,7 +548,9 @@ def encode_tokens_packed(
                 cfg_c.emit_render_plan = original_emit_render_plan_c
                 cfg_c.render_plan_capacity = original_render_plan_capacity_c
         else:
-            result = lib.MageEncodeTokensPacked(req, cfg, enc_out, tok_cfg, packed_out)
+            result = lib.MageEncodeTokensPacked(
+                req, cfg, enc_out, tok_cfg, packed_out, blank_cfg, blank_out
+            )
             if result.error_code != 0:
                 message = "MageEncodeTokensPacked failed"
                 if result.error_message != ffi.NULL:
@@ -400,7 +561,9 @@ def encode_tokens_packed(
                 if "requires cfg.emit_render_plan=1" in message:
                     cfg.emit_render_plan = original_emit_render_plan
                     cfg.render_plan_capacity = original_render_plan_capacity
-                    result = lib.MageEncodeTokensPacked(req, cfg, enc_out, tok_cfg, packed_out)
+                    result = lib.MageEncodeTokensPacked(
+                        req, cfg, enc_out, tok_cfg, packed_out, blank_cfg, blank_out
+                    )
                     if result.error_code == 0:
                         message = ""
                 from magic_ai.slot_encoder.native_encoder import NativeEncodingError

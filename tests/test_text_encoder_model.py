@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.model import (
+    InlineBlankPolicy,
     PolicyHead,
     TargetHead,
     TextEncoderConfig,
@@ -128,6 +129,44 @@ def test_text_encoder_forward_pooling_heads_backward() -> None:
         if p.grad is not None
     ]
     assert any(g > 0 for g in grad_norms)
+
+
+def test_inline_blank_policy_scores_legal_candidates_and_masks_padding() -> None:
+    torch.manual_seed(0)
+    vocab_size = 32
+    d_model = 8
+    embed = torch.nn.Embedding(vocab_size, d_model)
+    dense = torch.nn.Linear(d_model, d_model)
+    norm = torch.nn.LayerNorm(d_model)
+    head = InlineBlankPolicy(embed, dense, norm, num_kinds=vocab_size)
+
+    hidden = torch.randn(2, 5, d_model, requires_grad=True)
+    blank_positions = torch.tensor([[1, 3], [2, -1]], dtype=torch.int32)
+    blank_kind = torch.tensor([[4, 5], [6, 0]], dtype=torch.int32)
+    blank_legal_ids = torch.tensor(
+        [
+            [[7, 8, 0], [9, 10, 11]],
+            [[12, 13, 0], [0, 0, 0]],
+        ],
+        dtype=torch.int32,
+    )
+    blank_legal_mask = torch.tensor(
+        [
+            [[True, True, False], [True, True, True]],
+            [[True, True, False], [False, False, False]],
+        ]
+    )
+
+    logits = head(hidden, blank_positions, blank_kind, blank_legal_ids, blank_legal_mask)
+
+    assert logits.shape == (2, 2, 3)
+    assert torch.isfinite(logits[blank_legal_mask]).all()
+    assert (logits[~blank_legal_mask] == float("-inf")).all()
+
+    loss = logits[blank_legal_mask].sum()
+    loss.backward()
+    assert hidden.grad is not None
+    assert float(hidden.grad.detach().abs().sum().item()) > 0
 
 
 def test_local_window_collapses_to_global_when_oversized() -> None:

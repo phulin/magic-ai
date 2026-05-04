@@ -245,6 +245,33 @@ def test_text_policy_end_to_end(
     assert out.option_mask.any()
 
 
+def test_text_policy_inline_blank_forward(
+    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
+) -> None:
+    cfg = _small_cfg(tokenizer)
+    cfg.use_inline_blanks = True
+    policy = build_text_policy(tokenizer, cfg)
+    batch = TextPolicy.encode_snapshots(
+        [_snapshot_with_action(real_card_names)],
+        actions_per_snapshot=None,
+        oracle=oracle,
+        tokenizer=tokenizer,
+        use_inline_blanks=True,
+    )
+
+    assert batch.blank_positions.shape[1] > 0
+    assert batch.blank_legal_mask.any()
+
+    out = policy(batch)
+
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+    assert (out.blank_logits[~batch.blank_legal_mask] == float("-inf")).all()
+    assert out.blank_group is batch.blank_group
+    assert out.blank_group_kind is batch.blank_group_kind
+
+
 def test_text_policy_backward(
     tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
 ) -> None:

@@ -37,7 +37,7 @@ from magic_ai.text_encoder.token_tables import (
     build_token_tables,
     fragment_text,
 )
-from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, load_tokenizer
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, MAX_NUM, load_tokenizer
 
 
 @pytest.fixture(scope="module")
@@ -192,6 +192,43 @@ def test_card_name_match(tokenizer, cache, tables) -> None:
         if row < 0 or row >= len(cache.row_to_name):
             continue
         assert tables.card_name[row] == _enc(tokenizer, cache.row_to_name[row])
+
+
+_INLINE_BLANK_SINGLETON_FIELDS: tuple[tuple[str, str], ...] = (
+    ("choose_target_id", "<choose-target>"),
+    ("choose_block_id", "<choose-block>"),
+    ("choose_damage_order_id", "<choose-damage-order>"),
+    ("choose_mode_id", "<choose-mode>"),
+    ("choose_may_id", "<choose-may>"),
+    ("choose_x_digit_id", "<choose-x-digit>"),
+    ("choose_mana_source_id", "<choose-mana-source>"),
+    ("choose_play_id", "<choose-play>"),
+    ("use_ability_id", "<use-ability>"),
+    ("chosen_id", "<chosen>"),
+    ("yes_id", "<yes>"),
+    ("no_id", "<no>"),
+    ("none_id", "<none>"),
+    ("x_end_id", "<x-end>"),
+)
+
+
+def test_inline_blank_singletons_resolve_to_single_ids(tokenizer, tables) -> None:
+    for attr, tok_str in _INLINE_BLANK_SINGLETON_FIELDS:
+        assert getattr(tables, attr) == tokenizer.convert_tokens_to_ids(tok_str), (attr, tok_str)
+
+
+def test_inline_blank_singletons_are_distinct(tables) -> None:
+    ids = [getattr(tables, attr) for attr, _ in _INLINE_BLANK_SINGLETON_FIELDS]
+    assert len(set(ids)) == len(ids)
+
+
+def test_inline_blank_num_ids_match(tokenizer, tables) -> None:
+    assert len(tables.num_ids) == MAX_NUM
+    for k in range(MAX_NUM):
+        assert tables.num_ids[k] == tokenizer.convert_tokens_to_ids(f"<num:{k}>")
+    # All distinct, none collide with pad.
+    assert len(set(tables.num_ids)) == MAX_NUM
+    assert tables.pad_id not in tables.num_ids
 
 
 def test_table_sizes_match_bounds(tables) -> None:

@@ -776,6 +776,18 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
         )
 
 
+# TODO(step3-replay-triton-blanks): the inline-blank tensors
+# (blank_positions / blank_kind / blank_group / blank_group_kind /
+# blank_legal_ids / blank_legal_mask) need to flow through this packed-append
+# kernel once Step 4+ stores them in the replay buffer. The kernel here is
+# explicit-column rather than shape-flexible — extending it is a column-list
+# extension on the same ragged-by-snapshot layout (per the inline-blanks
+# plan's "Triton kernel column update" line) but does require allocating new
+# dst_* tensors and copying / rebasing them analogously to option_positions.
+# Step 3 leaves this unwired because the Python assembler path produces the
+# correct fields and no replay-buffer code reads them yet.
+
+
 def append_batch_encoded_triton(
     *,
     token_ids: Tensor,

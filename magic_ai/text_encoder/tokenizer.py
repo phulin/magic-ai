@@ -336,6 +336,57 @@ def dict_entry_token(r: int) -> str:
 
 DICT_ENTRY_TOKENS: tuple[str, ...] = tuple(dict_entry_token(r) for r in range(MAX_DICT_ENTRIES))
 
+# ---------------------------------------------------------------------------
+# Inline-blank tokens (Step 1 of docs/text_encoder_inline_blanks_plan.md).
+#
+# Each ``<choose-*>`` token marks a decision-blank position emitted by the
+# renderer. Slot identity (which target slot, which defender, which mode
+# index) is carried by the blank's ordinal within its ``blank_group`` rather
+# than by parameterizing the token. ``<chosen>`` is the scoring token used
+# for cross-blank softmax groups. ``<yes>``/``<no>``/``<none>`` are the
+# boolean / decline answer vocab. ``<x-end>`` terminates a sequence of
+# ``<choose-x-digit>`` blanks. ``<num:k>`` for k=0..MAX_NUM-1 is the
+# small-integer answer vocab (mode index, single X digit).
+#
+# ``<pass>`` is reused as the priority-anchor "pass priority" token and is
+# already declared in ``ACTION_KIND_TOKENS`` — it is *not* duplicated here.
+# ---------------------------------------------------------------------------
+
+CHOOSE_KIND_TOKENS: tuple[str, ...] = (
+    "<choose-target>",
+    "<choose-block>",
+    "<choose-damage-order>",
+    "<choose-mode>",
+    "<choose-may>",
+    "<choose-x-digit>",
+    "<choose-mana-source>",
+    "<choose-play>",
+    "<use-ability>",
+)
+
+BLANK_ANSWER_TOKENS: tuple[str, ...] = (
+    "<chosen>",
+    "<yes>",
+    "<no>",
+    "<none>",
+    "<x-end>",
+)
+
+MAX_NUM = 16
+
+
+def num_token(k: int) -> str:
+    """Return the ``<num:k>`` small-integer answer token for index ``k``."""
+
+    if not 0 <= k < MAX_NUM:
+        raise ValueError(f"num index {k} out of range [0, {MAX_NUM})")
+    return f"<num:{k}>"
+
+
+NUM_TOKENS: tuple[str, ...] = tuple(num_token(k) for k in range(MAX_NUM))
+
+INLINE_BLANK_TOKENS: tuple[str, ...] = CHOOSE_KIND_TOKENS + BLANK_ANSWER_TOKENS + NUM_TOKENS
+
 # Union of every custom token, ordered (structural, status, mana, loyalty,
 # card-ref, dict-entry). The build script feeds this whole tuple to
 # ``add_special_tokens`` so each entry is guaranteed a single id and is
@@ -353,6 +404,7 @@ ALL_CUSTOM_TOKENS: tuple[str, ...] = (
     + STEP_TOKENS
     + SCALAR_WRAPPER_TOKENS
     + POOL_MANA_TOKENS
+    + INLINE_BLANK_TOKENS
 )
 
 

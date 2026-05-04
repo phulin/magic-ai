@@ -34,6 +34,17 @@ from magic_ai.text_encoder.tokenizer import (
     step_token,
 )
 
+
+class RenderError(RuntimeError):
+    """Raised when a snapshot can't be rendered into a legal blank layout.
+
+    Examples: an inline-blank pass produces a blank with zero legal candidates,
+    or a priority option references a card / permanent that isn't in any
+    visible zone. Render-time validation per
+    ``docs/text_encoder_inline_blanks_plan.md`` "Legality enforcement".
+    """
+
+
 DEFAULT_ORACLE_PATH = Path(__file__).resolve().parents[2] / "data" / "card_oracle_embeddings.json"
 
 
@@ -98,6 +109,32 @@ class OptionAnchor:
 
 
 @dataclass(frozen=True)
+class BlankAnchor:
+    """Position of an inline-blank ``<choose-*>`` token in the rendered string.
+
+    Step 2 of ``docs/text_encoder_inline_blanks_plan.md``. Only priority
+    blanks (``<choose-play>`` / ``<use-ability>`` / ``<pass>``) are emitted
+    today; combat / target / mode / X / mana-source kinds land in later
+    steps. All priority anchors in a snapshot share **one** ``group_id``
+    with ``group_kind == "CROSS_BLANK"`` per the plan's cross-blank
+    softmax design; the per-anchor "logit" is the score for selecting the
+    ``<chosen>`` token at that position, so ``legal_token_ids`` is the
+    singleton ``(<chosen>_id,)``.
+    """
+
+    blank_index: int  # ordinal across the snapshot (render order)
+    kind: str  # "<choose-play>" / "<use-ability>" / "<pass>"
+    char_start: int
+    char_end: int
+    group_id: int
+    group_kind: str  # "CROSS_BLANK" | "PER_BLANK" | "CONSTRAINED"
+    legal_token_ids: tuple[int, ...]
+    # Provenance: index into the engine's options list, so the engine adapter
+    # can map a chosen blank back to a concrete action.
+    option_index: int
+
+
+@dataclass(frozen=True)
 class TargetAnchor:
     """Position of a ``<target>`` block inside an option."""
 
@@ -114,6 +151,7 @@ class RenderedSnapshot:
     card_refs: dict[str, int] = field(default_factory=dict)
     card_ref_anchors: list[CardRefAnchor] = field(default_factory=list)
     option_anchors: list[OptionAnchor] = field(default_factory=list)
+    blank_anchors: list[BlankAnchor] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -508,11 +546,26 @@ class SnapshotRenderer:
         oracle: dict[str, OracleEntry] | None = None,
         *,
         max_card_refs: int = MAX_CARD_REFS,
+        use_inline_blanks: bool = False,
+        chosen_token_id: int | None = None,
     ) -> None:
         self._oracle = oracle if oracle is not None else {}
         self._max_card_refs = max_card_refs
+        self._use_inline_blanks = use_inline_blanks
+        self._chosen_token_id = chosen_token_id
         self._cur_self_id: str = ""
         self._cur_opp_id: str = ""
+        # Per-render scratch state for inline-blank emission. Reset in
+        # ``render`` before each pass so a renderer instance can be reused.
+        self._blank_options_by_card: dict[str, list[tuple[str, int, tuple[object, ...]]]] = {}
+        self._pass_options: list[int] = []
+        self._blank_group_id: int = 0
+        self._blank_index: int = 0
+        if use_inline_blanks and chosen_token_id is None:
+            raise ValueError(
+                "use_inline_blanks=True requires chosen_token_id (the "
+                "tokenizer id of the '<chosen>' scoring token)."
+            )
 
     # -- public ------------------------------------------------------------
 
@@ -520,9 +573,25 @@ class SnapshotRenderer:
         self,
         snapshot: GameStateSnapshot,
         actions: Sequence[PendingOptionState] | None = None,
+        *,
+        use_inline_blanks: bool | None = None,
     ) -> RenderedSnapshot:
+        if use_inline_blanks is None:
+            inline = self._use_inline_blanks
+        else:
+            inline = use_inline_blanks
+            if inline and self._chosen_token_id is None:
+                raise ValueError(
+                    "use_inline_blanks=True requires chosen_token_id on the "
+                    "renderer (the tokenizer id of the '<chosen>' token)."
+                )
         result = RenderedSnapshot(text="")
         buf: list[str] = []
+        # Reset per-render scratch state.
+        self._blank_options_by_card = {}
+        self._pass_options = []
+        self._blank_group_id = 0
+        self._blank_index = 0
         # First pass: assign card-ref indices in deterministic traversal order.
         card_refs = self._assign_card_refs(snapshot)
         result.card_refs = card_refs
@@ -533,6 +602,23 @@ class SnapshotRenderer:
         opp_player = players[1 - perspective] if len(players) == 2 else None
         self._cur_self_id = str(self_player.get("ID", "")) if self_player else ""
         self._cur_opp_id = str(opp_player.get("ID", "")) if opp_player else ""
+
+        # Resolve the pending options once so inline pre-classification and
+        # the later action / choices block use the same list.
+        if actions is None:
+            pending = snapshot.get("pending")
+            resolved_actions: Sequence[PendingOptionState] = (
+                pending.get("options", []) if pending is not None else []
+            )
+        else:
+            resolved_actions = actions
+
+        # Inline-blank pre-classification: bucket pending options by source
+        # card / permanent so the zone walk can splice the correct
+        # ``<choose-play>`` / ``<use-ability>`` token next to each card.
+        # Pass options are buffered for the trailing ``<choices>`` block.
+        if inline:
+            self._classify_inline_options(resolved_actions)
 
         buf.append("<bos><state>")
         # Top-level game info: <turn>N</turn><step:...>
@@ -588,10 +674,10 @@ class SnapshotRenderer:
             buf.append("<command></command>")
 
         # Actions
-        if actions is None:
-            pending = snapshot.get("pending")
-            actions = pending.get("options", []) if pending is not None else []
-        self._render_actions(buf, result, actions, card_refs)
+        if inline:
+            self._render_choices_inline(buf, result, resolved_actions)
+        else:
+            self._render_actions(buf, result, resolved_actions, card_refs)
 
         buf.append("</state><eos>")
         result.text = "".join(buf)
@@ -694,6 +780,15 @@ class SnapshotRenderer:
         elif tapped is False:
             buf.append("<untapped>")
         buf.append(closing)
+        # Inline-blank emission: any priority anchor whose source is this
+        # card / permanent gets emitted immediately after ``</card>``. The
+        # per-card option list was sorted at classification time so render
+        # order is deterministic across dict-iteration perturbations.
+        if cid:
+            options_here = self._blank_options_by_card.get(cid)
+            if options_here:
+                for kind_token, option_index, _sort_key in options_here:
+                    self._emit_blank(buf, result, kind_token, option_index)
 
     def _render_stack_object(
         self,
@@ -829,6 +924,139 @@ class SnapshotRenderer:
             )
         )
 
+    # -- inline-blank helpers ---------------------------------------------
+
+    def _classify_inline_options(self, actions: Sequence[PendingOptionState]) -> None:
+        """Bucket priority options into per-card blanks + a pass-only list.
+
+        Every option is one of:
+
+        - ``play`` / ``cast`` of a hand card → ``<choose-play>`` blank
+          adjacent to the hand-card render position.
+        - ``activate`` of an ability → ``<use-ability>`` blank adjacent to
+          the source permanent on the battlefield.
+        - ``pass`` → buffered for emission in the trailing ``<choices>``
+          block.
+
+        Per-card options are sorted by an engine-stable key so the blank
+        ordinal layout is deterministic across re-renders, independent of
+        Python dict iteration order. See "Stable blank numbering" in
+        ``docs/text_encoder_inline_blanks_plan.md``.
+        """
+
+        per_card: dict[str, list[tuple[str, int, tuple[object, ...]]]] = {}
+        pass_options: list[int] = []
+        for opt_idx, option in enumerate(actions):
+            kind = (option.get("kind") or "").lower()
+            if kind in ("play", "play_land", "cast", "cast_spell"):
+                source = option.get("card_id") or option.get("permanent_id") or ""
+                if not source:
+                    raise RenderError(
+                        f"play/cast option {opt_idx} ({kind!r}) has no card_id; "
+                        "cannot anchor inline blank."
+                    )
+                # Stable key: (ability_index_or_-1, option-id-string, opt_idx).
+                ability_idx = option.get("ability_index")
+                key: tuple[object, ...] = (
+                    "<choose-play>",
+                    -1 if ability_idx is None else int(ability_idx),
+                    str(option.get("id") or ""),
+                    opt_idx,
+                )
+                per_card.setdefault(source, []).append(("<choose-play>", opt_idx, key))
+            elif kind in ("activate", "activate_ability", "activated_ability"):
+                source = option.get("permanent_id") or option.get("card_id") or ""
+                if not source:
+                    raise RenderError(
+                        f"activate option {opt_idx} has no permanent_id / card_id; "
+                        "cannot anchor inline blank."
+                    )
+                ability_idx = option.get("ability_index")
+                key = (
+                    "<use-ability>",
+                    -1 if ability_idx is None else int(ability_idx),
+                    str(option.get("id") or ""),
+                    opt_idx,
+                )
+                per_card.setdefault(source, []).append(("<use-ability>", opt_idx, key))
+            elif kind == "pass":
+                pass_options.append(opt_idx)
+            else:
+                # Other kinds (mulligan, attack, block, choice, …) aren't
+                # in scope for Step 2. Silently drop them; later steps add
+                # their dedicated blank kinds. Crucially we don't raise:
+                # the legacy path still runs in non-inline mode for them.
+                continue
+
+        # Sort each card's options by their stable key so the blank ordinal
+        # ordering is independent of input-list permutation.
+        for cid in per_card:
+            per_card[cid].sort(key=lambda item: item[2])
+        self._blank_options_by_card = per_card
+        self._pass_options = pass_options
+
+    def _emit_blank(
+        self,
+        buf: list[str],
+        result: RenderedSnapshot,
+        kind_token: str,
+        option_index: int,
+    ) -> None:
+        """Write ``kind_token`` to ``buf`` and record a ``BlankAnchor``.
+
+        Step 2 emits only ``CROSS_BLANK`` priority groups: every priority
+        anchor in the snapshot shares one ``group_id``; the legal vocab at
+        each is the singleton ``<chosen>`` (per the plan's cross-blank
+        softmax). An empty legal set raises ``RenderError`` — we'd never
+        actually hit that here since ``<chosen>`` is always present, but the
+        validation belongs at the emission site so future kinds (target /
+        block / mode / …) can reuse it.
+        """
+
+        chosen_id = self._chosen_token_id
+        if chosen_id is None:
+            raise RenderError(
+                "_emit_blank called without a chosen_token_id; use_inline_blanks must be enabled."
+            )
+        legal_token_ids: tuple[int, ...] = (int(chosen_id),)
+        if not legal_token_ids:
+            raise RenderError(f"blank {kind_token!r} for option {option_index} has empty legal set")
+        char_start = sum(len(s) for s in buf)
+        buf.append(kind_token)
+        char_end = sum(len(s) for s in buf)
+        result.blank_anchors.append(
+            BlankAnchor(
+                blank_index=self._blank_index,
+                kind=kind_token,
+                char_start=char_start,
+                char_end=char_end,
+                group_id=self._blank_group_id,
+                group_kind="CROSS_BLANK",
+                legal_token_ids=legal_token_ids,
+                option_index=option_index,
+            )
+        )
+        self._blank_index += 1
+
+    def _render_choices_inline(
+        self,
+        buf: list[str],
+        result: RenderedSnapshot,
+        actions: Sequence[PendingOptionState],
+    ) -> None:
+        """Emit the trailing ``<choices>`` block with the ``<pass>`` blank.
+
+        Currently the choices zone only carries the priority-pass anchor;
+        later steps add ``<choose-mode>`` / ``<choose-may>`` / ``<choose-x>``
+        groups whose blanks live here too.
+        """
+
+        del actions  # _classify_inline_options already split everything we need
+        buf.append("<choices>")
+        for opt_idx in self._pass_options:
+            self._emit_blank(buf, result, "<pass>", opt_idx)
+        buf.append("</choices>")
+
 
 # ---------------------------------------------------------------------------
 # Convenience top-level function
@@ -841,12 +1069,27 @@ def render_snapshot(
     *,
     oracle: dict[str, OracleEntry] | None = None,
     max_card_refs: int = MAX_CARD_REFS,
+    use_inline_blanks: bool = False,
+    chosen_token_id: int | None = None,
 ) -> RenderedSnapshot:
     """Render ``snapshot`` (and optional ``actions``) to text + anchor metadata.
 
     The ``oracle`` dict (loaded once via :func:`load_oracle_text`) supplies card
     type lines, mana costs, and oracle text. If a card name is missing from the
     dict the renderer falls back to emitting only the card name + status flags.
+
+    ``use_inline_blanks`` switches the priority/action surface from the legacy
+    ``<actions>...<option>...</option>...</actions>`` block to inline
+    ``<choose-play>`` / ``<use-ability>`` blanks adjacent to their source card
+    plus a trailing ``<choices>`` block holding the single ``<pass>`` blank.
+    Required for Step 2+ of ``docs/text_encoder_inline_blanks_plan.md``;
+    callers must supply ``chosen_token_id`` (the tokenizer id of the
+    ``<chosen>`` scoring token).
     """
 
-    return SnapshotRenderer(oracle, max_card_refs=max_card_refs).render(snapshot, actions)
+    return SnapshotRenderer(
+        oracle,
+        max_card_refs=max_card_refs,
+        use_inline_blanks=use_inline_blanks,
+        chosen_token_id=chosen_token_id,
+    ).render(snapshot, actions)

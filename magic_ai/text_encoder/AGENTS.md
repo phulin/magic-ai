@@ -9,12 +9,12 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 - `batch.py` — Tokenize snapshots and collate into padded batches with position-anchored gather masks.
 - `card_cache.py` — Pre-tokenized card-body cache (Name/Type/P/T/oracle) keyed by engine card-row IDs.
 - `mlm.py` — Masked-LM pretraining: uint16 .bin token-stream dataset, BERT-style masking, tied LM head, MLMTrainer.
-- `model.py` — ModernBERT encoder trunk with position-anchored gather pools and policy/target/value heads.
-- `native_assembler.py` — Python wrapper for native Go MageEncodeTokensPacked assembler; manages packed token tensor I/O.
-- `native_token_tables.py` — Serialize TokenTables into flat buffers and register with Go-side mage lib.
-- `policy.py` — Self-contained text-encoder policy facade; exports encode_snapshots and forward.
+- `model.py` — ModernBERT encoder trunk with position-anchored gather pools, legacy policy/target/value heads, and inline-blank legal-token scoring.
+- `native_assembler.py` — Python wrapper for native Go MageEncodeTokensPacked assembler; manages packed token and inline-blank tensor I/O.
+- `native_token_tables.py` — Serialize TokenTables, including inline-blank singletons, into flat buffers and register with Go-side mage lib.
+- `policy.py` — Self-contained text-encoder policy facade; exports encode_snapshots and legacy/inline-blank forward outputs.
 - `recurrent.py` — LSTM history adapter wrapping TextPolicy; carries recurrence through encoder state vector.
-- `render.py` — Deterministic GameStateSnapshot → text renderer; produces custom-token-laced strings and anchor metadata.
+- `render.py` — Deterministic GameStateSnapshot → text renderer; produces custom-token-laced strings and anchor metadata, with flag-gated inline-blank priority mode (Step 2 of inline-blanks plan).
 - `render_plan.py` — Opcode definitions, writer, and Python emitter for render-plan ABI.
 - `replay_buffer.py` — Frozen dataclass storing encoded snapshots plus policy/value/trace metadata for training.
 - `replay_triton.py` — Optional CUDA/Triton kernels for packed replay-buffer batch append writes, gather packing, and position rebasing.

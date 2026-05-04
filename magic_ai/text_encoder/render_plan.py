@@ -116,6 +116,42 @@ OP_STACK_CLOSE: Final = 27
 OP_COMMAND_OPEN: Final = 28
 OP_COMMAND_CLOSE: Final = 29
 
+# Inline-blank opcodes (Step 3 of docs/text_encoder_inline_blanks_plan.md).
+# Mirror mage-go ``opEmitBlank=30`` / ``opEmitBlankLegal=31``.
+#
+# ``OP_EMIT_BLANK(kind_id, group_id, group_kind, legal_count)`` writes the
+# kind token at the cursor and records its position into the per-snapshot
+# blank table. It is followed by exactly ``legal_count`` ``OP_EMIT_BLANK_LEGAL
+# (token_id)`` opcodes, one per legal answer in this blank's vocabulary.
+OP_EMIT_BLANK: Final = 30
+OP_EMIT_BLANK_LEGAL: Final = 31
+
+# Group-kind enum (matches mage-go ``blankGroupPerBlank``/``...CrossBlank``/
+# ``...Constrained``).
+BLANK_GROUP_PER_BLANK: Final = 0
+BLANK_GROUP_CROSS_BLANK: Final = 1
+BLANK_GROUP_CONSTRAINED: Final = 2
+
+_BLANK_GROUP_KIND_BY_NAME: Final[dict[str, int]] = {
+    "PER_BLANK": BLANK_GROUP_PER_BLANK,
+    "CROSS_BLANK": BLANK_GROUP_CROSS_BLANK,
+    "CONSTRAINED": BLANK_GROUP_CONSTRAINED,
+}
+
+
+def blank_group_kind_id(name: str | int) -> int:
+    """Translate a group-kind name (``"PER_BLANK"``...) into its int32 enum.
+
+    Accepts an int unchanged (for already-resolved values).
+    """
+    if isinstance(name, int):
+        return int(name)
+    try:
+        return _BLANK_GROUP_KIND_BY_NAME[name]
+    except KeyError as exc:  # pragma: no cover - guard
+        raise ValueError(f"unknown blank group_kind {name!r}") from exc
+
+
 # Fixed arity per opcode (number of int32 payload slots after the opcode
 # header). ``-1`` marks a variable-length opcode whose first payload word is
 # ``length`` and whose total in-stream size is ``2 + length``.
@@ -149,6 +185,8 @@ OPCODE_ARITY: Final[dict[int, int]] = {
     OP_STACK_CLOSE: 0,
     OP_COMMAND_OPEN: 0,
     OP_COMMAND_CLOSE: 0,
+    OP_EMIT_BLANK: 4,
+    OP_EMIT_BLANK_LEGAL: 1,
 }
 
 # ---------------------------------------------------------------------------
@@ -315,6 +353,29 @@ class RenderPlanWriter:
             )
         )
 
+    # -- inline-blank opcodes (Step 3) ------------------------------------
+
+    def emit_blank(
+        self,
+        kind_id: int,
+        group_id: int,
+        group_kind: str | int,
+        legal_token_ids: Sequence[int],
+    ) -> None:
+        """Emit one ``OP_EMIT_BLANK`` followed by per-legal ``OP_EMIT_BLANK_LEGAL``.
+
+        ``group_kind`` accepts either the textual enum name
+        (``"PER_BLANK"``/``"CROSS_BLANK"``/``"CONSTRAINED"``) or the
+        already-resolved int32 enum value. The cursor position written to
+        the blank table is the assembler's emit position when it processes
+        this opcode — the writer itself does not track it.
+        """
+        gk = blank_group_kind_id(group_kind)
+        legal_count = len(legal_token_ids)
+        self._buf.extend((OP_EMIT_BLANK, int(kind_id), int(group_id), int(gk), int(legal_count)))
+        for tid in legal_token_ids:
+            self._buf.extend((OP_EMIT_BLANK_LEGAL, int(tid)))
+
     # -- literal token slice (variable length) ----------------------------
 
     def emit_literal_tokens(self, tokens: Sequence[int]) -> None:
@@ -334,6 +395,35 @@ class RenderPlanWriter:
 
 
 CardRowLookup = Callable[[str], int]
+
+
+def emit_blank_anchors(
+    w: RenderPlanWriter,
+    blank_anchors: Sequence[object],
+    *,
+    kind_token_id: Callable[[str], int],
+) -> None:
+    """Emit ``OP_EMIT_BLANK`` / ``OP_EMIT_BLANK_LEGAL`` for a render's blank list.
+
+    ``blank_anchors`` is a sequence of
+    :class:`magic_ai.text_encoder.render.BlankAnchor` (typed as ``object`` to
+    keep this module render-import-free) and is walked in the supplied order
+    — render order is the canonical blank ordinal, per the inline-blanks
+    plan's "Stable blank numbering" section. ``kind_token_id`` resolves a
+    ``BlankAnchor.kind`` string (e.g. ``"<choose-play>"``) to its single
+    token id.
+    """
+    for anchor in blank_anchors:
+        kind: str = getattr(anchor, "kind")
+        group_id: int = int(getattr(anchor, "group_id"))
+        group_kind = getattr(anchor, "group_kind")
+        legal_token_ids: Sequence[int] = tuple(getattr(anchor, "legal_token_ids"))
+        w.emit_blank(
+            kind_id=int(kind_token_id(kind)),
+            group_id=group_id,
+            group_kind=group_kind,
+            legal_token_ids=legal_token_ids,
+        )
 
 
 def _player_zone(player: PlayerState | None, attr: str) -> list[GameCardState]:

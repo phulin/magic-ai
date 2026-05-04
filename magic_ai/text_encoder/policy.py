@@ -29,7 +29,9 @@ from magic_ai.text_encoder.batch import (
     pack_batch,
     tokenize_snapshot,
 )
+from magic_ai.text_encoder.mlm import MLMHead
 from magic_ai.text_encoder.model import (
+    InlineBlankPolicy,
     PolicyHead,
     TargetHead,
     TextEncoderConfig,
@@ -61,6 +63,7 @@ class EncodedSnapshots:
     target_vectors: Tensor
     target_mask: Tensor
     state_vector: Tensor
+    blank_logits: Tensor | None = None
 
 
 @dataclass
@@ -80,6 +83,8 @@ class TextPolicyOutput:
     * ``target_vectors``: ``[B, O, M, D]``.
     * ``target_mask``: ``[B, O, M]`` bool.
     * ``state_vector``: ``[B, D]`` — pooled at position 0 (``<bos>``).
+    * ``blank_logits``: ``[B, K, V_max]`` when inline blanks are enabled,
+      otherwise ``None``.
     """
 
     policy_logits: Tensor
@@ -92,6 +97,13 @@ class TextPolicyOutput:
     target_vectors: Tensor
     target_mask: Tensor
     state_vector: Tensor
+    blank_logits: Tensor | None = None
+    blank_positions: Tensor | None = None
+    blank_kind: Tensor | None = None
+    blank_group: Tensor | None = None
+    blank_group_kind: Tensor | None = None
+    blank_legal_ids: Tensor | None = None
+    blank_legal_mask: Tensor | None = None
 
 
 class TextPolicy(nn.Module):
@@ -106,6 +118,13 @@ class TextPolicy(nn.Module):
         self.policy_head = PolicyHead(cfg.d_model)
         self.target_head = TargetHead(cfg.d_model)
         self.value_head = ValueHead(cfg.d_model)
+        self.mlm_head = MLMHead(self.encoder)
+        self.inline_blank_policy = InlineBlankPolicy(
+            self.encoder.tok_emb,
+            self.mlm_head.dense,
+            self.mlm_head.layer_norm,
+            num_kinds=cfg.vocab_size,
+        )
 
     def encode_only(self, batch: TextEncodedBatch) -> EncodedSnapshots:
         """Run the encoder + pool ops; return raw vectors without head logits.
@@ -131,6 +150,15 @@ class TextPolicy(nn.Module):
         option_vecs, option_mask = gather_option_vectors_packed(hidden, batch)
         target_vecs, target_mask = gather_target_vectors_packed(hidden, batch)
         state_vec = gather_state_vector_packed(hidden, batch)
+        blank_logits: Tensor | None = None
+        if self.cfg.use_inline_blanks:
+            blank_logits = self.inline_blank_policy(
+                hidden,
+                batch.blank_positions,
+                batch.blank_kind,
+                batch.blank_legal_ids,
+                batch.blank_legal_mask,
+            )
         return EncodedSnapshots(
             card_vectors=card_vecs,
             card_mask=card_mask,
@@ -139,6 +167,7 @@ class TextPolicy(nn.Module):
             target_vectors=target_vecs,
             target_mask=target_mask,
             state_vector=state_vec,
+            blank_logits=blank_logits,
         )
 
     def run_heads(
@@ -172,6 +201,13 @@ class TextPolicy(nn.Module):
             target_vectors=encoded.target_vectors,
             target_mask=encoded.target_mask,
             state_vector=encoded.state_vector,
+            blank_logits=encoded.blank_logits,
+            blank_positions=batch.blank_positions,
+            blank_kind=batch.blank_kind,
+            blank_group=batch.blank_group,
+            blank_group_kind=batch.blank_group_kind,
+            blank_legal_ids=batch.blank_legal_ids,
+            blank_legal_mask=batch.blank_legal_mask,
         )
 
     @staticmethod
@@ -180,6 +216,9 @@ class TextPolicy(nn.Module):
         actions_per_snapshot: Sequence[Sequence[PendingOptionState] | None] | None,
         oracle: dict[str, OracleEntry] | None,
         tokenizer: PreTrainedTokenizerFast,
+        *,
+        use_inline_blanks: bool = False,
+        chosen_token_id: int | None = None,
     ) -> TextEncodedBatch:
         """Render -> tokenize -> collate convenience.
 
@@ -203,8 +242,19 @@ class TextPolicy(nn.Module):
             action_lists = list(actions_per_snapshot)
 
         examples = []
+        if use_inline_blanks and chosen_token_id is None:
+            tid = tokenizer.convert_tokens_to_ids("<chosen>")
+            if isinstance(tid, list):
+                raise TypeError("convert_tokens_to_ids('<chosen>') returned a list")
+            chosen_token_id = int(tid)
         for snap, actions in zip(snapshots, action_lists, strict=True):
-            rendered = render_snapshot(snap, actions, oracle=oracle)
+            rendered = render_snapshot(
+                snap,
+                actions,
+                oracle=oracle,
+                use_inline_blanks=use_inline_blanks,
+                chosen_token_id=chosen_token_id,
+            )
             examples.append(tokenize_snapshot(rendered, tokenizer))
 
         pad_id = tokenizer.pad_token_id
