@@ -195,6 +195,8 @@ class RecurrentTextPolicy(nn.Module):
             lstm_input = None
         else:
             lstm_input = self.in_proj(encoded.state_vector)
+            h_in = h_in.to(device=device, dtype=lstm_input.dtype)
+            c_in = c_in.to(device=device, dtype=lstm_input.dtype)
             y, (h_out, c_out) = self.lstm(lstm_input.unsqueeze(1), (h_in, c_in))
             state_hidden = y.squeeze(1)
 

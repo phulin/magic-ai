@@ -275,8 +275,13 @@ class TextActorCritic(nn.Module):
             output, (h_out, c_out) = self.policy(moved, h_in=h_in, c_in=c_in)
         self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
 
-        none_logits = self.none_head(output.state_hidden).squeeze(-1)
-        may_logits = self.may_head(output.state_hidden).squeeze(-1)
+        with torch.autocast(
+            device_type=output.state_hidden.device.type,
+            dtype=torch.bfloat16,
+            enabled=output.state_hidden.device.type == "cuda",
+        ):
+            none_logits = self.none_head(output.state_hidden).squeeze(-1)
+            may_logits = self.may_head(output.state_hidden).squeeze(-1)
         # Phase 1: queue all GPU work without ever forcing a sync. We collect
         # selected-col 0-D tensors, per-step log_prob/entropy/value tensors,
         # and Python metadata. Old code synced once per step (selected cols
@@ -584,8 +589,13 @@ class TextActorCritic(nn.Module):
             max_cached_choices = int(native_batch.decision_mask.shape[1])
             device = output.values.device
 
-            none_logits = self.none_head(output.state_hidden).squeeze(-1)
-            may_logits = self.may_head(output.state_hidden).squeeze(-1)
+            with torch.autocast(
+                device_type=output.state_hidden.device.type,
+                dtype=torch.bfloat16,
+                enabled=output.state_hidden.device.type == "cuda",
+            ):
+                none_logits = self.none_head(output.state_hidden).squeeze(-1)
+                may_logits = self.may_head(output.state_hidden).squeeze(-1)
             step_log_probs = output.values.new_zeros(batch_size)
             step_entropies = output.values.new_zeros(batch_size)
 
@@ -1319,12 +1329,19 @@ class TextActorCritic(nn.Module):
         )
 
     def _replay_scoring_forward(self, output: RecurrentTextPolicyOutput) -> ReplayScoringForward:
+        with torch.autocast(
+            device_type=output.state_hidden.device.type,
+            dtype=torch.bfloat16,
+            enabled=output.state_hidden.device.type == "cuda",
+        ):
+            none_logits = self.none_head(output.state_hidden).squeeze(-1)
+            may_logits = self.may_head(output.state_hidden).squeeze(-1)
         return ReplayScoringForward.direct(
             values=output.values,
             option_vectors=output.option_vectors,
             target_vectors=output.target_vectors,
-            none_logits=self.none_head(output.state_hidden).squeeze(-1),
-            may_logits=self.may_head(output.state_hidden).squeeze(-1),
+            none_logits=none_logits,
+            may_logits=may_logits,
             hidden=output.state_hidden,
             option_logits=output.policy_logits,
             target_logits=output.target_logits,

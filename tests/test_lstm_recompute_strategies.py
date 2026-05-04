@@ -219,6 +219,47 @@ class LstmRecomputeChunkedBptt(unittest.TestCase):
         # Chunk=1 must lose gradient signal compared to full BPTT.
         self.assertLess(truncated_norm, full_bptt_norm)
 
+    def test_chunk_output_tracks_projection_dtype(self) -> None:
+        device = torch.device("cpu")
+        hidden = 8
+        num_layers = 2
+        lstm = _make_lstm(hidden, num_layers, torch.float32, device)
+        projected, lengths = _make_workload(
+            n_episodes=3,
+            t_max=4,
+            t_min=2,
+            hidden=hidden,
+            seed=17,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        per_ep = _per_episode(projected, lengths)
+
+        def mixed_dtype_runner(
+            packed: nn.utils.rnn.PackedSequence,
+            state: tuple[torch.Tensor, torch.Tensor],
+        ) -> tuple[nn.utils.rnn.PackedSequence, tuple[torch.Tensor, torch.Tensor]]:
+            h_in, c_in = state
+            out_packed = nn.utils.rnn.PackedSequence(
+                packed.data.to(dtype=torch.float16),
+                packed.batch_sizes,
+                packed.sorted_indices,
+                packed.unsorted_indices,
+            )
+            h_out = torch.zeros_like(h_in, dtype=torch.float16)
+            c_out = torch.zeros_like(c_in, dtype=torch.float16)
+            return out_packed, (h_out, c_out)
+
+        outputs = lstm_recompute_per_step_h_out(
+            lstm,
+            per_ep,
+            chunk_size=1,
+            compiled_lstm=mixed_dtype_runner,
+        )
+
+        self.assertEqual([out.shape for out in outputs], [(length, hidden) for length in lengths])
+        self.assertTrue(all(out.dtype == torch.bfloat16 for out in outputs))
+
 
 class LstmRecomputeStrategiesBenchmark(unittest.TestCase):
     """Wall-time comparison; opt in with ``RNAD_LSTM_BENCH=1``."""

@@ -402,7 +402,7 @@ class NativeTextTrajectoryBuffer:
                 self.num_envs,
                 self.max_steps,
                 self.lstm_proj_hidden,
-                dtype=torch.float16,
+                dtype=torch.bfloat16,
                 device=self.device,
             )
 
@@ -532,7 +532,7 @@ class NativeTextTrajectoryBuffer:
             )
         if self.projected_state is not None and payload.projected_state is not None:
             self.projected_state[env_t, step_t] = payload.projected_state.to(
-                device=self.device, dtype=torch.float16
+                device=self.device, dtype=torch.bfloat16
             )
         self.step_count[env_t] = step_t + 1
 

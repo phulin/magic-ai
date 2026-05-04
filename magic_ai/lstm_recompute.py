@@ -232,6 +232,15 @@ def lstm_recompute_per_step_h_out(
         c_in = c_state.index_select(1, active_idx_t).contiguous()
         packed = nn.utils.rnn.pack_sequence(chunk_seqs, enforce_sorted=False)
         out_packed, (h_out, c_out) = runner(packed, (h_in, c_in))
+        if out_packed.data.dtype != dtype:
+            out_packed = nn.utils.rnn.PackedSequence(
+                out_packed.data.to(dtype=dtype),
+                out_packed.batch_sizes,
+                out_packed.sorted_indices,
+                out_packed.unsorted_indices,
+            )
+        h_out = h_out.to(dtype=dtype)
+        c_out = c_out.to(dtype=dtype)
         # Detach state crossing the chunk boundary so the next chunk's
         # backward stops here. Within a chunk, BPTT is full.
         h_state.index_copy_(1, active_idx_t, h_out.detach())

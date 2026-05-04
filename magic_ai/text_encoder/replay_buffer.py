@@ -150,7 +150,7 @@ class TextReplayBuffer:
         self.projected_state: Tensor | None = None
         if self.lstm_proj_hidden > 0:
             self.projected_state = torch.zeros(
-                self.capacity, self.lstm_proj_hidden, dtype=torch.float16, device=self.device
+                self.capacity, self.lstm_proj_hidden, dtype=torch.bfloat16, device=self.device
             )
         self.core = ReplayCore(
             capacity=self.capacity,
@@ -600,12 +600,12 @@ class TextReplayBuffer:
         """Write cached LSTM input projections for the given rows.
 
         ``rows``: ``[N]`` long tensor of row indices.
-        ``projected``: ``[N, lstm_proj_hidden]`` tensor; stored as float16.
+        ``projected``: ``[N, lstm_proj_hidden]`` tensor; stored as bfloat16.
         """
         if self.projected_state is None:
             raise ValueError("buffer was constructed without projected_state storage")
         self.projected_state[rows.to(device=self.device)] = projected.to(
-            device=self.device, dtype=torch.float16
+            device=self.device, dtype=torch.bfloat16
         )
 
     def _write_encoded_row(
