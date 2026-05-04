@@ -573,7 +573,6 @@ class TextActorCritic(nn.Module):
             max_cached_choices = int(native_batch.decision_mask.shape[1])
             device = output.values.device
 
-            none_logits = self.none_head(output.state_hidden).squeeze(-1)
             may_logits = self.may_head(output.state_hidden).squeeze(-1)
             step_log_probs = output.values.new_zeros(batch_size)
             step_entropies = output.values.new_zeros(batch_size)
@@ -591,48 +590,77 @@ class TextActorCritic(nn.Module):
                 uses_none = native_batch.uses_none_head[:decision_rows].to(
                     device, dtype=torch.bool, non_blocking=device.type == "cuda"
                 )
-                step_for_group = torch.repeat_interleave(
-                    torch.arange(batch_size, device=device), decision_count
+                id_to_trace = {int(v): k for k, v in TRACE_KIND_TO_ID.items()}
+                selected_chunks: list[Tensor] = []
+                inline_batch = (
+                    moved_packed if moved_packed is not None else cast(TextEncodedBatch, moved_text)
                 )
-                logits = _direct_decision_logits_batched(
-                    output,
-                    none_logits,
-                    step_for_group=step_for_group,
-                    option_idx=option_idx,
-                    target_idx=target_idx,
-                    uses_none=uses_none,
+                cursor = 0
+                for step_idx in range(batch_size):
+                    group_count = int(decision_count[step_idx].item())
+                    if group_count == 0:
+                        continue
+                    group_slice = slice(cursor, cursor + group_count)
+                    cursor += group_count
+                    raw_trace = int(trace_kind_id[step_idx].item())
+                    trace_kind = id_to_trace[raw_trace]
+                    layout = TextDecisionLayout(
+                        trace_kind=trace_kind,
+                        decision_option_idx=option_idx[group_slice].detach().cpu(),
+                        decision_target_idx=target_idx[group_slice].detach().cpu(),
+                        decision_mask=decision_mask[group_slice].detach().cpu(),
+                        uses_none_head=uses_none[group_slice].detach().cpu(),
+                        pending=cast(PendingState, {"kind": trace_kind}),
+                    )
+                    inline_choice_sample = (
+                        _sample_inline_choice_index_for_step(
+                            output,
+                            inline_batch,
+                            step_idx=step_idx,
+                            deterministic=deterministic,
+                        )
+                        if trace_kind in ("choice_index", "choice_color")
+                        else None
+                    )
+                    inline_priority_sample = (
+                        _sample_inline_priority_for_step(
+                            output,
+                            inline_batch,
+                            layout,
+                            step_idx=step_idx,
+                            deterministic=deterministic,
+                        )
+                        if trace_kind == "priority"
+                        else None
+                    )
+                    inline_block_sample = (
+                        _sample_inline_blockers_for_step(
+                            output,
+                            inline_batch,
+                            layout,
+                            step_idx=step_idx,
+                            deterministic=deterministic,
+                        )
+                        if trace_kind == "blockers"
+                        else None
+                    )
+                    inline_sample = (
+                        inline_choice_sample or inline_priority_sample or inline_block_sample
+                    )
+                    if inline_sample is None:
+                        raise ValueError(
+                            "native text sampling requires inline blank metadata for "
+                            f"trace_kind={trace_kind!r} at batch row {step_idx}"
+                        )
+                    selected_tensors, log_prob, entropy = inline_sample
+                    selected_chunks.extend(selected_tensors)
+                    step_log_probs[step_idx] = step_log_probs[step_idx] + log_prob
+                    step_entropies[step_idx] = step_entropies[step_idx] + entropy
+                selected = (
+                    torch.stack(selected_chunks)
+                    if selected_chunks
+                    else torch.empty(0, dtype=torch.long, device=device)
                 )
-                visible_mask = _visible_decision_mask(
-                    output,
-                    step_for_group=step_for_group,
-                    option_idx=option_idx,
-                    target_idx=target_idx,
-                    decision_mask=decision_mask,
-                    uses_none=uses_none,
-                )
-                group_has_visible = visible_mask.any(dim=-1, keepdim=True)
-                effective_mask = torch.where(group_has_visible, visible_mask, decision_mask)
-                group_has_engine_choice = decision_mask.any(dim=-1, keepdim=True)
-                col0 = torch.arange(max_cached_choices, device=device).eq(0)
-                sentinel_mask = col0[None, :].expand_as(effective_mask)
-                effective_mask = torch.where(group_has_engine_choice, effective_mask, sentinel_mask)
-                safe_logits = torch.where(group_has_visible, logits, torch.zeros_like(logits))
-                masked_logits = safe_logits.masked_fill(~effective_mask, float("-inf"))
-                if deterministic:
-                    selected = masked_logits.argmax(dim=-1)
-                else:
-                    uniform = torch.rand_like(masked_logits).clamp_(1e-7, 1.0 - 1e-7)
-                    gumbel = -torch.log(-torch.log(uniform))
-                    selected = (masked_logits + gumbel).argmax(dim=-1)
-                log_probs_dense = torch.log_softmax(masked_logits, dim=-1)
-                group_log_probs = log_probs_dense.gather(1, selected[:, None]).squeeze(1)
-                probs = log_probs_dense.exp()
-                safe_log_probs = torch.where(
-                    effective_mask, log_probs_dense, log_probs_dense.new_zeros(())
-                )
-                group_entropies = -(probs * safe_log_probs).sum(dim=-1)
-                step_log_probs = step_log_probs.scatter_add(0, step_for_group, group_log_probs)
-                step_entropies = step_entropies.scatter_add(0, step_for_group, group_entropies)
             else:
                 option_idx = torch.empty((0, max_cached_choices), dtype=torch.long, device=device)
                 target_idx = torch.empty_like(option_idx)
@@ -1420,80 +1448,6 @@ def _decode_text_action(
         ActionTrace("choice_index", indices=(selected_idx,)),
         action_from_choice_index(selected_idx),
     )
-
-
-def _direct_decision_logits_batched(
-    output: RecurrentTextPolicyOutput,
-    none_logits: Tensor,
-    *,
-    step_for_group: Tensor,
-    option_idx: Tensor,
-    target_idx: Tensor,
-    uses_none: Tensor,
-) -> Tensor:
-    num_options = int(output.policy_logits.shape[1])
-    num_targets = int(output.target_logits.shape[2])
-    if num_options > 0:
-        opt_clamped = option_idx.clamp(min=0, max=num_options - 1)
-        option_vals = output.policy_logits[step_for_group].gather(1, opt_clamped)
-    else:
-        opt_clamped = option_idx.clamp(min=0)
-        option_vals = output.values.new_full(option_idx.shape, float("-inf"))
-    if num_options > 0 and num_targets > 0:
-        tgt_clamped = target_idx.clamp(min=0, max=num_targets - 1)
-        target_vals = output.target_logits[step_for_group].gather(
-            1,
-            opt_clamped.unsqueeze(-1).expand(-1, -1, num_targets),
-        )
-        target_vals = target_vals.gather(2, tgt_clamped.unsqueeze(-1)).squeeze(-1)
-    else:
-        tgt_clamped = target_idx.clamp(min=0)
-        target_vals = option_vals
-    logits = torch.where(target_idx >= 0, target_vals, option_vals)
-    opt_in_range = (option_idx >= 0) & (option_idx < num_options)
-    tgt_in_range = (target_idx >= 0) & (target_idx < num_targets)
-    neg_inf = output.values.new_tensor(float("-inf"))
-    logits = torch.where(opt_in_range, logits, neg_inf)
-    logits = torch.where((target_idx >= 0) & ~tgt_in_range, neg_inf, logits)
-    col0 = torch.arange(option_idx.shape[1], device=option_idx.device).eq(0)
-    none_mask = uses_none[:, None] & col0[None, :]
-    return torch.where(none_mask, none_logits[step_for_group, None], logits)
-
-
-def _visible_decision_mask(
-    output: RecurrentTextPolicyOutput,
-    *,
-    step_for_group: Tensor,
-    option_idx: Tensor,
-    target_idx: Tensor,
-    decision_mask: Tensor,
-    uses_none: Tensor,
-) -> Tensor:
-    num_options = int(output.option_mask.shape[1])
-    num_targets = int(output.target_mask.shape[2]) if output.target_mask.dim() == 3 else 0
-    opt_in_range = (option_idx >= 0) & (option_idx < num_options)
-    tgt_in_range = (target_idx >= 0) & (target_idx < num_targets)
-    if num_options > 0:
-        opt_clamped = option_idx.clamp(min=0, max=num_options - 1)
-        opt_visible = output.option_mask[step_for_group].gather(1, opt_clamped) & opt_in_range
-    else:
-        opt_clamped = option_idx.clamp(min=0)
-        opt_visible = torch.zeros_like(option_idx, dtype=torch.bool)
-    if num_options > 0 and num_targets > 0:
-        tgt_clamped = target_idx.clamp(min=0, max=num_targets - 1)
-        target_for_groups = output.target_mask[step_for_group].gather(
-            1,
-            opt_clamped.unsqueeze(-1).expand(-1, -1, num_targets),
-        )
-        tgt_visible = target_for_groups.gather(2, tgt_clamped.unsqueeze(-1)).squeeze(-1)
-        tgt_visible = tgt_visible & tgt_in_range
-    else:
-        tgt_visible = torch.zeros_like(option_idx, dtype=torch.bool)
-    target_required = target_idx >= 0
-    visible = opt_visible & (~target_required | tgt_visible)
-    col0 = torch.arange(option_idx.shape[1], device=option_idx.device).eq(0)
-    visible = visible | (uses_none[:, None] & col0[None, :])
-    return decision_mask & visible
 
 
 def _sample_inline_may_for_step(

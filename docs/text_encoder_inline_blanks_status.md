@@ -336,3 +336,6 @@ without treating the accuracy gate as a blocker.
 - `magic_ai/text_encoder/actor_critic.py` — removed Python live sampling
   fallback through direct option/target logits; non-may live decisions must be
   sampled from inline blank metadata.
+- `magic_ai/text_encoder/actor_critic.py` — native tensor sampling now uses
+  inline blank sampling helpers for priority, blockers, choice-index, and
+  choice-color decision rows instead of direct option/target logits.
