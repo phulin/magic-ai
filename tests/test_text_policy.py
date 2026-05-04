@@ -380,7 +380,6 @@ def test_text_policy_inline_blank_forward(
     tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
 ) -> None:
     cfg = _small_cfg(tokenizer)
-    cfg.use_inline_blanks = True
     policy = build_text_policy(tokenizer, cfg)
     batch = TextPolicy.encode_snapshots(
         [_snapshot_with_action(real_card_names)],
@@ -407,7 +406,6 @@ def test_text_policy_inline_block_blank_forward(
     tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
 ) -> None:
     cfg = _small_cfg(tokenizer)
-    cfg.use_inline_blanks = True
     policy = build_text_policy(tokenizer, cfg)
     batch = TextPolicy.encode_snapshots(
         [_snapshot_with_blockers(real_card_names)],
@@ -435,7 +433,6 @@ def test_text_policy_inline_may_blank_forward(
     tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
 ) -> None:
     cfg = _small_cfg(tokenizer)
-    cfg.use_inline_blanks = True
     policy = build_text_policy(tokenizer, cfg)
     batch = TextPolicy.encode_snapshots(
         [_snapshot_with_may(real_card_names)],
@@ -462,7 +459,6 @@ def test_text_policy_inline_mode_blank_forward(
     tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
 ) -> None:
     cfg = _small_cfg(tokenizer)
-    cfg.use_inline_blanks = True
     policy = build_text_policy(tokenizer, cfg)
     batch = TextPolicy.encode_snapshots(
         [_snapshot_with_mode(real_card_names)],
@@ -489,7 +485,6 @@ def test_text_policy_inline_number_blank_forward(
     tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
 ) -> None:
     cfg = _small_cfg(tokenizer)
-    cfg.use_inline_blanks = True
     policy = build_text_policy(tokenizer, cfg)
     batch = TextPolicy.encode_snapshots(
         [_snapshot_with_number(real_card_names)],
@@ -515,7 +510,6 @@ def test_text_policy_inline_mana_color_blank_forward(
     tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
 ) -> None:
     cfg = _small_cfg(tokenizer)
-    cfg.use_inline_blanks = True
     policy = build_text_policy(tokenizer, cfg)
     batch = TextPolicy.encode_snapshots(
         [_snapshot_with_mana_color(real_card_names)],

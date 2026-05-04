@@ -152,15 +152,13 @@ class TextPolicy(nn.Module):
         option_vecs, option_mask = gather_option_vectors_packed(hidden, batch)
         target_vecs, target_mask = gather_target_vectors_packed(hidden, batch)
         state_vec = gather_state_vector_packed(hidden, batch)
-        blank_logits: Tensor | None = None
-        if self.cfg.use_inline_blanks:
-            blank_logits = self.inline_blank_policy(
-                hidden,
-                batch.blank_positions,
-                batch.blank_kind,
-                batch.blank_legal_ids,
-                batch.blank_legal_mask,
-            )
+        blank_logits = self.inline_blank_policy(
+            hidden,
+            batch.blank_positions,
+            batch.blank_kind,
+            batch.blank_legal_ids,
+            batch.blank_legal_mask,
+        )
         return EncodedSnapshots(
             card_vectors=card_vecs,
             card_mask=card_mask,

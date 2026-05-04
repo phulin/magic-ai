@@ -20,11 +20,11 @@ the eight-step migration. Update at every step boundary.
 | 1 | Token table additions                      | ✅ done       | 30 new tokens; tokenizer rebuilt; Python `_Packed` holds singletons + `num_ids`. |
 | 2 | Render priority blanks (flag-gated)        | ✅ done       | `BlankAnchor`, `RenderError`, `<choices>…</choices>` block. Legacy path byte-identical when flag off. |
 | 3 | Batch + native assembler plumbing          | ✅ done       | Python + native paths tested; mage-go exposes `MagePackedBlankOutputs` and regenerated cffi. |
-| 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired behind `TextEncoderConfig.use_inline_blanks`. |
+| 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired; model forward now scores blank metadata unconditionally. |
 | 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ✅ done       | `<choose-block>` render/batch/model path, live sampler/action adapter, replay storage, and replay scoring landed. |
 | 7 | Targets / modes / mays / X / mana sources  | ✅ done       | Targets, may, modes, number/X, and mana-color choices are inline-blank wired. |
-| 8 | Delete legacy option/target heads          | ⏳ blocked-by 7 |  |
+| 8 | Delete legacy option/target heads          | 🚧 in progress | Model-side inline flag removed; legacy head/output and batch-field deletion remains. |
 
 ## What landed in each completed step
 
@@ -101,15 +101,15 @@ the eight-step migration. Update at every step boundary.
 
 ### Step 4 — Python side (`/home/user/magic-ai-inline-blanks`)
 
-- `magic_ai/text_encoder/model.py` — added `TextEncoderConfig.use_inline_blanks`
-  and `InlineBlankPolicy`, which gathers blank hidden states from padded or
+- `magic_ai/text_encoder/model.py` — added `InlineBlankPolicy`, which gathers
+  blank hidden states from padded or
   packed encoder outputs, scores only each blank's legal token ids against the
   tied input embedding rows, applies a learned per-kind temperature, and masks
   padded legal slots to `-inf`.
 - `magic_ai/text_encoder/policy.py` — `TextPolicy` now owns an `MLMHead` and
   passes its dense + layer-norm pre-projection modules into
   `InlineBlankPolicy`. `TextPolicyOutput` carries `blank_logits` plus the
-  batch's `blank_*` metadata when the flag is enabled. `encode_snapshots(...)`
+  batch's `blank_*` metadata. `encode_snapshots(...)`
   accepts `use_inline_blanks=True` and defaults `chosen_token_id` from the
   tokenizer's `<chosen>` id.
 - `tests/test_text_encoder_model.py`, `tests/test_text_policy.py` — focused

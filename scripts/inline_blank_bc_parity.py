@@ -596,7 +596,6 @@ def main(argv: list[str] | None = None) -> int:
             d_ff=int(args.d_ff),
             max_seq_len=int(args.max_seq_len),
             pad_id=int(pad_id),
-            use_inline_blanks=False,
         )
     ).to(device)
     torch.manual_seed(args.seed)
@@ -609,7 +608,6 @@ def main(argv: list[str] | None = None) -> int:
             d_ff=int(args.d_ff),
             max_seq_len=int(args.max_seq_len),
             pad_id=int(pad_id),
-            use_inline_blanks=True,
         )
     ).to(device)
 

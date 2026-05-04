@@ -54,7 +54,6 @@ class TextEncoderConfig:
     hf_revision: str | None = None
     hf_truncate_layers: int | None = None
     hf_trust_remote_code: bool = False
-    use_inline_blanks: bool = False
 
 
 DEFAULT_HF_ENCODER_MODEL = "jhu-clsp/ettin-encoder-17m"
