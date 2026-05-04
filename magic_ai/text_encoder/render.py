@@ -553,6 +553,7 @@ class SnapshotRenderer:
         yes_token_id: int | None = None,
         no_token_id: int | None = None,
         num_token_ids: Sequence[int] | None = None,
+        mana_token_ids: Sequence[int] | None = None,
         card_ref_token_ids: Sequence[int] | None = None,
     ) -> None:
         self._oracle = oracle if oracle is not None else {}
@@ -563,6 +564,7 @@ class SnapshotRenderer:
         self._yes_token_id = yes_token_id
         self._no_token_id = no_token_id
         self._num_token_ids = tuple(int(tid) for tid in num_token_ids or ())
+        self._mana_token_ids = tuple(int(tid) for tid in mana_token_ids or ())
         self._card_ref_token_ids = tuple(int(tid) for tid in card_ref_token_ids or ())
         self._cur_self_id: str = ""
         self._cur_opp_id: str = ""
@@ -1194,6 +1196,17 @@ class SnapshotRenderer:
                 legal_token_ids=tuple(self._num_token_ids[:choice_count]),
                 group_kind="PER_BLANK",
             )
+        if self._pending_kind == "mana_color":
+            if len(self._mana_token_ids) < 6:
+                raise RenderError("inline mana_color blanks require mana_token_ids")
+            self._emit_blank(
+                buf,
+                result,
+                "<choose-mana-source>",
+                -1,
+                legal_token_ids=tuple(self._mana_token_ids[:6]),
+                group_kind="PER_BLANK",
+            )
         buf.append("</choices>")
 
 
@@ -1214,6 +1227,7 @@ def render_snapshot(
     yes_token_id: int | None = None,
     no_token_id: int | None = None,
     num_token_ids: Sequence[int] | None = None,
+    mana_token_ids: Sequence[int] | None = None,
     card_ref_token_ids: Sequence[int] | None = None,
 ) -> RenderedSnapshot:
     """Render ``snapshot`` (and optional ``actions``) to text + anchor metadata.
@@ -1240,5 +1254,6 @@ def render_snapshot(
         yes_token_id=yes_token_id,
         no_token_id=no_token_id,
         num_token_ids=num_token_ids,
+        mana_token_ids=mana_token_ids,
         card_ref_token_ids=card_ref_token_ids,
     ).render(snapshot, actions)

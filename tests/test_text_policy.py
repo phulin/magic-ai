@@ -273,6 +273,35 @@ def _snapshot_with_number(names: list[str]) -> GameStateSnapshot:
     return cast(GameStateSnapshot, snap)
 
 
+def _snapshot_with_mana_color(names: list[str]) -> GameStateSnapshot:
+    a = names[0]
+    snap: dict[str, object] = {
+        "turn": 3,
+        "active_player": "p1",
+        "step": "Precombat Main",
+        "players": [
+            _player("p1", "Self", battlefield=[_card("c1", a, tapped=False)]),
+            _player("p2", "Opp"),
+        ],
+        "pending": cast(
+            PendingState,
+            {
+                "kind": "mana_color",
+                "player_idx": 0,
+                "options": [
+                    cast(PendingOptionState, {"id": "white", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "blue", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "black", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "red", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "green", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "colorless", "kind": "choice"}),
+                ],
+            },
+        ),
+    }
+    return cast(GameStateSnapshot, snap)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end smoke
 # ---------------------------------------------------------------------------
@@ -474,6 +503,32 @@ def test_text_policy_inline_number_blank_forward(
     for k in range(3):
         num_id = tokenizer.convert_tokens_to_ids(f"<num:{k}>")
         assert int(batch.blank_legal_ids[0, 0, k]) == int(num_id)
+
+    out = policy(batch)
+
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+
+
+def test_text_policy_inline_mana_color_blank_forward(
+    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
+) -> None:
+    cfg = _small_cfg(tokenizer)
+    cfg.use_inline_blanks = True
+    policy = build_text_policy(tokenizer, cfg)
+    batch = TextPolicy.encode_snapshots(
+        [_snapshot_with_mana_color(real_card_names)],
+        actions_per_snapshot=None,
+        oracle=oracle,
+        tokenizer=tokenizer,
+        use_inline_blanks=True,
+    )
+
+    assert batch.blank_positions.shape == (1, 1)
+    for k, symbol in enumerate(("W", "U", "B", "R", "G", "C")):
+        mana_id = tokenizer.convert_tokens_to_ids(f"<mana:{symbol}>")
+        assert int(batch.blank_legal_ids[0, 0, k]) == int(mana_id)
 
     out = policy(batch)
 

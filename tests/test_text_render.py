@@ -550,6 +550,7 @@ YES_FAKE_ID = 99997
 NO_FAKE_ID = 99996
 CARD_REF_FAKE_IDS = tuple(88000 + k for k in range(MAX_CARD_REFS))
 NUM_FAKE_IDS = tuple(77000 + k for k in range(16))
+MANA_FAKE_IDS = tuple(66000 + k for k in range(6))
 
 
 def _priority_snapshot() -> GameStateSnapshot:
@@ -794,6 +795,41 @@ def test_inline_blanks_number_emits_x_digit_blank(oracle: dict[str, OracleEntry]
     assert anchor.kind == "<choose-x-digit>"
     assert anchor.group_kind == "PER_BLANK"
     assert anchor.legal_token_ids == NUM_FAKE_IDS[:4]
+    assert anchor.option_index == -1
+
+
+def test_inline_blanks_mana_color_emits_mana_source_blank(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = _basic_snapshot()
+    pending = cast(
+        PendingState,
+        {
+            "kind": "mana_color",
+            "player_idx": 0,
+            "options": [
+                cast(PendingOptionState, {"id": "white", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "blue", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "black", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "red", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "green", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "colorless", "kind": "choice"}),
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        use_inline_blanks=True,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        mana_token_ids=MANA_FAKE_IDS,
+    )
+
+    assert "<choices><choose-mana-source></choices>" in rendered.text
+    [anchor] = rendered.blank_anchors
+    assert anchor.kind == "<choose-mana-source>"
+    assert anchor.group_kind == "PER_BLANK"
+    assert anchor.legal_token_ids == MANA_FAKE_IDS
     assert anchor.option_index == -1
 
 

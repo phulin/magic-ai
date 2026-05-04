@@ -249,6 +249,7 @@ class TextPolicy(nn.Module):
         yes_token_id: int | None = None
         no_token_id: int | None = None
         num_token_ids: list[int] | None = None
+        mana_token_ids: list[int] | None = None
         card_ref_token_ids: list[int] | None = None
         if use_inline_blanks and chosen_token_id is None:
             tid = tokenizer.convert_tokens_to_ids("<chosen>")
@@ -274,6 +275,12 @@ class TextPolicy(nn.Module):
                 if isinstance(tid, list):
                     raise TypeError(f"convert_tokens_to_ids('<num:{k}>') returned a list")
                 num_token_ids.append(int(tid))
+            mana_token_ids = []
+            for symbol in ("W", "U", "B", "R", "G", "C"):
+                tid = tokenizer.convert_tokens_to_ids(f"<mana:{symbol}>")
+                if isinstance(tid, list):
+                    raise TypeError(f"convert_tokens_to_ids('<mana:{symbol}>') returned a list")
+                mana_token_ids.append(int(tid))
             card_ref_token_ids = []
             for k in range(MAX_CARD_REFS):
                 tid = tokenizer.convert_tokens_to_ids(f"<card-ref:{k}>")
@@ -291,6 +298,7 @@ class TextPolicy(nn.Module):
                 yes_token_id=yes_token_id,
                 no_token_id=no_token_id,
                 num_token_ids=num_token_ids,
+                mana_token_ids=mana_token_ids,
                 card_ref_token_ids=card_ref_token_ids,
             )
             examples.append(tokenize_snapshot(rendered, tokenizer))
