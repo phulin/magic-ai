@@ -39,6 +39,22 @@ def _batch(batch_size: int = 2) -> TextEncodedBatch:
     option_mask = option_positions >= 0
     target_positions = torch.full((batch_size, 2, 1), -1, dtype=torch.long)
     target_mask = target_positions >= 0
+    blank_positions = torch.full((batch_size, 2), -1, dtype=torch.long)
+    blank_positions[:, 0] = 1
+    if batch_size > 1:
+        blank_positions[0, 1] = 2
+    else:
+        blank_positions[0, 1] = 2
+    blank_kind = torch.full((batch_size, 2), 7, dtype=torch.long)
+    blank_group = torch.full((batch_size, 2), -1, dtype=torch.long)
+    blank_group[:, 0] = 0
+    blank_group[0, 1] = 0
+    blank_group_kind = torch.full((batch_size, 2), BLANK_GROUP_CROSS_BLANK, dtype=torch.long)
+    blank_option_index = torch.full((batch_size, 2), -1, dtype=torch.long)
+    blank_option_index[:, 0] = 0
+    blank_option_index[0, 1] = 1
+    blank_legal_ids = torch.full((batch_size, 2, 1), 3, dtype=torch.long)
+    blank_legal_mask = blank_positions.unsqueeze(-1) >= 0
     seq_lengths = torch.tensor([4, 3])[:batch_size]
     return TextEncodedBatch(
         token_ids=token_ids,
@@ -48,6 +64,13 @@ def _batch(batch_size: int = 2) -> TextEncodedBatch:
         option_mask=option_mask,
         target_positions=target_positions,
         target_mask=target_mask,
+        blank_positions=blank_positions,
+        blank_kind=blank_kind,
+        blank_group=blank_group,
+        blank_group_kind=blank_group_kind,
+        blank_option_index=blank_option_index,
+        blank_legal_ids=blank_legal_ids,
+        blank_legal_mask=blank_legal_mask,
         seq_lengths=seq_lengths,
     )
 

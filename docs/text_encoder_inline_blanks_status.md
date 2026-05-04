@@ -24,7 +24,7 @@ the eight-step migration. Update at every step boundary.
 | 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ✅ done       | `<choose-block>` render/batch/model path, live sampler/action adapter, replay storage, and replay scoring landed. |
 | 7 | Targets / modes / mays / X / mana sources  | ✅ done       | Targets, may, modes, number/X, and mana-color choices are inline-blank wired. |
-| 8 | Delete legacy option/target heads          | 🚧 in progress | Model-side inline flag removed; legacy head/output and batch-field deletion remains. |
+| 8 | Delete legacy option/target heads          | 🚧 in progress | Model-side inline flag removed; replay fallback deleted; batch-field deletion remains. |
 
 ## What landed in each completed step
 
@@ -325,3 +325,9 @@ without treating the accuracy gate as a blocker.
   while downstream replay paths are migrated off the old fields.
 - `magic_ai/text_encoder/model.py` — deleted the unused `PolicyHead` and
   `TargetHead` classes from the model module.
+- `magic_ai/text_encoder/actor_critic.py` — removed replay decision-group
+  fallback scoring through legacy option/target logits. Replay rows with
+  decision groups must now have matching inline blank metadata.
+- `magic_ai/text_encoder/recurrent.py` — cached `forward_from_encoded(...)`
+  now preserves `blank_logits` so R-NaD cached replay evaluation scores the
+  same inline groups as the uncached path.

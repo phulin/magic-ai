@@ -33,8 +33,6 @@ from magic_ai.lstm_recompute import lstm_recompute_per_step_h_out_per_player
 from magic_ai.replay_decisions import (
     ReplayPerChoice,
     ReplayScoringForward,
-    direct_decision_logits_from_forward,
-    direct_flat_decision_distribution_from_forward,
     score_may_decisions_from_forward,
 )
 from magic_ai.slot_encoder.model import _clone_detaching_buffer
@@ -1355,159 +1353,11 @@ class TextActorCritic(nn.Module):
             return log_probs, entropies, inline_per_choice
 
         legacy_group_ids = legacy_group_mask.nonzero(as_tuple=False).squeeze(-1)
-        steps_t = batch.step_for_decision_group[legacy_group_mask]
-        flat_option_idx = batch.decision_option_idx[legacy_group_mask]
-        flat_target_idx = batch.decision_target_idx[legacy_group_mask]
-        flat_masks = batch.decision_mask[legacy_group_mask]
-        flat_uses_none = batch.uses_none_head[legacy_group_mask]
-        flat_selected = batch.selected_indices[legacy_group_mask]
-        g_legacy = int(steps_t.shape[0])
-
-        # AND in model-visibility on top of the engine mask, mirroring the
-        # filter ``sample_text_batch`` applies. Layout cols pointing at
-        # options/targets that the assembler truncated past ``max_tokens``
-        # have ``option_mask`` / ``target_mask`` False at the encoder, so
-        # their logits come back ``-inf`` — without this filter, groups
-        # whose only engine-valid cols are all-truncated produce all-(-inf)
-        # rows and ``log_softmax`` returns NaN.
-        opt_visibility = output.option_mask  # [n, max_opts]
-        tgt_visibility = output.target_mask  # [n, max_opts, max_tgts]
-        num_opts_view = int(opt_visibility.shape[1])
-        num_tgts_view = int(tgt_visibility.shape[2]) if tgt_visibility.dim() == 3 else 0
-        if num_opts_view > 0:
-            opt_clamped = flat_option_idx.clamp(min=0, max=num_opts_view - 1)
-            opt_in_range = (flat_option_idx >= 0) & (flat_option_idx < num_opts_view)
-            opt_visible = opt_visibility[steps_t.unsqueeze(-1).expand_as(opt_clamped), opt_clamped]
-            opt_visible = opt_visible & opt_in_range
-        else:
-            opt_clamped = flat_option_idx.clamp(min=0)
-            opt_visible = torch.zeros_like(flat_option_idx, dtype=torch.bool)
-        if num_opts_view > 0 and num_tgts_view > 0:
-            tgt_clamped = flat_target_idx.clamp(min=0, max=num_tgts_view - 1)
-            tgt_in_range = (flat_target_idx >= 0) & (flat_target_idx < num_tgts_view)
-            tgt_visible = tgt_visibility[
-                steps_t.unsqueeze(-1).expand_as(opt_clamped), opt_clamped, tgt_clamped
-            ]
-            tgt_visible = tgt_visible & tgt_in_range
-        else:
-            tgt_visible = torch.zeros_like(flat_option_idx, dtype=torch.bool)
-        target_required = flat_target_idx >= 0
-        visible = opt_visible & (~target_required | tgt_visible)
-        # The ``none`` slot lives at col 0 and isn't a real option/target;
-        # keep it visible whenever ``uses_none`` is set.
-        visible[flat_uses_none, 0] = True
-        visible_mask = flat_masks & visible
-
-        # Groups where every engine-valid col is truncated-invisible mirror
-        # the sample-time uniform fallback: log_prob = -log(n_engine_valid),
-        # entropy = log(n_engine_valid). We achieve this by substituting
-        # neutral zero logits (no gradient) over the engine mask for those
-        # groups; ratio in PPO collapses to ~1 and they contribute no real
-        # gradient through the policy head.
-        group_has_visible = visible_mask.any(dim=-1, keepdim=True)
-        effective_mask = torch.where(group_has_visible, visible_mask, flat_masks)
-
-        if return_per_choice:
-            all_logits = direct_decision_logits_from_forward(
-                forward,
-                step_positions=steps_t,
-                option_idx=flat_option_idx,
-                target_idx=flat_target_idx,
-                masks=flat_masks,
-                uses_none=flat_uses_none,
-            )
-            # ``torch.where`` with ``-inf`` in either branch produces NaN
-            # gradients on the unselected branch (autograd evaluates both),
-            # so keep both branches finite and mask only after the where.
-            safe_logits = torch.where(
-                group_has_visible,
-                all_logits,
-                torch.zeros_like(all_logits),
-            )
-            masked_logits = safe_logits.masked_fill(~effective_mask, float("-inf"))
-            log_probs_dense = torch.log_softmax(masked_logits, dim=-1)
-            probs_dense = log_probs_dense.exp()
-            # log_probs_dense is ``-inf`` at masked-out positions; ``probs_dense``
-            # there is 0, so the entropy term is 0 — but ``0 * -inf`` is NaN both
-            # in forward and (more dangerously) in backward through ``where``.
-            # Replace the log-prob with 0 outside the effective mask before the
-            # multiply so neither path produces NaN.
-            safe_log_probs = torch.where(
-                effective_mask,
-                log_probs_dense,
-                log_probs_dense.new_zeros(()),
-            )
-            entropy_terms = probs_dense * safe_log_probs
-
-            per_group_log_prob = log_probs_dense.gather(
-                -1,
-                flat_selected.unsqueeze(-1),
-            ).squeeze(-1)
-            per_group_entropy = -entropy_terms.sum(dim=-1)
-        else:
-            group_idx, choice_cols, _flat_logits, flat_log_probs, per_group_entropy = (
-                direct_flat_decision_distribution_from_forward(
-                    forward,
-                    step_positions=steps_t,
-                    option_idx=flat_option_idx,
-                    target_idx=flat_target_idx,
-                    masks=effective_mask,
-                    uses_none=flat_uses_none,
-                )
-            )
-            group_has_visible_1d = group_has_visible.squeeze(-1)
-            valid_counts = effective_mask.sum(dim=-1).to(dtype=flat_log_probs.dtype)
-            fallback_flat = ~group_has_visible_1d[group_idx]
-            fallback_log_probs = -valid_counts[group_idx].log()
-            flat_log_probs = torch.where(fallback_flat, fallback_log_probs, flat_log_probs)
-            per_group_entropy = torch.where(
-                group_has_visible_1d,
-                per_group_entropy,
-                valid_counts.log(),
-            )
-            is_selected = choice_cols == flat_selected[group_idx]
-            per_group_log_prob = output.values.new_zeros(g_legacy)
-            per_group_log_prob.scatter_add_(
-                0,
-                group_idx[is_selected],
-                flat_log_probs[is_selected].to(per_group_log_prob.dtype),
-            )
-
-        log_probs = log_probs.scatter_add(0, steps_t, per_group_log_prob)
-        entropies = entropies.scatter_add(0, steps_t, per_group_entropy)
-
-        if not return_per_choice:
-            return log_probs, entropies
-
-        # ``nonzero`` returns row-major (group, col-ascending), matching the
-        # original per-group ``mask.nonzero()`` concatenation order.
-        flat_indices = flat_masks.nonzero(as_tuple=False)
-        decision_group_id_flat = legacy_group_ids[flat_indices[:, 0]]
-        choice_cols = flat_indices[:, 1]
-        flat_logits = all_logits[flat_indices[:, 0], choice_cols]
-        flat_log_probs = log_probs_dense[flat_indices[:, 0], choice_cols]
-        is_sampled_flat = choice_cols == flat_selected[flat_indices[:, 0]]
-        group_idx_out = steps_t[flat_indices[:, 0]]
-
-        legacy_per_choice = ReplayPerChoice(
-            flat_logits=flat_logits,
-            flat_log_probs=flat_log_probs,
-            group_idx=group_idx_out,
-            choice_cols=choice_cols,
-            is_sampled_flat=is_sampled_flat,
-            may_is_active=torch.zeros(n, dtype=torch.bool, device=device),
-            may_logits_per_step=output.values.new_zeros(n),
-            may_selected_per_step=output.values.new_zeros(n),
-            decision_group_id_flat=decision_group_id_flat,
-            step_for_decision_group=steps_t,
-        )
-        assert inline_per_choice is not None
-        per_choice = _concat_replay_per_choice(legacy_per_choice, inline_per_choice)
-
-        return (
-            log_probs,
-            entropies,
-            per_choice,
+        kinds = batch.trace_kind_id[batch.step_for_decision_group[legacy_group_ids]]
+        raise ValueError(
+            "text replay batch contains decision groups without inline blank scoring "
+            f"(group_ids={legacy_group_ids.detach().cpu().tolist()}, "
+            f"trace_kind_ids={kinds.detach().cpu().tolist()})"
         )
 
     def _replay_scoring_forward(self, output: RecurrentTextPolicyOutput) -> ReplayScoringForward:

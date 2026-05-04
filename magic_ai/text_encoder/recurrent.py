@@ -255,6 +255,7 @@ class RecurrentTextPolicy(nn.Module):
             target_mask=encoded.target_mask,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,
+            blank_logits=encoded.blank_logits,
         )
 
 
