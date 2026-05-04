@@ -24,7 +24,7 @@ the eight-step migration. Update at every step boundary.
 | 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ✅ done       | `<choose-block>` render/batch/model path, live sampler/action adapter, replay storage, and replay scoring landed. |
 | 7 | Targets / modes / mays / X / mana sources  | ✅ done       | Targets, may, modes, number/X, and mana-color choices are inline-blank wired. |
-| 8 | Delete legacy option/target heads          | 🚧 in progress | Model-side inline flag removed; replay fallback deleted; batch-field deletion remains. |
+| 8 | Delete legacy option/target heads          | 🚧 in progress | Python model/policy/batch/replay/render surfaces are inline-only; dead Triton helpers and native Go ABI scratch fields remain. |
 
 ## What landed in each completed step
 
