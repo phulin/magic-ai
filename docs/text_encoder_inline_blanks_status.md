@@ -331,3 +331,5 @@ without treating the accuracy gate as a blocker.
 - `magic_ai/text_encoder/recurrent.py` — cached `forward_from_encoded(...)`
   now preserves `blank_logits` so R-NaD cached replay evaluation scores the
   same inline groups as the uncached path.
+- `magic_ai/replay_decisions.py` — removed direct option/target-logit replay
+  helper APIs that existed only for the deleted text-head fallback.
