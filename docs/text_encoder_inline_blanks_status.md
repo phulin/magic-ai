@@ -21,7 +21,7 @@ the eight-step migration. Update at every step boundary.
 | 2 | Render priority blanks (flag-gated)        | ✅ done       | `BlankAnchor`, `RenderError`, `<choices>…</choices>` block. Legacy path byte-identical when flag off. |
 | 3 | Batch + native assembler plumbing          | ✅ done       | Python + native paths tested; mage-go exposes `MagePackedBlankOutputs` and regenerated cffi. |
 | 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired behind `TextEncoderConfig.use_inline_blanks`. |
-| 5 | BC parity gate (priority-only)             | 🚧 scaffolded | Inline priority BC loss/accuracy utilities landed; parity experiment still pending. |
+| 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ⏳ blocked-by 5 |  |
 | 7 | Targets / modes / mays / X / mana sources  | ⏳ blocked-by 6 |  |
 | 8 | Delete legacy option/target heads          | ⏳ blocked-by 7 |  |
@@ -132,17 +132,30 @@ the eight-step migration. Update at every step boundary.
 - Targeted slice:
   `uv run pytest tests/test_text_encoder_training.py -q`
   → **17 passed**.
+- `scripts/inline_blank_bc_parity.py` — added a priority-only parity CLI that
+  trains legacy option-head BC and inline cross-blank BC on the same fixed
+  JSONL rows, then fails if held-out inline accuracy regresses by more than
+  the configured pp threshold. It accepts trace rows with either
+  `selected_option_index` or `selected_option_id` and includes a
+  `--synthetic-fixture` smoke mode.
+- `tests/test_inline_blank_bc_parity.py` — coverage for synthetic fixture
+  generation, trace loading, selected option-id resolution, and render-order
+  target mapping for legacy vs inline rows.
+- Smoke:
+  `uv run python scripts/inline_blank_bc_parity.py --synthetic-fixture 8 --epochs 1 --batch-size 4 --d-model 32 --n-layers 1 --n-heads 4 --d-ff 64 --max-seq-len 512 --seed 0`
+  → **passed**.
 
 ## Open blockers
 
-None for Steps 1-4. Step 5 still needs the BC parity experiment; the
-priority inline-blank loss/metric surface is now available for it.
+None for Steps 1-4. Step 5 still needs the real fixed-trace BC parity run;
+the priority inline-blank loss/metric surface and CLI harness are now
+available for it.
 
 ## Next steps
 
-1. **Step 5 — BC parity gate.** Wire the fixed-trace train/eval harness to
-   legacy BC and `inline_blank_priority_loss(...)`. Require ≤ 0.5 pp accuracy
-   regression before extending. Record the gate decision in this status file.
+1. **Step 5 — BC parity gate.** Run `scripts/inline_blank_bc_parity.py` on a
+   fixed real trace set. Require ≤ 0.5 pp accuracy regression before
+   extending. Record the gate decision in this status file.
 2. **Steps 6-7** — combat blocks, then targets/modes/mays/X-cost/
    mana sources. Re-gate at each step.
 3. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
