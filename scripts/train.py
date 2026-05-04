@@ -2477,7 +2477,6 @@ def train_native_batched_envs(
                 q_corr_rho_bar=args.rnad_q_corr_rho_bar,
                 bptt_chunk_size=args.rnad_bptt_chunk_size,
                 step_minibatch_size=args.minibatch_size,
-                draw_reward=-args.draw_penalty,
             ),
             reg_snapshot_dir=args.output.parent / "rnad",
             device=policy.device,
@@ -2665,8 +2664,19 @@ def train_native_batched_envs(
                 pending_step_count += n_new
                 total_generated_rollout_steps += n_new
             cursor = 0
-            for (env, winner_idx, _is_timeout), env_rows, step_count in zip(
-                finished, replay_rows_by_env, step_counts_h, strict=True
+            for (
+                (env, winner_idx, _is_timeout),
+                env_rows,
+                step_count,
+                tp0,
+                zs,
+            ) in zip(
+                finished,
+                replay_rows_by_env,
+                step_counts_h,
+                terminal_p0_h,
+                zero_sum_h,
+                strict=True,
             ):
                 if step_count:
                     end = cursor + step_count
@@ -2687,7 +2697,11 @@ def train_native_batched_envs(
                     ]
                     cursor = end
                     pending_episodes.append(
-                        EpisodeBatch(steps=episode_steps, winner_idx=int(winner_idx))
+                        EpisodeBatch(
+                            steps=episode_steps,
+                            terminal_reward_p0=float(tp0),
+                            zero_sum=bool(zs),
+                        )
                     )
 
         for env, winner_idx, is_timeout in finished:
@@ -3563,7 +3577,6 @@ def train_text_native_batched_envs(
                 q_corr_rho_bar=args.rnad_q_corr_rho_bar,
                 bptt_chunk_size=args.rnad_bptt_chunk_size,
                 step_minibatch_size=args.minibatch_size,
-                draw_reward=-args.draw_penalty,
             ),
             reg_snapshot_dir=args.output.parent / "rnad",
             device=backend.policy.device,
@@ -3708,9 +3721,16 @@ def train_text_native_batched_envs(
                     # replay rows attached now. Sync per finished batch.
                     counts_h = step_counts.tolist()
                     per_env_rows_h = torch.split(flat_rows.cpu(), counts_h)
-                    for (env, winner_idx, _is_timeout), rows_chunk in zip(
+                    for (
+                        (env, _winner_idx, _is_timeout),
+                        rows_chunk,
+                        tp0,
+                        zs,
+                    ) in zip(
                         finished_with_steps,
                         per_env_rows_h,
+                        terminal_p0_h,
+                        zero_sum_h,
                         strict=True,
                     ):
                         ep_rows = [int(r) for r in rows_chunk.tolist()]
@@ -3721,7 +3741,8 @@ def train_text_native_batched_envs(
                         pending_episodes.append(
                             EpisodeBatch(
                                 steps=list(env.episode_steps),
-                                winner_idx=int(winner_idx),
+                                terminal_reward_p0=float(tp0),
+                                zero_sum=bool(zs),
                             )
                         )
                 else:

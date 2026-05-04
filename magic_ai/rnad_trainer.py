@@ -51,10 +51,18 @@ from magic_ai.training_interfaces import RNaDTrainablePolicy
 
 @dataclass
 class EpisodeBatch:
-    """Full-episode view of the RolloutSteps extending a single game."""
+    """Full-episode view of the RolloutSteps extending a single game.
+
+    ``terminal_reward_p0`` is the resolved terminal reward in p0's
+    perspective (+1 / -1 / life-tiebreak / -draw_penalty), and ``zero_sum``
+    selects the cross-perspective sign. Mirrors ``ppo.gae_returns_batched``
+    so engine wins/losses, engine draws, and step-cap timeouts are handled
+    identically across both trainers (see :func:`magic_ai.ppo.terminal_reward_for_finish`).
+    """
 
     steps: list[RolloutStep]
-    winner_idx: int
+    terminal_reward_p0: float
+    zero_sum: bool
 
 
 @dataclass
@@ -205,7 +213,8 @@ def run_rnad_update(
     per_episode_replay_rows: list[list[int]] = []
     per_episode_perspective: list[list[int]] = []
     per_episode_logp_mu: list[list[float]] = []
-    per_episode_winner_idx: list[int] = []
+    per_episode_terminal_reward_p0: list[float] = []
+    per_episode_zero_sum: list[bool] = []
     for episode in episodes:
         if not episode.steps:
             continue
@@ -221,7 +230,8 @@ def run_rnad_update(
         per_episode_replay_rows.append(rows)
         per_episode_perspective.append(persp)
         per_episode_logp_mu.append(lp)
-        per_episode_winner_idx.append(int(episode.winner_idx))
+        per_episode_terminal_reward_p0.append(float(episode.terminal_reward_p0))
+        per_episode_zero_sum.append(bool(episode.zero_sum))
 
     if not per_episode_replay_rows:
         raise ValueError("no non-empty episodes to update on")
@@ -262,7 +272,8 @@ def run_rnad_update(
             reg_prev=state.reg_prev,
             episodes_replay_rows=per_episode_replay_rows[lo:hi],
             episodes_perspective=per_episode_perspective[lo:hi],
-            episodes_winner_idx=per_episode_winner_idx[lo:hi],
+            episodes_terminal_reward_p0=per_episode_terminal_reward_p0[lo:hi],
+            episodes_zero_sum=per_episode_zero_sum[lo:hi],
             episodes_logp_mu=episodes_logp_mu[lo:hi],
             config=state.config,
             alpha=alpha,

@@ -138,11 +138,6 @@ class RNaDConfig:
     cap activation memory at the cost of truncating gradient flow at
     chunk boundaries."""
 
-    draw_reward: float = -1.0
-    """Terminal reward given to both players when a game ends in a draw
-    (``winner_idx < 0``). Default ``-1.0`` treats a draw the same as a
-    loss, removing any incentive to drag games out to the step cap."""
-
 
 # ---------------------------------------------------------------------------
 # Reward transformation
@@ -366,21 +361,20 @@ def two_player_vtrace(
     # Own-turn linear recurrence:
     #   v_hat_own[k] = A[k] + B[k] * v_hat_own[k+1],  v_hat_own[K] = 0
     #
-    # Run the K-step recurrence on host (K is small, ~50 typical) to avoid
-    # K GPU kernel launches per call. v-trace inputs are detached at every
-    # call site (values come from the frozen target net, logp from behavior
-    # / target policies after .detach()) so the output is a pure target with
-    # no gradient flowing through this branch.
+    # Closed-form on-device scan (mirrors :func:`magic_ai.ppo.gae_returns`
+    # and the batched v-trace below): no GPU->CPU sync. ``B`` is the
+    # coefficient between v[k] and v[k+1]; B[-1] never multiplies a real
+    # v[k+1] (terminal) and is dropped. v-trace inputs are detached at every
+    # call site, so this branch carries no gradient regardless.
     A = pre_c - c * v_next_own_vec
     B = c
-    A_h = A.detach().cpu().tolist()
-    B_h = B.detach().cpu().tolist()
-    v_h = [0.0] * K
-    next_val = 0.0
-    for k in range(K - 1, -1, -1):
-        next_val = A_h[k] + B_h[k] * next_val
-        v_h[k] = next_val
-    v_hat_own = torch.tensor(v_h, dtype=dtype, device=device)
+    if K == 1:
+        v_hat_own = A.detach().clone()
+    else:
+        coeffs_rev = B[:-1].detach().flip(0)
+        deltas_rev = A.detach().flip(0)
+        scan_coeffs = torch.cat([A.new_ones(1), coeffs_rev.cumprod(0)])
+        v_hat_own = (scan_coeffs * torch.cumsum(deltas_rev / scan_coeffs, dim=0)).flip(0)
 
     # Scatter own-turn results back; opp-turn steps inherit v_hat from the
     # next own-turn (or zero if none follows).
@@ -416,6 +410,7 @@ def _two_player_vtrace_batched(
     logp_mu: Tensor,
     perspective_is_player_i: Tensor,
     ep_offsets: Tensor,
+    max_ep_len: int | None = None,
     rho_bar: float = 1.0,
     c_bar: float = 1.0,
 ) -> VTraceOutput:
@@ -536,7 +531,15 @@ def _two_player_vtrace_batched(
     # reverse scan along dim=1, then gather per own-turn step.
     K_per_ep = torch.zeros(n_eps, dtype=torch.long, device=device)
     K_per_ep.scatter_add_(0, own_ep_idx, torch.ones_like(own_ep_idx))
-    max_own_per_ep = int(K_per_ep.max().item())
+    # Pad bound: if the caller supplied an upper bound (host-known max
+    # episode length), use it to skip the GPU->CPU sync that
+    # ``int(K_per_ep.max().item())`` would force. Own-turn count per
+    # episode is bounded above by total ep length, so over-padding by ~2x
+    # is safe and the closed-form scan masks padded positions out.
+    if max_ep_len is None:
+        max_own_per_ep = int(K_per_ep.max().item())
+    else:
+        max_own_per_ep = int(max_ep_len)
     cumlen_before_ep = torch.cat([K_per_ep.new_zeros(1), K_per_ep.cumsum(0)[:-1]])
     own_pos_in_ep = torch.arange(K, device=device) - cumlen_before_ep[own_ep_idx]
 
@@ -1103,7 +1106,8 @@ def rnad_trajectory_loss(
     reg_prev: Any,
     replay_rows: list[int],
     perspective_player_idx: Sequence[int],
-    winner_idx: int,
+    terminal_reward_p0: float,
+    zero_sum: bool,
     logp_mu: Tensor,
     config: RNaDConfig,
     alpha: float,
@@ -1176,7 +1180,8 @@ def rnad_trajectory_loss(
         reg_prev=reg_prev,
         episodes_replay_rows=[replay_rows],
         episodes_perspective=[perspective_player_idx],
-        episodes_winner_idx=[winner_idx],
+        episodes_terminal_reward_p0=[terminal_reward_p0],
+        episodes_zero_sum=[zero_sum],
         episodes_logp_mu=[logp_mu],
         config=config,
         alpha=alpha,
@@ -1195,7 +1200,8 @@ def _trajectory_loss_from_forwards(
     pc_reg_cur: Any,
     pc_reg_prev: Any,
     perspective: Tensor,
-    winner_idx: int,
+    terminal_reward_p0: float,
+    zero_sum: bool,
     logp_mu: Tensor,
     config: RNaDConfig,
     alpha: float,
@@ -1344,13 +1350,17 @@ def _trajectory_loss_from_forwards(
             may_inv_mu = (1.0 / may_mu_sampled.clamp_min(1e-30)).clamp(max=config.q_corr_rho_bar)
         may_sampled_log_ratio = torch.where(sampled_is_accept, log_ratio_accept, log_ratio_decline)
 
+    # Per-perspective terminal rewards. Zero-sum (engine win/loss,
+    # life-tiebreak timeout) flips p1's sign; non-zero-sum (engine draw)
+    # gives both players the same value. Mirrors PPO's gae_returns.
+    r_p0 = float(terminal_reward_p0)
+    r_p1 = -r_p0 if zero_sum else r_p0
+    terminal_per_own = (r_p0, r_p1)
+
     for own_idx in (0, 1):
         is_own = perspective == own_idx
         rewards = torch.zeros(t_len, dtype=dtype, device=device)
-        if winner_idx >= 0:
-            rewards[-1] = 1.0 if winner_idx == own_idx else -1.0
-        else:
-            rewards[-1] = config.draw_reward
+        rewards[-1] = terminal_per_own[own_idx]
 
         transformed = transform_rewards(
             rewards,
@@ -1520,9 +1530,11 @@ def _batched_trajectory_loss_from_forwards(
     pc_reg_cur: Any,
     pc_reg_prev: Any,
     perspective: Tensor,
-    winners: Tensor,
+    terminal_reward_p0: Tensor,
+    zero_sum: Tensor,
     logp_mu: Tensor,
     ep_offsets: Tensor,
+    max_ep_len: int | None = None,
     config: RNaDConfig,
     alpha: float,
     compute_v_target_reg_share: bool = False,
@@ -1537,8 +1549,13 @@ def _batched_trajectory_loss_from_forwards(
     :func:`_two_player_vtrace_batched`.
 
     ``perspective`` is a ``(T_total,)`` long tensor with values in ``{0, 1}``
-    (the per-step current-turn player). ``winners`` is ``(n_eps,)`` long,
-    with ``-1`` meaning "no terminal reward". ``logp_mu`` is ``(T_total,)``
+    (the per-step current-turn player). ``terminal_reward_p0`` is
+    ``(n_eps,)`` float (terminal reward in p0's perspective per episode);
+    ``zero_sum`` is ``(n_eps,)`` bool — ``True`` means p1's terminal is
+    ``-terminal_reward_p0`` (engine win/loss, life-tiebreak timeout),
+    ``False`` means p1 sees the same value (engine-draw symmetric absorbing
+    state). Mirrors PPO's ``gae_returns_batched`` so trainers handle
+    win/loss/draw/timeout identically. ``logp_mu`` is ``(T_total,)``
     (concatenation of episodes' rollout-time log-probs). ``ep_offsets`` is
     ``(n_eps + 1,)`` long with ``ep_offsets[0] == 0``,
     ``ep_offsets[-1] == T_total``.
@@ -1547,7 +1564,6 @@ def _batched_trajectory_loss_from_forwards(
     step-weighted across the flat batch (rather than the original mean of
     per-episode means). All other fields aggregate identically.
     """
-    n_eps = int(ep_offsets.numel()) - 1
     T_total = int(lp_online.shape[0])
     device = v_online.device
     dtype = v_online.dtype
@@ -1613,25 +1629,20 @@ def _batched_trajectory_loss_from_forwards(
         ~online_moved_up, is_bias_step, torch.zeros_like(is_bias_step)
     ).sum()
 
-    # Terminal rewards: scatter ±1 at each episode's last step; draws get
-    # draw_reward for both players (not 0, to remove any incentive to stall).
+    # Terminal rewards: scatter the resolved p0-perspective terminal at each
+    # episode's last step. Zero-sum episodes (engine win/loss, life-tiebreak
+    # timeout) flip the sign for p1; non-zero-sum (engine draw) keeps it the
+    # same — the symmetric absorbing-state branch lets the discounted draw
+    # penalty reach every step under both perspectives. See
+    # ``magic_ai.ppo.gae_returns_batched`` for the matching PPO logic.
     last_idx = ep_offsets[1:] - 1
-    winner_dev = winners.to(device=device, dtype=torch.long)
-    valid_w = winner_dev >= 0
-    sign_per_ep = torch.where(
-        winner_dev == 0,
-        torch.ones(n_eps, dtype=dtype, device=device),
-        -torch.ones(n_eps, dtype=dtype, device=device),
-    )
-    sign_per_ep = torch.where(valid_w, sign_per_ep, torch.zeros(n_eps, dtype=dtype, device=device))
+    tr_p0 = terminal_reward_p0.to(device=device, dtype=dtype)
+    zs_dev = zero_sum.to(device=device, dtype=torch.bool)
+    tr_p1 = torch.where(zs_dev, -tr_p0, tr_p0)
     rewards_p0 = torch.zeros(T_total, dtype=dtype, device=device)
-    rewards_p0.scatter_(0, last_idx, sign_per_ep)
-    rewards_p1 = -rewards_p0
-    # Both players receive draw_reward on drawn episodes (scatter_add is a no-op
-    # for win/loss episodes where the draw mask is zero).
-    draw_ep_reward = (~valid_w).to(dtype=dtype) * config.draw_reward
-    rewards_p0.scatter_add_(0, last_idx, draw_ep_reward)
-    rewards_p1.scatter_add_(0, last_idx, draw_ep_reward)
+    rewards_p1 = torch.zeros(T_total, dtype=dtype, device=device)
+    rewards_p0.scatter_(0, last_idx, tr_p0)
+    rewards_p1.scatter_(0, last_idx, tr_p1)
 
     is_own_p0 = perspective == 0
     is_own_p1 = perspective == 1
@@ -1652,28 +1663,30 @@ def _batched_trajectory_loss_from_forwards(
         v_per_choice = torch.zeros(0, dtype=dtype, device=device)
         base_q_flat = torch.zeros(0, dtype=dtype, device=device)
 
-    may_any = bool(pc_online.may_is_active.any().item())
-    if may_any:
-        may_logits_step = pc_online.may_logits_per_step.to(dtype=dtype)
-        log_pi_accept = torch.nn.functional.logsigmoid(may_logits_step)
-        log_pi_decline = torch.nn.functional.logsigmoid(-may_logits_step)
-        with torch.no_grad():
-            may_reg_cur_logits = pc_reg_cur.may_logits_per_step.to(dtype=dtype)
-            may_reg_prev_logits = pc_reg_prev.may_logits_per_step.to(dtype=dtype)
-            may_lp_reg_blend_accept = alpha * torch.nn.functional.logsigmoid(may_reg_cur_logits) + (
-                1.0 - alpha
-            ) * torch.nn.functional.logsigmoid(may_reg_prev_logits)
-            may_lp_reg_blend_decline = alpha * torch.nn.functional.logsigmoid(
-                -may_reg_cur_logits
-            ) + (1.0 - alpha) * torch.nn.functional.logsigmoid(-may_reg_prev_logits)
-        log_ratio_accept = log_pi_accept.detach() - may_lp_reg_blend_accept
-        log_ratio_decline = log_pi_decline.detach() - may_lp_reg_blend_decline
-        sampled_is_accept = pc_online.may_selected_per_step > 0.5
-        with torch.no_grad():
-            tgt_p_accept = torch.sigmoid(pc_tgt.may_logits_per_step.to(dtype=dtype))
-            may_mu_sampled = torch.where(sampled_is_accept, tgt_p_accept, 1.0 - tgt_p_accept)
-            may_inv_mu = (1.0 / may_mu_sampled.clamp_min(1e-30)).clamp(max=config.q_corr_rho_bar)
-        may_sampled_log_ratio = torch.where(sampled_is_accept, log_ratio_accept, log_ratio_decline)
+    # May-head setup runs unconditionally — ``may_neurd_loss`` masks padded
+    # positions out by ``own_turn_may_mask``, so when no may steps are active
+    # the contribution is exactly zero. Always running avoids a per-call
+    # ``.any().item()`` sync on ``may_is_active``.
+    may_logits_step = pc_online.may_logits_per_step.to(dtype=dtype)
+    log_pi_accept = torch.nn.functional.logsigmoid(may_logits_step)
+    log_pi_decline = torch.nn.functional.logsigmoid(-may_logits_step)
+    with torch.no_grad():
+        may_reg_cur_logits = pc_reg_cur.may_logits_per_step.to(dtype=dtype)
+        may_reg_prev_logits = pc_reg_prev.may_logits_per_step.to(dtype=dtype)
+        may_lp_reg_blend_accept = alpha * torch.nn.functional.logsigmoid(may_reg_cur_logits) + (
+            1.0 - alpha
+        ) * torch.nn.functional.logsigmoid(may_reg_prev_logits)
+        may_lp_reg_blend_decline = alpha * torch.nn.functional.logsigmoid(-may_reg_cur_logits) + (
+            1.0 - alpha
+        ) * torch.nn.functional.logsigmoid(-may_reg_prev_logits)
+    log_ratio_accept = log_pi_accept.detach() - may_lp_reg_blend_accept
+    log_ratio_decline = log_pi_decline.detach() - may_lp_reg_blend_decline
+    sampled_is_accept = pc_online.may_selected_per_step > 0.5
+    with torch.no_grad():
+        tgt_p_accept = torch.sigmoid(pc_tgt.may_logits_per_step.to(dtype=dtype))
+        may_mu_sampled = torch.where(sampled_is_accept, tgt_p_accept, 1.0 - tgt_p_accept)
+        may_inv_mu = (1.0 / may_mu_sampled.clamp_min(1e-30)).clamp(max=config.q_corr_rho_bar)
+    may_sampled_log_ratio = torch.where(sampled_is_accept, log_ratio_accept, log_ratio_decline)
 
     cl_sum = v_online.new_zeros(())
     pl_sum = v_online.new_zeros(())
@@ -1707,6 +1720,7 @@ def _batched_trajectory_loss_from_forwards(
             logp_mu=logp_mu_dev,
             perspective_is_player_i=is_own_p,
             ep_offsets=ep_offsets,
+            max_ep_len=max_ep_len,
             rho_bar=config.vtrace_rho_bar,
             c_bar=config.vtrace_c_bar,
         )
@@ -1720,6 +1734,7 @@ def _batched_trajectory_loss_from_forwards(
                     logp_mu=logp_mu_dev,
                     perspective_is_player_i=is_own_p,
                     ep_offsets=ep_offsets,
+                    max_ep_len=max_ep_len,
                     rho_bar=config.vtrace_rho_bar,
                     c_bar=config.vtrace_c_bar,
                 )
@@ -1748,44 +1763,45 @@ def _batched_trajectory_loss_from_forwards(
         else:
             sampled_inner_per_step = torch.zeros(T_total, dtype=dtype, device=device)
 
-        if may_any:
-            may_and_own = pc_online.may_is_active & is_own_p
-            may_sampled_inner = (
-                rewards_p
-                + config.eta * may_sampled_log_ratio
-                + ratio_own_per_step * (v_out.r_hat_next + v_out.v_hat_next)
-                - v_tgt_dt
+        # May-head loss runs unconditionally; ``own_turn_may_mask`` masks
+        # padded/inactive positions out so empty batches contribute 0.
+        may_and_own = pc_online.may_is_active & is_own_p
+        may_sampled_inner = (
+            rewards_p
+            + config.eta * may_sampled_log_ratio
+            + ratio_own_per_step * (v_out.r_hat_next + v_out.v_hat_next)
+            - v_tgt_dt
+        )
+        may_q_sampled_correction = may_inv_mu * may_sampled_inner
+        q_accept = (
+            -config.eta * log_ratio_accept
+            + torch.where(
+                sampled_is_accept,
+                may_q_sampled_correction,
+                torch.zeros_like(rewards_p),
             )
-            may_q_sampled_correction = may_inv_mu * may_sampled_inner
-            q_accept = (
-                -config.eta * log_ratio_accept
-                + torch.where(
-                    sampled_is_accept,
-                    may_q_sampled_correction,
-                    torch.zeros_like(rewards_p),
-                )
-                + v_tgt_dt
+            + v_tgt_dt
+        )
+        q_decline = (
+            -config.eta * log_ratio_decline
+            + torch.where(
+                ~sampled_is_accept,
+                may_q_sampled_correction,
+                torch.zeros_like(rewards_p),
             )
-            q_decline = (
-                -config.eta * log_ratio_decline
-                + torch.where(
-                    ~sampled_is_accept,
-                    may_q_sampled_correction,
-                    torch.zeros_like(rewards_p),
-                )
-                + v_tgt_dt
-            )
-            may_pl_sum, may_pl_count = may_neurd_loss(
-                may_logits=may_logits_step,
-                q_accept=q_accept,
-                q_decline=q_decline,
-                own_turn_may_mask=may_and_own,
-                beta=config.neurd_beta,
-                clip=config.neurd_clip,
-                lr=config.learning_rate,
-            )
-            pl_sum = pl_sum + may_pl_sum
-            pl_count_total += may_pl_count
+            + v_tgt_dt
+        )
+        may_pl_sum, may_pl_count = may_neurd_loss(
+            may_logits=may_logits_step,
+            q_accept=q_accept,
+            q_decline=q_decline,
+            own_turn_may_mask=may_and_own,
+            beta=config.neurd_beta,
+            clip=config.neurd_clip,
+            lr=config.learning_rate,
+        )
+        pl_sum = pl_sum + may_pl_sum
+        pl_count_total += may_pl_count
 
         if has_groups:
             step_is_own_flat = is_own_p[step_for_flat]
@@ -1895,7 +1911,8 @@ def rnad_batched_trajectory_loss(
     reg_prev: Any,
     episodes_replay_rows: Sequence[Sequence[int]],
     episodes_perspective: Sequence[Sequence[int]],
-    episodes_winner_idx: Sequence[int],
+    episodes_terminal_reward_p0: Sequence[float],
+    episodes_zero_sum: Sequence[bool],
     episodes_logp_mu: Sequence[Tensor],
     config: RNaDConfig,
     alpha: float,
@@ -1927,18 +1944,23 @@ def rnad_batched_trajectory_loss(
     n_eps = len(episodes_replay_rows)
     if len(episodes_perspective) != n_eps:
         raise ValueError("episodes_perspective length mismatch")
-    if len(episodes_winner_idx) != n_eps:
-        raise ValueError("episodes_winner_idx length mismatch")
+    if len(episodes_terminal_reward_p0) != n_eps:
+        raise ValueError("episodes_terminal_reward_p0 length mismatch")
+    if len(episodes_zero_sum) != n_eps:
+        raise ValueError("episodes_zero_sum length mismatch")
     if len(episodes_logp_mu) != n_eps:
         raise ValueError("episodes_logp_mu length mismatch")
 
     flat_rows: list[int] = []
     ep_offsets: list[int] = [0]
+    max_ep_len = 0
     for ep in episodes_replay_rows:
         if not ep:
             raise ValueError("each episode must contain at least one row")
         flat_rows.extend(int(r) for r in ep)
         ep_offsets.append(ep_offsets[-1] + len(ep))
+        if len(ep) > max_ep_len:
+            max_ep_len = len(ep)
 
     device = next(iter(online.parameters())).device
 
@@ -2006,7 +2028,10 @@ def rnad_batched_trajectory_loss(
         dtype=torch.long,
         device=device,
     )
-    winners_t = torch.tensor([int(w) for w in episodes_winner_idx], dtype=torch.long, device=device)
+    terminal_reward_p0_t = torch.tensor(
+        [float(r) for r in episodes_terminal_reward_p0], dtype=torch.float32, device=device
+    )
+    zero_sum_t = torch.tensor([bool(z) for z in episodes_zero_sum], dtype=torch.bool, device=device)
     target_dtype = v_online_b.dtype
     logp_mu_flat = torch.cat([t.to(device=device, dtype=target_dtype) for t in episodes_logp_mu])
     ep_offsets_t = torch.tensor(ep_offsets, dtype=torch.long, device=device)
@@ -2021,9 +2046,11 @@ def rnad_batched_trajectory_loss(
         pc_reg_cur=pc_reg_cur_b,
         pc_reg_prev=pc_reg_prev_b,
         perspective=perspective_flat,
-        winners=winners_t,
+        terminal_reward_p0=terminal_reward_p0_t,
+        zero_sum=zero_sum_t,
         logp_mu=logp_mu_flat,
         ep_offsets=ep_offsets_t,
+        max_ep_len=max_ep_len,
         config=config,
         alpha=alpha,
         compute_v_target_reg_share=compute_v_target_reg_share,
@@ -2040,7 +2067,8 @@ def rnad_update_trajectory(
     optimizer: torch.optim.Optimizer,
     replay_rows: list[int],
     perspective_player_idx: Sequence[int],
-    winner_idx: int,
+    terminal_reward_p0: float,
+    zero_sum: bool,
     logp_mu: Tensor,
     config: RNaDConfig,
     alpha: float,
@@ -2054,7 +2082,8 @@ def rnad_update_trajectory(
         reg_prev=reg_prev,
         replay_rows=replay_rows,
         perspective_player_idx=perspective_player_idx,
-        winner_idx=winner_idx,
+        terminal_reward_p0=terminal_reward_p0,
+        zero_sum=zero_sum,
         logp_mu=logp_mu,
         config=config,
         alpha=alpha,

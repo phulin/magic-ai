@@ -499,7 +499,8 @@ class TextActorCriticTests(unittest.TestCase):
                             replay_idx=rows[1],
                         ),
                     ],
-                    winner_idx=0,
+                    terminal_reward_p0=1.0,
+                    zero_sum=True,
                 ),
                 EpisodeBatch(
                     steps=[
@@ -516,7 +517,8 @@ class TextActorCriticTests(unittest.TestCase):
                             replay_idx=rows[3],
                         ),
                     ],
-                    winner_idx=1,
+                    terminal_reward_p0=-1.0,
+                    zero_sum=True,
                 ),
             ]
             stats = run_rnad_update(model, optimizer, state, episodes)
