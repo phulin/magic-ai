@@ -320,7 +320,6 @@ def encode_parity_rows(
             row.snapshot,
             actions,
             oracle=oracle,
-            use_inline_blanks=True,
             chosen_token_id=chosen_token_id,
         )
         legacy_rendered.append(legacy)

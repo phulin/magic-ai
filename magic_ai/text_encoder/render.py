@@ -547,7 +547,6 @@ class SnapshotRenderer:
         oracle: dict[str, OracleEntry] | None = None,
         *,
         max_card_refs: int = MAX_CARD_REFS,
-        use_inline_blanks: bool = False,
         chosen_token_id: int | None = None,
         none_token_id: int | None = None,
         yes_token_id: int | None = None,
@@ -558,14 +557,15 @@ class SnapshotRenderer:
     ) -> None:
         self._oracle = oracle if oracle is not None else {}
         self._max_card_refs = max_card_refs
-        self._use_inline_blanks = use_inline_blanks
-        self._chosen_token_id = chosen_token_id
+        self._chosen_token_id = 0 if chosen_token_id is None else chosen_token_id
         self._none_token_id = none_token_id
         self._yes_token_id = yes_token_id
         self._no_token_id = no_token_id
         self._num_token_ids = tuple(int(tid) for tid in num_token_ids or ())
         self._mana_token_ids = tuple(int(tid) for tid in mana_token_ids or ())
-        self._card_ref_token_ids = tuple(int(tid) for tid in card_ref_token_ids or ())
+        self._card_ref_token_ids = tuple(
+            int(tid) for tid in (card_ref_token_ids or range(max_card_refs))
+        )
         self._cur_self_id: str = ""
         self._cur_opp_id: str = ""
         # Per-render scratch state for inline-blank emission. Reset in
@@ -577,11 +577,6 @@ class SnapshotRenderer:
         self._blank_group_id: int = 0
         self._blank_index: int = 0
         self._pending_kind: str = ""
-        if use_inline_blanks and chosen_token_id is None:
-            raise ValueError(
-                "use_inline_blanks=True requires chosen_token_id (the "
-                "tokenizer id of the '<chosen>' scoring token)."
-            )
 
     # -- public ------------------------------------------------------------
 
@@ -590,7 +585,6 @@ class SnapshotRenderer:
         snapshot: GameStateSnapshot,
         actions: Sequence[PendingOptionState] | None = None,
     ) -> RenderedSnapshot:
-        inline = self._use_inline_blanks
         result = RenderedSnapshot(text="")
         buf: list[str] = []
         # Reset per-render scratch state.
@@ -625,8 +619,7 @@ class SnapshotRenderer:
         # card / permanent so the zone walk can splice the correct
         # ``<choose-play>`` / ``<use-ability>`` token next to each card.
         # Pass options are buffered for the trailing ``<choices>`` block.
-        if inline:
-            self._classify_inline_options(resolved_actions, card_refs)
+        self._classify_inline_options(resolved_actions, card_refs)
 
         buf.append("<bos><state>")
         # Top-level game info: <turn>N</turn><step:...>
@@ -681,11 +674,8 @@ class SnapshotRenderer:
         if has_command:
             buf.append("<command></command>")
 
-        # Actions
-        if inline:
-            self._render_choices_inline(buf, result, resolved_actions)
-        else:
-            self._render_actions(buf, result, resolved_actions, card_refs)
+        # Decision blanks / choices.
+        self._render_choices_inline(buf, result, resolved_actions)
 
         buf.append("</state><eos>")
         result.text = "".join(buf)
@@ -1211,7 +1201,6 @@ def render_snapshot(
     *,
     oracle: dict[str, OracleEntry] | None = None,
     max_card_refs: int = MAX_CARD_REFS,
-    use_inline_blanks: bool = False,
     chosen_token_id: int | None = None,
     none_token_id: int | None = None,
     yes_token_id: int | None = None,
@@ -1226,19 +1215,16 @@ def render_snapshot(
     type lines, mana costs, and oracle text. If a card name is missing from the
     dict the renderer falls back to emitting only the card name + status flags.
 
-    ``use_inline_blanks`` switches the priority/action surface from the legacy
-    ``<actions>...<option>...</option>...</actions>`` block to inline
-    ``<choose-play>`` / ``<use-ability>`` blanks adjacent to their source card
-    plus a trailing ``<choices>`` block holding the single ``<pass>`` blank.
-    Required for Step 2+ of ``docs/text_encoder_inline_blanks_plan.md``;
-    callers must supply ``chosen_token_id`` (the tokenizer id of the
-    ``<chosen>`` scoring token).
+    Pending decisions are rendered as inline ``<choose-*>`` blanks adjacent to
+    their natural source text plus a trailing ``<choices>`` block for
+    standalone choices. Scoring callers should supply ``chosen_token_id`` (the
+    tokenizer id of the ``<chosen>`` scoring token); render-only callers may
+    omit it.
     """
 
     return SnapshotRenderer(
         oracle,
         max_card_refs=max_card_refs,
-        use_inline_blanks=use_inline_blanks,
         chosen_token_id=chosen_token_id,
         none_token_id=none_token_id,
         yes_token_id=yes_token_id,

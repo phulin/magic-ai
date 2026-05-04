@@ -244,7 +244,6 @@ class TextPolicy(nn.Module):
                 snap,
                 actions,
                 oracle=oracle,
-                use_inline_blanks=True,
                 chosen_token_id=chosen_token_id,
                 none_token_id=none_token_id,
                 yes_token_id=yes_token_id,

@@ -364,3 +364,7 @@ without treating the accuracy gate as a blocker.
 - `magic_ai/text_encoder/native_assembler.py` — `MageEncodeTokensPacked`
   wrapper now always allocates/passes inline blank buffers; the lower-level
   `use_inline_blanks` switch is removed.
+- `magic_ai/text_encoder/render.py` — renderer construction and
+  `render_snapshot(...)` are inline-only; the public `use_inline_blanks`
+  switch is removed and pending decisions always render as blank anchors plus
+  `<choices>`.

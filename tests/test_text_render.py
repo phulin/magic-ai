@@ -182,16 +182,15 @@ def test_action_target_uses_same_card_ref(oracle: dict[str, OracleEntry]) -> Non
     target_ref = rendered.card_refs[target_id]
     bolt_ref = rendered.card_refs[bolt_id]
     target_token = card_ref_token(target_ref)
-    bolt_token = card_ref_token(bolt_ref)
-    # Cast option references the bolt via card-ref (no leading space, no cost).
-    assert f"<cast>{bolt_token}" in rendered.text
-    # And targets carry the same K used for the opposing creature's <card-ref>.
-    assert f"<target>{target_token}</target>" in rendered.text
-    # Anchors agree.
-    [opt_anchor] = rendered.option_anchors
-    assert opt_anchor.kind == "cast"
-    [tgt_anchor] = opt_anchor.target_anchors
-    assert tgt_anchor.referenced_card_ref == target_ref
+    assert card_ref_token(bolt_ref) in rendered.text
+    assert target_token in rendered.text
+    assert "<choose-play>" in rendered.text
+    assert "<choose-target>" in rendered.text
+    target_blanks = [
+        anchor for anchor in rendered.blank_anchors if anchor.kind == "<choose-target>"
+    ]
+    assert len(target_blanks) == 1
+    assert target_blanks[0].legal_token_ids == (target_ref,)
     # Note: ``bolt`` also appears in the hand (silences ruff F841).
     assert bolt is not None
 
@@ -250,19 +249,19 @@ def test_busy_midgame_length_stats(oracle: dict[str, OracleEntry]) -> None:
     print(
         f"[busy-midgame] chars={char_len} words={word_len} "
         f"card_refs={len(rendered.card_refs)} "
-        f"option_anchors={len(rendered.option_anchors)}"
+        f"blank_anchors={len(rendered.blank_anchors)}"
     )
     # Sanity floor — a busy snapshot should at least exceed the empty snapshot.
     assert char_len > 200
 
 
-def test_render_contains_state_and_actions(oracle: dict[str, OracleEntry]) -> None:
+def test_render_contains_state_and_choices(oracle: dict[str, OracleEntry]) -> None:
     snap = _basic_snapshot()
     rendered = render_snapshot(snap, oracle=oracle)
     assert rendered.text.startswith("<bos><state>")
     assert rendered.text.endswith("</state><eos>")
-    assert "<actions>" in rendered.text
-    assert "</actions>" in rendered.text
+    assert "<actions>" not in rendered.text
+    assert "<choices>" in rendered.text
 
 
 def test_status_flags_only_when_in_snapshot(oracle: dict[str, OracleEntry]) -> None:
@@ -297,7 +296,7 @@ def test_pass_action(oracle: dict[str, OracleEntry]) -> None:
     )
     snap_with_pending = cast(GameStateSnapshot, {**snap, "pending": pending})
     rendered = render_snapshot(snap_with_pending, oracle=oracle)
-    assert "<option><pass></option>" in rendered.text
+    assert "<choices><pass></choices>" in rendered.text
 
 
 def test_stack_renders(oracle: dict[str, OracleEntry]) -> None:
@@ -588,18 +587,15 @@ def _priority_snapshot() -> GameStateSnapshot:
     return cast(GameStateSnapshot, {**snap, "pending": cast(PendingState, pending)})
 
 
-def test_inline_blanks_legacy_path_unchanged(oracle: dict[str, OracleEntry]) -> None:
+def test_inline_blanks_are_default(oracle: dict[str, OracleEntry]) -> None:
     snap = _priority_snapshot()
-    rendered = render_snapshot(snap, oracle=oracle)  # default: legacy
-    # Legacy emits <actions>...<option>...</option>...</actions> and no
-    # <choose-*> / <choices> markers.
-    assert "<actions>" in rendered.text
-    assert "</actions>" in rendered.text
-    assert "<choose-play>" not in rendered.text
-    assert "<use-ability>" not in rendered.text
-    assert "<choices>" not in rendered.text
-    assert rendered.blank_anchors == []
-    assert len(rendered.option_anchors) == 3
+    rendered = render_snapshot(snap, oracle=oracle)
+    assert "<actions>" not in rendered.text
+    assert "<choose-play>" in rendered.text
+    assert "<use-ability>" in rendered.text
+    assert "<choices>" in rendered.text
+    assert len(rendered.blank_anchors) == 3
+    assert rendered.option_anchors == []
 
 
 def test_inline_blanks_emits_anchors_and_choices_block(
@@ -609,7 +605,6 @@ def test_inline_blanks_emits_anchors_and_choices_block(
     rendered = render_snapshot(
         snap,
         oracle=oracle,
-        use_inline_blanks=True,
         chosen_token_id=CHOSEN_FAKE_ID,
     )
     # Inline mode replaces <actions>...</actions> with a trailing <choices>...
@@ -673,7 +668,6 @@ def test_inline_blanks_targeted_priority_option_emits_target_blank(
     rendered = render_snapshot(
         cast(GameStateSnapshot, {**snap, "pending": pending}),
         oracle=oracle,
-        use_inline_blanks=True,
         chosen_token_id=CHOSEN_FAKE_ID,
         card_ref_token_ids=CARD_REF_FAKE_IDS,
     )
@@ -704,7 +698,6 @@ def test_inline_blanks_pass_only_snapshot(oracle: dict[str, OracleEntry]) -> Non
     rendered = render_snapshot(
         snap_with_pending,
         oracle=oracle,
-        use_inline_blanks=True,
         chosen_token_id=CHOSEN_FAKE_ID,
     )
     assert "<choices><pass></choices>" in rendered.text
@@ -723,7 +716,6 @@ def test_inline_blanks_may_emits_yes_no_blank(oracle: dict[str, OracleEntry]) ->
     rendered = render_snapshot(
         cast(GameStateSnapshot, {**snap, "pending": pending}),
         oracle=oracle,
-        use_inline_blanks=True,
         chosen_token_id=CHOSEN_FAKE_ID,
         yes_token_id=YES_FAKE_ID,
         no_token_id=NO_FAKE_ID,
@@ -754,7 +746,6 @@ def test_inline_blanks_mode_emits_num_blank(oracle: dict[str, OracleEntry]) -> N
     rendered = render_snapshot(
         cast(GameStateSnapshot, {**snap, "pending": pending}),
         oracle=oracle,
-        use_inline_blanks=True,
         chosen_token_id=CHOSEN_FAKE_ID,
         num_token_ids=NUM_FAKE_IDS,
     )
@@ -785,7 +776,6 @@ def test_inline_blanks_number_emits_x_digit_blank(oracle: dict[str, OracleEntry]
     rendered = render_snapshot(
         cast(GameStateSnapshot, {**snap, "pending": pending}),
         oracle=oracle,
-        use_inline_blanks=True,
         chosen_token_id=CHOSEN_FAKE_ID,
         num_token_ids=NUM_FAKE_IDS,
     )
@@ -820,7 +810,6 @@ def test_inline_blanks_mana_color_emits_mana_source_blank(
     rendered = render_snapshot(
         cast(GameStateSnapshot, {**snap, "pending": pending}),
         oracle=oracle,
-        use_inline_blanks=True,
         chosen_token_id=CHOSEN_FAKE_ID,
         mana_token_ids=MANA_FAKE_IDS,
     )
@@ -877,7 +866,6 @@ def test_inline_blanks_blockers_emit_constrained_block_blanks(
     rendered = render_snapshot(
         snap,
         oracle=oracle,
-        use_inline_blanks=True,
         chosen_token_id=CHOSEN_FAKE_ID,
         none_token_id=NONE_FAKE_ID,
         card_ref_token_ids=CARD_REF_FAKE_IDS,
@@ -918,12 +906,8 @@ def test_inline_blanks_ordinal_parity_under_option_permutation(
             ),
         },
     )
-    rendered_a = render_snapshot(
-        snap_a, oracle=oracle, use_inline_blanks=True, chosen_token_id=CHOSEN_FAKE_ID
-    )
-    rendered_b = render_snapshot(
-        snap_b, oracle=oracle, use_inline_blanks=True, chosen_token_id=CHOSEN_FAKE_ID
-    )
+    rendered_a = render_snapshot(snap_a, oracle=oracle, chosen_token_id=CHOSEN_FAKE_ID)
+    rendered_b = render_snapshot(snap_b, oracle=oracle, chosen_token_id=CHOSEN_FAKE_ID)
     # Text is byte-for-byte identical across permutations: zone-walk order is
     # fixed and per-card option lists are sorted by stable key.
     assert rendered_a.text == rendered_b.text
@@ -931,12 +915,6 @@ def test_inline_blanks_ordinal_parity_under_option_permutation(
     assert [(a.blank_index, a.kind, a.group_id) for a in rendered_a.blank_anchors] == [
         (b.blank_index, b.kind, b.group_id) for b in rendered_b.blank_anchors
     ]
-
-
-def test_inline_blanks_requires_chosen_token_id(oracle: dict[str, OracleEntry]) -> None:
-    snap = _priority_snapshot()
-    with pytest.raises(ValueError, match="chosen_token_id"):
-        render_snapshot(snap, oracle=oracle, use_inline_blanks=True)
 
 
 def test_inline_blanks_render_error_exists() -> None:

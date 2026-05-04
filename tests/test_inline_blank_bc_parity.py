@@ -90,15 +90,12 @@ def test_target_mappings_use_render_order_not_payload_order() -> None:
         },
     )
 
-    legacy = render_snapshot(permuted_snapshot, permuted)
     inline = render_snapshot(
         permuted_snapshot,
         permuted,
-        use_inline_blanks=True,
         chosen_token_id=12345,
     )
 
-    assert parity._target_legacy_ordinal(legacy, selected_payload_index) == 3
     assert parity._target_inline_blank_index(inline, selected_payload_index) == 0
 
 
