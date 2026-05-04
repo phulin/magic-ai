@@ -239,7 +239,15 @@ class ValuePretrainTrainer:
         self,
         token_ids: Tensor,
         labels: Tensor,
+        *,
+        compute_stats: bool = True,
     ) -> dict[str, float]:
+        """Run a single optimizer step.
+
+        ``compute_stats=False`` skips all `.item()` conversions on the
+        return path so the caller can avoid ~7 D2H syncs per step on
+        iterations where the stats won't be logged.
+        """
         self.encoder.train()
         self.value_head.train()
         device = next(self.encoder.parameters()).device
@@ -258,25 +266,24 @@ class ValuePretrainTrainer:
             grad_norm = torch.tensor(0.0)
         self.optimizer.step()
 
+        if not compute_stats:
+            return {}
+
+        labels_dev = labels.detach().to(device=device, dtype=preds.dtype)
         with torch.no_grad():
-            decisive = labels.abs() > 0.5
-            if decisive.any():
-                sign_acc = float(
-                    (torch.sign(preds[decisive]) == torch.sign(labels[decisive].to(preds.device)))
-                    .float()
-                    .mean()
-                    .item()
-                )
-            else:
-                sign_acc = 0.0
+            decisive = labels_dev.abs() > 0.5
+            decisive_count = decisive.sum().clamp_min(1)
+            sign_match = (torch.sign(preds.detach()) == torch.sign(labels_dev)) & decisive
+            sign_acc_t = sign_match.float().sum() / decisive_count.float()
+        loss_v = float(loss.detach().item())
         return {
-            "loss": float(loss.detach().item()),
-            "rmse": float(math.sqrt(max(0.0, loss.detach().item()))),
+            "loss": loss_v,
+            "rmse": math.sqrt(max(0.0, loss_v)),
             "grad_norm": float(grad_norm),
             "pred_mean": float(preds.detach().mean().item()),
             "pred_abs_mean": float(preds.detach().abs().mean().item()),
-            "label_mean": float(labels.detach().to(preds.device).mean().item()),
-            "sign_accuracy": sign_acc,
+            "label_mean": float(labels_dev.mean().item()),
+            "sign_accuracy": float(sign_acc_t.item()),
         }
 
     @torch.no_grad()

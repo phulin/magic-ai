@@ -1675,9 +1675,10 @@ def run_value_pretrain(
         for tokens_np, labels_np in train_ds.iter_epoch(cfg.batch_size, np_rng):
             token_ids = torch.from_numpy(tokens_np).to(device=device, dtype=torch.long)
             labels = torch.from_numpy(labels_np).to(device=device, dtype=torch.float32)
+            log_now = global_step % log_every == 0
             with amp_ctx:
-                stats = trainer.step(token_ids, labels)
-            if global_step % log_every == 0:
+                stats = trainer.step(token_ids, labels, compute_stats=log_now)
+            if log_now:
                 print(
                     f"[value] epoch={epoch} step={global_step:6d} loss={stats['loss']:.4f} "
                     f"sign_acc={stats['sign_accuracy']:.3f} "
