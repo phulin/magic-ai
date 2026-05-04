@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import hashlib
 import json
 import random
 import sys
@@ -31,6 +32,10 @@ from torch import Tensor
 # Allow direct invocation as ``uv run python scripts/inline_blank_bc_parity.py``.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from magic_ai.actions import (  # noqa: E402
+    build_priority_candidates,
+    selected_priority_candidate_index,
+)
 from magic_ai.game_state import (  # noqa: E402
     GameCardState,
     GameStateSnapshot,
@@ -75,6 +80,16 @@ class EvalStats:
     total: int
 
 
+def _hash_path(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _open_text(path: Path) -> Iterable[str]:
     if path.suffix == ".gz":
         with gzip.open(path, "rt", encoding="utf-8") as fh:
@@ -82,6 +97,35 @@ def _open_text(path: Path) -> Iterable[str]:
     else:
         with path.open("rt", encoding="utf-8") as fh:
             yield from fh
+
+
+def _snapshot_from_payload(payload: dict[str, Any]) -> GameStateSnapshot:
+    if "snapshot" in payload:
+        return cast(GameStateSnapshot, payload["snapshot"])
+    if "state" in payload:
+        snapshot = dict(cast(dict[str, Any], payload["state"]))
+        if "pending" in payload:
+            snapshot["pending"] = payload["pending"]
+        return cast(GameStateSnapshot, snapshot)
+    return cast(GameStateSnapshot, payload)
+
+
+def _priority_option_index_from_trace(pending: PendingState, trace: dict[str, Any]) -> int:
+    if trace.get("kind") != "priority":
+        raise ValueError("trace row is not a priority trace")
+    indices = trace.get("indices", [])
+    if not indices:
+        return 0
+    candidate_index = int(indices[0])
+    candidates = build_priority_candidates(pending)
+    if candidates:
+        if not 0 <= candidate_index < len(candidates):
+            raise ValueError(
+                f"priority trace index {candidate_index} out of range for "
+                f"{len(candidates)} candidates"
+            )
+        return int(candidates[candidate_index].option_index)
+    return candidate_index
 
 
 def _selected_option_index(snapshot: GameStateSnapshot, payload: dict[str, Any]) -> int:
@@ -102,7 +146,30 @@ def _selected_option_index(snapshot: GameStateSnapshot, payload: dict[str, Any])
             if str(option.get("id", "")) == selected_id:
                 return idx
         raise ValueError(f"selected_option_id {selected_id!r} not present in priority options")
-    raise ValueError("trace row needs selected_option_index or selected_option_id")
+    trace = payload.get("trace")
+    if isinstance(trace, dict):
+        index = _priority_option_index_from_trace(pending, trace)
+        if not 0 <= index < len(options):
+            raise ValueError(
+                f"trace-selected option {index} out of range for {len(options)} options"
+            )
+        return index
+    action = payload.get("action")
+    if isinstance(action, dict):
+        candidate_index = selected_priority_candidate_index(pending, action)
+        if candidate_index < 0:
+            raise ValueError("action does not match any priority candidate")
+        candidates = build_priority_candidates(pending)
+        if not 0 <= candidate_index < len(candidates):
+            raise ValueError(
+                f"action-selected candidate {candidate_index} out of range for "
+                f"{len(candidates)} candidates"
+            )
+        return int(candidates[candidate_index].option_index)
+    raise ValueError(
+        "trace row needs selected_option_index, selected_option_id, priority trace, "
+        "or priority action"
+    )
 
 
 def load_priority_trace(path: Path, *, limit: int | None = None) -> list[PriorityTraceRow]:
@@ -112,7 +179,7 @@ def load_priority_trace(path: Path, *, limit: int | None = None) -> list[Priorit
         if not stripped:
             continue
         payload = json.loads(stripped)
-        snapshot = cast(GameStateSnapshot, payload.get("snapshot", payload))
+        snapshot = _snapshot_from_payload(payload)
         try:
             selected = _selected_option_index(snapshot, payload)
         except ValueError as exc:
@@ -479,8 +546,14 @@ def main(argv: list[str] | None = None) -> int:
     oracle = load_oracle_text(args.oracle) if args.oracle is not None else None
 
     if args.trace_jsonl is not None:
+        source_kind = "trace_jsonl"
+        source_path = str(args.trace_jsonl)
+        source_sha256 = _hash_path(args.trace_jsonl)
         rows = load_priority_trace(args.trace_jsonl, limit=args.limit)
     else:
+        source_kind = "synthetic_fixture"
+        source_path = None
+        source_sha256 = None
         rows = make_synthetic_priority_trace(int(args.synthetic_fixture))
         if args.limit is not None:
             rows = rows[: args.limit]
@@ -562,6 +635,26 @@ def main(argv: list[str] | None = None) -> int:
     regression_pp = (legacy_stats.accuracy - inline_stats.accuracy) * 100.0
     passed = regression_pp <= float(args.regression_pp)
     result = {
+        "source": {
+            "kind": source_kind,
+            "path": source_path,
+            "sha256": source_sha256,
+            "limit": args.limit,
+        },
+        "seed": int(args.seed),
+        "model": {
+            "d_model": int(args.d_model),
+            "n_layers": int(args.n_layers),
+            "n_heads": int(args.n_heads),
+            "d_ff": int(args.d_ff),
+            "max_seq_len": int(args.max_seq_len),
+        },
+        "train": {
+            "epochs": int(args.epochs),
+            "batch_size": int(args.batch_size),
+            "lr": float(args.lr),
+            "train_frac": float(args.train_frac),
+        },
         "train_rows": len(train_rows),
         "eval_rows": len(eval_rows),
         "legacy": legacy_stats.__dict__,

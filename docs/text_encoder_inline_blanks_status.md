@@ -136,11 +136,13 @@ the eight-step migration. Update at every step boundary.
   trains legacy option-head BC and inline cross-blank BC on the same fixed
   JSONL rows, then fails if held-out inline accuracy regresses by more than
   the configured pp threshold. It accepts trace rows with either
-  `selected_option_index` or `selected_option_id` and includes a
+  `selected_option_index`, `selected_option_id`, `trace.indices`, or
+  transcript-style `state`/`pending`/`action` fields; result JSON records the
+  source hash, seed, model config, and training config. Includes a
   `--synthetic-fixture` smoke mode.
 - `tests/test_inline_blank_bc_parity.py` — coverage for synthetic fixture
-  generation, trace loading, selected option-id resolution, and render-order
-  target mapping for legacy vs inline rows.
+  generation, trace loading, selected option-id/action/trace resolution, and
+  render-order target mapping for legacy vs inline rows.
 - Smoke:
   `uv run python scripts/inline_blank_bc_parity.py --synthetic-fixture 8 --epochs 1 --batch-size 4 --d-model 32 --n-layers 1 --n-heads 4 --d-ff 64 --max-seq-len 512 --seed 0`
   → **passed**.

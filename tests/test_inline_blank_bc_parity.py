@@ -42,6 +42,40 @@ def test_trace_loader_accepts_selected_option_id(tmp_path: Path) -> None:
     assert loaded[0].selected_option_index == 2
 
 
+def test_trace_loader_accepts_priority_trace_indices(tmp_path: Path) -> None:
+    [row] = parity.make_synthetic_priority_trace(2)[:1]
+    path = tmp_path / "trace.jsonl"
+    path.write_text(
+        json.dumps({"snapshot": row.snapshot, "trace": {"kind": "priority", "indices": [0]}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = parity.load_priority_trace(path)
+
+    assert loaded[0].selected_option_index == 3
+
+
+def test_trace_loader_accepts_transcript_action_shape(tmp_path: Path) -> None:
+    [row] = parity.make_synthetic_priority_trace(2)[:1]
+    state = dict(row.snapshot)
+    pending = dict(state.pop("pending"))
+    options = list(pending["options"])
+    options[0] = {**options[0], "kind": "cast_spell"}
+    pending["options"] = options
+    action = {"kind": "cast_spell", "card_id": options[0]["card_id"], "targets": []}
+    path = tmp_path / "transcript.jsonl"
+    path.write_text(
+        json.dumps({"state": state, "pending": pending, "action": action}) + "\n",
+        encoding="utf-8",
+    )
+
+    loaded = parity.load_priority_trace(path)
+
+    assert loaded[0].snapshot["pending"]["kind"] == "priority"
+    assert loaded[0].selected_option_index == 0
+
+
 def test_target_mappings_use_render_order_not_payload_order() -> None:
     [row] = parity.make_synthetic_priority_trace(2)[:1]
     snapshot = row.snapshot
