@@ -23,7 +23,7 @@ the eight-step migration. Update at every step boundary.
 | 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired behind `TextEncoderConfig.use_inline_blanks`. |
 | 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ✅ done       | `<choose-block>` render/batch/model path, live sampler/action adapter, replay storage, and replay scoring landed. |
-| 7 | Targets / modes / mays / X / mana sources  | 🚧 mode wired | Targets, may decisions, and mode choices are wired through render, live sampling, and replay scoring. |
+| 7 | Targets / modes / mays / X / mana sources  | 🚧 X renderer | Targets, may, and modes are wired; number/X choices render `<choose-x-digit>` blanks. |
 | 8 | Delete legacy option/target heads          | ⏳ blocked-by 7 |  |
 
 ## What landed in each completed step
@@ -207,7 +207,8 @@ without treating the accuracy gate as a blocker.
 
 ## Next steps
 
-1. **Step 7** — continue with X-cost/mana sources.
+1. **Step 7** — wire X/number blanks into live/replay scoring, then continue
+   with mana sources.
 2. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
    `target_*` batch fields, the legacy renderer branch, and the
    `use_inline_blanks` flag. Bump replay-buffer on-disk version.
@@ -282,3 +283,11 @@ without treating the accuracy gate as a blocker.
   stored blank logits and falls back to legacy option scoring otherwise.
 - `tests/test_text_actor_critic.py` — coverage for deterministic mode blank
   sampling, replay log-prob reconstruction, and per-choice output shape.
+
+### Step 7 — X/number renderer slice (`/home/user/magic-ai-inline-blanks`)
+
+- `magic_ai/text_encoder/render.py` — inline `number` pending states now emit
+  one `<choose-x-digit>` blank in the trailing `<choices>` block with legal
+  ids `<num:0>...<num:N-1>` for the available numeric options.
+- `tests/test_text_render.py`, `tests/test_text_policy.py` — coverage for
+  render placement, legal id order, batch propagation, and forward logits.

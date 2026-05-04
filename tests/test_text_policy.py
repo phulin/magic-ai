@@ -247,6 +247,32 @@ def _snapshot_with_mode(names: list[str]) -> GameStateSnapshot:
     return cast(GameStateSnapshot, snap)
 
 
+def _snapshot_with_number(names: list[str]) -> GameStateSnapshot:
+    a = names[0]
+    snap: dict[str, object] = {
+        "turn": 3,
+        "active_player": "p1",
+        "step": "Precombat Main",
+        "players": [
+            _player("p1", "Self", battlefield=[_card("c1", a, tapped=False)]),
+            _player("p2", "Opp"),
+        ],
+        "pending": cast(
+            PendingState,
+            {
+                "kind": "number",
+                "player_idx": 0,
+                "options": [
+                    cast(PendingOptionState, {"id": "x-0", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "x-1", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "x-2", "kind": "choice"}),
+                ],
+            },
+        ),
+    }
+    return cast(GameStateSnapshot, snap)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end smoke
 # ---------------------------------------------------------------------------
@@ -422,6 +448,32 @@ def test_text_policy_inline_mode_blank_forward(
     num1_id = tokenizer.convert_tokens_to_ids("<num:1>")
     assert int(batch.blank_legal_ids[0, 0, 0]) == int(num0_id)
     assert int(batch.blank_legal_ids[0, 0, 1]) == int(num1_id)
+
+    out = policy(batch)
+
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+
+
+def test_text_policy_inline_number_blank_forward(
+    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
+) -> None:
+    cfg = _small_cfg(tokenizer)
+    cfg.use_inline_blanks = True
+    policy = build_text_policy(tokenizer, cfg)
+    batch = TextPolicy.encode_snapshots(
+        [_snapshot_with_number(real_card_names)],
+        actions_per_snapshot=None,
+        oracle=oracle,
+        tokenizer=tokenizer,
+        use_inline_blanks=True,
+    )
+
+    assert batch.blank_positions.shape == (1, 1)
+    for k in range(3):
+        num_id = tokenizer.convert_tokens_to_ids(f"<num:{k}>")
+        assert int(batch.blank_legal_ids[0, 0, k]) == int(num_id)
 
     out = policy(batch)
 

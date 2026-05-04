@@ -766,6 +766,37 @@ def test_inline_blanks_mode_emits_num_blank(oracle: dict[str, OracleEntry]) -> N
     assert anchor.option_index == -1
 
 
+def test_inline_blanks_number_emits_x_digit_blank(oracle: dict[str, OracleEntry]) -> None:
+    snap = _basic_snapshot()
+    pending = cast(
+        PendingState,
+        {
+            "kind": "number",
+            "player_idx": 0,
+            "options": [
+                cast(PendingOptionState, {"id": "x-0", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "x-1", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "x-2", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "x-3", "kind": "choice"}),
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        use_inline_blanks=True,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        num_token_ids=NUM_FAKE_IDS,
+    )
+
+    assert "<choices><choose-x-digit></choices>" in rendered.text
+    [anchor] = rendered.blank_anchors
+    assert anchor.kind == "<choose-x-digit>"
+    assert anchor.group_kind == "PER_BLANK"
+    assert anchor.legal_token_ids == NUM_FAKE_IDS[:4]
+    assert anchor.option_index == -1
+
+
 def test_inline_blanks_blockers_emit_constrained_block_blanks(
     oracle: dict[str, OracleEntry],
 ) -> None:

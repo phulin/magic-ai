@@ -1176,20 +1176,22 @@ class SnapshotRenderer:
                 legal_token_ids=(int(no_id), int(yes_id)),
                 group_kind="PER_BLANK",
             )
-        if self._pending_kind == "mode":
-            mode_count = len(actions)
-            if mode_count < 1:
-                raise RenderError("inline mode blanks require at least one option")
-            if mode_count > MAX_NUM:
-                raise RenderError(f"inline mode option count {mode_count} exceeds MAX_NUM")
-            if len(self._num_token_ids) < mode_count:
-                raise RenderError("inline mode blanks require num_token_ids")
+        if self._pending_kind in ("mode", "number"):
+            choice_count = len(actions)
+            if choice_count < 1:
+                raise RenderError(f"inline {self._pending_kind} blanks require at least one option")
+            if choice_count > MAX_NUM:
+                raise RenderError(
+                    f"inline {self._pending_kind} option count {choice_count} exceeds MAX_NUM"
+                )
+            if len(self._num_token_ids) < choice_count:
+                raise RenderError(f"inline {self._pending_kind} blanks require num_token_ids")
             self._emit_blank(
                 buf,
                 result,
-                "<choose-mode>",
+                "<choose-mode>" if self._pending_kind == "mode" else "<choose-x-digit>",
                 -1,
-                legal_token_ids=tuple(self._num_token_ids[:mode_count]),
+                legal_token_ids=tuple(self._num_token_ids[:choice_count]),
                 group_kind="PER_BLANK",
             )
         buf.append("</choices>")
