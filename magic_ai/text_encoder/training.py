@@ -468,31 +468,19 @@ class TextEncoderTrainer:
         target_weight: float = 1.0,
         value_weight: float = 0.5,
     ) -> dict[str, float]:
-        self.policy.train()
-        out, _ = self.policy(batch, h_in=None, c_in=None)
-
-        p_loss = policy_distillation_loss(
-            out.policy_logits, teacher_policy_logits, batch.option_mask
+        del (
+            batch,
+            teacher_policy_logits,
+            teacher_target_logits,
+            value_targets,
+            policy_weight,
+            target_weight,
+            value_weight,
         )
-        t_loss = target_distillation_loss(
-            out.target_logits, teacher_target_logits, batch.target_mask
+        raise NotImplementedError(
+            "legacy option/target distillation is no longer supported; "
+            "use inline blank pretraining losses instead"
         )
-        total = policy_weight * p_loss + target_weight * t_loss
-
-        v_loss_val = 0.0
-        if value_targets is not None:
-            v_loss = value_loss(out.values, value_targets)
-            total = total + value_weight * v_loss
-            v_loss_val = float(v_loss.detach().item())
-
-        gn = self._step_with_clip(total)
-        return {
-            "loss": float(total.detach().item()),
-            "policy_loss": float(p_loss.detach().item()),
-            "target_loss": float(t_loss.detach().item()),
-            "value_loss": v_loss_val,
-            "grad_norm": gn,
-        }
 
 
 __all__ = [

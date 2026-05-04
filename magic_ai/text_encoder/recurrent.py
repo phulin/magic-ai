@@ -198,9 +198,7 @@ class RecurrentTextPolicy(nn.Module):
             state_hidden = y.squeeze(1)
 
         state_for_heads = self.out_proj(state_hidden)
-        _policy_logits, _target_logits, values = self.text_policy.run_heads(
-            encoded, state_vec=state_for_heads
-        )
+        values = self.text_policy.run_heads(encoded, state_vec=state_for_heads)
 
         out = RecurrentTextPolicyOutput(
             values=values,
@@ -237,9 +235,7 @@ class RecurrentTextPolicy(nn.Module):
             device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
         ):
             state_for_heads = self.out_proj(state_hidden)
-            _policy_logits, _target_logits, values = self.text_policy.run_heads(
-                encoded, state_vec=state_for_heads
-            )
+            values = self.text_policy.run_heads(encoded, state_vec=state_for_heads)
         return RecurrentTextPolicyOutput(
             values=values,
             state_hidden=state_hidden,

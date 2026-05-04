@@ -421,39 +421,9 @@ class TextRolloutWorker:
             seq_lengths=batch.seq_lengths.to(self.device),
         )
 
-        with torch.no_grad():
-            out, (h_out, c_out) = self.policy(moved, h_in=state.h, c_in=state.c)
-
-        # Sample option idx.
-        opt_logits = out.policy_logits[0]  # [O]
-        opt_mask = out.option_mask[0]  # [O]
-        if opt_mask.numel() == 0 or not bool(opt_mask.any()):
-            return None
-        chosen_opt = _categorical_sample(
-            opt_logits, opt_mask, temperature=self.sampling_temperature, generator=self._gen
-        )
-        if chosen_opt < 0:
-            return None
-
-        # Sample target idx among targets of the chosen option, if any.
-        chosen_tgt: int | None = None
-        if out.target_mask.shape[-1] > 0:
-            tgt_mask = out.target_mask[0, chosen_opt]
-            if bool(tgt_mask.any()):
-                tgt_logits = out.target_logits[0, chosen_opt]
-                tidx = _categorical_sample(
-                    tgt_logits,
-                    tgt_mask,
-                    temperature=self.sampling_temperature,
-                    generator=self._gen,
-                )
-                chosen_tgt = tidx if tidx >= 0 else None
-
-        return (
-            chosen_opt,
-            chosen_tgt,
-            _PlayerLSTM(h=h_out.detach().clone(), c=c_out.detach().clone()),
-        )
+        del moved
+        logger.warning("legacy text rollout scoring is disabled after inline-blank migration")
+        return None
 
     # --- public API -------------------------------------------------------
 

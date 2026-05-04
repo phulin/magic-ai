@@ -17,7 +17,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-import torch
 import torch.nn as nn
 from torch import Tensor
 from transformers import PreTrainedTokenizerFast
@@ -73,8 +72,6 @@ class TextPolicyOutput:
     Shapes (B = batch, O = max options, M = max targets, K = ``MAX_CARD_REFS``,
     D = ``cfg.d_model``):
 
-    * ``policy_logits``: ``[B, O]``, ``-inf`` at masked-out option slots.
-    * ``target_logits``: ``[B, O, M]``, ``-inf`` at masked-out target slots.
     * ``values``: ``[B]``.
     * ``card_vectors``: ``[B, K, D]``, zero rows where ``card_mask`` is False.
     * ``card_mask``: ``[B, K]`` bool.
@@ -87,8 +84,6 @@ class TextPolicyOutput:
       otherwise ``None``.
     """
 
-    policy_logits: Tensor
-    target_logits: Tensor
     values: Tensor
     card_vectors: Tensor
     card_mask: Tensor
@@ -105,11 +100,6 @@ class TextPolicyOutput:
     blank_option_index: Tensor | None = None
     blank_legal_ids: Tensor | None = None
     blank_legal_mask: Tensor | None = None
-
-
-def _empty_masked_logits(mask: Tensor) -> Tensor:
-    logits = torch.zeros(mask.shape, device=mask.device, dtype=torch.float32)
-    return logits.masked_fill(~mask.to(dtype=torch.bool), float("-inf"))
 
 
 class TextPolicy(nn.Module):
@@ -172,27 +162,19 @@ class TextPolicy(nn.Module):
             blank_logits=blank_logits,
         )
 
-    def run_heads(
-        self, encoded: EncodedSnapshots, state_vec: Tensor | None = None
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Run the three heads against ``encoded`` using ``state_vec``.
+    def run_heads(self, encoded: EncodedSnapshots, state_vec: Tensor | None = None) -> Tensor:
+        """Run the value head against ``encoded`` using ``state_vec``.
 
         If ``state_vec`` is ``None``, ``encoded.state_vector`` is used.
-        Returns ``(policy_logits, target_logits, values)``.
         """
 
-        policy_logits = _empty_masked_logits(encoded.option_mask)
-        target_logits = _empty_masked_logits(encoded.target_mask)
         sv = encoded.state_vector if state_vec is None else state_vec
-        values = self.value_head(sv)
-        return policy_logits, target_logits, values
+        return self.value_head(sv)
 
     def forward(self, batch: TextEncodedBatch) -> TextPolicyOutput:
         encoded = self.encode_only(batch)
-        policy_logits, target_logits, values = self.run_heads(encoded)
+        values = self.run_heads(encoded)
         return TextPolicyOutput(
-            policy_logits=policy_logits,
-            target_logits=target_logits,
             values=values,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,

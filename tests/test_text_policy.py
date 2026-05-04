@@ -347,14 +347,13 @@ def test_text_policy_end_to_end(
 
     out: TextPolicyOutput = policy(batch)
 
-    b_size, max_opts = batch.option_positions.shape
+    b_size = batch.token_ids.shape[0]
+    max_opts = batch.option_positions.shape[1]
     max_targets = batch.target_positions.shape[2]
     d = cfg.d_model
     k = batch.card_ref_positions.shape[1]
 
     # Shapes
-    assert out.policy_logits.shape == (b_size, max_opts)
-    assert out.target_logits.shape == (b_size, max_opts, max_targets)
     assert out.values.shape == (b_size,)
     assert out.card_vectors.shape == (b_size, k, d)
     assert out.card_mask.shape == (b_size, k)
@@ -367,10 +366,6 @@ def test_text_policy_end_to_end(
     # Finiteness on valid slots; -inf on masked-out logits.
     assert torch.isfinite(out.values).all()
     assert torch.isfinite(out.state_vector).all()
-    assert torch.isfinite(out.policy_logits[out.option_mask]).all()
-    assert (out.policy_logits[~out.option_mask] == float("-inf")).all()
-    assert torch.isfinite(out.target_logits[out.target_mask]).all()
-    assert (out.target_logits[~out.target_mask] == float("-inf")).all()
 
     assert out.blank_logits is not None
     assert out.blank_logits.shape == batch.blank_legal_ids.shape
@@ -535,11 +530,8 @@ def test_text_policy_backward(
 
     out = policy(batch)
 
-    loss = (
-        out.values.sum()
-        + out.policy_logits[out.option_mask].sum()
-        + out.target_logits[out.target_mask].sum()
-    )
+    assert out.blank_logits is not None
+    loss = out.values.sum() + out.blank_logits[batch.blank_legal_mask].sum()
     loss.backward()
 
     grad_norms = [

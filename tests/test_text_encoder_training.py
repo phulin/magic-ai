@@ -8,6 +8,7 @@ through :class:`RecurrentTextPolicy`.
 
 from __future__ import annotations
 
+import pytest
 import torch
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
@@ -376,22 +377,19 @@ def _build_small_policy(vocab_size: int = 200) -> RecurrentTextPolicy:
     return RecurrentTextPolicy(rcfg)
 
 
-def test_distill_step_returns_expected_keys_and_grad() -> None:
+def test_distill_step_rejects_legacy_option_target_logits() -> None:
     torch.manual_seed(0)
     policy = _build_small_policy()
     trainer = TextEncoderTrainer(policy, lr=1e-3)
     batch, teacher_p, teacher_t, value_targets = _make_batch()
 
-    stats = trainer.distill_step(
-        batch,
-        teacher_policy_logits=teacher_p,
-        teacher_target_logits=teacher_t,
-        value_targets=value_targets,
-    )
-    expected = {"loss", "policy_loss", "target_loss", "value_loss", "grad_norm"}
-    assert expected.issubset(stats.keys())
-    assert stats["grad_norm"] > 0.0
-    assert stats["loss"] > 0.0
+    with pytest.raises(NotImplementedError, match="legacy option/target distillation"):
+        trainer.distill_step(
+            batch,
+            teacher_policy_logits=teacher_p,
+            teacher_target_logits=teacher_t,
+            value_targets=value_targets,
+        )
 
 
 def test_value_step_returns_expected_keys() -> None:

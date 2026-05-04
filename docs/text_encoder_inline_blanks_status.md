@@ -341,3 +341,9 @@ without treating the accuracy gate as a blocker.
   choice-color decision rows instead of direct option/target logits.
 - `magic_ai/text_encoder/recurrent.py` — recurrent/actor-facing policy output
   no longer carries legacy `policy_logits` / `target_logits`.
+- `magic_ai/text_encoder/policy.py` — `TextPolicyOutput` no longer carries
+  legacy `policy_logits` / `target_logits`; `TextPolicy.run_heads(...)` is now
+  value-head only.
+- `magic_ai/text_encoder/training.py`, `magic_ai/text_encoder/rollout.py`,
+  `scripts/inline_blank_bc_parity.py` — legacy option/target-logit training
+  and rollout paths now fail closed instead of consuming removed logits.

@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any, cast
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 # Allow direct invocation as ``uv run python scripts/inline_blank_bc_parity.py``.
@@ -340,31 +339,6 @@ def encode_parity_rows(
     )
 
 
-def _legacy_priority_loss(logits: Tensor, mask: Tensor, target: Tensor) -> Tensor:
-    safe_target = target.clamp(min=0, max=max(0, logits.shape[1] - 1))
-    target_is_supported = mask.gather(1, safe_target.unsqueeze(1)).squeeze(1)
-    valid_rows = (target >= 0) & (target < logits.shape[1]) & target_is_supported
-    if not valid_rows.any():
-        return logits.sum() * 0.0
-    masked_logits = logits.masked_fill(~mask, float("-inf"))
-    return F.cross_entropy(masked_logits[valid_rows], target[valid_rows])
-
-
-@torch.no_grad()
-def _legacy_priority_accuracy(
-    logits: Tensor, mask: Tensor, target: Tensor
-) -> dict[str, float | int]:
-    safe_target = target.clamp(min=0, max=max(0, logits.shape[1] - 1))
-    target_is_supported = mask.gather(1, safe_target.unsqueeze(1)).squeeze(1)
-    valid_rows = (target >= 0) & (target < logits.shape[1]) & target_is_supported
-    total = int(valid_rows.sum().item())
-    if total == 0:
-        return {"accuracy": 0.0, "correct": 0, "total": 0}
-    pred = logits.masked_fill(~mask, float("-inf"))[valid_rows].argmax(dim=-1)
-    correct = int((pred == target[valid_rows]).sum().item())
-    return {"accuracy": correct / total, "correct": correct, "total": total}
-
-
 def _batch_to_device(batch: TextEncodedBatch, device: torch.device) -> TextEncodedBatch:
     return TextEncodedBatch(
         token_ids=batch.token_ids.to(device),
@@ -420,15 +394,8 @@ def train_legacy(
     batch_size: int,
     lr: float,
 ) -> None:
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    n = int(target.shape[0])
-    for _epoch in range(epochs):
-        for idx in _iter_minibatches(n, batch_size, shuffle=True, device=target.device):
-            out = model(_slice_batch(batch, idx))
-            loss = _legacy_priority_loss(out.policy_logits, out.option_mask, target[idx])
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
+    del model, batch, target, epochs, batch_size, lr
+    raise NotImplementedError("legacy option-head BC was removed after inline blank migration")
 
 
 def train_inline(
@@ -461,15 +428,8 @@ def train_inline(
 
 @torch.no_grad()
 def eval_legacy(model: TextPolicy, batch: TextEncodedBatch, target: Tensor) -> EvalStats:
-    model.eval()
-    out = model(batch)
-    loss = _legacy_priority_loss(out.policy_logits, out.option_mask, target)
-    stats = _legacy_priority_accuracy(out.policy_logits, out.option_mask, target)
-    return EvalStats(
-        loss=float(loss.item()),
-        accuracy=float(stats["accuracy"]),
-        total=int(stats["total"]),
-    )
+    del model, batch, target
+    raise NotImplementedError("legacy option-head BC was removed after inline blank migration")
 
 
 @torch.no_grad()
