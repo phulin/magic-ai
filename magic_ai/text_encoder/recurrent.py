@@ -37,8 +37,6 @@ class RecurrentTextPolicyConfig:
 
 @dataclass
 class RecurrentTextPolicyOutput:
-    policy_logits: Tensor  # [B, max_opts]
-    target_logits: Tensor  # [B, max_opts, max_targets]
     values: Tensor  # [B]
     state_hidden: Tensor  # [B, lstm_hidden]
     option_vectors: Tensor  # [B, max_opts, d_model]
@@ -200,13 +198,11 @@ class RecurrentTextPolicy(nn.Module):
             state_hidden = y.squeeze(1)
 
         state_for_heads = self.out_proj(state_hidden)
-        policy_logits, target_logits, values = self.text_policy.run_heads(
+        _policy_logits, _target_logits, values = self.text_policy.run_heads(
             encoded, state_vec=state_for_heads
         )
 
         out = RecurrentTextPolicyOutput(
-            policy_logits=policy_logits,
-            target_logits=target_logits,
             values=values,
             state_hidden=state_hidden,
             option_vectors=encoded.option_vectors,
@@ -241,12 +237,10 @@ class RecurrentTextPolicy(nn.Module):
             device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
         ):
             state_for_heads = self.out_proj(state_hidden)
-            policy_logits, target_logits, values = self.text_policy.run_heads(
+            _policy_logits, _target_logits, values = self.text_policy.run_heads(
                 encoded, state_vec=state_for_heads
             )
         return RecurrentTextPolicyOutput(
-            policy_logits=policy_logits,
-            target_logits=target_logits,
             values=values,
             state_hidden=state_hidden,
             option_vectors=encoded.option_vectors,

@@ -79,8 +79,6 @@ def test_recurrent_forward_and_state_shape() -> None:
     max_targets = batch.target_positions.shape[2]
     d = policy.cfg.encoder.d_model
 
-    assert out.policy_logits.shape == (b, max_opts)
-    assert out.target_logits.shape == (b, max_opts, max_targets)
     assert out.values.shape == (b,)
     assert out.state_hidden.shape == (b, lstm_hidden)
     assert out.option_vectors.shape == (b, max_opts, d)
@@ -95,8 +93,6 @@ def test_recurrent_forward_and_state_shape() -> None:
 
     assert torch.isfinite(out.values).all()
     assert torch.isfinite(out.state_hidden).all()
-    assert torch.isfinite(out.policy_logits[out.option_mask]).all()
-    assert (out.policy_logits[~out.option_mask] == float("-inf")).all()
 
 
 def test_recurrent_state_persists_across_calls() -> None:
@@ -126,7 +122,7 @@ def test_recurrent_backward_smoke() -> None:
     batch = _make_batch(vocab_size=vocab_size)
 
     out, _ = policy(batch)
-    loss = out.values.sum() + out.policy_logits[out.option_mask].sum()
+    loss = out.values.sum()
     loss.backward()
 
     lstm_grads = [

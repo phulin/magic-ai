@@ -339,3 +339,5 @@ without treating the accuracy gate as a blocker.
 - `magic_ai/text_encoder/actor_critic.py` — native tensor sampling now uses
   inline blank sampling helpers for priority, blockers, choice-index, and
   choice-color decision rows instead of direct option/target logits.
+- `magic_ai/text_encoder/recurrent.py` — recurrent/actor-facing policy output
+  no longer carries legacy `policy_logits` / `target_logits`.

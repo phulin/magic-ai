@@ -125,7 +125,6 @@ class TextActorCriticTests(unittest.TestCase):
             perspective_player_indices=[0, 1],
         )
 
-        self.assertEqual(tuple(step.output.policy_logits.shape), (2, 2))
         self.assertEqual(tuple(step.output.values.shape), (2,))
         self.assertFalse(torch.equal(model.live_lstm_h[:, 0], torch.zeros(1, 8)))
         self.assertFalse(torch.equal(model.live_lstm_h[:, 3], torch.zeros(1, 8)))
@@ -231,8 +230,6 @@ class TextActorCriticTests(unittest.TestCase):
 
     def test_inline_blocker_sampler_uses_blank_option_indices(self) -> None:
         output = RecurrentTextPolicyOutput(
-            policy_logits=torch.empty(1, 0),
-            target_logits=torch.empty(1, 0, 0),
             values=torch.zeros(1),
             state_hidden=torch.zeros(1, 8),
             option_vectors=torch.empty(1, 0, 8),
@@ -281,8 +278,6 @@ class TextActorCriticTests(unittest.TestCase):
 
     def test_inline_priority_sampler_maps_target_blank_to_candidate_column(self) -> None:
         output = RecurrentTextPolicyOutput(
-            policy_logits=torch.empty(1, 0),
-            target_logits=torch.empty(1, 0, 0),
             values=torch.zeros(1),
             state_hidden=torch.zeros(1, 8),
             option_vectors=torch.empty(1, 0, 8),
@@ -334,8 +329,6 @@ class TextActorCriticTests(unittest.TestCase):
 
     def test_inline_may_sampler_uses_yes_no_blank(self) -> None:
         output = RecurrentTextPolicyOutput(
-            policy_logits=torch.empty(1, 0),
-            target_logits=torch.empty(1, 0, 0),
             values=torch.zeros(1),
             state_hidden=torch.zeros(1, 8),
             option_vectors=torch.empty(1, 0, 8),
@@ -375,8 +368,6 @@ class TextActorCriticTests(unittest.TestCase):
 
     def test_inline_choice_index_sampler_uses_mode_blank(self) -> None:
         output = RecurrentTextPolicyOutput(
-            policy_logits=torch.empty(1, 0),
-            target_logits=torch.empty(1, 0, 0),
             values=torch.zeros(1),
             state_hidden=torch.zeros(1, 8),
             option_vectors=torch.empty(1, 0, 8),
@@ -416,8 +407,6 @@ class TextActorCriticTests(unittest.TestCase):
 
     def test_inline_blocker_replay_scoring_uses_blank_logits(self) -> None:
         output = RecurrentTextPolicyOutput(
-            policy_logits=torch.empty(1, 0),
-            target_logits=torch.empty(1, 0, 0),
             values=torch.zeros(1),
             state_hidden=torch.zeros(1, 8),
             option_vectors=torch.empty(1, 0, 8),
@@ -486,8 +475,6 @@ class TextActorCriticTests(unittest.TestCase):
 
     def test_inline_priority_replay_scoring_uses_target_blank_logits(self) -> None:
         output = RecurrentTextPolicyOutput(
-            policy_logits=torch.empty(1, 0),
-            target_logits=torch.empty(1, 0, 0),
             values=torch.zeros(1),
             state_hidden=torch.zeros(1, 8),
             option_vectors=torch.empty(1, 0, 8),
@@ -559,8 +546,6 @@ class TextActorCriticTests(unittest.TestCase):
 
     def test_inline_may_replay_scoring_uses_yes_no_blank(self) -> None:
         output = RecurrentTextPolicyOutput(
-            policy_logits=torch.empty(1, 0),
-            target_logits=torch.empty(1, 0, 0),
             values=torch.zeros(1),
             state_hidden=torch.zeros(1, 8),
             option_vectors=torch.empty(1, 0, 8),
@@ -625,8 +610,6 @@ class TextActorCriticTests(unittest.TestCase):
 
     def test_inline_choice_index_replay_scoring_uses_mode_blank(self) -> None:
         output = RecurrentTextPolicyOutput(
-            policy_logits=torch.empty(1, 0),
-            target_logits=torch.empty(1, 0, 0),
             values=torch.zeros(1),
             state_hidden=torch.zeros(1, 8),
             option_vectors=torch.empty(1, 0, 8),
@@ -695,8 +678,6 @@ class TextActorCriticTests(unittest.TestCase):
 
     def test_inline_choice_color_replay_scoring_uses_mana_blank(self) -> None:
         output = RecurrentTextPolicyOutput(
-            policy_logits=torch.empty(1, 0),
-            target_logits=torch.empty(1, 0, 0),
             values=torch.zeros(1),
             state_hidden=torch.zeros(1, 8),
             option_vectors=torch.empty(1, 0, 8),
