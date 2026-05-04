@@ -2,8 +2,8 @@
 
 The packed path concatenates rows along one sequence axis and uses a
 flex_attention document mask plus per-token RoPE. After gathering at
-the same anchors, the resulting per-card / per-option / per-target /
-state vectors must agree with the padded path to fp tolerance.
+the same anchors, the resulting per-card / state vectors must agree with the
+padded path to fp tolerance.
 """
 
 from __future__ import annotations
@@ -15,12 +15,8 @@ from magic_ai.text_encoder.model import (
     TextStateEncoder,
     gather_card_vectors,
     gather_card_vectors_packed,
-    gather_option_vectors,
-    gather_option_vectors_packed,
     gather_state_vector,
     gather_state_vector_packed,
-    gather_target_vectors,
-    gather_target_vectors_packed,
 )
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -116,16 +112,6 @@ def test_padded_vs_packed_parity() -> None:
     card_packed, card_mask_packed = gather_card_vectors_packed(hidden_packed, packed)
     assert torch.equal(card_mask_dense, card_mask_packed)
     assert torch.allclose(card_dense, card_packed, atol=1e-5, rtol=1e-4)
-
-    opt_dense, opt_mask_dense = gather_option_vectors(hidden_dense, padded)
-    opt_packed, opt_mask_packed = gather_option_vectors_packed(hidden_packed, packed)
-    assert torch.equal(opt_mask_dense, opt_mask_packed)
-    assert torch.allclose(opt_dense, opt_packed, atol=1e-5, rtol=1e-4)
-
-    tgt_dense, tgt_mask_dense = gather_target_vectors(hidden_dense, padded)
-    tgt_packed, tgt_mask_packed = gather_target_vectors_packed(hidden_packed, packed)
-    assert torch.equal(tgt_mask_dense, tgt_mask_packed)
-    assert torch.allclose(tgt_dense, tgt_packed, atol=1e-5, rtol=1e-4)
 
 
 def test_packed_backward_smoke() -> None:

@@ -10,9 +10,7 @@ from magic_ai.text_encoder.model import (
     TextStateEncoder,
     ValueHead,
     gather_card_vectors,
-    gather_option_vectors,
     gather_state_vector,
-    gather_target_vectors,
 )
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -80,18 +78,6 @@ def test_text_encoder_forward_pooling_heads_backward() -> None:
     assert (card_vecs[~card_mask] == 0).all()
     assert card_mask[0, :3].all() and not card_mask[0, 3:].any()
 
-    # Options.
-    opt_vecs, opt_mask = gather_option_vectors(hidden, batch)
-    assert opt_vecs.shape == (2, 4, cfg.d_model)
-    assert opt_mask.shape == (2, 4)
-    assert (opt_vecs[~opt_mask] == 0).all()
-
-    # Targets.
-    tgt_vecs, tgt_mask = gather_target_vectors(hidden, batch)
-    assert tgt_vecs.shape == (2, 4, 3, cfg.d_model)
-    assert tgt_mask.shape == (2, 4, 3)
-    assert (tgt_vecs[~tgt_mask] == 0).all()
-
     # State.
     state_vec = gather_state_vector(hidden, batch)
     assert state_vec.shape == (2, cfg.d_model)
@@ -105,7 +91,7 @@ def test_text_encoder_forward_pooling_heads_backward() -> None:
     assert torch.isfinite(values).all()
 
     # Backward smoke.
-    loss = values.sum() + opt_vecs[opt_mask].sum() + tgt_vecs[tgt_mask].sum()
+    loss = values.sum() + card_vecs[card_mask].sum()
     loss.backward()
 
     grad_norms = [

@@ -350,3 +350,5 @@ without treating the accuracy gate as a blocker.
 - `magic_ai/text_encoder/policy.py`, `magic_ai/text_encoder/recurrent.py` —
   policy outputs no longer pool or expose legacy option/target vectors or
   masks; actor-critic replay scoring uses inline blanks plus value/may heads.
+- `magic_ai/text_encoder/model.py` — removed public option/target gather
+  helpers; only card/state pools remain exposed.

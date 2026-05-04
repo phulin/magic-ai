@@ -733,16 +733,6 @@ def gather_card_vectors(hidden: Tensor, batch: TextEncodedBatch) -> tuple[Tensor
     return _gather_at(hidden, batch.card_ref_positions)
 
 
-def gather_option_vectors(hidden: Tensor, batch: TextEncodedBatch) -> tuple[Tensor, Tensor]:
-    vecs, _ = _gather_at(hidden, batch.option_positions)
-    return vecs, batch.option_mask
-
-
-def gather_target_vectors(hidden: Tensor, batch: TextEncodedBatch) -> tuple[Tensor, Tensor]:
-    vecs, _ = _gather_at(hidden, batch.target_positions)
-    return vecs, batch.target_mask
-
-
 def gather_state_vector(hidden: Tensor, batch: TextEncodedBatch) -> Tensor:
     del batch  # position 0 is always the <bos>/<state> opener.
     return hidden[:, 0, :]
@@ -765,16 +755,6 @@ def _gather_packed(hidden: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
 
 def gather_card_vectors_packed(hidden: Tensor, batch: PackedTextBatch) -> tuple[Tensor, Tensor]:
     return _gather_packed(hidden, batch.card_ref_positions)
-
-
-def gather_option_vectors_packed(hidden: Tensor, batch: PackedTextBatch) -> tuple[Tensor, Tensor]:
-    vecs, _ = _gather_packed(hidden, batch.option_positions)
-    return vecs, batch.option_mask
-
-
-def gather_target_vectors_packed(hidden: Tensor, batch: PackedTextBatch) -> tuple[Tensor, Tensor]:
-    vecs, _ = _gather_packed(hidden, batch.target_positions)
-    return vecs, batch.target_mask
 
 
 def gather_state_vector_packed(hidden: Tensor, batch: PackedTextBatch) -> Tensor:
@@ -864,12 +844,8 @@ __all__ = [
     "ValueHead",
     "DEFAULT_HF_ENCODER_MODEL",
     "gather_card_vectors",
-    "gather_option_vectors",
-    "gather_target_vectors",
     "gather_state_vector",
     "gather_card_vectors_packed",
-    "gather_option_vectors_packed",
-    "gather_target_vectors_packed",
     "gather_state_vector_packed",
     "initialize_text_state_encoder_from_hf",
     "text_encoder_config_from_hf",
