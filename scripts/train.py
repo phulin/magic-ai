@@ -3036,14 +3036,11 @@ def train_native_batched_envs(
                     step_prefix=cli_step_prefix(),
                     log_fn=tracked_wandb_log,
                 )
-
-        if opponent_pool is not None and retrospective_schedule is not None:
-            for horizon_pct, horizon_step_count in retrospective_schedule.fire(completed_games):
                 if wandb.run is not None:
                     log_retrospective_table(
                         wandb.run,
-                        horizon_pct=horizon_pct,
-                        horizon_step_count=horizon_step_count,
+                        horizon_pct=int(round(threshold * 100 / max(1, args.episodes))),
+                        horizon_step_count=threshold,
                         ratings=retrospective_rating_rows(
                             opponent_pool,
                             total_episodes=args.episodes,
@@ -3414,14 +3411,11 @@ def train_text_envs(
                     step_prefix=f"step={total_wandb_logs}",
                     log_fn=tracked_wandb_log,
                 )
-
-        if opponent_pool is not None and retrospective_schedule is not None:
-            for horizon_pct, horizon_step_count in retrospective_schedule.fire(completed_games):
                 if wandb.run is not None:
                     log_retrospective_table(
                         wandb.run,
-                        horizon_pct=horizon_pct,
-                        horizon_step_count=horizon_step_count,
+                        horizon_pct=int(round(threshold * 100 / max(1, args.episodes))),
+                        horizon_step_count=threshold,
                         ratings=retrospective_rating_rows(
                             opponent_pool,
                             total_episodes=args.episodes,
@@ -4278,24 +4272,21 @@ def train_text_native_batched_envs(
                                     step_prefix=cli_step_prefix(),
                                     log_fn=tracked_wandb_log,
                                 )
+                                if wandb.run is not None:
+                                    log_retrospective_table(
+                                        wandb.run,
+                                        horizon_pct=int(
+                                            round(threshold * 100 / max(1, args.episodes))
+                                        ),
+                                        horizon_step_count=threshold,
+                                        ratings=retrospective_rating_rows(
+                                            opponent_pool,
+                                            total_episodes=args.episodes,
+                                        ),
+                                        log_fn=tracked_wandb_log,
+                                    )
                         finally:
                             server.resume()
-
-                if opponent_pool is not None and retrospective_schedule is not None:
-                    for horizon_pct, horizon_step_count in retrospective_schedule.fire(
-                        completed_games
-                    ):
-                        if wandb.run is not None:
-                            log_retrospective_table(
-                                wandb.run,
-                                horizon_pct=horizon_pct,
-                                horizon_step_count=horizon_step_count,
-                                ratings=retrospective_rating_rows(
-                                    opponent_pool,
-                                    total_episodes=args.episodes,
-                                ),
-                                log_fn=tracked_wandb_log,
-                            )
         finally:
             for actor in actors:
                 actor.stop()
