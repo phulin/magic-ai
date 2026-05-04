@@ -15,9 +15,12 @@ from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
     RecurrentTextPolicyConfig,
 )
+from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from magic_ai.text_encoder.training import (
     TextEncoderTrainer,
+    inline_blank_priority_accuracy,
+    inline_blank_priority_loss,
     policy_distillation_loss,
     target_distillation_loss,
     value_loss,
@@ -75,6 +78,103 @@ def test_value_loss_mask() -> None:
     # Only first and third contribute: (1 + 1) / 2 = 1.0
     loss = value_loss(pred, targ, mask)
     assert abs(loss.item() - 1.0) < 1e-6
+
+
+def test_inline_blank_priority_loss_low_for_correct_anchor() -> None:
+    logits = torch.tensor([[[0.0], [5.0], [-2.0]]], requires_grad=True)
+    group = torch.zeros((1, 3), dtype=torch.int64)
+    group_kind = torch.full((1, 3), BLANK_GROUP_CROSS_BLANK, dtype=torch.int64)
+    legal_mask = torch.ones((1, 3, 1), dtype=torch.bool)
+    target = torch.tensor([1])
+
+    loss = inline_blank_priority_loss(logits, group, group_kind, legal_mask, target)
+
+    assert loss.item() < 0.01
+    loss.backward()
+    assert logits.grad is not None
+    assert logits.grad[0, :, 0].abs().sum().item() > 0.0
+
+
+def test_inline_blank_priority_loss_positive_for_wrong_anchor() -> None:
+    logits = torch.tensor([[[0.0], [5.0], [-2.0]]])
+    group = torch.zeros((1, 3), dtype=torch.int64)
+    group_kind = torch.full((1, 3), BLANK_GROUP_CROSS_BLANK, dtype=torch.int64)
+    legal_mask = torch.ones((1, 3, 1), dtype=torch.bool)
+    target = torch.tensor([2])
+
+    loss = inline_blank_priority_loss(logits, group, group_kind, legal_mask, target)
+
+    assert loss.item() > 6.0
+
+
+def test_inline_blank_priority_ignores_padding_and_non_cross_blanks() -> None:
+    logits = torch.tensor([[[0.0], [4.0], [100.0], [200.0]]], requires_grad=True)
+    group = torch.zeros((1, 4), dtype=torch.int64)
+    group_kind = torch.tensor(
+        [
+            [
+                BLANK_GROUP_CROSS_BLANK,
+                BLANK_GROUP_CROSS_BLANK,
+                BLANK_GROUP_PER_BLANK,
+                BLANK_GROUP_CROSS_BLANK,
+            ]
+        ]
+    )
+    legal_mask = torch.tensor([[[True], [True], [True], [False]]])
+    target = torch.tensor([1])
+
+    loss = inline_blank_priority_loss(logits, group, group_kind, legal_mask, target)
+    loss.backward()
+
+    assert loss.item() < 0.02
+    assert logits.grad is not None
+    assert logits.grad[0, 0, 0].abs().item() > 0.0
+    assert logits.grad[0, 1, 0].abs().item() > 0.0
+    assert logits.grad[0, 2, 0].item() == 0.0
+    assert logits.grad[0, 3, 0].item() == 0.0
+
+
+def test_inline_blank_priority_ignores_invalid_target_rows() -> None:
+    logits = torch.tensor([[[0.0], [5.0]], [[1.0], [2.0]]], requires_grad=True)
+    group = torch.zeros((2, 2), dtype=torch.int64)
+    group_kind = torch.full((2, 2), BLANK_GROUP_CROSS_BLANK, dtype=torch.int64)
+    legal_mask = torch.ones((2, 2, 1), dtype=torch.bool)
+    target = torch.tensor([-1, 1])
+
+    loss = inline_blank_priority_loss(logits, group, group_kind, legal_mask, target)
+    loss.backward()
+
+    assert loss.item() < 0.32
+    assert logits.grad is not None
+    assert logits.grad[0].abs().sum().item() == 0.0
+    assert logits.grad[1].abs().sum().item() > 0.0
+
+
+def test_inline_blank_priority_all_ignored_returns_zero_loss() -> None:
+    logits = torch.randn(2, 3, 1, requires_grad=True)
+    group = torch.zeros((2, 3), dtype=torch.int64)
+    group_kind = torch.full((2, 3), BLANK_GROUP_CROSS_BLANK, dtype=torch.int64)
+    legal_mask = torch.ones((2, 3, 1), dtype=torch.bool)
+    target = torch.tensor([-1, 99])
+
+    loss = inline_blank_priority_loss(logits, group, group_kind, legal_mask, target)
+    loss.backward()
+
+    assert loss.item() == 0.0
+    assert logits.grad is not None
+    assert logits.grad.abs().sum().item() == 0.0
+
+
+def test_inline_blank_priority_accuracy_counts_valid_rows_only() -> None:
+    logits = torch.tensor([[[0.0], [4.0]], [[3.0], [1.0]], [[7.0], [8.0]]])
+    group = torch.zeros((3, 2), dtype=torch.int64)
+    group_kind = torch.full((3, 2), BLANK_GROUP_CROSS_BLANK, dtype=torch.int64)
+    legal_mask = torch.ones((3, 2, 1), dtype=torch.bool)
+    target = torch.tensor([1, 1, -1])
+
+    stats = inline_blank_priority_accuracy(logits, group, group_kind, legal_mask, target)
+
+    assert stats == {"accuracy": 0.5, "correct": 1, "total": 2}
 
 
 # ---------------------------------------------------------------------------

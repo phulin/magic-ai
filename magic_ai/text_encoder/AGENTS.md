@@ -21,5 +21,5 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 - `rollout.py` — End-to-end Python Magic game player using text encoder and RecurrentTextPolicy.
 - `token_tables.py` — Closed-vocabulary token-id lookup tables for every assembler emission; source of truth for native side.
 - `tokenizer.py` — ModernBERT BPE tokenizer augmented with custom mana/card-ref/status/structural tokens.
-- `training.py` — Value pretrain and BC distillation scaffolding; pure PyTorch losses and TextEncoderTrainer.
+- `training.py` — Value pretrain and BC distillation scaffolding; pure PyTorch legacy and inline-blank losses plus TextEncoderTrainer.
 - `value_pretrain.py` — Stage-3a value-head pretrain: ValueLabeledBinDataset (paired *.bin/*.json) + ValuePretrainTrainer (encoder + ValueHead, MSE on perspective-signed terminal outcomes).

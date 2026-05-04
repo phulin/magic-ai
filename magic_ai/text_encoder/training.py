@@ -29,6 +29,7 @@ from torch import Tensor
 
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy
+from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK
 
 # ---------------------------------------------------------------------------
 # Loss functions
@@ -150,6 +151,149 @@ def target_distillation_loss(
     return per_option_kl[valid_options].mean()
 
 
+def _validate_inline_priority_shapes(
+    blank_logits: Tensor,
+    blank_group: Tensor,
+    blank_group_kind: Tensor,
+    blank_legal_mask: Tensor,
+    target_blank_index: Tensor,
+) -> None:
+    if blank_logits.ndim != 3:
+        raise ValueError(
+            "inline_blank_priority_loss: blank_logits must be [B, K, V], "
+            f"got {tuple(blank_logits.shape)}"
+        )
+    if blank_logits.shape[-1] < 1:
+        raise ValueError("inline_blank_priority_loss: blank_logits needs at least one legal slot")
+    if blank_group.shape != blank_logits.shape[:2]:
+        raise ValueError(
+            "inline_blank_priority_loss: blank_group shape mismatch "
+            f"{tuple(blank_group.shape)} vs {tuple(blank_logits.shape[:2])}"
+        )
+    if blank_group_kind.shape != blank_logits.shape[:2]:
+        raise ValueError(
+            "inline_blank_priority_loss: blank_group_kind shape mismatch "
+            f"{tuple(blank_group_kind.shape)} vs {tuple(blank_logits.shape[:2])}"
+        )
+    if blank_legal_mask.shape != blank_logits.shape:
+        raise ValueError(
+            "inline_blank_priority_loss: blank_legal_mask shape mismatch "
+            f"{tuple(blank_legal_mask.shape)} vs {tuple(blank_logits.shape)}"
+        )
+    if target_blank_index.shape != blank_logits.shape[:1]:
+        raise ValueError(
+            "inline_blank_priority_loss: target_blank_index must be [B], "
+            f"got {tuple(target_blank_index.shape)}"
+        )
+
+
+def _inline_priority_support_mask(
+    blank_group: Tensor,
+    blank_group_kind: Tensor,
+    blank_legal_mask: Tensor,
+    group_id: int,
+) -> Tensor:
+    """Return ``[B, K]`` mask for anchors participating in the priority softmax."""
+
+    return (
+        (blank_group == group_id)
+        & (blank_group_kind == BLANK_GROUP_CROSS_BLANK)
+        & blank_legal_mask[..., 0]
+    )
+
+
+def inline_blank_priority_loss(
+    blank_logits: Tensor,
+    blank_group: Tensor,
+    blank_group_kind: Tensor,
+    blank_legal_mask: Tensor,
+    target_blank_index: Tensor,
+    *,
+    group_id: int = 0,
+    ignore_index: int = -1,
+) -> Tensor:
+    """Cross-blank CE for priority inline blanks.
+
+    Priority anchors are rendered as one ``CROSS_BLANK`` group. Each anchor has
+    a singleton legal vocabulary headed by ``<chosen>``, so slot 0 of
+    ``blank_logits`` is the score for selecting that anchor. Targets are blank
+    ordinals within ``K``; rows with ``ignore_index`` targets or invalid target
+    anchors are skipped.
+    """
+
+    _validate_inline_priority_shapes(
+        blank_logits,
+        blank_group,
+        blank_group_kind,
+        blank_legal_mask,
+        target_blank_index,
+    )
+
+    support = _inline_priority_support_mask(
+        blank_group,
+        blank_group_kind,
+        blank_legal_mask,
+        group_id,
+    )
+    scores = blank_logits[..., 0]
+    target = target_blank_index.to(device=scores.device, dtype=torch.long)
+
+    in_range = (target >= 0) & (target < scores.shape[1]) & (target != ignore_index)
+    safe_target = target.clamp(min=0, max=scores.shape[1] - 1)
+    target_is_supported = support.gather(1, safe_target.unsqueeze(1)).squeeze(1)
+    valid_rows = in_range & target_is_supported & support.any(dim=1)
+    if not valid_rows.any():
+        return scores.sum() * 0.0
+
+    neg_inf = torch.full_like(scores, float("-inf"))
+    masked_scores = torch.where(support, scores, neg_inf)
+    return F.cross_entropy(masked_scores[valid_rows], target[valid_rows])
+
+
+@torch.no_grad()
+def inline_blank_priority_accuracy(
+    blank_logits: Tensor,
+    blank_group: Tensor,
+    blank_group_kind: Tensor,
+    blank_legal_mask: Tensor,
+    target_blank_index: Tensor,
+    *,
+    group_id: int = 0,
+    ignore_index: int = -1,
+) -> dict[str, float | int]:
+    """Accuracy for the priority cross-blank categorical."""
+
+    _validate_inline_priority_shapes(
+        blank_logits,
+        blank_group,
+        blank_group_kind,
+        blank_legal_mask,
+        target_blank_index,
+    )
+
+    support = _inline_priority_support_mask(
+        blank_group,
+        blank_group_kind,
+        blank_legal_mask,
+        group_id,
+    )
+    scores = blank_logits[..., 0]
+    target = target_blank_index.to(device=scores.device, dtype=torch.long)
+    in_range = (target >= 0) & (target < scores.shape[1]) & (target != ignore_index)
+    safe_target = target.clamp(min=0, max=scores.shape[1] - 1)
+    target_is_supported = support.gather(1, safe_target.unsqueeze(1)).squeeze(1)
+    valid_rows = in_range & target_is_supported & support.any(dim=1)
+    total = int(valid_rows.sum().item())
+    if total == 0:
+        return {"accuracy": 0.0, "correct": 0, "total": 0}
+
+    neg_inf = torch.full_like(scores, float("-inf"))
+    masked_scores = torch.where(support, scores, neg_inf)
+    pred = masked_scores[valid_rows].argmax(dim=-1)
+    correct = int((pred == target[valid_rows]).sum().item())
+    return {"accuracy": correct / total, "correct": correct, "total": total}
+
+
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
@@ -236,6 +380,8 @@ class TextEncoderTrainer:
 
 __all__ = [
     "TextEncoderTrainer",
+    "inline_blank_priority_accuracy",
+    "inline_blank_priority_loss",
     "policy_distillation_loss",
     "target_distillation_loss",
     "value_loss",

@@ -21,7 +21,7 @@ the eight-step migration. Update at every step boundary.
 | 2 | Render priority blanks (flag-gated)        | ✅ done       | `BlankAnchor`, `RenderError`, `<choices>…</choices>` block. Legacy path byte-identical when flag off. |
 | 3 | Batch + native assembler plumbing          | ✅ done       | Python + native paths tested; mage-go exposes `MagePackedBlankOutputs` and regenerated cffi. |
 | 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired behind `TextEncoderConfig.use_inline_blanks`. |
-| 5 | BC parity gate (priority-only)             | ⏳ next       |  |
+| 5 | BC parity gate (priority-only)             | 🚧 scaffolded | Inline priority BC loss/accuracy utilities landed; parity experiment still pending. |
 | 6 | Combat blocks                               | ⏳ blocked-by 5 |  |
 | 7 | Targets / modes / mays / X / mana sources  | ⏳ blocked-by 6 |  |
 | 8 | Delete legacy option/target heads          | ⏳ blocked-by 7 |  |
@@ -118,15 +118,31 @@ the eight-step migration. Update at every step boundary.
   `uv run pytest tests/test_text_encoder_model.py tests/test_text_policy.py tests/test_text_assembler.py -q`
   → **22 passed / 1 skipped**.
 
+### Step 5 — BC utility scaffold (`/home/user/magic-ai-inline-blanks`)
+
+- `magic_ai/text_encoder/training.py` — added
+  `inline_blank_priority_loss(...)` and
+  `inline_blank_priority_accuracy(...)` for priority-only `CROSS_BLANK`
+  groups. The loss treats slot 0 of each blank's legal-token logits as the
+  `<chosen>` score, masks padded / non-cross anchors, skips ignored target
+  rows, and returns a differentiable zero when no rows are valid.
+- `tests/test_text_encoder_training.py` — coverage for low/high CE,
+  padding and non-cross masking, ignored rows, all-ignored zero loss, accuracy
+  accounting, and gradient flow.
+- Targeted slice:
+  `uv run pytest tests/test_text_encoder_training.py -q`
+  → **17 passed**.
+
 ## Open blockers
 
-None for Steps 1-4. Step 5 still needs the BC parity experiment.
+None for Steps 1-4. Step 5 still needs the BC parity experiment; the
+priority inline-blank loss/metric surface is now available for it.
 
 ## Next steps
 
-1. **Step 5 — BC parity gate.** Train a BC head on a fixed trace set
-   under both render modes. Require ≤ 0.5 pp accuracy regression
-   before extending. Record the gate decision in this status file.
+1. **Step 5 — BC parity gate.** Wire the fixed-trace train/eval harness to
+   legacy BC and `inline_blank_priority_loss(...)`. Require ≤ 0.5 pp accuracy
+   regression before extending. Record the gate decision in this status file.
 2. **Steps 6-7** — combat blocks, then targets/modes/mays/X-cost/
    mana sources. Re-gate at each step.
 3. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
