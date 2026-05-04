@@ -1218,16 +1218,31 @@ class TextActorCritic(nn.Module):
                 ),
             )
 
-        inline_log_probs, inline_entropies, inline_group_mask, inline_per_choice = (
-            _evaluate_inline_blocker_replay_groups(
+        priority_log_probs, priority_entropies, priority_group_mask, priority_per_choice = (
+            _evaluate_inline_priority_replay_groups(
                 output,
                 batch,
                 return_per_choice=return_per_choice,
             )
         )
-        log_probs = log_probs + inline_log_probs
-        entropies = entropies + inline_entropies
+        blocker_log_probs, blocker_entropies, blocker_group_mask, blocker_per_choice = (
+            _evaluate_inline_blocker_replay_groups(
+                output,
+                batch,
+                return_per_choice=return_per_choice,
+                group_skip_mask=priority_group_mask,
+            )
+        )
+        log_probs = log_probs + priority_log_probs + blocker_log_probs
+        entropies = entropies + priority_entropies + blocker_entropies
 
+        inline_group_mask = priority_group_mask | blocker_group_mask
+        if return_per_choice:
+            assert priority_per_choice is not None
+            assert blocker_per_choice is not None
+            inline_per_choice = _concat_replay_per_choice(priority_per_choice, blocker_per_choice)
+        else:
+            inline_per_choice = None
         legacy_group_mask = ~inline_group_mask
         if not bool(legacy_group_mask.any().item()):
             if not return_per_choice:
@@ -1817,11 +1832,232 @@ def _sample_inline_blockers_for_step(
     return selected, log_prob, entropy
 
 
+def _evaluate_inline_priority_replay_groups(
+    output: RecurrentTextPolicyOutput,
+    batch: TextReplayBatch,
+    *,
+    return_per_choice: bool,
+) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice | None]:
+    decision_count = batch.decision_count
+    n = int(decision_count.shape[0])
+    g_total = int(batch.step_for_decision_group.shape[0])
+    log_probs = output.values.new_zeros(n)
+    entropies = output.values.new_zeros(n)
+    device = output.values.device
+    group_mask = torch.zeros(g_total, dtype=torch.bool, device=device)
+
+    blank_logits = output.blank_logits
+    if (
+        g_total == 0
+        or blank_logits is None
+        or blank_logits.numel() == 0
+        or batch.encoded.blank_option_index.numel() == 0
+    ):
+        per_choice = _empty_replay_per_choice(output, n, device) if return_per_choice else None
+        return log_probs, entropies, group_mask, per_choice
+
+    steps_t = batch.step_for_decision_group.to(device=device, dtype=torch.long)
+    option_idx = batch.decision_option_idx.to(device=device, dtype=torch.long)
+    target_idx = batch.decision_target_idx.to(device=device, dtype=torch.long)
+    decision_mask = batch.decision_mask.to(device=device, dtype=torch.bool)
+    selected = batch.selected_indices.to(device=device, dtype=torch.long)
+    trace_kind = batch.trace_kind_id.to(device=device, dtype=torch.long)
+
+    choice_width = int(decision_mask.shape[1])
+    if choice_width == 0:
+        per_choice = _empty_replay_per_choice(output, n, device) if return_per_choice else None
+        return log_probs, entropies, group_mask, per_choice
+    selected_in_range = (selected >= 0) & (selected < choice_width)
+    safe_selected = selected.clamp(min=0, max=choice_width - 1)
+    selected_masked = decision_mask.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
+    selected_option = option_idx.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
+    selected_target = target_idx.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
+
+    blank_option_index = batch.encoded.blank_option_index.to(device=device, dtype=torch.long)
+    blank_group_kind = batch.encoded.blank_group_kind.to(device=device, dtype=torch.long)
+    blank_legal_mask = batch.encoded.blank_legal_mask.to(device=device, dtype=torch.bool)
+
+    row_blank_option = blank_option_index[steps_t]
+    row_blank_kind = blank_group_kind[steps_t]
+    row_legal_mask = blank_legal_mask[steps_t]
+    if int(row_blank_kind.shape[1]) == 0:
+        per_choice = _empty_replay_per_choice(output, n, device) if return_per_choice else None
+        return log_probs, entropies, group_mask, per_choice
+    cross_support = (
+        (row_blank_kind == BLANK_GROUP_CROSS_BLANK)
+        & (row_blank_option >= 0)
+        & row_legal_mask[..., 0]
+    )
+    cross_matches = cross_support & (row_blank_option == selected_option.unsqueeze(1))
+    cross_count = cross_matches.sum(dim=-1)
+    cross_blank_idx = cross_matches.to(dtype=torch.long).argmax(dim=-1)
+
+    priority_scores = blank_logits[steps_t, :, 0]
+    dummy_cross = torch.zeros_like(cross_support)
+    if int(dummy_cross.shape[1]) > 0:
+        dummy_cross[:, 0] = True
+    effective_cross = torch.where(
+        cross_support.any(dim=-1, keepdim=True), cross_support, dummy_cross
+    )
+    safe_priority_scores = torch.where(
+        cross_support.any(dim=-1, keepdim=True),
+        priority_scores,
+        torch.zeros_like(priority_scores),
+    )
+    cross_log_probs_dense = torch.log_softmax(
+        safe_priority_scores.masked_fill(~effective_cross, float("-inf")),
+        dim=-1,
+    )
+    cross_probs = cross_log_probs_dense.exp()
+    safe_cross_log_probs = torch.where(
+        effective_cross,
+        cross_log_probs_dense,
+        cross_log_probs_dense.new_zeros(()),
+    )
+    cross_entropy = -(cross_probs * safe_cross_log_probs).sum(dim=-1)
+    cross_log_prob = cross_log_probs_dense.gather(1, cross_blank_idx.unsqueeze(1)).squeeze(1)
+
+    target_required = selected_target >= 0
+    target_support = (
+        (row_blank_kind == BLANK_GROUP_PER_BLANK)
+        & (row_blank_option == selected_option.unsqueeze(1))
+        & row_legal_mask.any(dim=-1)
+    )
+    target_count = target_support.sum(dim=-1)
+    target_blank_idx = target_support.to(dtype=torch.long).argmax(dim=-1)
+    target_legal_mask = row_legal_mask[
+        torch.arange(g_total, dtype=torch.long, device=device),
+        target_blank_idx,
+    ]
+    target_width = int(target_legal_mask.shape[1])
+    if target_width == 0:
+        per_choice = _empty_replay_per_choice(output, n, device) if return_per_choice else None
+        return log_probs, entropies, group_mask, per_choice
+    selected_target_in_range = (selected_target >= 0) & (selected_target < target_width)
+    safe_selected_target = selected_target.clamp(min=0, max=target_width - 1)
+    selected_target_legal = target_legal_mask.gather(
+        1,
+        safe_selected_target.unsqueeze(1),
+    ).squeeze(1)
+
+    target_group_valid = (~target_required) | (
+        (target_count == 1) & selected_target_in_range & selected_target_legal
+    )
+    is_priority_step = trace_kind[steps_t] == TRACE_KIND_TO_ID["priority"]
+    group_mask = (
+        is_priority_step
+        & selected_in_range
+        & selected_masked
+        & (cross_count == 1)
+        & target_group_valid
+    )
+
+    row_target_logits = blank_logits[
+        steps_t,
+        target_blank_idx,
+    ]
+    dummy_target_mask = torch.zeros_like(target_legal_mask)
+    dummy_target_mask[:, 0] = True
+    effective_target_mask = torch.where(
+        target_required.unsqueeze(1) & group_mask.unsqueeze(1),
+        target_legal_mask,
+        dummy_target_mask,
+    )
+    safe_target_logits = torch.where(
+        target_required.unsqueeze(1) & group_mask.unsqueeze(1),
+        row_target_logits,
+        torch.zeros_like(row_target_logits),
+    )
+    target_log_probs_dense = torch.log_softmax(
+        safe_target_logits.masked_fill(~effective_target_mask, float("-inf")),
+        dim=-1,
+    )
+    target_probs = target_log_probs_dense.exp()
+    safe_target_log_probs = torch.where(
+        effective_target_mask,
+        target_log_probs_dense,
+        target_log_probs_dense.new_zeros(()),
+    )
+    target_entropy = -(target_probs * safe_target_log_probs).sum(dim=-1)
+    target_log_prob = target_log_probs_dense.gather(
+        1,
+        safe_selected_target.unsqueeze(1),
+    ).squeeze(1)
+    target_log_prob = torch.where(
+        target_required,
+        target_log_prob,
+        target_log_prob.new_zeros(()),
+    )
+    target_entropy = torch.where(target_required, target_entropy, target_entropy.new_zeros(()))
+
+    per_group_log_prob = torch.where(
+        group_mask,
+        cross_log_prob + target_log_prob,
+        cross_log_prob.new_zeros(()),
+    )
+    per_group_entropy = torch.where(
+        group_mask,
+        cross_entropy + target_entropy,
+        cross_entropy.new_zeros(()),
+    )
+    log_probs = log_probs.scatter_add(0, steps_t, per_group_log_prob)
+    entropies = entropies.scatter_add(0, steps_t, per_group_entropy)
+
+    if not return_per_choice:
+        return log_probs, entropies, group_mask, None
+
+    flat_indices = (group_mask.unsqueeze(1) & decision_mask).nonzero(as_tuple=False)
+    if int(flat_indices.numel()) == 0:
+        per_choice = _empty_replay_per_choice(output, n, device)
+    else:
+        group_ids = flat_indices[:, 0]
+        choice_cols = flat_indices[:, 1]
+        col_options = option_idx[group_ids, choice_cols]
+        col_targets = target_idx[group_ids, choice_cols]
+        col_target_required = col_targets >= 0
+        col_cross_matches = cross_support[group_ids] & (
+            row_blank_option[group_ids] == col_options.unsqueeze(1)
+        )
+        col_cross_blank = col_cross_matches.to(dtype=torch.long).argmax(dim=-1)
+        col_cross_log_probs = cross_log_probs_dense[group_ids, col_cross_blank]
+        col_cross_logits = priority_scores[group_ids, col_cross_blank]
+
+        col_target_matches = target_support[group_ids]
+        col_target_blank = col_target_matches.to(dtype=torch.long).argmax(dim=-1)
+        safe_col_targets = col_targets.clamp(min=0, max=target_width - 1)
+        col_target_log_probs = target_log_probs_dense[group_ids, safe_col_targets]
+        col_target_logits = blank_logits[steps_t[group_ids], col_target_blank, safe_col_targets]
+        flat_log_probs = torch.where(
+            col_target_required,
+            col_cross_log_probs + col_target_log_probs,
+            col_cross_log_probs,
+        )
+        flat_logits = torch.where(
+            col_target_required,
+            col_cross_logits + col_target_logits,
+            col_cross_logits,
+        )
+        per_choice = ReplayPerChoice(
+            flat_logits=flat_logits,
+            flat_log_probs=flat_log_probs,
+            group_idx=steps_t[group_ids],
+            choice_cols=choice_cols,
+            is_sampled_flat=choice_cols == selected[group_ids],
+            may_is_active=torch.zeros(n, dtype=torch.bool, device=device),
+            may_logits_per_step=output.values.new_zeros(n),
+            may_selected_per_step=output.values.new_zeros(n),
+            decision_group_id_flat=group_ids,
+            step_for_decision_group=steps_t[group_mask],
+        )
+    return log_probs, entropies, group_mask, per_choice
+
+
 def _evaluate_inline_blocker_replay_groups(
     output: RecurrentTextPolicyOutput,
     batch: TextReplayBatch,
     *,
     return_per_choice: bool,
+    group_skip_mask: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice | None]:
     """Score replayed block choices from inline blank logits when available."""
 
@@ -1876,6 +2112,8 @@ def _evaluate_inline_blocker_replay_groups(
     group_mask = (
         is_blocker_step & has_option & (match_count == 1) & selected_in_range & selected_legal
     )
+    if group_skip_mask is not None:
+        group_mask = group_mask & ~group_skip_mask.to(device=device, dtype=torch.bool)
 
     dummy_mask = torch.zeros_like(row_legal_mask)
     if legal_width > 0:
