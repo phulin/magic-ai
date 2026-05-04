@@ -246,6 +246,8 @@ class TextPolicy(nn.Module):
 
         examples = []
         none_token_id: int | None = None
+        yes_token_id: int | None = None
+        no_token_id: int | None = None
         card_ref_token_ids: list[int] | None = None
         if use_inline_blanks and chosen_token_id is None:
             tid = tokenizer.convert_tokens_to_ids("<chosen>")
@@ -257,6 +259,14 @@ class TextPolicy(nn.Module):
             if isinstance(none_tid, list):
                 raise TypeError("convert_tokens_to_ids('<none>') returned a list")
             none_token_id = int(none_tid)
+            yes_tid = tokenizer.convert_tokens_to_ids("<yes>")
+            if isinstance(yes_tid, list):
+                raise TypeError("convert_tokens_to_ids('<yes>') returned a list")
+            yes_token_id = int(yes_tid)
+            no_tid = tokenizer.convert_tokens_to_ids("<no>")
+            if isinstance(no_tid, list):
+                raise TypeError("convert_tokens_to_ids('<no>') returned a list")
+            no_token_id = int(no_tid)
             card_ref_token_ids = []
             for k in range(MAX_CARD_REFS):
                 tid = tokenizer.convert_tokens_to_ids(f"<card-ref:{k}>")
@@ -271,6 +281,8 @@ class TextPolicy(nn.Module):
                 use_inline_blanks=use_inline_blanks,
                 chosen_token_id=chosen_token_id,
                 none_token_id=none_token_id,
+                yes_token_id=yes_token_id,
+                no_token_id=no_token_id,
                 card_ref_token_ids=card_ref_token_ids,
             )
             examples.append(tokenize_snapshot(rendered, tokenizer))

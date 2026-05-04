@@ -546,6 +546,8 @@ def test_saga() -> None:
 
 CHOSEN_FAKE_ID = 99999
 NONE_FAKE_ID = 99998
+YES_FAKE_ID = 99997
+NO_FAKE_ID = 99996
 CARD_REF_FAKE_IDS = tuple(88000 + k for k in range(MAX_CARD_REFS))
 
 
@@ -711,6 +713,26 @@ def test_inline_blanks_pass_only_snapshot(oracle: dict[str, OracleEntry]) -> Non
     assert anchor.group_id == 0
     assert anchor.group_kind == "CROSS_BLANK"
     assert anchor.legal_token_ids == (CHOSEN_FAKE_ID,)
+
+
+def test_inline_blanks_may_emits_yes_no_blank(oracle: dict[str, OracleEntry]) -> None:
+    snap = _basic_snapshot()
+    pending = cast(PendingState, {"kind": "may", "player_idx": 0, "options": []})
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        use_inline_blanks=True,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        yes_token_id=YES_FAKE_ID,
+        no_token_id=NO_FAKE_ID,
+    )
+
+    assert "<choices><choose-may></choices>" in rendered.text
+    [anchor] = rendered.blank_anchors
+    assert anchor.kind == "<choose-may>"
+    assert anchor.group_kind == "PER_BLANK"
+    assert anchor.legal_token_ids == (NO_FAKE_ID, YES_FAKE_ID)
+    assert anchor.option_index == -1
 
 
 def test_inline_blanks_blockers_emit_constrained_block_blanks(

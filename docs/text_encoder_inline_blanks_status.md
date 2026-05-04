@@ -23,7 +23,7 @@ the eight-step migration. Update at every step boundary.
 | 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired behind `TextEncoderConfig.use_inline_blanks`. |
 | 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ✅ done       | `<choose-block>` render/batch/model path, live sampler/action adapter, replay storage, and replay scoring landed. |
-| 7 | Targets / modes / mays / X / mana sources  | 🚧 targets wired | Targeted priority cast/activate options render `<choose-target>` blanks; live and replay scoring can consume them. |
+| 7 | Targets / modes / mays / X / mana sources  | 🚧 may renderer | Targets are wired through live/replay scoring; may decisions render `<choose-may>` blanks. |
 | 8 | Delete legacy option/target heads          | ⏳ blocked-by 7 |  |
 
 ## What landed in each completed step
@@ -207,7 +207,8 @@ without treating the accuracy gate as a blocker.
 
 ## Next steps
 
-1. **Step 7** — continue with modes/mays/X-cost/mana sources.
+1. **Step 7** — wire may blanks into live/replay scoring, then continue with
+   modes/X-cost/mana sources.
 2. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
    `target_*` batch fields, the legacy renderer branch, and the
    `use_inline_blanks` flag. Bump replay-buffer on-disk version.
@@ -241,3 +242,14 @@ without treating the accuracy gate as a blocker.
   option/target replay scoring.
 - `tests/test_text_actor_critic.py` — coverage for replayed target-blank
   log-prob reconstruction and per-choice output shape.
+
+### Step 7 — May renderer slice (`/home/user/magic-ai-inline-blanks`)
+
+- `magic_ai/text_encoder/render.py` — inline `may` pending states now emit
+  one `<choose-may>` blank in the trailing `<choices>` block with legal ids
+  ordered as `<no>, <yes>` so existing `may_selected` labels map to legal
+  slot 0/1.
+- `magic_ai/text_encoder/policy.py` — `encode_snapshots(use_inline_blanks=True)`
+  now resolves and passes the `<yes>` / `<no>` token ids to the renderer.
+- `tests/test_text_render.py`, `tests/test_text_policy.py` — coverage for
+  render placement, legal id order, batch propagation, and forward logits.

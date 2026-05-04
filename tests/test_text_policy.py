@@ -207,6 +207,21 @@ def _snapshot_with_blockers(names: list[str]) -> GameStateSnapshot:
     return cast(GameStateSnapshot, snap)
 
 
+def _snapshot_with_may(names: list[str]) -> GameStateSnapshot:
+    a = names[0]
+    snap: dict[str, object] = {
+        "turn": 3,
+        "active_player": "p1",
+        "step": "Upkeep",
+        "players": [
+            _player("p1", "Self", battlefield=[_card("c1", a, tapped=False)]),
+            _player("p2", "Opp"),
+        ],
+        "pending": cast(PendingState, {"kind": "may", "player_idx": 0, "options": []}),
+    }
+    return cast(GameStateSnapshot, snap)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end smoke
 # ---------------------------------------------------------------------------
@@ -333,6 +348,33 @@ def test_text_policy_inline_block_blank_forward(
     assert out.blank_logits is not None
     assert out.blank_logits.shape == batch.blank_legal_ids.shape
     assert out.blank_option_index is batch.blank_option_index
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+
+
+def test_text_policy_inline_may_blank_forward(
+    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
+) -> None:
+    cfg = _small_cfg(tokenizer)
+    cfg.use_inline_blanks = True
+    policy = build_text_policy(tokenizer, cfg)
+    batch = TextPolicy.encode_snapshots(
+        [_snapshot_with_may(real_card_names)],
+        actions_per_snapshot=None,
+        oracle=oracle,
+        tokenizer=tokenizer,
+        use_inline_blanks=True,
+    )
+
+    assert batch.blank_positions.shape == (1, 1)
+    no_id = tokenizer.convert_tokens_to_ids("<no>")
+    yes_id = tokenizer.convert_tokens_to_ids("<yes>")
+    assert int(batch.blank_legal_ids[0, 0, 0]) == int(no_id)
+    assert int(batch.blank_legal_ids[0, 0, 1]) == int(yes_id)
+
+    out = policy(batch)
+
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
     assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
 
 

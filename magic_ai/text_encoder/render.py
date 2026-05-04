@@ -549,6 +549,8 @@ class SnapshotRenderer:
         use_inline_blanks: bool = False,
         chosen_token_id: int | None = None,
         none_token_id: int | None = None,
+        yes_token_id: int | None = None,
+        no_token_id: int | None = None,
         card_ref_token_ids: Sequence[int] | None = None,
     ) -> None:
         self._oracle = oracle if oracle is not None else {}
@@ -556,6 +558,8 @@ class SnapshotRenderer:
         self._use_inline_blanks = use_inline_blanks
         self._chosen_token_id = chosen_token_id
         self._none_token_id = none_token_id
+        self._yes_token_id = yes_token_id
+        self._no_token_id = no_token_id
         self._card_ref_token_ids = tuple(int(tid) for tid in card_ref_token_ids or ())
         self._cur_self_id: str = ""
         self._cur_opp_id: str = ""
@@ -567,6 +571,7 @@ class SnapshotRenderer:
         self._pass_options: list[int] = []
         self._blank_group_id: int = 0
         self._blank_index: int = 0
+        self._pending_kind: str = ""
         if use_inline_blanks and chosen_token_id is None:
             raise ValueError(
                 "use_inline_blanks=True requires chosen_token_id (the "
@@ -598,6 +603,7 @@ class SnapshotRenderer:
         self._pass_options = []
         self._blank_group_id = 0
         self._blank_index = 0
+        self._pending_kind = ""
         # First pass: assign card-ref indices in deterministic traversal order.
         card_refs = self._assign_card_refs(snapshot)
         result.card_refs = card_refs
@@ -611,8 +617,9 @@ class SnapshotRenderer:
 
         # Resolve the pending options once so inline pre-classification and
         # the later action / choices block use the same list.
+        pending = snapshot.get("pending")
+        self._pending_kind = str((pending or {}).get("kind") or "").lower()
         if actions is None:
-            pending = snapshot.get("pending")
             resolved_actions: Sequence[PendingOptionState] = (
                 pending.get("options", []) if pending is not None else []
             )
@@ -1134,9 +1141,9 @@ class SnapshotRenderer:
     ) -> None:
         """Emit the trailing ``<choices>`` block with the ``<pass>`` blank.
 
-        Currently the choices zone only carries the priority-pass anchor;
-        later steps add ``<choose-mode>`` / ``<choose-may>`` / ``<choose-x>``
-        groups whose blanks live here too.
+        Currently the choices zone carries priority-pass anchors and the
+        Step-7 ``<choose-may>`` blank. Later steps add ``<choose-mode>`` /
+        ``<choose-x>`` groups whose blanks live here too.
         """
 
         del actions  # _classify_inline_options already split everything we need
@@ -1153,6 +1160,19 @@ class SnapshotRenderer:
                 opt_idx,
                 legal_token_ids=priority_legal_ids,
                 group_kind="CROSS_BLANK",
+            )
+        if self._pending_kind == "may":
+            yes_id = self._yes_token_id
+            no_id = self._no_token_id
+            if yes_id is None or no_id is None:
+                raise RenderError("inline may blanks require yes_token_id and no_token_id")
+            self._emit_blank(
+                buf,
+                result,
+                "<choose-may>",
+                -1,
+                legal_token_ids=(int(no_id), int(yes_id)),
+                group_kind="PER_BLANK",
             )
         buf.append("</choices>")
 
@@ -1171,6 +1191,8 @@ def render_snapshot(
     use_inline_blanks: bool = False,
     chosen_token_id: int | None = None,
     none_token_id: int | None = None,
+    yes_token_id: int | None = None,
+    no_token_id: int | None = None,
     card_ref_token_ids: Sequence[int] | None = None,
 ) -> RenderedSnapshot:
     """Render ``snapshot`` (and optional ``actions``) to text + anchor metadata.
@@ -1194,5 +1216,7 @@ def render_snapshot(
         use_inline_blanks=use_inline_blanks,
         chosen_token_id=chosen_token_id,
         none_token_id=none_token_id,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
         card_ref_token_ids=card_ref_token_ids,
     ).render(snapshot, actions)
