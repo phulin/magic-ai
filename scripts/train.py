@@ -1524,7 +1524,7 @@ def main() -> None:
     initialize_game_log(game_log_path(args))
     if args.learning_rate is None:
         args.learning_rate = 5e-5 if args.trainer == "rnad" else 3e-4
-    deck_pool = load_deck_pool(args.deck_json, args.deck_dir)
+    deck_pool = load_deck_pool(args.deck_json, args.deck_dir, args.jumpstart_dir)
     validate_deck_embeddings(args.embeddings, deck_pool)
     if args.torch_threads is not None:
         torch.set_num_threads(args.torch_threads)
@@ -1690,6 +1690,13 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="directory of deck JSON files to sample randomly per game",
+    )
+    parser.add_argument(
+        "--jumpstart-dir",
+        type=Path,
+        default=None,
+        help="directory of jumpstart-pack JSON files; each player's deck is "
+        "two packs sampled from the directory and concatenated",
     )
     parser.add_argument(
         "--trainer",
@@ -2209,8 +2216,17 @@ def validate_args(args: argparse.Namespace) -> None:
         args.spr = False
     if args.torch_compile and not args.no_validate:
         raise ValueError("--torch-compile requires --no-validate")
-    if args.deck_json is not None and args.deck_dir is not None:
-        raise ValueError("--deck-json and --deck-dir are mutually exclusive")
+    deck_sources = [
+        name
+        for name, value in (
+            ("--deck-json", args.deck_json),
+            ("--deck-dir", args.deck_dir),
+            ("--jumpstart-dir", args.jumpstart_dir),
+        )
+        if value is not None
+    ]
+    if len(deck_sources) > 1:
+        raise ValueError(f"{', '.join(deck_sources)} are mutually exclusive")
     if args.eval_games_per_snapshot is not None and args.eval_games_per_snapshot < 0:
         raise ValueError("--eval-games-per-snapshot must be non-negative")
     if args.eval_num_envs is not None and args.eval_num_envs < 1:
@@ -2520,6 +2536,7 @@ def train_native_batched_envs(
             deck_pool,
             seed,
             fixed=getattr(args, "deck_json", None) is not None,
+            jumpstart=getattr(args, "jumpstart_dir", None) is not None,
         )
         return LiveGame(
             game=mage.new_game(
@@ -3253,6 +3270,7 @@ def train_text_envs(
             deck_pool,
             seed,
             fixed=getattr(args, "deck_json", None) is not None,
+            jumpstart=getattr(args, "jumpstart_dir", None) is not None,
         )
         game = mage.new_game(
             deck_a,
@@ -3623,7 +3641,12 @@ def train_text_native_batched_envs(
         if sampling_policy is not backend.policy:
             sampling_policy.reset_lstm_env_states([slot_idx])
         seed = args.seed + episode_idx
-        deck_a, deck_b = sample_decks(deck_pool, seed, fixed=args.deck_json is not None)
+        deck_a, deck_b = sample_decks(
+            deck_pool,
+            seed,
+            fixed=args.deck_json is not None,
+            jumpstart=getattr(args, "jumpstart_dir", None) is not None,
+        )
         return LiveGame(
             game=mage.new_game(
                 deck_a,
@@ -4641,7 +4664,13 @@ def take_snapshot_and_eval(
     )
 
 
-def load_deck_pool(deck_json: Path | None, deck_dir: Path | None) -> list[dict[str, Any]]:
+def load_deck_pool(
+    deck_json: Path | None,
+    deck_dir: Path | None,
+    jumpstart_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    if jumpstart_dir is not None:
+        return load_deck_dir(jumpstart_dir)
     if deck_dir is not None:
         return load_deck_dir(deck_dir)
     return list(load_decks(deck_json))
@@ -4668,6 +4697,7 @@ def sample_decks(
     seed: int,
     *,
     fixed: bool = False,
+    jumpstart: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if not deck_pool:
         raise ValueError("deck pool must contain at least one deck")
@@ -4675,7 +4705,25 @@ def sample_decks(
         # deck_json supplies exactly [player_a, player_b] in order; don't randomize
         return deck_pool[0], deck_pool[1]
     rng = random.Random(seed)
+    if jumpstart:
+        if len(deck_pool) < 2:
+            raise ValueError("jumpstart pool must contain at least two packs")
+        a1, a2 = rng.sample(deck_pool, 2)
+        b1, b2 = rng.sample(deck_pool, 2)
+        return _merge_packs(a1, a2), _merge_packs(b1, b2)
     return rng.choice(deck_pool), rng.choice(deck_pool)
+
+
+def _merge_packs(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    for pack in (a, b):
+        for card in pack.get("cards", []):
+            name = card["name"]
+            counts[name] = counts.get(name, 0) + int(card.get("count", 1))
+    return {
+        "name": f"{a.get('name', '?')}+{b.get('name', '?')}",
+        "cards": [{"name": n, "count": c} for n, c in counts.items()],
+    }
 
 
 def load_decks(path: Path | None) -> tuple[dict[str, Any], dict[str, Any]]:
