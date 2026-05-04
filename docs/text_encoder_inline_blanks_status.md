@@ -110,7 +110,7 @@ the eight-step migration. Update at every step boundary.
   passes its dense + layer-norm pre-projection modules into
   `InlineBlankPolicy`. `TextPolicyOutput` carries `blank_logits` plus the
   batch's `blank_*` metadata. `encode_snapshots(...)`
-  accepts `use_inline_blanks=True` and defaults `chosen_token_id` from the
+  defaults `chosen_token_id` from the
   tokenizer's `<chosen>` id.
 - `tests/test_text_encoder_model.py`, `tests/test_text_policy.py` — focused
   scorer mask/backprop coverage plus an end-to-end inline-blank snapshot
@@ -247,7 +247,7 @@ without treating the accuracy gate as a blocker.
   one `<choose-may>` blank in the trailing `<choices>` block with legal ids
   ordered as `<no>, <yes>` so existing `may_selected` labels map to legal
   slot 0/1.
-- `magic_ai/text_encoder/policy.py` — `encode_snapshots(use_inline_blanks=True)`
+- `magic_ai/text_encoder/policy.py` — inline `encode_snapshots(...)`
   now resolves and passes the `<yes>` / `<no>` token ids to the renderer.
 - `tests/test_text_render.py`, `tests/test_text_policy.py` — coverage for
   render placement, legal id order, batch propagation, and forward logits.
@@ -267,7 +267,7 @@ without treating the accuracy gate as a blocker.
 - `magic_ai/text_encoder/render.py` — inline `mode` pending states now emit
   one `<choose-mode>` blank in the trailing `<choices>` block with legal ids
   `<num:0>...<num:N-1>` for the available mode options.
-- `magic_ai/text_encoder/policy.py` — `encode_snapshots(use_inline_blanks=True)`
+- `magic_ai/text_encoder/policy.py` — inline `encode_snapshots(...)`
   now resolves and passes the `<num:k>` token ids to the renderer.
 - `tests/test_text_render.py`, `tests/test_text_policy.py` — coverage for
   render placement, legal id order, batch propagation, and forward logits.
@@ -296,7 +296,7 @@ without treating the accuracy gate as a blocker.
   emit one `<choose-mana-source>` blank in the trailing `<choices>` block with
   legal ids ordered as `<mana:W>, <mana:U>, <mana:B>, <mana:R>, <mana:G>,
   <mana:C>`, matching the existing `COLORS` selected-column order.
-- `magic_ai/text_encoder/policy.py` — `encode_snapshots(use_inline_blanks=True)`
+- `magic_ai/text_encoder/policy.py` — inline `encode_snapshots(...)`
   now resolves and passes the mana-token ids to the renderer.
 - `tests/test_text_render.py`, `tests/test_text_policy.py` — coverage for
   render placement, legal id order, batch propagation, and forward logits.

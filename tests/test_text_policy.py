@@ -372,8 +372,9 @@ def test_text_policy_end_to_end(
     assert torch.isfinite(out.target_logits[out.target_mask]).all()
     assert (out.target_logits[~out.target_mask] == float("-inf")).all()
 
-    # At least one valid option in this batch.
-    assert out.option_mask.any()
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
 
 
 def test_text_policy_inline_blank_forward(
@@ -386,7 +387,6 @@ def test_text_policy_inline_blank_forward(
         actions_per_snapshot=None,
         oracle=oracle,
         tokenizer=tokenizer,
-        use_inline_blanks=True,
     )
 
     assert batch.blank_positions.shape[1] > 0
@@ -412,7 +412,6 @@ def test_text_policy_inline_block_blank_forward(
         actions_per_snapshot=None,
         oracle=oracle,
         tokenizer=tokenizer,
-        use_inline_blanks=True,
     )
 
     assert batch.blank_positions.shape == (1, 1)
@@ -439,7 +438,6 @@ def test_text_policy_inline_may_blank_forward(
         actions_per_snapshot=None,
         oracle=oracle,
         tokenizer=tokenizer,
-        use_inline_blanks=True,
     )
 
     assert batch.blank_positions.shape == (1, 1)
@@ -465,7 +463,6 @@ def test_text_policy_inline_mode_blank_forward(
         actions_per_snapshot=None,
         oracle=oracle,
         tokenizer=tokenizer,
-        use_inline_blanks=True,
     )
 
     assert batch.blank_positions.shape == (1, 1)
@@ -491,7 +488,6 @@ def test_text_policy_inline_number_blank_forward(
         actions_per_snapshot=None,
         oracle=oracle,
         tokenizer=tokenizer,
-        use_inline_blanks=True,
     )
 
     assert batch.blank_positions.shape == (1, 1)
@@ -516,7 +512,6 @@ def test_text_policy_inline_mana_color_blank_forward(
         actions_per_snapshot=None,
         oracle=oracle,
         tokenizer=tokenizer,
-        use_inline_blanks=True,
     )
 
     assert batch.blank_positions.shape == (1, 1)
