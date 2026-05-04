@@ -44,6 +44,7 @@ from magic_ai.text_encoder.model import (
     initialize_text_state_encoder_from_hf,
 )
 from magic_ai.text_encoder.render import OracleEntry, render_snapshot
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 
 @dataclass
@@ -242,11 +243,24 @@ class TextPolicy(nn.Module):
             action_lists = list(actions_per_snapshot)
 
         examples = []
+        none_token_id: int | None = None
+        card_ref_token_ids: list[int] | None = None
         if use_inline_blanks and chosen_token_id is None:
             tid = tokenizer.convert_tokens_to_ids("<chosen>")
             if isinstance(tid, list):
                 raise TypeError("convert_tokens_to_ids('<chosen>') returned a list")
             chosen_token_id = int(tid)
+        if use_inline_blanks:
+            none_tid = tokenizer.convert_tokens_to_ids("<none>")
+            if isinstance(none_tid, list):
+                raise TypeError("convert_tokens_to_ids('<none>') returned a list")
+            none_token_id = int(none_tid)
+            card_ref_token_ids = []
+            for k in range(MAX_CARD_REFS):
+                tid = tokenizer.convert_tokens_to_ids(f"<card-ref:{k}>")
+                if isinstance(tid, list):
+                    raise TypeError(f"convert_tokens_to_ids('<card-ref:{k}>') returned a list")
+                card_ref_token_ids.append(int(tid))
         for snap, actions in zip(snapshots, action_lists, strict=True):
             rendered = render_snapshot(
                 snap,
@@ -254,6 +268,8 @@ class TextPolicy(nn.Module):
                 oracle=oracle,
                 use_inline_blanks=use_inline_blanks,
                 chosen_token_id=chosen_token_id,
+                none_token_id=none_token_id,
+                card_ref_token_ids=card_ref_token_ids,
             )
             examples.append(tokenize_snapshot(rendered, tokenizer))
 

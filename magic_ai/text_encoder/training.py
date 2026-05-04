@@ -29,7 +29,11 @@ from torch import Tensor
 
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy
-from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK
+from magic_ai.text_encoder.render_plan import (
+    BLANK_GROUP_CONSTRAINED,
+    BLANK_GROUP_CROSS_BLANK,
+    BLANK_GROUP_PER_BLANK,
+)
 
 # ---------------------------------------------------------------------------
 # Loss functions
@@ -294,6 +298,119 @@ def inline_blank_priority_accuracy(
     return {"accuracy": correct / total, "correct": correct, "total": total}
 
 
+def _validate_inline_per_blank_shapes(
+    blank_logits: Tensor,
+    blank_group_kind: Tensor,
+    blank_legal_mask: Tensor,
+    target_legal_index: Tensor,
+) -> None:
+    if blank_logits.ndim != 3:
+        raise ValueError(
+            "inline_blank_per_blank_loss: blank_logits must be [B, K, V], "
+            f"got {tuple(blank_logits.shape)}"
+        )
+    if blank_group_kind.shape != blank_logits.shape[:2]:
+        raise ValueError(
+            "inline_blank_per_blank_loss: blank_group_kind shape mismatch "
+            f"{tuple(blank_group_kind.shape)} vs {tuple(blank_logits.shape[:2])}"
+        )
+    if blank_legal_mask.shape != blank_logits.shape:
+        raise ValueError(
+            "inline_blank_per_blank_loss: blank_legal_mask shape mismatch "
+            f"{tuple(blank_legal_mask.shape)} vs {tuple(blank_logits.shape)}"
+        )
+    if target_legal_index.shape != blank_logits.shape[:2]:
+        raise ValueError(
+            "inline_blank_per_blank_loss: target_legal_index must be [B, K], "
+            f"got {tuple(target_legal_index.shape)}"
+        )
+
+
+def _inline_per_blank_valid_slots(
+    blank_group_kind: Tensor,
+    blank_legal_mask: Tensor,
+    target_legal_index: Tensor,
+    ignore_index: int,
+) -> Tensor:
+    target = target_legal_index.to(device=blank_legal_mask.device, dtype=torch.long)
+    group_kind = blank_group_kind.to(device=blank_legal_mask.device)
+    support = (
+        (group_kind == BLANK_GROUP_PER_BLANK) | (group_kind == BLANK_GROUP_CONSTRAINED)
+    ) & blank_legal_mask.any(dim=-1)
+    in_range = (target >= 0) & (target < blank_legal_mask.shape[-1]) & (target != ignore_index)
+    safe_target = target.clamp(min=0, max=max(0, blank_legal_mask.shape[-1] - 1))
+    target_is_legal = blank_legal_mask.gather(-1, safe_target.unsqueeze(-1)).squeeze(-1)
+    return support & in_range & target_is_legal
+
+
+def inline_blank_per_blank_loss(
+    blank_logits: Tensor,
+    blank_group_kind: Tensor,
+    blank_legal_mask: Tensor,
+    target_legal_index: Tensor,
+    *,
+    ignore_index: int = -1,
+) -> Tensor:
+    """Per-blank CE for ``PER_BLANK`` and ``CONSTRAINED`` inline groups.
+
+    ``target_legal_index`` stores the chosen legal-slot ordinal per blank
+    (for blockers: 0 is ``<none>``, 1..N are legal attackers). Cross-blank
+    groups are ignored; they are handled by :func:`inline_blank_priority_loss`.
+    """
+
+    _validate_inline_per_blank_shapes(
+        blank_logits,
+        blank_group_kind,
+        blank_legal_mask,
+        target_legal_index,
+    )
+    target = target_legal_index.to(device=blank_logits.device, dtype=torch.long)
+    valid = _inline_per_blank_valid_slots(
+        blank_group_kind,
+        blank_legal_mask,
+        target,
+        ignore_index,
+    )
+    if not valid.any():
+        return blank_logits.sum() * 0.0
+
+    masked_logits = blank_logits.masked_fill(~blank_legal_mask, float("-inf"))
+    return F.cross_entropy(masked_logits[valid], target[valid])
+
+
+@torch.no_grad()
+def inline_blank_per_blank_accuracy(
+    blank_logits: Tensor,
+    blank_group_kind: Tensor,
+    blank_legal_mask: Tensor,
+    target_legal_index: Tensor,
+    *,
+    ignore_index: int = -1,
+) -> dict[str, float | int]:
+    """Accuracy for ``PER_BLANK`` and ``CONSTRAINED`` inline groups."""
+
+    _validate_inline_per_blank_shapes(
+        blank_logits,
+        blank_group_kind,
+        blank_legal_mask,
+        target_legal_index,
+    )
+    target = target_legal_index.to(device=blank_logits.device, dtype=torch.long)
+    valid = _inline_per_blank_valid_slots(
+        blank_group_kind,
+        blank_legal_mask,
+        target,
+        ignore_index,
+    )
+    total = int(valid.sum().item())
+    if total == 0:
+        return {"accuracy": 0.0, "correct": 0, "total": 0}
+
+    pred = blank_logits.masked_fill(~blank_legal_mask, float("-inf"))[valid].argmax(dim=-1)
+    correct = int((pred == target[valid]).sum().item())
+    return {"accuracy": correct / total, "correct": correct, "total": total}
+
+
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
@@ -380,6 +497,8 @@ class TextEncoderTrainer:
 
 __all__ = [
     "TextEncoderTrainer",
+    "inline_blank_per_blank_accuracy",
+    "inline_blank_per_blank_loss",
     "inline_blank_priority_accuracy",
     "inline_blank_priority_loss",
     "policy_distillation_loss",

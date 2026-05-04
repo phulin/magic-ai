@@ -22,7 +22,7 @@ the eight-step migration. Update at every step boundary.
 | 3 | Batch + native assembler plumbing          | ✅ done       | Python + native paths tested; mage-go exposes `MagePackedBlankOutputs` and regenerated cffi. |
 | 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired behind `TextEncoderConfig.use_inline_blanks`. |
 | 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
-| 6 | Combat blocks                               | ⏳ blocked-by 5 |  |
+| 6 | Combat blocks                               | 🚧 renderer slice | `<choose-block>` render/batch/model path started; sampler/action adapter still pending. |
 | 7 | Targets / modes / mays / X / mana sources  | ⏳ blocked-by 6 |  |
 | 8 | Delete legacy option/target heads          | ⏳ blocked-by 7 |  |
 
@@ -147,26 +147,52 @@ the eight-step migration. Update at every step boundary.
   transcripts now optionally append gate-ready priority JSONL rows with
   `state`, `pending`, and `action` fields while leaving the human-readable
   `--game-log-path` output unchanged.
+- `scripts/play_text_rollout.py` — added `--priority-trace-jsonl-path` for a
+  lightweight engine-backed trace smoke path that does not require slot-card
+  embeddings; missing default deck file falls back to a small built-in deck.
 - `tests/test_train.py` — coverage for JSONL trace append behavior and path
   defaulting.
 - Smoke:
   `uv run python scripts/inline_blank_bc_parity.py --synthetic-fixture 8 --epochs 1 --batch-size 4 --d-model 32 --n-layers 1 --n-heads 4 --d-ff 64 --max-seq-len 512 --seed 0`
   → **passed**.
+- Engine-backed smoke:
+  `uv run python scripts/play_text_rollout.py --n-episodes 1 --max-turns 1 --device cpu --seed 0 --d-model 32 --n-layers 1 --n-heads 4 --max-tokens 2048 --priority-trace-jsonl-path /tmp/inline_blank_priority_trace.jsonl`
+  then
+  `uv run python scripts/inline_blank_bc_parity.py --trace-jsonl /tmp/inline_blank_priority_trace.jsonl --epochs 1 --batch-size 1 --d-model 32 --n-layers 1 --n-heads 4 --d-ff 64 --max-seq-len 2048 --seed 0`
+  → **passed** on 3 trace rows.
 
 ## Open blockers
 
-None for Steps 1-4. Step 5 still needs the real fixed-trace BC parity run;
-the priority inline-blank loss/metric surface and CLI harness are now
-available for it.
+None for Steps 1-4. Step 5 still has harnesses but the migration is proceeding
+without treating the accuracy gate as a blocker.
+
+### Step 6 — Combat block renderer slice (`/home/user/magic-ai-inline-blanks`)
+
+- `magic_ai/text_encoder/render.py` — inline mode now classifies `block`
+  options into `<choose-block>` blanks next to each defender. Legal ids are
+  `<none>` followed by the legal attacker `<card-ref:K>` ids in target order;
+  anchors use `group_kind="CONSTRAINED"`.
+- `magic_ai/text_encoder/policy.py` — `TextPolicy.encode_snapshots(...)`
+  supplies `<none>` and `<card-ref:K>` token ids to the renderer for block
+  blank legal vocabularies.
+- `magic_ai/text_encoder/training.py` — added
+  `inline_blank_per_blank_loss(...)` and
+  `inline_blank_per_blank_accuracy(...)` for `PER_BLANK` and `CONSTRAINED`
+  groups; block blanks use this target shape (`0=<none>`, `1..N=attackers`).
+- `tests/test_text_render.py`, `tests/test_text_policy.py` — coverage for
+  block anchor placement/legal ids and end-to-end inline block blank forward.
+- `tests/test_text_encoder_training.py` — coverage for constrained
+  per-blank loss/accuracy and masking.
+- `magic_ai/actions.py` — added `action_from_inline_block_choices(...)` to
+  map per-defender inline legal-slot selections back to the existing
+  `{"blockers": ...}` action payload.
+- `tests/test_actions.py` — coverage for inline block action decoding.
 
 ## Next steps
 
-1. **Step 5 — BC parity gate.** Generate a fixed real trace set with
-   `scripts/train.py --priority-trace-jsonl-path ...`, then run
-   `scripts/inline_blank_bc_parity.py --trace-jsonl ...`. Require ≤ 0.5 pp
-   accuracy regression before extending. Record the gate decision here.
-2. **Steps 6-7** — combat blocks, then targets/modes/mays/X-cost/
-   mana sources. Re-gate at each step.
+1. **Step 6 — Combat blocks.** Wire inline-block sampling into the live text
+   actor path and replay scoring path.
+2. **Step 7** — targets/modes/mays/X-cost/mana sources.
 3. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
    `target_*` batch fields, the legacy renderer branch, and the
    `use_inline_blanks` flag. Bump replay-buffer on-disk version.

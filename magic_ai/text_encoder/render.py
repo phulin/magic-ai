@@ -548,16 +548,22 @@ class SnapshotRenderer:
         max_card_refs: int = MAX_CARD_REFS,
         use_inline_blanks: bool = False,
         chosen_token_id: int | None = None,
+        none_token_id: int | None = None,
+        card_ref_token_ids: Sequence[int] | None = None,
     ) -> None:
         self._oracle = oracle if oracle is not None else {}
         self._max_card_refs = max_card_refs
         self._use_inline_blanks = use_inline_blanks
         self._chosen_token_id = chosen_token_id
+        self._none_token_id = none_token_id
+        self._card_ref_token_ids = tuple(int(tid) for tid in card_ref_token_ids or ())
         self._cur_self_id: str = ""
         self._cur_opp_id: str = ""
         # Per-render scratch state for inline-blank emission. Reset in
         # ``render`` before each pass so a renderer instance can be reused.
-        self._blank_options_by_card: dict[str, list[tuple[str, int, tuple[object, ...]]]] = {}
+        self._blank_options_by_card: dict[
+            str, list[tuple[str, int, tuple[int, ...], str, tuple[object, ...]]]
+        ] = {}
         self._pass_options: list[int] = []
         self._blank_group_id: int = 0
         self._blank_index: int = 0
@@ -618,7 +624,7 @@ class SnapshotRenderer:
         # ``<choose-play>`` / ``<use-ability>`` token next to each card.
         # Pass options are buffered for the trailing ``<choices>`` block.
         if inline:
-            self._classify_inline_options(resolved_actions)
+            self._classify_inline_options(resolved_actions, card_refs)
 
         buf.append("<bos><state>")
         # Top-level game info: <turn>N</turn><step:...>
@@ -787,8 +793,15 @@ class SnapshotRenderer:
         if cid:
             options_here = self._blank_options_by_card.get(cid)
             if options_here:
-                for kind_token, option_index, _sort_key in options_here:
-                    self._emit_blank(buf, result, kind_token, option_index)
+                for kind_token, option_index, legal_ids, group_kind, _sort_key in options_here:
+                    self._emit_blank(
+                        buf,
+                        result,
+                        kind_token,
+                        option_index,
+                        legal_token_ids=legal_ids,
+                        group_kind=group_kind,
+                    )
 
     def _render_stack_object(
         self,
@@ -926,8 +939,12 @@ class SnapshotRenderer:
 
     # -- inline-blank helpers ---------------------------------------------
 
-    def _classify_inline_options(self, actions: Sequence[PendingOptionState]) -> None:
-        """Bucket priority options into per-card blanks + a pass-only list.
+    def _classify_inline_options(
+        self,
+        actions: Sequence[PendingOptionState],
+        card_refs: dict[str, int],
+    ) -> None:
+        """Bucket inline options into per-card blanks + a pass-only list.
 
         Every option is one of:
 
@@ -944,7 +961,11 @@ class SnapshotRenderer:
         ``docs/text_encoder_inline_blanks_plan.md``.
         """
 
-        per_card: dict[str, list[tuple[str, int, tuple[object, ...]]]] = {}
+        chosen_id = self._chosen_token_id
+        if chosen_id is None:
+            raise RenderError("inline priority blanks require chosen_token_id")
+        priority_legal_ids = (int(chosen_id),)
+        per_card: dict[str, list[tuple[str, int, tuple[int, ...], str, tuple[object, ...]]]] = {}
         pass_options: list[int] = []
         for opt_idx, option in enumerate(actions):
             kind = (option.get("kind") or "").lower()
@@ -963,7 +984,9 @@ class SnapshotRenderer:
                     str(option.get("id") or ""),
                     opt_idx,
                 )
-                per_card.setdefault(source, []).append(("<choose-play>", opt_idx, key))
+                per_card.setdefault(source, []).append(
+                    ("<choose-play>", opt_idx, priority_legal_ids, "CROSS_BLANK", key)
+                )
             elif kind in ("activate", "activate_ability", "activated_ability"):
                 source = option.get("permanent_id") or option.get("card_id") or ""
                 if not source:
@@ -978,7 +1001,21 @@ class SnapshotRenderer:
                     str(option.get("id") or ""),
                     opt_idx,
                 )
-                per_card.setdefault(source, []).append(("<use-ability>", opt_idx, key))
+                per_card.setdefault(source, []).append(
+                    ("<use-ability>", opt_idx, priority_legal_ids, "CROSS_BLANK", key)
+                )
+            elif kind == "block":
+                source = option.get("permanent_id") or option.get("card_id") or ""
+                if not source:
+                    raise RenderError(
+                        f"block option {opt_idx} has no permanent_id / card_id; "
+                        "cannot anchor inline blank."
+                    )
+                legal_ids = self._block_legal_token_ids(option, card_refs)
+                key = ("<choose-block>", str(option.get("id") or ""), opt_idx)
+                per_card.setdefault(source, []).append(
+                    ("<choose-block>", opt_idx, legal_ids, "CONSTRAINED", key)
+                )
             elif kind == "pass":
                 pass_options.append(opt_idx)
             else:
@@ -991,9 +1028,30 @@ class SnapshotRenderer:
         # Sort each card's options by their stable key so the blank ordinal
         # ordering is independent of input-list permutation.
         for cid in per_card:
-            per_card[cid].sort(key=lambda item: item[2])
+            per_card[cid].sort(key=lambda item: item[4])
         self._blank_options_by_card = per_card
         self._pass_options = pass_options
+
+    def _block_legal_token_ids(
+        self,
+        option: PendingOptionState,
+        card_refs: dict[str, int],
+    ) -> tuple[int, ...]:
+        none_id = self._none_token_id
+        if none_id is None:
+            raise RenderError("inline block blanks require none_token_id")
+        legal_ids = [int(none_id)]
+        for target in option.get("valid_targets") or []:
+            tid = target.get("id", "")
+            ref = card_refs.get(tid)
+            if ref is None:
+                continue
+            if not 0 <= ref < len(self._card_ref_token_ids):
+                raise RenderError(
+                    f"block target card-ref:{ref} has no token id in card_ref_token_ids"
+                )
+            legal_ids.append(int(self._card_ref_token_ids[ref]))
+        return tuple(legal_ids)
 
     def _emit_blank(
         self,
@@ -1001,24 +1059,16 @@ class SnapshotRenderer:
         result: RenderedSnapshot,
         kind_token: str,
         option_index: int,
+        *,
+        legal_token_ids: tuple[int, ...],
+        group_kind: str,
     ) -> None:
         """Write ``kind_token`` to ``buf`` and record a ``BlankAnchor``.
 
-        Step 2 emits only ``CROSS_BLANK`` priority groups: every priority
-        anchor in the snapshot shares one ``group_id``; the legal vocab at
-        each is the singleton ``<chosen>`` (per the plan's cross-blank
-        softmax). An empty legal set raises ``RenderError`` — we'd never
-        actually hit that here since ``<chosen>`` is always present, but the
-        validation belongs at the emission site so future kinds (target /
-        block / mode / …) can reuse it.
+        An empty legal set raises ``RenderError``; every inline blank must
+        expose at least one legal answer token.
         """
 
-        chosen_id = self._chosen_token_id
-        if chosen_id is None:
-            raise RenderError(
-                "_emit_blank called without a chosen_token_id; use_inline_blanks must be enabled."
-            )
-        legal_token_ids: tuple[int, ...] = (int(chosen_id),)
         if not legal_token_ids:
             raise RenderError(f"blank {kind_token!r} for option {option_index} has empty legal set")
         char_start = sum(len(s) for s in buf)
@@ -1031,7 +1081,7 @@ class SnapshotRenderer:
                 char_start=char_start,
                 char_end=char_end,
                 group_id=self._blank_group_id,
-                group_kind="CROSS_BLANK",
+                group_kind=group_kind,
                 legal_token_ids=legal_token_ids,
                 option_index=option_index,
             )
@@ -1053,8 +1103,19 @@ class SnapshotRenderer:
 
         del actions  # _classify_inline_options already split everything we need
         buf.append("<choices>")
+        chosen_id = self._chosen_token_id
+        if chosen_id is None:
+            raise RenderError("inline pass blanks require chosen_token_id")
+        priority_legal_ids = (int(chosen_id),)
         for opt_idx in self._pass_options:
-            self._emit_blank(buf, result, "<pass>", opt_idx)
+            self._emit_blank(
+                buf,
+                result,
+                "<pass>",
+                opt_idx,
+                legal_token_ids=priority_legal_ids,
+                group_kind="CROSS_BLANK",
+            )
         buf.append("</choices>")
 
 
@@ -1071,6 +1132,8 @@ def render_snapshot(
     max_card_refs: int = MAX_CARD_REFS,
     use_inline_blanks: bool = False,
     chosen_token_id: int | None = None,
+    none_token_id: int | None = None,
+    card_ref_token_ids: Sequence[int] | None = None,
 ) -> RenderedSnapshot:
     """Render ``snapshot`` (and optional ``actions``) to text + anchor metadata.
 
@@ -1092,4 +1155,6 @@ def render_snapshot(
         max_card_refs=max_card_refs,
         use_inline_blanks=use_inline_blanks,
         chosen_token_id=chosen_token_id,
+        none_token_id=none_token_id,
+        card_ref_token_ids=card_ref_token_ids,
     ).render(snapshot, actions)

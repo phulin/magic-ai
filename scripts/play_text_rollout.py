@@ -40,6 +40,13 @@ from magic_ai.text_encoder.tokenizer import load_tokenizer  # noqa: E402
 
 DEFAULT_CACHE = REPO_ROOT / "data" / "text_encoder_card_tokens.pt"
 DEFAULT_DECK = REPO_ROOT / "decks" / "bears.json"
+FALLBACK_DECK = {
+    "name": "bolt-mountain",
+    "cards": [
+        {"name": "Mountain", "count": 24},
+        {"name": "Lightning Bolt", "count": 36},
+    ],
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,14 +84,52 @@ def parse_args() -> argparse.Namespace:
         help="Emit each unique card body once at the top, reference per-zone "
         "occurrences (v2 ``<dict>`` opcode set).",
     )
+    p.add_argument(
+        "--priority-trace-jsonl-path",
+        type=Path,
+        default=None,
+        help=(
+            "optional JSONL path for priority rows; output is suitable for "
+            "scripts/inline_blank_bc_parity.py --trace-jsonl"
+        ),
+    )
     return p.parse_args()
 
 
 def _load_decks(path: Path) -> tuple[dict, dict]:
+    if not path.exists() and path == DEFAULT_DECK:
+        return dict(FALLBACK_DECK), dict(FALLBACK_DECK)
     payload = json.loads(path.read_text())
     if "player_a" in payload or "player_b" in payload:
         return payload.get("player_a", payload), payload.get("player_b", payload)
     return payload, payload
+
+
+def _append_priority_trace_jsonl(path: Path | None, episode, *, episode_idx: int) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for action_idx, step in enumerate(episode.steps):
+            snapshot = dict(step.snapshot)
+            snapshot["pending"] = {
+                "kind": "priority",
+                "player_idx": int(step.perspective_player_idx),
+                "options": step.legal_options,
+            }
+            handle.write(
+                json.dumps(
+                    {
+                        "episode_idx": int(episode_idx),
+                        "action_idx": int(action_idx),
+                        "winner_idx": episode.winner_player_idx,
+                        "snapshot": snapshot,
+                        "selected_option_index": int(step.chosen_option_idx),
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
 
 
 def main() -> int:
@@ -119,6 +164,9 @@ def main() -> int:
 
     deck_a, deck_b = _load_decks(args.decks)
     base_seed = int(args.seed)
+    if args.priority_trace_jsonl_path is not None:
+        args.priority_trace_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        args.priority_trace_jsonl_path.write_text("", encoding="utf-8")
 
     worker = TextRolloutWorker(
         policy=policy,
@@ -145,6 +193,11 @@ def main() -> int:
         }
         t0 = time.perf_counter()
         episode = worker.play_episode(cfg_dict, max_turns=int(args.max_turns))
+        _append_priority_trace_jsonl(
+            args.priority_trace_jsonl_path,
+            episode,
+            episode_idx=ep_i,
+        )
         dt = time.perf_counter() - t0
         total_steps += len(episode.steps)
         total_wall += dt

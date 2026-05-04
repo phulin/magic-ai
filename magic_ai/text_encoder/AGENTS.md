@@ -14,7 +14,7 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 - `native_token_tables.py` — Serialize TokenTables, including inline-blank singletons, into flat buffers and register with Go-side mage lib.
 - `policy.py` — Self-contained text-encoder policy facade; exports encode_snapshots and legacy/inline-blank forward outputs.
 - `recurrent.py` — LSTM history adapter wrapping TextPolicy; carries recurrence through encoder state vector.
-- `render.py` — Deterministic GameStateSnapshot → text renderer; produces custom-token-laced strings and anchor metadata, with flag-gated inline-blank priority mode (Step 2 of inline-blanks plan).
+- `render.py` — Deterministic GameStateSnapshot → text renderer; produces custom-token-laced strings and anchor metadata, with flag-gated inline-blank priority/blocker modes.
 - `render_plan.py` — Opcode definitions, writer, and Python emitter for render-plan ABI.
 - `replay_buffer.py` — Frozen dataclass storing encoded snapshots plus policy/value/trace metadata for training.
 - `replay_triton.py` — Optional CUDA/Triton kernels for packed replay-buffer batch append writes, gather packing, and position rebasing.

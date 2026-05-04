@@ -15,10 +15,16 @@ from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
     RecurrentTextPolicyConfig,
 )
-from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
+from magic_ai.text_encoder.render_plan import (
+    BLANK_GROUP_CONSTRAINED,
+    BLANK_GROUP_CROSS_BLANK,
+    BLANK_GROUP_PER_BLANK,
+)
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from magic_ai.text_encoder.training import (
     TextEncoderTrainer,
+    inline_blank_per_blank_accuracy,
+    inline_blank_per_blank_loss,
     inline_blank_priority_accuracy,
     inline_blank_priority_loss,
     policy_distillation_loss,
@@ -173,6 +179,68 @@ def test_inline_blank_priority_accuracy_counts_valid_rows_only() -> None:
     target = torch.tensor([1, 1, -1])
 
     stats = inline_blank_priority_accuracy(logits, group, group_kind, legal_mask, target)
+
+    assert stats == {"accuracy": 0.5, "correct": 1, "total": 2}
+
+
+def test_inline_blank_per_blank_loss_for_constrained_block_choices() -> None:
+    logits = torch.tensor([[[0.0, 5.0, -1.0], [4.0, 0.0, -2.0]]], requires_grad=True)
+    group_kind = torch.full((1, 2), BLANK_GROUP_CONSTRAINED, dtype=torch.int64)
+    legal_mask = torch.tensor([[[True, True, True], [True, True, False]]])
+    target = torch.tensor([[1, 0]])
+
+    loss = inline_blank_per_blank_loss(logits, group_kind, legal_mask, target)
+    loss.backward()
+
+    assert loss.item() < 0.03
+    assert logits.grad is not None
+    assert logits.grad[0, 0].abs().sum().item() > 0.0
+    assert logits.grad[0, 1, :2].abs().sum().item() > 0.0
+    assert logits.grad[0, 1, 2].item() == 0.0
+
+
+def test_inline_blank_per_blank_ignores_cross_and_invalid_targets() -> None:
+    logits = torch.tensor(
+        [
+            [[100.0, -100.0], [0.0, 3.0], [9.0, 0.0]],
+            [[1.0, 2.0], [5.0, 0.0], [7.0, 8.0]],
+        ],
+        requires_grad=True,
+    )
+    group_kind = torch.tensor(
+        [
+            [BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK, BLANK_GROUP_CONSTRAINED],
+            [BLANK_GROUP_CONSTRAINED, BLANK_GROUP_CONSTRAINED, BLANK_GROUP_CONSTRAINED],
+        ]
+    )
+    legal_mask = torch.tensor(
+        [
+            [[True, True], [True, True], [True, False]],
+            [[True, True], [True, False], [False, False]],
+        ]
+    )
+    target = torch.tensor([[0, 1, 1], [-1, 1, 0]])
+
+    loss = inline_blank_per_blank_loss(logits, group_kind, legal_mask, target)
+    loss.backward()
+
+    assert loss.item() < 0.05
+    assert logits.grad is not None
+    assert logits.grad[0, 0].abs().sum().item() == 0.0
+    assert logits.grad[0, 1].abs().sum().item() > 0.0
+    assert logits.grad[0, 2].abs().sum().item() == 0.0
+    assert logits.grad[1].abs().sum().item() == 0.0
+
+
+def test_inline_blank_per_blank_accuracy_counts_valid_slots_only() -> None:
+    logits = torch.tensor([[[0.0, 3.0], [4.0, 0.0], [7.0, 8.0]]])
+    group_kind = torch.tensor(
+        [[BLANK_GROUP_CONSTRAINED, BLANK_GROUP_PER_BLANK, BLANK_GROUP_CROSS_BLANK]]
+    )
+    legal_mask = torch.ones((1, 3, 2), dtype=torch.bool)
+    target = torch.tensor([[1, 1, 1]])
+
+    stats = inline_blank_per_blank_accuracy(logits, group_kind, legal_mask, target)
 
     assert stats == {"accuracy": 0.5, "correct": 1, "total": 2}
 

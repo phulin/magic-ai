@@ -171,6 +171,42 @@ def _snapshot_simple(names: list[str]) -> GameStateSnapshot:
     return cast(GameStateSnapshot, snap)
 
 
+def _snapshot_with_blockers(names: list[str]) -> GameStateSnapshot:
+    blocker_name, attacker_name = names[0], names[1]
+    blocker = _card("blocker-1", blocker_name, tapped=False)
+    attacker = _card("attacker-1", attacker_name, tapped=True)
+    snap: dict[str, object] = {
+        "turn": 4,
+        "active_player": "p2",
+        "step": "Declare Blockers",
+        "players": [
+            _player("p1", "Self", battlefield=[blocker]),
+            _player("p2", "Opp", battlefield=[attacker]),
+        ],
+        "pending": cast(
+            PendingState,
+            {
+                "kind": "blockers",
+                "player_idx": 0,
+                "options": [
+                    cast(
+                        PendingOptionState,
+                        {
+                            "id": "block-opt",
+                            "kind": "block",
+                            "permanent_id": blocker["ID"],
+                            "valid_targets": [
+                                cast(TargetState, {"id": attacker["ID"], "label": attacker_name})
+                            ],
+                        },
+                    )
+                ],
+            },
+        ),
+    }
+    return cast(GameStateSnapshot, snap)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end smoke
 # ---------------------------------------------------------------------------
@@ -270,6 +306,32 @@ def test_text_policy_inline_blank_forward(
     assert (out.blank_logits[~batch.blank_legal_mask] == float("-inf")).all()
     assert out.blank_group is batch.blank_group
     assert out.blank_group_kind is batch.blank_group_kind
+
+
+def test_text_policy_inline_block_blank_forward(
+    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
+) -> None:
+    cfg = _small_cfg(tokenizer)
+    cfg.use_inline_blanks = True
+    policy = build_text_policy(tokenizer, cfg)
+    batch = TextPolicy.encode_snapshots(
+        [_snapshot_with_blockers(real_card_names)],
+        actions_per_snapshot=None,
+        oracle=oracle,
+        tokenizer=tokenizer,
+        use_inline_blanks=True,
+    )
+
+    assert batch.blank_positions.shape == (1, 1)
+    assert batch.blank_legal_ids.shape == (1, 1, 2)
+    none_id = tokenizer.convert_tokens_to_ids("<none>")
+    assert int(batch.blank_legal_ids[0, 0, 0]) == int(none_id)
+
+    out = policy(batch)
+
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
 
 
 def test_text_policy_backward(

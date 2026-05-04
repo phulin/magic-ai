@@ -545,6 +545,8 @@ def test_saga() -> None:
 # ---------------------------------------------------------------------------
 
 CHOSEN_FAKE_ID = 99999
+NONE_FAKE_ID = 99998
+CARD_REF_FAKE_IDS = tuple(88000 + k for k in range(MAX_CARD_REFS))
 
 
 def _priority_snapshot() -> GameStateSnapshot:
@@ -662,6 +664,70 @@ def test_inline_blanks_pass_only_snapshot(oracle: dict[str, OracleEntry]) -> Non
     assert anchor.group_id == 0
     assert anchor.group_kind == "CROSS_BLANK"
     assert anchor.legal_token_ids == (CHOSEN_FAKE_ID,)
+
+
+def test_inline_blanks_blockers_emit_constrained_block_blanks(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    blocker = _card("blocker-1", "Grizzly Bears", tapped=False)
+    attacker = _card("attacker-1", "Serra Angel", tapped=True)
+    snap = cast(
+        GameStateSnapshot,
+        {
+            "turn": 4,
+            "active_player": "p2",
+            "step": "Declare Blockers",
+            "players": [
+                _player("p1", "Self", battlefield=[blocker]),
+                _player("p2", "Opp", battlefield=[attacker]),
+            ],
+            "pending": cast(
+                PendingState,
+                {
+                    "kind": "blockers",
+                    "player_idx": 0,
+                    "options": [
+                        cast(
+                            PendingOptionState,
+                            {
+                                "id": "block-opt",
+                                "kind": "block",
+                                "permanent_id": blocker["ID"],
+                                "valid_targets": [
+                                    cast(
+                                        TargetState,
+                                        {"id": attacker["ID"], "label": "Serra Angel"},
+                                    )
+                                ],
+                            },
+                        )
+                    ],
+                },
+            ),
+        },
+    )
+
+    rendered = render_snapshot(
+        snap,
+        oracle=oracle,
+        use_inline_blanks=True,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        none_token_id=NONE_FAKE_ID,
+        card_ref_token_ids=CARD_REF_FAKE_IDS,
+    )
+
+    assert "<actions>" not in rendered.text
+    self_bf_segment = rendered.text.split("<self><battlefield>", 1)[1].split(
+        "</battlefield></self>", 1
+    )[0]
+    assert "<choose-block>" in self_bf_segment
+    [anchor] = rendered.blank_anchors
+    attacker_ref = rendered.card_refs[attacker["ID"]]
+    assert anchor.kind == "<choose-block>"
+    assert anchor.group_id == 0
+    assert anchor.group_kind == "CONSTRAINED"
+    assert anchor.legal_token_ids == (NONE_FAKE_ID, CARD_REF_FAKE_IDS[attacker_ref])
+    assert anchor.option_index == 0
 
 
 def test_inline_blanks_ordinal_parity_under_option_permutation(
