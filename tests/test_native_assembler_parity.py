@@ -303,7 +303,6 @@ class NativeAssemblerParityTests(unittest.TestCase):
             max_card_refs=self.max_card_refs_native,
             max_blanks=32,
             max_legal_per_blank=4,
-            use_inline_blanks=True,
         )
 
     def _encode_native_packed_reuse(

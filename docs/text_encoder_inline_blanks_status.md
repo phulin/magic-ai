@@ -361,3 +361,6 @@ without treating the accuracy gate as a blocker.
 - `magic_ai/text_encoder/replay_buffer.py`, `scripts/train.py` — text replay
   storage and native rollout staging no longer allocate, copy, gather, or
   rebase legacy option/target position columns.
+- `magic_ai/text_encoder/native_assembler.py` — `MageEncodeTokensPacked`
+  wrapper now always allocates/passes inline blank buffers; the lower-level
+  `use_inline_blanks` switch is removed.

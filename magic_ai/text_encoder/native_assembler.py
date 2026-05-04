@@ -301,7 +301,6 @@ def encode_tokens_packed(
     max_legal_per_blank: int = 64,
     outputs: NativePackedAssemblerOutputs | None = None,
     include_trace_kinds: bool = True,
-    use_inline_blanks: bool = False,
 ) -> tuple[Any, NativePackedAssemblerOutputs]:
     """Run ``MageEncodeTokensPacked`` for a batch of games.
 
@@ -327,10 +326,10 @@ def encode_tokens_packed(
             max_options=max_options,
             max_targets=max_targets,
             max_card_refs=max_card_refs,
-            max_blanks=max_blanks if use_inline_blanks else 0,
-            max_legal_per_blank=max_legal_per_blank if use_inline_blanks else 0,
+            max_blanks=max_blanks,
+            max_legal_per_blank=max_legal_per_blank,
         )
-    elif use_inline_blanks and (
+    elif (
         outputs.blank_positions.shape[1] < max_blanks
         or outputs.blank_legal_ids.shape[2] < max_legal_per_blank
     ):
@@ -389,34 +388,31 @@ def encode_tokens_packed(
         )
     tok_cfg = outputs._tok_cfg_cffi
     packed_out = outputs._packed_out_cffi
-    blank_cfg: Any = ffi.NULL
-    blank_out: Any = ffi.NULL
-    if use_inline_blanks:
-        if outputs._blank_cfg_cffi is None:
-            outputs._blank_cfg_cffi = ffi.new(
-                "MageBlankAssemblerConfig *",
-                {
-                    "max_blanks": max_blanks,
-                    "max_legal_per_blank": max_legal_per_blank,
-                },
-            )
-        if outputs._blank_out_cffi is None:
-            outputs._blank_out_cffi = ffi.new(
-                "MagePackedBlankOutputs *",
-                {
-                    "k_max": max_blanks,
-                    "v_max": max_legal_per_blank,
-                    "blank_positions": ffi.cast("int32_t *", outputs.blank_positions.data_ptr()),
-                    "blank_kind": ffi.cast("int32_t *", outputs.blank_kind.data_ptr()),
-                    "blank_group": ffi.cast("int32_t *", outputs.blank_group.data_ptr()),
-                    "blank_group_kind": ffi.cast("int32_t *", outputs.blank_group_kind.data_ptr()),
-                    "blank_legal_ids": ffi.cast("int32_t *", outputs.blank_legal_ids.data_ptr()),
-                    "blank_legal_mask": ffi.cast("uint8_t *", outputs.blank_legal_mask.data_ptr()),
-                    "blank_overflow": ffi.cast("int32_t *", outputs.blank_overflow.data_ptr()),
-                },
-            )
-        blank_cfg = outputs._blank_cfg_cffi
-        blank_out = outputs._blank_out_cffi
+    if outputs._blank_cfg_cffi is None:
+        outputs._blank_cfg_cffi = ffi.new(
+            "MageBlankAssemblerConfig *",
+            {
+                "max_blanks": max_blanks,
+                "max_legal_per_blank": max_legal_per_blank,
+            },
+        )
+    if outputs._blank_out_cffi is None:
+        outputs._blank_out_cffi = ffi.new(
+            "MagePackedBlankOutputs *",
+            {
+                "k_max": max_blanks,
+                "v_max": max_legal_per_blank,
+                "blank_positions": ffi.cast("int32_t *", outputs.blank_positions.data_ptr()),
+                "blank_kind": ffi.cast("int32_t *", outputs.blank_kind.data_ptr()),
+                "blank_group": ffi.cast("int32_t *", outputs.blank_group.data_ptr()),
+                "blank_group_kind": ffi.cast("int32_t *", outputs.blank_group_kind.data_ptr()),
+                "blank_legal_ids": ffi.cast("int32_t *", outputs.blank_legal_ids.data_ptr()),
+                "blank_legal_mask": ffi.cast("uint8_t *", outputs.blank_legal_mask.data_ptr()),
+                "blank_overflow": ffi.cast("int32_t *", outputs.blank_overflow.data_ptr()),
+            },
+        )
+    blank_cfg: Any = outputs._blank_cfg_cffi
+    blank_out: Any = outputs._blank_out_cffi
 
     buffers = scratch.buffers
     assert buffers is not None
@@ -456,28 +452,25 @@ def encode_tokens_packed(
                     )
                 tok_cfg_c = outputs._tok_cfg_ctypes
                 packed_out_c = outputs._packed_out_ctypes
-                blank_cfg_c: _MageBlankAssemblerConfigC | None = None
-                blank_out_c: _MagePackedBlankOutputsC | None = None
-                if use_inline_blanks:
-                    if outputs._blank_cfg_ctypes is None:
-                        outputs._blank_cfg_ctypes = _MageBlankAssemblerConfigC(
-                            max_blanks=max_blanks,
-                            max_legal_per_blank=max_legal_per_blank,
-                        )
-                    if outputs._blank_out_ctypes is None:
-                        outputs._blank_out_ctypes = _MagePackedBlankOutputsC(
-                            k_max=max_blanks,
-                            v_max=max_legal_per_blank,
-                            blank_positions=_tensor_ptr(outputs.blank_positions, ctypes.c_int32),
-                            blank_kind=_tensor_ptr(outputs.blank_kind, ctypes.c_int32),
-                            blank_group=_tensor_ptr(outputs.blank_group, ctypes.c_int32),
-                            blank_group_kind=_tensor_ptr(outputs.blank_group_kind, ctypes.c_int32),
-                            blank_legal_ids=_tensor_ptr(outputs.blank_legal_ids, ctypes.c_int32),
-                            blank_legal_mask=_tensor_ptr(outputs.blank_legal_mask, ctypes.c_uint8),
-                            blank_overflow=_tensor_ptr(outputs.blank_overflow, ctypes.c_int32),
-                        )
-                    blank_cfg_c = outputs._blank_cfg_ctypes
-                    blank_out_c = outputs._blank_out_ctypes
+                if outputs._blank_cfg_ctypes is None:
+                    outputs._blank_cfg_ctypes = _MageBlankAssemblerConfigC(
+                        max_blanks=max_blanks,
+                        max_legal_per_blank=max_legal_per_blank,
+                    )
+                if outputs._blank_out_ctypes is None:
+                    outputs._blank_out_ctypes = _MagePackedBlankOutputsC(
+                        k_max=max_blanks,
+                        v_max=max_legal_per_blank,
+                        blank_positions=_tensor_ptr(outputs.blank_positions, ctypes.c_int32),
+                        blank_kind=_tensor_ptr(outputs.blank_kind, ctypes.c_int32),
+                        blank_group=_tensor_ptr(outputs.blank_group, ctypes.c_int32),
+                        blank_group_kind=_tensor_ptr(outputs.blank_group_kind, ctypes.c_int32),
+                        blank_legal_ids=_tensor_ptr(outputs.blank_legal_ids, ctypes.c_int32),
+                        blank_legal_mask=_tensor_ptr(outputs.blank_legal_mask, ctypes.c_uint8),
+                        blank_overflow=_tensor_ptr(outputs.blank_overflow, ctypes.c_int32),
+                    )
+                blank_cfg_c = outputs._blank_cfg_ctypes
+                blank_out_c = outputs._blank_out_ctypes
                 assert tok_cfg_c is not None and packed_out_c is not None
                 result = ctypes_lib.MageEncodeTokensPacked(
                     ctypes.byref(req_c),
