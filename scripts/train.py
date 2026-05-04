@@ -4592,9 +4592,18 @@ def train_text_native_batched_envs(
                         finally:
                             server.resume()
         finally:
+            # Stop the inference server first so any actor blocked in
+            # ``future.result()`` wakes immediately (queued futures are
+            # rejected). Then signal all actors in parallel before joining,
+            # so a Ctrl-C shutdown isn't serialized across N actors.
+            try:
+                server.stop()
+            except Exception:
+                pass
             for actor in actors:
-                actor.stop()
-            server.stop()
+                actor.signal_stop()
+            for actor in actors:
+                actor.join(timeout=1.0)
 
     if int(getattr(args, "num_rollout_actors", 1)) > 1:
         run_text_rollouts_actor_loop()  # nested below; uses surrounding closures

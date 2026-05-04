@@ -216,7 +216,11 @@ class TextInferenceServer:
             self._paused = False
             self._cond.notify_all()
         self._queue.put(None)
-        self._thread.join(timeout=10.0)
+        # Reject any queued requests so actors blocked in ``future.result()``
+        # wake up immediately instead of waiting for the server thread to
+        # drain. The server thread itself returns on the None sentinel.
+        self._fail_pending(RuntimeError("inference server is stopping"))
+        self._thread.join(timeout=2.0)
         if self._exc is not None:
             raise self._exc
 

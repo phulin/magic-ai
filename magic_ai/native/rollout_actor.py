@@ -119,15 +119,27 @@ class TextRolloutActor:
         )
         self._thread.start()
 
-    def stop(self) -> None:
+    def signal_stop(self) -> None:
+        """Set the stop flag and wake the actor without waiting for it.
+
+        Lets a caller signal every actor in parallel before joining any of
+        them, so a Ctrl-C shutdown isn't serialized across N × join-timeout.
+        """
+
         self._stop_event.set()
         # Unblock the actor if it's waiting on a refill.
         try:
             self.refill_response_queue.put_nowait(RefillResponse(games=[], no_more_episodes=True))
         except Exception:
             pass
+
+    def join(self, timeout: float = 1.0) -> None:
         if self._thread is not None:
-            self._thread.join(timeout=10.0)
+            self._thread.join(timeout=timeout)
+
+    def stop(self) -> None:
+        self.signal_stop()
+        self.join(timeout=1.0)
 
     # --------------------------------------------------------------- internal
 
