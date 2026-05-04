@@ -2239,7 +2239,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.05,
         help="fraction of games to hold out for evaluation (deterministic via "
-        "hash(game_id) % bucket); 0 disables the eval split",
+        "hash(game_id) %% bucket); 0 disables the eval split",
     )
     parser.add_argument(
         "--pretrain-value-amp",
