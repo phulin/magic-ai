@@ -949,9 +949,11 @@ class SnapshotRenderer:
         Every option is one of:
 
         - ``play`` / ``cast`` of a hand card → ``<choose-play>`` blank
-          adjacent to the hand-card render position.
+          adjacent to the hand-card render position; targeted cast options
+          also get a following ``<choose-target>`` blank.
         - ``activate`` of an ability → ``<use-ability>`` blank adjacent to
-          the source permanent on the battlefield.
+          the source permanent on the battlefield; targeted abilities also
+          get a following ``<choose-target>`` blank.
         - ``pass`` → buffered for emission in the trailing ``<choices>``
           block.
 
@@ -979,6 +981,7 @@ class SnapshotRenderer:
                 # Stable key: (ability_index_or_-1, option-id-string, opt_idx).
                 ability_idx = option.get("ability_index")
                 key: tuple[object, ...] = (
+                    0,
                     "<choose-play>",
                     -1 if ability_idx is None else int(ability_idx),
                     str(option.get("id") or ""),
@@ -987,6 +990,7 @@ class SnapshotRenderer:
                 per_card.setdefault(source, []).append(
                     ("<choose-play>", opt_idx, priority_legal_ids, "CROSS_BLANK", key)
                 )
+                self._append_target_blank_option(per_card, source, opt_idx, option, card_refs)
             elif kind in ("activate", "activate_ability", "activated_ability"):
                 source = option.get("permanent_id") or option.get("card_id") or ""
                 if not source:
@@ -996,6 +1000,7 @@ class SnapshotRenderer:
                     )
                 ability_idx = option.get("ability_index")
                 key = (
+                    0,
                     "<use-ability>",
                     -1 if ability_idx is None else int(ability_idx),
                     str(option.get("id") or ""),
@@ -1004,6 +1009,7 @@ class SnapshotRenderer:
                 per_card.setdefault(source, []).append(
                     ("<use-ability>", opt_idx, priority_legal_ids, "CROSS_BLANK", key)
                 )
+                self._append_target_blank_option(per_card, source, opt_idx, option, card_refs)
             elif kind == "block":
                 source = option.get("permanent_id") or option.get("card_id") or ""
                 if not source:
@@ -1012,7 +1018,7 @@ class SnapshotRenderer:
                         "cannot anchor inline blank."
                     )
                 legal_ids = self._block_legal_token_ids(option, card_refs)
-                key = ("<choose-block>", str(option.get("id") or ""), opt_idx)
+                key = (0, "<choose-block>", str(option.get("id") or ""), opt_idx)
                 per_card.setdefault(source, []).append(
                     ("<choose-block>", opt_idx, legal_ids, "CONSTRAINED", key)
                 )
@@ -1032,6 +1038,22 @@ class SnapshotRenderer:
         self._blank_options_by_card = per_card
         self._pass_options = pass_options
 
+    def _append_target_blank_option(
+        self,
+        per_card: dict[str, list[tuple[str, int, tuple[int, ...], str, tuple[object, ...]]]],
+        source: str,
+        opt_idx: int,
+        option: PendingOptionState,
+        card_refs: dict[str, int],
+    ) -> None:
+        legal_ids = self._target_legal_token_ids(option, card_refs)
+        if not legal_ids:
+            return
+        key = (1, "<choose-target>", str(option.get("id") or ""), opt_idx)
+        per_card.setdefault(source, []).append(
+            ("<choose-target>", opt_idx, legal_ids, "PER_BLANK", key)
+        )
+
     def _block_legal_token_ids(
         self,
         option: PendingOptionState,
@@ -1050,6 +1072,22 @@ class SnapshotRenderer:
                 raise RenderError(
                     f"block target card-ref:{ref} has no token id in card_ref_token_ids"
                 )
+            legal_ids.append(int(self._card_ref_token_ids[ref]))
+        return tuple(legal_ids)
+
+    def _target_legal_token_ids(
+        self,
+        option: PendingOptionState,
+        card_refs: dict[str, int],
+    ) -> tuple[int, ...]:
+        legal_ids: list[int] = []
+        for target in option.get("valid_targets") or []:
+            tid = target.get("id", "")
+            ref = card_refs.get(tid)
+            if ref is None:
+                continue
+            if not 0 <= ref < len(self._card_ref_token_ids):
+                raise RenderError(f"target card-ref:{ref} has no token id in card_ref_token_ids")
             legal_ids.append(int(self._card_ref_token_ids[ref]))
         return tuple(legal_ids)
 

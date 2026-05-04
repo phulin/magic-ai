@@ -639,6 +639,53 @@ def test_inline_blanks_emits_anchors_and_choices_block(
     assert {a.option_index for a in rendered.blank_anchors} == {0, 1, 2}
 
 
+def test_inline_blanks_targeted_priority_option_emits_target_blank(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = _basic_snapshot()
+    bolt_id = snap["players"][0]["Hand"][0]["ID"]
+    target_id = snap["players"][1]["Battlefield"][0]["ID"]
+    pending = cast(
+        PendingState,
+        {
+            "kind": "priority",
+            "player_idx": 0,
+            "options": [
+                cast(
+                    PendingOptionState,
+                    {
+                        "id": "bolt-target",
+                        "kind": "cast",
+                        "card_id": bolt_id,
+                        "card_name": "Lightning Bolt",
+                        "valid_targets": [
+                            cast(TargetState, {"id": target_id, "label": "Serra Angel"})
+                        ],
+                    },
+                )
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        use_inline_blanks=True,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        card_ref_token_ids=CARD_REF_FAKE_IDS,
+    )
+
+    hand_segment = rendered.text.split("<hand>", 1)[1].split("</hand>", 1)[0]
+    assert "<choose-play><choose-target>" in hand_segment
+    assert [a.kind for a in rendered.blank_anchors] == ["<choose-play>", "<choose-target>"]
+    priority_anchor, target_anchor = rendered.blank_anchors
+    target_ref = rendered.card_refs[target_id]
+    assert priority_anchor.group_kind == "CROSS_BLANK"
+    assert priority_anchor.legal_token_ids == (CHOSEN_FAKE_ID,)
+    assert target_anchor.group_kind == "PER_BLANK"
+    assert target_anchor.legal_token_ids == (CARD_REF_FAKE_IDS[target_ref],)
+    assert target_anchor.option_index == 0
+
+
 def test_inline_blanks_pass_only_snapshot(oracle: dict[str, OracleEntry]) -> None:
     snap = _basic_snapshot()
     pending = cast(
