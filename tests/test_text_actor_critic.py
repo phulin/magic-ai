@@ -10,13 +10,18 @@ from magic_ai.text_encoder.actor_critic import (
     TextDecisionLayout,
     _evaluate_inline_blocker_replay_groups,
     _sample_inline_blockers_for_step,
+    _sample_inline_priority_for_step,
     build_text_decision_layout,
     infer_text_trace_kind,
 )
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig, RecurrentTextPolicyOutput
-from magic_ai.text_encoder.render_plan import BLANK_GROUP_CONSTRAINED
+from magic_ai.text_encoder.render_plan import (
+    BLANK_GROUP_CONSTRAINED,
+    BLANK_GROUP_CROSS_BLANK,
+    BLANK_GROUP_PER_BLANK,
+)
 from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -243,6 +248,59 @@ class TextActorCriticTests(unittest.TestCase):
         assert sampled is not None
         selected, log_prob, entropy = sampled
         self.assertEqual([int(t.item()) for t in selected], [0, 1])
+        self.assertTrue(torch.isfinite(log_prob))
+        self.assertTrue(torch.isfinite(entropy))
+
+    def test_inline_priority_sampler_maps_target_blank_to_candidate_column(self) -> None:
+        output = RecurrentTextPolicyOutput(
+            policy_logits=torch.empty(1, 0),
+            target_logits=torch.empty(1, 0, 0),
+            values=torch.zeros(1),
+            state_hidden=torch.zeros(1, 8),
+            option_vectors=torch.empty(1, 0, 8),
+            option_mask=torch.zeros(1, 0, dtype=torch.bool),
+            target_vectors=torch.empty(1, 0, 0, 8),
+            target_mask=torch.zeros(1, 0, 0, dtype=torch.bool),
+            card_vectors=torch.empty(1, MAX_CARD_REFS, 8),
+            card_mask=torch.zeros(1, MAX_CARD_REFS, dtype=torch.bool),
+            blank_logits=torch.tensor([[[5.0, 0.0], [0.0, 4.0], [0.0, 1.0]]]),
+        )
+        batch = TextEncodedBatch(
+            token_ids=torch.tensor([[1, 2, 3]]),
+            attention_mask=torch.ones(1, 3, dtype=torch.long),
+            card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
+            option_positions=torch.empty(1, 0, dtype=torch.long),
+            option_mask=torch.zeros(1, 0, dtype=torch.bool),
+            target_positions=torch.empty(1, 0, 0, dtype=torch.long),
+            target_mask=torch.zeros(1, 0, 0, dtype=torch.bool),
+            seq_lengths=torch.tensor([3]),
+            blank_group_kind=torch.tensor(
+                [[BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK, BLANK_GROUP_CROSS_BLANK]],
+                dtype=torch.int32,
+            ),
+            blank_option_index=torch.tensor([[0, 0, 1]], dtype=torch.int32),
+            blank_legal_mask=torch.tensor([[[True, False], [True, True], [True, False]]]),
+        )
+        layout = TextDecisionLayout(
+            trace_kind="priority",
+            decision_option_idx=torch.tensor([[0, 0, 1]]),
+            decision_target_idx=torch.tensor([[0, 1, -1]]),
+            decision_mask=torch.ones(1, 3, dtype=torch.bool),
+            uses_none_head=torch.zeros(1, dtype=torch.bool),
+            pending=cast(PendingState, {"kind": "priority", "player_idx": 0, "options": []}),
+        )
+
+        sampled = _sample_inline_priority_for_step(
+            output,
+            batch,
+            layout,
+            step_idx=0,
+            deterministic=True,
+        )
+
+        assert sampled is not None
+        selected, log_prob, entropy = sampled
+        self.assertEqual([int(t.item()) for t in selected], [1])
         self.assertTrue(torch.isfinite(log_prob))
         self.assertTrue(torch.isfinite(entropy))
 

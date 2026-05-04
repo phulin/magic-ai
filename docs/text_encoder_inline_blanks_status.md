@@ -23,7 +23,7 @@ the eight-step migration. Update at every step boundary.
 | 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired behind `TextEncoderConfig.use_inline_blanks`. |
 | 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ✅ done       | `<choose-block>` render/batch/model path, live sampler/action adapter, replay storage, and replay scoring landed. |
-| 7 | Targets / modes / mays / X / mana sources  | 🚧 target renderer | Targeted priority cast/activate options can emit `<choose-target>` blanks for visible card-ref targets. |
+| 7 | Targets / modes / mays / X / mana sources  | 🚧 target sampler | Targeted priority cast/activate options render `<choose-target>` blanks and live priority sampling can consume them. |
 | 8 | Delete legacy option/target heads          | ⏳ blocked-by 7 |  |
 
 ## What landed in each completed step
@@ -207,8 +207,8 @@ without treating the accuracy gate as a blocker.
 
 ## Next steps
 
-1. **Step 7** — wire target blanks into live/replay sampling, then continue
-   with modes/mays/X-cost/mana sources.
+1. **Step 7** — wire target blanks into replay scoring, then continue with
+   modes/mays/X-cost/mana sources.
 2. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
    `target_*` batch fields, the legacy renderer branch, and the
    `use_inline_blanks` flag. Bump replay-buffer on-disk version.
@@ -222,3 +222,13 @@ without treating the accuracy gate as a blocker.
   via `option_index`, and scores against the target card-ref token ids.
 - `tests/test_text_render.py` — coverage for render placement, ordering after
   `<choose-play>`, legal token ids, group kind, and option provenance.
+
+### Step 7 — Target live-sampler slice (`/home/user/magic-ai-inline-blanks`)
+
+- `magic_ai/text_encoder/actor_critic.py` — live priority sampling now uses
+  inline `CROSS_BLANK` priority anchors when present and, for targeted
+  options, samples the matching `PER_BLANK` `<choose-target>` blank before
+  mapping the `(option, target)` pair back to the existing priority-candidate
+  selected column.
+- `tests/test_text_actor_critic.py` — coverage for deterministic target-blank
+  sampling and candidate-column reconstruction.

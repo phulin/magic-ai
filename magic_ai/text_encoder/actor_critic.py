@@ -51,7 +51,11 @@ from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicyConfig,
     RecurrentTextPolicyOutput,
 )
-from magic_ai.text_encoder.render_plan import BLANK_GROUP_CONSTRAINED
+from magic_ai.text_encoder.render_plan import (
+    BLANK_GROUP_CONSTRAINED,
+    BLANK_GROUP_CROSS_BLANK,
+    BLANK_GROUP_PER_BLANK,
+)
 from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 
 
@@ -314,6 +318,27 @@ class TextActorCritic(nn.Module):
                 inline_batch = (
                     moved_packed if moved_packed is not None else cast(TextEncodedBatch, moved)
                 )
+                inline_priority_sample = (
+                    _sample_inline_priority_for_step(
+                        output,
+                        inline_batch,
+                        layout,
+                        step_idx=step_idx,
+                        deterministic=deterministic,
+                    )
+                    if trace_kind == "priority"
+                    else None
+                )
+                if inline_priority_sample is not None:
+                    selected_tensors, log_prob, entropy = inline_priority_sample
+                    per_step_log_prob.append(log_prob)
+                    per_step_entropy.append(entropy)
+                    per_step_value.append(value)
+                    per_step_may_sample.append(may_sample_t)
+                    per_step_trace_kind.append(trace_kind)
+                    per_step_layout.append(layout)
+                    per_step_selected_tensors.append(selected_tensors)
+                    continue
                 inline_block_sample = (
                     _sample_inline_blockers_for_step(
                         output,
@@ -1657,6 +1682,85 @@ def _visible_decision_mask(
     col0 = torch.arange(option_idx.shape[1], device=option_idx.device).eq(0)
     visible = visible | (uses_none[:, None] & col0[None, :])
     return decision_mask & visible
+
+
+def _sample_inline_priority_for_step(
+    output: RecurrentTextPolicyOutput,
+    batch: TextEncodedBatch | PackedTextBatch,
+    layout: TextDecisionLayout,
+    *,
+    step_idx: int,
+    deterministic: bool,
+) -> tuple[list[Tensor], Tensor, Tensor] | None:
+    blank_logits = output.blank_logits
+    if blank_logits is None or blank_logits.numel() == 0:
+        return None
+    if batch.blank_option_index.numel() == 0:
+        return None
+    if layout.decision_option_idx.shape[0] != 1:
+        return None
+
+    row_group_kind = batch.blank_group_kind[step_idx].to(device=blank_logits.device)
+    row_option_index = batch.blank_option_index[step_idx].to(device=blank_logits.device)
+    row_legal_mask = batch.blank_legal_mask[step_idx].to(
+        device=blank_logits.device, dtype=torch.bool
+    )
+    row_logits = blank_logits[step_idx]
+
+    priority_support = (
+        (row_group_kind == BLANK_GROUP_CROSS_BLANK)
+        & (row_option_index >= 0)
+        & row_legal_mask[..., 0]
+    )
+    priority_blanks = priority_support.nonzero(as_tuple=False).squeeze(-1)
+    if priority_blanks.numel() == 0:
+        return None
+
+    priority_logits = row_logits[priority_blanks, 0]
+    priority_dist = Categorical(logits=priority_logits)
+    chosen_priority = torch.argmax(priority_logits) if deterministic else priority_dist.sample()
+    chosen_blank = priority_blanks[chosen_priority]
+    chosen_option_idx = row_option_index[chosen_blank]
+    log_prob = priority_dist.log_prob(chosen_priority)
+    entropy = priority_dist.entropy()
+
+    option_row = layout.decision_option_idx[0].to(device=blank_logits.device)
+    target_row = layout.decision_target_idx[0].to(device=blank_logits.device)
+    mask_row = layout.decision_mask[0].to(device=blank_logits.device, dtype=torch.bool)
+    candidate_mask = mask_row & (option_row == chosen_option_idx)
+    if not bool(candidate_mask.any().item()):
+        return None
+
+    target_required = target_row >= 0
+    target_candidate_mask = candidate_mask & target_required
+    if not bool(target_candidate_mask.any().item()):
+        cols = candidate_mask.nonzero(as_tuple=False).squeeze(-1)
+        return [cols[0].to(dtype=torch.long)], log_prob, entropy
+
+    target_support = (
+        (row_group_kind == BLANK_GROUP_PER_BLANK)
+        & (row_option_index == chosen_option_idx)
+        & row_legal_mask.any(dim=-1)
+    )
+    target_blanks = target_support.nonzero(as_tuple=False).squeeze(-1)
+    if target_blanks.numel() != 1:
+        return None
+    target_blank = target_blanks[0]
+    legal_slots = row_legal_mask[target_blank].nonzero(as_tuple=False).squeeze(-1)
+    if legal_slots.numel() == 0:
+        return None
+    target_logits = row_logits[target_blank, legal_slots]
+    target_dist = Categorical(logits=target_logits)
+    chosen_in_legal = torch.argmax(target_logits) if deterministic else target_dist.sample()
+    chosen_legal_slot = legal_slots[chosen_in_legal]
+    log_prob = log_prob + target_dist.log_prob(chosen_in_legal)
+    entropy = entropy + target_dist.entropy()
+
+    chosen_col_mask = target_candidate_mask & (target_row == chosen_legal_slot)
+    chosen_cols = chosen_col_mask.nonzero(as_tuple=False).squeeze(-1)
+    if chosen_cols.numel() != 1:
+        return None
+    return [chosen_cols[0].to(dtype=torch.long)], log_prob, entropy
 
 
 def _sample_inline_blockers_for_step(
