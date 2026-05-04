@@ -129,6 +129,11 @@ from magic_ai.text_encoder.tokenizer import (  # noqa: E402
     TOKENIZER_DIR,
     load_tokenizer,
 )
+from magic_ai.text_encoder.value_pretrain import (  # noqa: E402
+    ValueLabeledBinDataset,
+    ValuePretrainConfig,
+    ValuePretrainTrainer,
+)
 
 DEFAULT_DECK = {
     "name": "bolt-mountain",
@@ -1037,6 +1042,10 @@ def _is_post_mlm_checkpoint(checkpoint: dict[str, Any] | None) -> bool:
     return bool(_checkpoint_metadata(checkpoint).get("post_mlm", False))
 
 
+def _is_post_value_checkpoint(checkpoint: dict[str, Any] | None) -> bool:
+    return bool(_checkpoint_metadata(checkpoint).get("post_value", False))
+
+
 def _checkpoint_wandb_run_id(checkpoint: dict[str, Any] | None) -> str | None:
     run_id = _checkpoint_metadata(checkpoint).get("wandb_run_id")
     return str(run_id) if isinstance(run_id, str) and run_id else None
@@ -1518,6 +1527,144 @@ def run_mlm_pretrain(
     print(f"[mlm] finished epochs={args.pretrain_mlm_epochs} steps={global_step}")
 
 
+def run_value_pretrain(
+    args: argparse.Namespace,
+    text_backend: TextTrainingBackend,
+    device: torch.device,
+) -> None:
+    """Pretrain the encoder + value head against terminal win/loss outcomes.
+
+    Stage 3a of ``docs/text_encoder_value_pretrain_plan.md``. Reads paired
+    ``*.bin`` (uint16 token spans, ``<bos>``-delimited) + ``*.json``
+    (perspective-signed labels per span) from ``args.pretrain_value_dir``,
+    runs the encoder forward over each span and minimises MSE between
+    ``value_head(hidden[:, 0, :])`` and the label. The encoder + value head
+    parameters trained here are the same ``nn.Module`` instances used in
+    RL, so a checkpoint slots straight into a ``--checkpoint``-resumed RL
+    run with the same ``--text-*`` hyperparameters.
+    """
+
+    tokenizer = text_backend.tokenizer
+    text_policy = text_backend.policy.policy.text_policy
+    encoder = text_policy.encoder
+    value_head = text_policy.value_head
+
+    pad_id = int(tokenizer.pad_token_id)
+    seq_len = args.pretrain_value_seq_len
+    if seq_len > args.text_max_tokens:
+        raise ValueError(
+            f"--pretrain-value-seq-len ({seq_len}) must be <= --text-max-tokens "
+            f"({args.text_max_tokens})"
+        )
+
+    cfg = ValuePretrainConfig(
+        data_dir=args.pretrain_value_dir,
+        seq_len=seq_len,
+        batch_size=args.pretrain_value_batch_size,
+        pad_token_id=pad_id,
+        eval_fraction=args.pretrain_value_eval_fraction,
+        gamma=args.gamma,
+    )
+    train_ds = ValueLabeledBinDataset(
+        cfg.data_dir,
+        seq_len=cfg.seq_len,
+        pad_token_id=cfg.pad_token_id,
+        split="train",
+        eval_fraction=cfg.eval_fraction,
+        gamma=cfg.gamma,
+    )
+    eval_ds: ValueLabeledBinDataset | None = None
+    if cfg.eval_fraction > 0:
+        try:
+            eval_ds = ValueLabeledBinDataset(
+                cfg.data_dir,
+                seq_len=cfg.seq_len,
+                pad_token_id=cfg.pad_token_id,
+                split="eval",
+                eval_fraction=cfg.eval_fraction,
+                gamma=cfg.gamma,
+            )
+        except ValueError:
+            # Corpus too small for the requested eval split; train-only is fine.
+            eval_ds = None
+
+    counts = train_ds.label_counts()
+    total = sum(counts.values()) or 1
+    print(
+        f"[value] train_games={train_ds.n_games} train_spans={train_ds.n_spans} "
+        f"wins={counts['wins']} losses={counts['losses']} draws={counts['draws']} "
+        f"(draw_frac={counts['draws'] / total:.2%})"
+    )
+    if eval_ds is not None:
+        ec = eval_ds.label_counts()
+        print(
+            f"[value] eval_games={eval_ds.n_games} eval_spans={eval_ds.n_spans} "
+            f"wins={ec['wins']} losses={ec['losses']} draws={ec['draws']}"
+        )
+
+    if args.torch_compile:
+        _compiled_forward: Any = torch.compile(encoder.forward, dynamic=True)
+        object.__setattr__(encoder, "forward", _compiled_forward)
+
+    trainer = ValuePretrainTrainer(
+        encoder=encoder,
+        value_head=value_head,
+        cfg=cfg,
+        lr=args.pretrain_value_lr,
+        grad_clip=args.pretrain_value_grad_clip,
+    )
+
+    np_rng = np.random.default_rng(args.seed)
+    eval_rng = np.random.default_rng(args.seed + 1)
+
+    log_every = max(1, args.pretrain_value_log_every)
+    eval_every = max(0, args.pretrain_value_eval_every)
+    use_amp = bool(args.pretrain_value_amp) and device.type == "cuda"
+    if use_amp:
+        amp_ctx: Any = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    else:
+        amp_ctx = contextlib.nullcontext()
+    global_step = 0
+    for epoch in range(args.pretrain_value_epochs):
+        for tokens_np, labels_np in train_ds.iter_epoch(cfg.batch_size, np_rng):
+            token_ids = torch.from_numpy(tokens_np).to(device=device, dtype=torch.long)
+            labels = torch.from_numpy(labels_np).to(device=device, dtype=torch.float32)
+            with amp_ctx:
+                stats = trainer.step(token_ids, labels)
+            if global_step % log_every == 0:
+                print(
+                    f"[value] epoch={epoch} step={global_step:6d} loss={stats['loss']:.4f} "
+                    f"sign_acc={stats['sign_accuracy']:.3f} "
+                    f"pred_abs={stats['pred_abs_mean']:.3f} "
+                    f"grad_norm={stats['grad_norm']:.3f}"
+                )
+                if not args.no_wandb and wandb.run is not None:
+                    wandb.log(
+                        {f"pretrain_value/{k}": v for k, v in stats.items()},
+                        step=global_step,
+                    )
+            if (
+                eval_ds is not None
+                and eval_every > 0
+                and global_step > 0
+                and global_step % eval_every == 0
+            ):
+                with amp_ctx:
+                    eval_stats = trainer.evaluate(eval_ds, eval_rng)
+                print(
+                    f"[value] eval step={global_step} loss={eval_stats['eval_loss']:.4f} "
+                    f"sign_acc={eval_stats['eval_sign_accuracy']:.3f} "
+                    f"n={int(eval_stats['eval_n'])}"
+                )
+                if not args.no_wandb and wandb.run is not None:
+                    wandb.log(
+                        {f"pretrain_value/{k}": v for k, v in eval_stats.items()},
+                        step=global_step,
+                    )
+            global_step += 1
+    print(f"[value] finished epochs={args.pretrain_value_epochs} steps={global_step}")
+
+
 def main() -> None:
     args = parse_args()
     validate_args(args)
@@ -1593,17 +1740,32 @@ def main() -> None:
             optimizer.load_state_dict(checkpoint["optimizer"])
 
     resumed_post_mlm = _is_post_mlm_checkpoint(checkpoint_cpu)
-    if resumed_post_mlm:
+    resumed_post_value = _is_post_value_checkpoint(checkpoint_cpu)
+    if resumed_post_value:
+        print(
+            "[value] resuming from post-value-pretrain checkpoint "
+            f"{args.checkpoint}: skipping MLM and value pretraining, opponent pool starts empty"
+        )
+    elif resumed_post_mlm:
         print(
             "[mlm] resuming from post-MLM checkpoint "
             f"{args.checkpoint}: skipping MLM pretraining, opponent pool starts empty"
         )
-    run_mlm_now = getattr(args, "pretrain_mlm_dir", None) is not None and not resumed_post_mlm
+    run_mlm_now = (
+        getattr(args, "pretrain_mlm_dir", None) is not None
+        and not resumed_post_mlm
+        and not resumed_post_value
+    )
     if run_mlm_now:
         if encoder_kind != "text" or text_backend is None:
             raise ValueError("--pretrain-mlm-dir requires --encoder text")
         run_mlm_pretrain(args, text_backend, device)
-    if run_mlm_now or resumed_post_mlm:
+    run_value_now = getattr(args, "pretrain_value_dir", None) is not None and not resumed_post_value
+    if run_value_now:
+        if encoder_kind != "text" or text_backend is None:
+            raise ValueError("--pretrain-value-dir requires --encoder text")
+        run_value_pretrain(args, text_backend, device)
+    if run_mlm_now or run_value_now or resumed_post_mlm or resumed_post_value:
         # Reset optimizer state: MLM used a separate AdamW; the RL optimizer
         # tracks the still-randomly-initialized policy heads alongside the
         # pretrained encoder, so its moments must start fresh.
@@ -1634,6 +1796,25 @@ def main() -> None:
             print(
                 f"[mlm] saved post-MLM checkpoint -> {args.post_mlm_checkpoint} "
                 f"(resume RL with --checkpoint {args.post_mlm_checkpoint})"
+            )
+        if run_value_now and getattr(args, "post_value_checkpoint", None) is not None:
+            save_checkpoint(
+                args.post_value_checkpoint,
+                policy,
+                optimizer,
+                args,
+                opponent_pool=None,
+                snapshot_schedule=None,
+                retrospective_schedule=None,
+                resume_state=None,
+                wandb_run_id=active_wandb_run_id,
+                run_artifact_dir=run_artifact_dir,
+                rnad_state=None,
+                post_value=True,
+            )
+            print(
+                f"[value] saved post-value-pretrain checkpoint -> {args.post_value_checkpoint} "
+                f"(resume RL with --checkpoint {args.post_value_checkpoint})"
             )
         # Linear LR warmup over the first N RL updates to absorb the
         # pretrained-encoder × random-RL-heads mismatch. AdamW's first step
@@ -1975,6 +2156,50 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="run the MLM forward+backward under torch.autocast(bf16) on CUDA. No-op on CPU.",
+    )
+    parser.add_argument(
+        "--pretrain-value-dir",
+        type=Path,
+        default=None,
+        help="if set, after MLM (or instead of MLM if --pretrain-mlm-dir is unset) "
+        "run supervised value-head pretraining over a directory of paired "
+        "*.bin (uint16 tokens, <bos>-delimited spans) + *.json (per-span "
+        "perspective-signed terminal-outcome labels) produced by "
+        "scripts/jsonl_games_to_value_bin.py. Requires --encoder text.",
+    )
+    parser.add_argument(
+        "--post-value-checkpoint",
+        type=Path,
+        default=None,
+        help="if set, after value-head pretraining completes, save a checkpoint "
+        "with post-value weights (and a `post_value` metadata flag) to this path "
+        "before starting RL. Pass this path back as --checkpoint to skip both "
+        "pretraining phases; opponent pool will start empty.",
+    )
+    parser.add_argument("--pretrain-value-epochs", type=int, default=1)
+    parser.add_argument("--pretrain-value-batch-size", type=int, default=128)
+    parser.add_argument("--pretrain-value-seq-len", type=int, default=512)
+    parser.add_argument("--pretrain-value-lr", type=float, default=1e-4)
+    parser.add_argument("--pretrain-value-grad-clip", type=float, default=1.0)
+    parser.add_argument("--pretrain-value-log-every", type=int, default=50)
+    parser.add_argument(
+        "--pretrain-value-eval-every",
+        type=int,
+        default=500,
+        help="run evaluation on the held-out shard every N training steps (0 disables)",
+    )
+    parser.add_argument(
+        "--pretrain-value-eval-fraction",
+        type=float,
+        default=0.05,
+        help="fraction of games to hold out for evaluation (deterministic via "
+        "hash(game_id) % bucket); 0 disables the eval split",
+    )
+    parser.add_argument(
+        "--pretrain-value-amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="run the value-pretrain forward+backward under torch.autocast(bf16) on CUDA.",
     )
     parser.add_argument(
         "--native-text-rollout",
@@ -4820,6 +5045,7 @@ def save_checkpoint(
     run_artifact_dir: Path | None = None,
     rnad_state: RNaDTrainerState | None = None,
     post_mlm: bool = False,
+    post_value: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     effective_run_artifact_dir = run_artifact_dir or args.opponent_pool_dir.parent
@@ -4859,6 +5085,8 @@ def save_checkpoint(
     }
     if post_mlm:
         metadata["post_mlm"] = True
+    if post_value:
+        metadata["post_value"] = True
     if getattr(args, "encoder", "slots") == "text":
         cache_path = Path(getattr(args, "card_token_cache", ""))
         actual_text_cfg = getattr(

@@ -11,6 +11,19 @@ event whose ``snapshot.playableActions`` is non-empty), wrapped in
 ``<bos>...<eos>`` so the result is the same shape
 ``magic_ai.text_encoder.mlm.BinTokenDataset`` expects.
 
+When ``--with-value-labels`` is passed, an additional ``<gameId>.json``
+sidecar is written alongside each ``.bin`` carrying ``winner_id``,
+``players``, and a ``spans`` list of
+``{offset, length, perspective_id, label, steps_to_end}`` per decision
+point. ``label`` is the perspective-signed terminal outcome (``+1`` win,
+``-1`` loss, ``0`` draw). ``steps_to_end`` counts decision points from
+this span to the terminal so downstream consumers can apply a discount
+``γ^steps_to_end`` and treat each span as a Monte-Carlo return-to-go from
+that decision (matching the ``gae_returns`` convention in
+``magic_ai/ppo.py`` with no bootstrap and λ=1). The bin half stays
+byte-identical regardless of the flag, so the same artifact directory can
+drive both pretraining phases.
+
 Layout matches the live native Go encoder (``mage-go/cmd/pylib/
 direct_token_emitter.go``) with ``dedupCardBodies=true``: a single
 ``<dict>...</dict>`` block at the top of the snapshot lists each unique card
@@ -26,6 +39,11 @@ Usage:
     uv run python scripts/jsonl_games_to_bin.py \
         --in-dir data/games \
         --out-dir data/games_bin
+
+    uv run python scripts/jsonl_games_to_bin.py \
+        --in-dir data/games \
+        --out-dir data/games_value_bin \
+        --with-value-labels
 """
 
 from __future__ import annotations
@@ -58,6 +76,37 @@ from magic_ai.text_encoder.token_tables import (
     build_token_tables,
 )
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, load_tokenizer
+
+
+def _resolve_label(winner_id: str | None, priority_id: str) -> float:
+    if not winner_id:
+        return 0.0
+    return 1.0 if winner_id == priority_id else -1.0
+
+
+def _winner_from_snapshot(snap: dict[str, Any]) -> str | None:
+    """Recover the winner from a terminal snapshot.
+
+    The recorder's META ``winnerId`` is null on every game in the current
+    corpus even when the game has a clear loser (e.g. life <= 0,
+    ``hasLost=True``); META reports a draw whenever the engine doesn't
+    set a winner explicitly. We instead trust the per-player
+    ``hasWon`` / ``hasLost`` flags on the last snapshot, which are
+    populated correctly by the engine. Returns the winning player id, or
+    ``None`` if the snapshot is genuinely tied (both lost / neither
+    flagged).
+    """
+
+    players = snap.get("players") or []
+    won = [p for p in players if p.get("hasWon")]
+    if len(won) == 1:
+        return str(won[0].get("id") or "") or None
+    lost = [p for p in players if p.get("hasLost")]
+    survivors = [p for p in players if not p.get("hasLost")]
+    if len(lost) == 1 and len(survivors) == 1:
+        return str(survivors[0].get("id") or "") or None
+    return None
+
 
 # --- recorder field normalization --------------------------------------------
 
@@ -586,20 +635,45 @@ def convert_one(
     tables: TokenTables,
     name_to_row: dict[str, int],
     vocab_size: int,
+    *,
+    with_value_labels: bool = False,
 ) -> tuple[Path, int, int]:
     game_id: str | None = None
+    meta_winner_id: str | None = None
+    last_snapshot: dict[str, Any] | None = None
+    players_meta: list[dict[str, str]] = []
     token_chunks: list[np.ndarray] = []
+    span_records: list[dict[str, Any]] = []  # offset/length/perspective_id; label filled after
+    cursor = 0
     n_decisions = 0
 
     for rec in _iter_records(in_path):
         if rec.get("record") == "META":
             game_id = rec.get("gameId")
+            if with_value_labels:
+                raw_winner = rec.get("winnerId")
+                meta_winner_id = str(raw_winner) if raw_winner else None
+                for p in rec.get("players") or []:
+                    players_meta.append(
+                        {
+                            "id": str(p.get("id") or ""),
+                            "name": str(p.get("name") or ""),
+                        }
+                    )
             continue
-        if rec.get("record") != "EVENT" or not _is_decision(rec):
+        if rec.get("record") != "EVENT":
+            continue
+        if with_value_labels:
+            evt_snap = rec.get("snapshot")
+            if isinstance(evt_snap, dict):
+                last_snapshot = evt_snap
+        if not _is_decision(rec):
             continue
         snap = rec["snapshot"]
         players = snap.get("players") or []
         priority_id = snap.get("priorityPlayerId")
+        if with_value_labels and not priority_id:
+            continue
         perspective = 0
         for idx, p in enumerate(players):
             if p.get("id") == priority_id:
@@ -636,7 +710,17 @@ def convert_one(
                 f"token id out of range (vocab_size={vocab_size}) for {in_path.name};"
                 " refusing to truncate to uint16"
             )
-        token_chunks.append(np.asarray(ids, dtype=np.uint16))
+        chunk = np.asarray(ids, dtype=np.uint16)
+        if with_value_labels:
+            span_records.append(
+                {
+                    "offset": int(cursor),
+                    "length": int(chunk.shape[0]),
+                    "perspective_id": str(priority_id),
+                }
+            )
+            cursor += int(chunk.shape[0])
+        token_chunks.append(chunk)
         n_decisions += 1
 
     if game_id is None:
@@ -644,6 +728,27 @@ def convert_one(
     out_path = out_dir / f"{game_id}.bin"
     flat = np.concatenate(token_chunks) if token_chunks else np.empty((0,), dtype=np.uint16)
     flat.astype(np.uint16, copy=False).tofile(out_path)
+    if with_value_labels:
+        winner_id = meta_winner_id
+        if winner_id is None and last_snapshot is not None:
+            winner_id = _winner_from_snapshot(last_snapshot)
+        n_dec = len(span_records)
+        spans = [
+            {
+                **rec,
+                "label": _resolve_label(winner_id, str(rec["perspective_id"])),
+                "steps_to_end": int(n_dec - 1 - i),
+            }
+            for i, rec in enumerate(span_records)
+        ]
+        sidecar = {
+            "game_id": game_id,
+            "winner_id": winner_id,
+            "is_draw": winner_id is None,
+            "players": players_meta,
+            "spans": spans,
+        }
+        out_path.with_suffix(".json").write_text(json.dumps(sidecar, indent=2))
     return out_path, n_decisions, int(flat.shape[0])
 
 
@@ -653,7 +758,11 @@ _WORKER: dict[str, Any] = {}
 
 
 def _worker_init(
-    tokenizer_dir: str, cache_path: str, vocab_size: int, name_to_row: dict[str, int]
+    tokenizer_dir: str,
+    cache_path: str,
+    vocab_size: int,
+    name_to_row: dict[str, int],
+    with_value_labels: bool = False,
 ) -> None:
     tokenizer = load_tokenizer(tokenizer_dir)
     cache = _load_or_build_cache(cache_path, tokenizer, list(name_to_row.keys()))
@@ -661,6 +770,7 @@ def _worker_init(
     _WORKER["tables"] = tables
     _WORKER["name_to_row"] = name_to_row
     _WORKER["vocab_size"] = vocab_size
+    _WORKER["with_value_labels"] = with_value_labels
 
 
 def _worker_convert(args: tuple[str, str]) -> tuple[str, int, int]:
@@ -671,6 +781,7 @@ def _worker_convert(args: tuple[str, str]) -> tuple[str, int, int]:
         _WORKER["tables"],
         _WORKER["name_to_row"],
         _WORKER["vocab_size"],
+        with_value_labels=bool(_WORKER.get("with_value_labels", False)),
     )
     return str(out_path), n_dec, n_tok
 
@@ -711,6 +822,12 @@ def main() -> None:
     parser.add_argument("--tokenizer-dir", type=str, default="data/text_encoder_tokenizer")
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     parser.add_argument("--limit", type=int, default=0, help="Process at most N files (0 = all).")
+    parser.add_argument(
+        "--with-value-labels",
+        action="store_true",
+        help="also write a <gameId>.json sidecar with winner_id, players, and "
+        "per-span perspective-signed labels for value-head pretraining.",
+    )
     args = parser.parse_args()
 
     in_dir: Path = args.in_dir
@@ -748,7 +865,14 @@ def main() -> None:
         total_dec = 0
         total_tok = 0
         for i, p in enumerate(inputs):
-            out_path, n_dec, n_tok = convert_one(p, out_dir, tables, name_to_row, vocab_size)
+            out_path, n_dec, n_tok = convert_one(
+                p,
+                out_dir,
+                tables,
+                name_to_row,
+                vocab_size,
+                with_value_labels=bool(args.with_value_labels),
+            )
             total_dec += n_dec
             total_tok += n_tok
             if (i + 1) % 50 == 0 or i == len(inputs) - 1:
@@ -766,7 +890,13 @@ def main() -> None:
     with ctx.Pool(
         processes=args.workers,
         initializer=_worker_init,
-        initargs=(args.tokenizer_dir, "", vocab_size, name_to_row),
+        initargs=(
+            args.tokenizer_dir,
+            "",
+            vocab_size,
+            name_to_row,
+            bool(args.with_value_labels),
+        ),
     ) as pool:
         total_dec = 0
         total_tok = 0

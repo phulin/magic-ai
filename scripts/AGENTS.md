@@ -12,7 +12,7 @@ Utility scripts for building data pipelines, evaluating card embeddings, pretrai
 - `build_text_encoder_vocab.py` — Register custom tokens in ModernBERT tokenizer and save augmented vocab.
 - `compare_reports.py` — Display side-by-side comparison of eval_card_embeddings JSON reports with delta highlighting.
 - `eval_card_embeddings.py` — Evaluate embeddings against triplet/synonym/cluster labels and compute composite scores.
-- `jsonl_games_to_bin.py` — Convert recorded `*.jsonl.gz` game logs into per-game uint16 `.bin` token streams (one rendered snapshot per decision point) for MLM pretraining.
+- `jsonl_games_to_bin.py` — Convert recorded `*.jsonl.gz` game logs into per-game uint16 `.bin` token streams (one rendered snapshot per decision point) for MLM pretraining; pass `--with-value-labels` to also emit a `<gameId>.json` sidecar (winner_id, players, per-span perspective-signed labels) for value-head pretraining.
 - `play_text_rollout.py` — Run smoke-test episodes with RecurrentTextPolicy against the mage engine.
 - `pretrain_text_encoder.py` — Smoke-test the text encoder training loop with synthetic data (value or distill mode).
 - `synth_embedding_eval.py` — Evaluate synthetic card embeddings for invariance and analogies under rules-text encoding.
