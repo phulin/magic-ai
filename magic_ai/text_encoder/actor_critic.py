@@ -303,15 +303,27 @@ class TextActorCritic(nn.Module):
             selected_tensors: list[Tensor] = []
 
             if trace_kind == "may":
-                may_logit = may_logits[step_idx]
-                may_dist = Bernoulli(logits=may_logit)
-                may_sample_t = (
-                    (may_logit >= 0).to(dtype=output.values.dtype)
-                    if deterministic
-                    else may_dist.sample()
+                inline_batch = (
+                    moved_packed if moved_packed is not None else cast(TextEncodedBatch, moved)
                 )
-                log_prob = may_dist.log_prob(may_sample_t)
-                entropy = may_dist.entropy()
+                inline_may_sample = _sample_inline_may_for_step(
+                    output,
+                    inline_batch,
+                    step_idx=step_idx,
+                    deterministic=deterministic,
+                )
+                if inline_may_sample is None:
+                    may_logit = may_logits[step_idx]
+                    may_dist = Bernoulli(logits=may_logit)
+                    may_sample_t = (
+                        (may_logit >= 0).to(dtype=output.values.dtype)
+                        if deterministic
+                        else may_dist.sample()
+                    )
+                    log_prob = may_dist.log_prob(may_sample_t)
+                    entropy = may_dist.entropy()
+                else:
+                    may_sample_t, log_prob, entropy = inline_may_sample
             else:
                 log_prob = output.values.new_zeros(())
                 entropy = output.values.new_zeros(())
@@ -831,15 +843,18 @@ class TextActorCritic(nn.Module):
 
             forward = self._replay_scoring_forward(output)
             may_mask = batch.trace_kind_id == TRACE_KIND_TO_ID["may"]
+            inline_may_log_probs, inline_may_entropies, inline_may_mask, _, _ = (
+                _score_inline_may_decisions(output, batch)
+            )
             may_log_probs, may_entropies, _may_logits_per_step, _may_selected_per_step = (
                 score_may_decisions_from_forward(
                     forward,
                     may_selected=batch.may_selected,
-                    may_mask=may_mask,
+                    may_mask=may_mask & ~inline_may_mask,
                 )
             )
-            log_probs = log_probs + may_log_probs
-            entropies = entropies + may_entropies
+            log_probs = log_probs + may_log_probs + inline_may_log_probs
+            entropies = entropies + may_entropies + inline_may_entropies
 
             decision_log_probs, decision_entropies = cast(
                 tuple[Tensor, Tensor],
@@ -926,15 +941,32 @@ class TextActorCritic(nn.Module):
         entropies = output.values.new_zeros(n)
         forward = self._replay_scoring_forward(output)
         may_mask = batch.trace_kind_id == TRACE_KIND_TO_ID["may"]
+        (
+            inline_may_log_probs,
+            inline_may_entropies,
+            inline_may_mask,
+            inline_may_logits,
+            inline_may_selected,
+        ) = _score_inline_may_decisions(output, batch)
         may_log_probs, may_entropies, may_logits_per_step, may_selected_per_step = (
             score_may_decisions_from_forward(
                 forward,
                 may_selected=batch.may_selected,
-                may_mask=may_mask,
+                may_mask=may_mask & ~inline_may_mask,
             )
         )
-        log_probs = log_probs + may_log_probs
-        entropies = entropies + may_entropies
+        log_probs = log_probs + may_log_probs + inline_may_log_probs
+        entropies = entropies + may_entropies + inline_may_entropies
+        may_logits_per_step = torch.where(
+            inline_may_mask,
+            inline_may_logits,
+            may_logits_per_step,
+        )
+        may_selected_per_step = torch.where(
+            inline_may_mask,
+            inline_may_selected,
+            may_selected_per_step,
+        )
 
         decision_log_probs, decision_entropies, per_choice = cast(
             tuple[Tensor, Tensor, ReplayPerChoice],
@@ -1697,6 +1729,94 @@ def _visible_decision_mask(
     col0 = torch.arange(option_idx.shape[1], device=option_idx.device).eq(0)
     visible = visible | (uses_none[:, None] & col0[None, :])
     return decision_mask & visible
+
+
+def _sample_inline_may_for_step(
+    output: RecurrentTextPolicyOutput,
+    batch: TextEncodedBatch | PackedTextBatch,
+    *,
+    step_idx: int,
+    deterministic: bool,
+) -> tuple[Tensor, Tensor, Tensor] | None:
+    blank_logits = output.blank_logits
+    if blank_logits is None or blank_logits.numel() == 0:
+        return None
+    if batch.blank_option_index.numel() == 0:
+        return None
+    row_group_kind = batch.blank_group_kind[step_idx].to(device=blank_logits.device)
+    row_option_index = batch.blank_option_index[step_idx].to(device=blank_logits.device)
+    row_legal_mask = batch.blank_legal_mask[step_idx].to(
+        device=blank_logits.device, dtype=torch.bool
+    )
+    may_support = (
+        (row_group_kind == BLANK_GROUP_PER_BLANK)
+        & (row_option_index < 0)
+        & row_legal_mask[..., :2].all(dim=-1)
+    )
+    may_blanks = may_support.nonzero(as_tuple=False).squeeze(-1)
+    if may_blanks.numel() != 1:
+        return None
+    logits = blank_logits[step_idx, may_blanks[0], :2]
+    dist = Categorical(logits=logits)
+    selected = torch.argmax(logits) if deterministic else dist.sample()
+    may_selected = selected.to(dtype=output.values.dtype)
+    return may_selected, dist.log_prob(selected), dist.entropy()
+
+
+def _score_inline_may_decisions(
+    output: RecurrentTextPolicyOutput,
+    batch: TextReplayBatch,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    n = int(batch.trace_kind_id.shape[0])
+    log_probs = output.values.new_zeros(n)
+    entropies = output.values.new_zeros(n)
+    logits_per_step = output.values.new_zeros(n)
+    selected_per_step = output.values.new_zeros(n)
+    device = output.values.device
+    active = torch.zeros(n, dtype=torch.bool, device=device)
+
+    blank_logits = output.blank_logits
+    if (
+        n == 0
+        or blank_logits is None
+        or blank_logits.numel() == 0
+        or batch.encoded.blank_option_index.numel() == 0
+    ):
+        return log_probs, entropies, active, logits_per_step, selected_per_step
+
+    blank_group_kind = batch.encoded.blank_group_kind.to(device=device, dtype=torch.long)
+    blank_option_index = batch.encoded.blank_option_index.to(device=device, dtype=torch.long)
+    blank_legal_mask = batch.encoded.blank_legal_mask.to(device=device, dtype=torch.bool)
+    if int(blank_group_kind.shape[1]) == 0 or int(blank_legal_mask.shape[2]) < 2:
+        return log_probs, entropies, active, logits_per_step, selected_per_step
+
+    may_support = (
+        (blank_group_kind == BLANK_GROUP_PER_BLANK)
+        & (blank_option_index < 0)
+        & blank_legal_mask[..., :2].all(dim=-1)
+    )
+    match_count = may_support.sum(dim=-1)
+    blank_idx = may_support.to(dtype=torch.long).argmax(dim=-1)
+    selected = batch.may_selected.to(device=device, dtype=torch.long)
+    selected_in_range = (selected >= 0) & (selected < 2)
+    active = (
+        (batch.trace_kind_id.to(device=device) == TRACE_KIND_TO_ID["may"])
+        & (match_count == 1)
+        & selected_in_range
+    )
+    row_logits = blank_logits[torch.arange(n, dtype=torch.long, device=device), blank_idx, :2]
+    log_probs_dense = torch.log_softmax(row_logits, dim=-1)
+    probs = log_probs_dense.exp()
+    entropy_dense = -(probs * log_probs_dense).sum(dim=-1)
+    safe_selected = selected.clamp(min=0, max=1)
+    selected_log_prob = log_probs_dense.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
+    log_probs = torch.where(active, selected_log_prob, log_probs)
+    entropies = torch.where(active, entropy_dense, entropies)
+    logits_per_step = torch.where(active, row_logits[:, 1] - row_logits[:, 0], logits_per_step)
+    selected_per_step = torch.where(
+        active, selected.to(dtype=selected_per_step.dtype), selected_per_step
+    )
+    return log_probs, entropies, active, logits_per_step, selected_per_step
 
 
 def _sample_inline_priority_for_step(
