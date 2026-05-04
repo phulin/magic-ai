@@ -309,3 +309,14 @@ without treating the accuracy gate as a blocker.
   legacy option scoring otherwise.
 - `tests/test_text_actor_critic.py` — coverage for mana-color replay log-prob
   reconstruction and per-choice output shape.
+
+### Step 8 — Flag cleanup slices (`/home/user/magic-ai-inline-blanks`)
+
+- `magic_ai/text_encoder/model.py`, `magic_ai/text_encoder/policy.py` —
+  removed `TextEncoderConfig.use_inline_blanks`; blank logits are now scored
+  directly from batch blank metadata.
+- `magic_ai/text_encoder/policy.py` — `TextPolicy.encode_snapshots(...)` now
+  always renders inline blanks and owns the required token-id lookup.
+- `magic_ai/text_encoder/render.py` — removed the per-call
+  `SnapshotRenderer.render(use_inline_blanks=...)` override; render mode is
+  fixed when constructing the renderer.

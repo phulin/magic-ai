@@ -589,18 +589,8 @@ class SnapshotRenderer:
         self,
         snapshot: GameStateSnapshot,
         actions: Sequence[PendingOptionState] | None = None,
-        *,
-        use_inline_blanks: bool | None = None,
     ) -> RenderedSnapshot:
-        if use_inline_blanks is None:
-            inline = self._use_inline_blanks
-        else:
-            inline = use_inline_blanks
-            if inline and self._chosen_token_id is None:
-                raise ValueError(
-                    "use_inline_blanks=True requires chosen_token_id on the "
-                    "renderer (the tokenizer id of the '<chosen>' token)."
-                )
+        inline = self._use_inline_blanks
         result = RenderedSnapshot(text="")
         buf: list[str] = []
         # Reset per-render scratch state.
