@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import torch
 import torch.nn as nn
 from torch import Tensor
 from transformers import PreTrainedTokenizerFast
@@ -32,8 +33,6 @@ from magic_ai.text_encoder.batch import (
 from magic_ai.text_encoder.mlm import MLMHead
 from magic_ai.text_encoder.model import (
     InlineBlankPolicy,
-    PolicyHead,
-    TargetHead,
     TextEncoderConfig,
     TextStateEncoder,
     ValueHead,
@@ -108,6 +107,11 @@ class TextPolicyOutput:
     blank_legal_mask: Tensor | None = None
 
 
+def _empty_masked_logits(mask: Tensor) -> Tensor:
+    logits = torch.zeros(mask.shape, device=mask.device, dtype=torch.float32)
+    return logits.masked_fill(~mask.to(dtype=torch.bool), float("-inf"))
+
+
 class TextPolicy(nn.Module):
     """Encoder + three heads, callable on a :class:`TextEncodedBatch`."""
 
@@ -117,8 +121,6 @@ class TextPolicy(nn.Module):
         self.encoder = TextStateEncoder(cfg)
         if cfg.hf_model_name is not None:
             initialize_text_state_encoder_from_hf(self.encoder, cfg)
-        self.policy_head = PolicyHead(cfg.d_model)
-        self.target_head = TargetHead(cfg.d_model)
         self.value_head = ValueHead(cfg.d_model)
         self.mlm_head = MLMHead(self.encoder)
         self.inline_blank_policy = InlineBlankPolicy(
@@ -179,11 +181,9 @@ class TextPolicy(nn.Module):
         Returns ``(policy_logits, target_logits, values)``.
         """
 
+        policy_logits = _empty_masked_logits(encoded.option_mask)
+        target_logits = _empty_masked_logits(encoded.target_mask)
         sv = encoded.state_vector if state_vec is None else state_vec
-        policy_logits = self.policy_head(encoded.option_vectors, sv, encoded.option_mask)
-        target_logits = self.target_head(
-            encoded.target_vectors, encoded.option_vectors, sv, encoded.target_mask
-        )
         values = self.value_head(sv)
         return policy_logits, target_logits, values
 

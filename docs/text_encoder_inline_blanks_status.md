@@ -320,3 +320,6 @@ without treating the accuracy gate as a blocker.
 - `magic_ai/text_encoder/render.py` — removed the per-call
   `SnapshotRenderer.render(use_inline_blanks=...)` override; render mode is
   fixed when constructing the renderer.
+- `magic_ai/text_encoder/policy.py` — `TextPolicy` no longer owns or trains
+  the legacy option/target heads; it returns mask-shaped placeholder logits
+  while downstream replay paths are migrated off the old fields.
