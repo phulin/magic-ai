@@ -1193,12 +1193,31 @@ class TextActorCritic(nn.Module):
                 ),
             )
 
-        steps_t = batch.step_for_decision_group
-        flat_option_idx = batch.decision_option_idx
-        flat_target_idx = batch.decision_target_idx
-        flat_masks = batch.decision_mask
-        flat_uses_none = batch.uses_none_head
-        flat_selected = batch.selected_indices
+        inline_log_probs, inline_entropies, inline_group_mask, inline_per_choice = (
+            _evaluate_inline_blocker_replay_groups(
+                output,
+                batch,
+                return_per_choice=return_per_choice,
+            )
+        )
+        log_probs = log_probs + inline_log_probs
+        entropies = entropies + inline_entropies
+
+        legacy_group_mask = ~inline_group_mask
+        if not bool(legacy_group_mask.any().item()):
+            if not return_per_choice:
+                return log_probs, entropies
+            assert inline_per_choice is not None
+            return log_probs, entropies, inline_per_choice
+
+        legacy_group_ids = legacy_group_mask.nonzero(as_tuple=False).squeeze(-1)
+        steps_t = batch.step_for_decision_group[legacy_group_mask]
+        flat_option_idx = batch.decision_option_idx[legacy_group_mask]
+        flat_target_idx = batch.decision_target_idx[legacy_group_mask]
+        flat_masks = batch.decision_mask[legacy_group_mask]
+        flat_uses_none = batch.uses_none_head[legacy_group_mask]
+        flat_selected = batch.selected_indices[legacy_group_mask]
+        g_legacy = int(steps_t.shape[0])
 
         # AND in model-visibility on top of the engine mask, mirroring the
         # filter ``sample_text_batch`` applies. Layout cols pointing at
@@ -1303,7 +1322,7 @@ class TextActorCritic(nn.Module):
                 valid_counts.log(),
             )
             is_selected = choice_cols == flat_selected[group_idx]
-            per_group_log_prob = output.values.new_zeros(g_total)
+            per_group_log_prob = output.values.new_zeros(g_legacy)
             per_group_log_prob.scatter_add_(
                 0,
                 group_idx[is_selected],
@@ -1319,28 +1338,32 @@ class TextActorCritic(nn.Module):
         # ``nonzero`` returns row-major (group, col-ascending), matching the
         # original per-group ``mask.nonzero()`` concatenation order.
         flat_indices = flat_masks.nonzero(as_tuple=False)
-        decision_group_id_flat = flat_indices[:, 0]
+        decision_group_id_flat = legacy_group_ids[flat_indices[:, 0]]
         choice_cols = flat_indices[:, 1]
-        flat_logits = all_logits[decision_group_id_flat, choice_cols]
-        flat_log_probs = log_probs_dense[decision_group_id_flat, choice_cols]
-        is_sampled_flat = choice_cols == flat_selected[decision_group_id_flat]
-        group_idx_out = steps_t[decision_group_id_flat]
+        flat_logits = all_logits[flat_indices[:, 0], choice_cols]
+        flat_log_probs = log_probs_dense[flat_indices[:, 0], choice_cols]
+        is_sampled_flat = choice_cols == flat_selected[flat_indices[:, 0]]
+        group_idx_out = steps_t[flat_indices[:, 0]]
+
+        legacy_per_choice = ReplayPerChoice(
+            flat_logits=flat_logits,
+            flat_log_probs=flat_log_probs,
+            group_idx=group_idx_out,
+            choice_cols=choice_cols,
+            is_sampled_flat=is_sampled_flat,
+            may_is_active=torch.zeros(n, dtype=torch.bool, device=device),
+            may_logits_per_step=output.values.new_zeros(n),
+            may_selected_per_step=output.values.new_zeros(n),
+            decision_group_id_flat=decision_group_id_flat,
+            step_for_decision_group=steps_t,
+        )
+        assert inline_per_choice is not None
+        per_choice = _concat_replay_per_choice(legacy_per_choice, inline_per_choice)
 
         return (
             log_probs,
             entropies,
-            ReplayPerChoice(
-                flat_logits=flat_logits,
-                flat_log_probs=flat_log_probs,
-                group_idx=group_idx_out,
-                choice_cols=choice_cols,
-                is_sampled_flat=is_sampled_flat,
-                may_is_active=torch.zeros(n, dtype=torch.bool, device=device),
-                may_logits_per_step=output.values.new_zeros(n),
-                may_selected_per_step=output.values.new_zeros(n),
-                decision_group_id_flat=decision_group_id_flat,
-                step_for_decision_group=steps_t,
-            ),
+            per_choice,
         )
 
     def _replay_scoring_forward(self, output: RecurrentTextPolicyOutput) -> ReplayScoringForward:
@@ -1688,6 +1711,158 @@ def _sample_inline_blockers_for_step(
         entropy = entropy + dist.entropy()
         selected.append(legal_slots[chosen_in_legal].to(dtype=torch.long))
     return selected, log_prob, entropy
+
+
+def _evaluate_inline_blocker_replay_groups(
+    output: RecurrentTextPolicyOutput,
+    batch: TextReplayBatch,
+    *,
+    return_per_choice: bool,
+) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice | None]:
+    """Score replayed block choices from inline blank logits when available."""
+
+    decision_count = batch.decision_count
+    n = int(decision_count.shape[0])
+    g_total = int(batch.step_for_decision_group.shape[0])
+    log_probs = output.values.new_zeros(n)
+    entropies = output.values.new_zeros(n)
+    device = output.values.device
+    group_mask = torch.zeros(g_total, dtype=torch.bool, device=device)
+
+    blank_logits = output.blank_logits
+    if (
+        g_total == 0
+        or blank_logits is None
+        or blank_logits.numel() == 0
+        or batch.encoded.blank_option_index.numel() == 0
+    ):
+        per_choice = _empty_replay_per_choice(output, n, device) if return_per_choice else None
+        return log_probs, entropies, group_mask, per_choice
+
+    steps_t = batch.step_for_decision_group.to(device=device, dtype=torch.long)
+    option_idx = batch.decision_option_idx.to(device=device, dtype=torch.long)
+    selected = batch.selected_indices.to(device=device, dtype=torch.long)
+    trace_kind = batch.trace_kind_id.to(device=device, dtype=torch.long)
+
+    option_valid = option_idx >= 0
+    has_option = option_valid.any(dim=-1)
+    first_option_col = option_valid.to(dtype=torch.long).argmax(dim=-1)
+    group_option_idx = option_idx.gather(1, first_option_col.unsqueeze(1)).squeeze(1)
+
+    blank_option_index = batch.encoded.blank_option_index.to(device=device, dtype=torch.long)
+    blank_group_kind = batch.encoded.blank_group_kind.to(device=device, dtype=torch.long)
+    blank_legal_mask = batch.encoded.blank_legal_mask.to(device=device, dtype=torch.bool)
+
+    row_blank_option = blank_option_index[steps_t]
+    row_blank_kind = blank_group_kind[steps_t]
+    blank_support = (row_blank_kind == BLANK_GROUP_CONSTRAINED) & (row_blank_option >= 0)
+    matches = (row_blank_option == group_option_idx.unsqueeze(1)) & blank_support
+    match_count = matches.sum(dim=-1)
+    blank_idx = matches.to(dtype=torch.long).argmax(dim=-1)
+
+    row_legal_mask = blank_legal_mask[steps_t, blank_idx]
+    legal_width = int(row_legal_mask.shape[1])
+    if legal_width == 0:
+        per_choice = _empty_replay_per_choice(output, n, device) if return_per_choice else None
+        return log_probs, entropies, group_mask, per_choice
+    selected_in_range = (selected >= 0) & (selected < legal_width)
+    safe_selected = selected.clamp(min=0, max=legal_width - 1)
+    selected_legal = row_legal_mask.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
+    is_blocker_step = trace_kind[steps_t] == TRACE_KIND_TO_ID["blockers"]
+    group_mask = (
+        is_blocker_step & has_option & (match_count == 1) & selected_in_range & selected_legal
+    )
+
+    dummy_mask = torch.zeros_like(row_legal_mask)
+    if legal_width > 0:
+        dummy_mask[:, 0] = True
+    effective_mask = torch.where(group_mask.unsqueeze(1), row_legal_mask, dummy_mask)
+    row_logits = blank_logits[steps_t, blank_idx]
+    safe_logits = torch.where(group_mask.unsqueeze(1), row_logits, torch.zeros_like(row_logits))
+    masked_logits = safe_logits.masked_fill(~effective_mask, float("-inf"))
+    log_probs_dense = torch.log_softmax(masked_logits, dim=-1)
+    probs_dense = log_probs_dense.exp()
+    safe_log_probs = torch.where(effective_mask, log_probs_dense, log_probs_dense.new_zeros(()))
+    per_group_log_prob = log_probs_dense.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
+    per_group_entropy = -(probs_dense * safe_log_probs).sum(dim=-1)
+    per_group_log_prob = torch.where(
+        group_mask,
+        per_group_log_prob,
+        per_group_log_prob.new_zeros(()),
+    )
+    per_group_entropy = torch.where(
+        group_mask,
+        per_group_entropy,
+        per_group_entropy.new_zeros(()),
+    )
+
+    log_probs = log_probs.scatter_add(0, steps_t, per_group_log_prob)
+    entropies = entropies.scatter_add(0, steps_t, per_group_entropy)
+
+    if not return_per_choice:
+        return log_probs, entropies, group_mask, None
+
+    flat_indices = (group_mask.unsqueeze(1) & row_legal_mask).nonzero(as_tuple=False)
+    if int(flat_indices.numel()) == 0:
+        per_choice = _empty_replay_per_choice(output, n, device)
+    else:
+        group_ids = flat_indices[:, 0]
+        choice_cols = flat_indices[:, 1]
+        per_choice = ReplayPerChoice(
+            flat_logits=row_logits[group_ids, choice_cols],
+            flat_log_probs=log_probs_dense[group_ids, choice_cols],
+            group_idx=steps_t[group_ids],
+            choice_cols=choice_cols,
+            is_sampled_flat=choice_cols == selected[group_ids],
+            may_is_active=torch.zeros(n, dtype=torch.bool, device=device),
+            may_logits_per_step=output.values.new_zeros(n),
+            may_selected_per_step=output.values.new_zeros(n),
+            decision_group_id_flat=group_ids,
+            step_for_decision_group=steps_t[group_mask],
+        )
+    return log_probs, entropies, group_mask, per_choice
+
+
+def _empty_replay_per_choice(
+    output: RecurrentTextPolicyOutput,
+    n: int,
+    device: torch.device,
+) -> ReplayPerChoice:
+    empty_long = torch.zeros(0, dtype=torch.long, device=device)
+    empty_bool = torch.zeros(0, dtype=torch.bool, device=device)
+    return ReplayPerChoice(
+        flat_logits=output.values.new_zeros(0),
+        flat_log_probs=output.values.new_zeros(0),
+        group_idx=empty_long,
+        choice_cols=empty_long,
+        is_sampled_flat=empty_bool,
+        may_is_active=torch.zeros(n, dtype=torch.bool, device=device),
+        may_logits_per_step=output.values.new_zeros(n),
+        may_selected_per_step=output.values.new_zeros(n),
+        decision_group_id_flat=empty_long,
+        step_for_decision_group=empty_long,
+    )
+
+
+def _concat_replay_per_choice(left: ReplayPerChoice, right: ReplayPerChoice) -> ReplayPerChoice:
+    return ReplayPerChoice(
+        flat_logits=torch.cat((left.flat_logits, right.flat_logits), dim=0),
+        flat_log_probs=torch.cat((left.flat_log_probs, right.flat_log_probs), dim=0),
+        group_idx=torch.cat((left.group_idx, right.group_idx), dim=0),
+        choice_cols=torch.cat((left.choice_cols, right.choice_cols), dim=0),
+        is_sampled_flat=torch.cat((left.is_sampled_flat, right.is_sampled_flat), dim=0),
+        may_is_active=left.may_is_active,
+        may_logits_per_step=left.may_logits_per_step,
+        may_selected_per_step=left.may_selected_per_step,
+        decision_group_id_flat=torch.cat(
+            (left.decision_group_id_flat, right.decision_group_id_flat),
+            dim=0,
+        ),
+        step_for_decision_group=torch.cat(
+            (left.step_for_decision_group, right.step_for_decision_group),
+            dim=0,
+        ),
+    )
 
 
 def _dense_from_packed_batch(

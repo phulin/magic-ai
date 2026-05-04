@@ -3,19 +3,21 @@ from types import SimpleNamespace
 from typing import cast
 
 import torch
+from magic_ai.actions import TRACE_KIND_TO_ID
 from magic_ai.game_state import PendingState
 from magic_ai.text_encoder.actor_critic import (
     TextActorCritic,
     TextDecisionLayout,
+    _evaluate_inline_blocker_replay_groups,
     _sample_inline_blockers_for_step,
     build_text_decision_layout,
     infer_text_trace_kind,
 )
-from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig, RecurrentTextPolicyOutput
 from magic_ai.text_encoder.render_plan import BLANK_GROUP_CONSTRAINED
-from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
+from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 
@@ -243,6 +245,76 @@ class TextActorCriticTests(unittest.TestCase):
         self.assertEqual([int(t.item()) for t in selected], [0, 1])
         self.assertTrue(torch.isfinite(log_prob))
         self.assertTrue(torch.isfinite(entropy))
+
+    def test_inline_blocker_replay_scoring_uses_blank_logits(self) -> None:
+        output = RecurrentTextPolicyOutput(
+            policy_logits=torch.empty(1, 0),
+            target_logits=torch.empty(1, 0, 0),
+            values=torch.zeros(1),
+            state_hidden=torch.zeros(1, 8),
+            option_vectors=torch.empty(1, 0, 8),
+            option_mask=torch.zeros(1, 0, dtype=torch.bool),
+            target_vectors=torch.empty(1, 0, 0, 8),
+            target_mask=torch.zeros(1, 0, 0, dtype=torch.bool),
+            card_vectors=torch.empty(1, MAX_CARD_REFS, 8),
+            card_mask=torch.zeros(1, MAX_CARD_REFS, dtype=torch.bool),
+            blank_logits=torch.tensor([[[1.0, 0.0, 4.0], [0.0, 3.0, -2.0]]]),
+        )
+        encoded = PackedTextBatch(
+            token_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
+            seq_id=torch.tensor([0, 0, 0], dtype=torch.int32),
+            pos_in_seq=torch.tensor([0, 1, 2], dtype=torch.int32),
+            cu_seqlens=torch.tensor([0, 3], dtype=torch.int32),
+            seq_lengths=torch.tensor([3], dtype=torch.int32),
+            state_positions=torch.tensor([0], dtype=torch.int32),
+            card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.int32),
+            option_positions=torch.empty(1, 0, dtype=torch.int32),
+            option_mask=torch.zeros(1, 0, dtype=torch.bool),
+            target_positions=torch.empty(1, 0, 0, dtype=torch.int32),
+            target_mask=torch.zeros(1, 0, 0, dtype=torch.bool),
+            blank_positions=torch.tensor([[1, 2]], dtype=torch.int32),
+            blank_kind=torch.ones(1, 2, dtype=torch.int32),
+            blank_group=torch.zeros(1, 2, dtype=torch.int32),
+            blank_group_kind=torch.full((1, 2), BLANK_GROUP_CONSTRAINED, dtype=torch.int32),
+            blank_option_index=torch.tensor([[1, 0]], dtype=torch.int32),
+            blank_legal_ids=torch.ones(1, 2, 3, dtype=torch.int32),
+            blank_legal_mask=torch.tensor([[[True, True, True], [True, True, False]]]),
+        )
+        batch = TextReplayBatch(
+            encoded=encoded,
+            trace_kind_id=torch.tensor([TRACE_KIND_TO_ID["blockers"]]),
+            decision_start=torch.tensor([0]),
+            decision_count=torch.tensor([2]),
+            decision_option_idx=torch.tensor([[-1, 0], [-1, 1]]),
+            decision_target_idx=torch.tensor([[-1, 0], [-1, 0]]),
+            decision_mask=torch.ones(2, 2, dtype=torch.bool),
+            uses_none_head=torch.ones(2, dtype=torch.bool),
+            selected_indices=torch.tensor([1, 2]),
+            step_for_decision_group=torch.tensor([0, 0]),
+            may_selected=torch.zeros(1),
+            old_log_prob=torch.zeros(1),
+            value=torch.zeros(1),
+            perspective_player_idx=torch.zeros(1, dtype=torch.long),
+            lstm_h_in=None,
+            lstm_c_in=None,
+        )
+
+        log_probs, entropies, group_mask, per_choice = _evaluate_inline_blocker_replay_groups(
+            output,
+            batch,
+            return_per_choice=True,
+        )
+
+        blank_logits = output.blank_logits
+        assert blank_logits is not None
+        expected = torch.log_softmax(blank_logits[0, 1, :2], dim=0)[1]
+        expected = expected + torch.log_softmax(blank_logits[0, 0], dim=0)[2]
+        torch.testing.assert_close(log_probs[0], expected)
+        self.assertTrue(torch.isfinite(entropies).all())
+        torch.testing.assert_close(group_mask, torch.tensor([True, True]))
+        assert per_choice is not None
+        self.assertEqual(tuple(per_choice.flat_logits.shape), (5,))
+        self.assertEqual(int(per_choice.is_sampled_flat.sum()), 2)
 
     def test_sample_native_tensor_batch_appends_replay_rows(self) -> None:
         torch.manual_seed(0)
