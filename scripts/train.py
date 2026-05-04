@@ -59,6 +59,7 @@ from magic_ai.opponent_pool import (  # noqa: E402
     opponent_policy_state_dict,
     run_eval_matches,
     save_snapshot,
+    snapshot_games_from_tag,
     snapshot_tag,
 )
 from magic_ai.ppo import (  # noqa: E402
@@ -1153,9 +1154,51 @@ def _restore_opponent_pool(
             if resolved in known_paths:
                 continue
             tag = snapshot_path.stem.removeprefix("snapshot_")
-            pool.add_snapshot(snapshot_path, tag)
+            parsed_games = snapshot_games_from_tag(tag)
+            pool.add_snapshot(
+                snapshot_path,
+                tag,
+                snapshot_games=int(parsed_games) if parsed_games is not None else 0,
+            )
             known_paths.add(resolved)
     return pool
+
+
+def _prune_pool_to_schedule(
+    pool: OpponentPool,
+    schedule: SnapshotSchedule,
+    completed_games: int,
+) -> None:
+    """Keep only entries closest to each not-yet-completed schedule threshold.
+
+    When a run is extended by raising ``--episodes``, the schedule's 1% / 2N%
+    thresholds shift to larger absolute game counts. Old snapshots that don't
+    line up with the new grid are dropped (files are left on disk; only the
+    pool's in-memory entry list is shrunk). Entries without a known
+    ``snapshot_games`` (e.g. legacy tags) are kept untouched so we don't
+    silently delete state we can't reason about.
+    """
+    candidates = [e for e in pool.entries if e.snapshot_games > 0]
+    if not candidates:
+        return
+    legacy = [e for e in pool.entries if e.snapshot_games <= 0]
+    fired_thresholds = [t for t in schedule.thresholds if t <= completed_games]
+    if not fired_thresholds:
+        pool.entries = legacy
+        return
+    chosen_paths: list[Path] = []
+    seen: set[Path] = set()
+    for threshold in fired_thresholds:
+        best = min(candidates, key=lambda e: abs(e.snapshot_games - threshold))
+        key = best.path.resolve() if best.path else Path(best.tag)
+        if key in seen:
+            continue
+        seen.add(key)
+        chosen_paths.append(key)
+    chosen_set = set(chosen_paths)
+    kept = [e for e in candidates if (e.path.resolve() if e.path else Path(e.tag)) in chosen_set]
+    kept.sort(key=lambda e: e.snapshot_games)
+    pool.entries = legacy + kept
 
 
 def _resume_state_from_checkpoint(checkpoint: dict[str, Any] | None) -> TrainingResumeState:
@@ -1362,14 +1405,17 @@ def _build_opponent_schedules(
     snapshot_schedule = SnapshotSchedule.build(args.episodes)
     retrospective_schedule = RetrospectiveLogSchedule.build(args.episodes)
     training_state = _training_state_dict(checkpoint_cpu)
-    snapshot_schedule.next_idx = min(
-        int(training_state.get("snapshot_schedule_next_idx", 0)),
-        len(snapshot_schedule.thresholds),
+    completed_games = int(training_state.get("completed_games", 0))
+    # Derive next_idx from completed_games rather than the stored index:
+    # when --episodes is raised on resume, the schedule's thresholds shift,
+    # so the previously-saved next_idx no longer points at the right slot.
+    snapshot_schedule.next_idx = sum(
+        1 for t in snapshot_schedule.thresholds if t <= completed_games
     )
-    retrospective_schedule.next_idx = min(
-        int(training_state.get("retrospective_schedule_next_idx", 0)),
-        len(retrospective_schedule.thresholds),
+    retrospective_schedule.next_idx = sum(
+        1 for t in retrospective_schedule.thresholds if t <= completed_games
     )
+    _prune_pool_to_schedule(opponent_pool, snapshot_schedule, completed_games)
     return opponent_pool, snapshot_schedule, retrospective_schedule
 
 
@@ -2541,20 +2587,17 @@ def log_ppo_stats(
 
 
 def _snapshot_games_from_tag(tag: str) -> int | None:
-    match = re.match(r"g(\d+)_p", tag)
-    if match is None:
-        return None
-    return int(match.group(1))
+    return snapshot_games_from_tag(tag)
 
 
 def _snapshot_pct_from_tag(tag: str, total_episodes: int) -> float | None:
+    games = snapshot_games_from_tag(tag)
+    if games is not None:
+        return 100.0 * games / max(1, total_episodes)
     match = re.search(r"_p(\d+(?:\.\d+)?)$", tag)
     if match is not None:
         return float(match.group(1))
-    snapshot_games = _snapshot_games_from_tag(tag)
-    if snapshot_games is None:
-        return None
-    return 100.0 * snapshot_games / max(1, total_episodes)
+    return None
 
 
 def retrospective_rating_rows(
@@ -4785,7 +4828,7 @@ def take_snapshot_and_eval(
 ) -> None:
     tag = snapshot_tag(threshold, args.episodes)
     snapshot_path = save_snapshot(policy, args.opponent_pool_dir, tag)
-    current_entry = opponent_pool.add_snapshot(snapshot_path, tag)
+    current_entry = opponent_pool.add_snapshot(snapshot_path, tag, snapshot_games=threshold)
     current_entry.cached_policy = opponent_policy_state_dict(policy)
     print(
         step_prefix,

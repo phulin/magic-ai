@@ -32,6 +32,7 @@ class OpponentEntry:
     tag: str
     rating: trueskill.Rating
     n_games: int = 0
+    snapshot_games: int = 0
     cached_policy: dict[str, torch.Tensor] | None = None
 
 
@@ -40,7 +41,7 @@ class OpponentPool:
     env: trueskill.TrueSkill = field(default_factory=trueskill.TrueSkill)
     entries: list[OpponentEntry] = field(default_factory=list)
 
-    def add_snapshot(self, path: Path, tag: str) -> OpponentEntry:
+    def add_snapshot(self, path: Path, tag: str, *, snapshot_games: int = 0) -> OpponentEntry:
         # Use the previous checkpoint's mean as a temporal prior, but reset
         # uncertainty because each checkpoint is a separate fixed player.
         env = cast(Any, self.env)
@@ -49,7 +50,9 @@ class OpponentPool:
             seed_rating = env.create_rating(mu=prev.mu)
         else:
             seed_rating = env.create_rating()
-        entry = OpponentEntry(path=path, tag=tag, rating=seed_rating)
+        entry = OpponentEntry(
+            path=path, tag=tag, rating=seed_rating, snapshot_games=int(snapshot_games)
+        )
         self.entries.append(entry)
         return entry
 
@@ -114,6 +117,7 @@ class OpponentPool:
                     "mu": float(entry.rating.mu),
                     "sigma": float(entry.rating.sigma),
                     "n_games": int(entry.n_games),
+                    "snapshot_games": int(entry.snapshot_games),
                 }
                 for entry in self.entries
             ],
@@ -128,14 +132,22 @@ class OpponentPool:
             for item in entries:
                 if not isinstance(item, dict):
                     continue
+                tag = str(item.get("tag", ""))
+                snapshot_games_raw = item.get("snapshot_games")
+                if snapshot_games_raw is None:
+                    parsed = snapshot_games_from_tag(tag)
+                    snapshot_games = int(parsed) if parsed is not None else 0
+                else:
+                    snapshot_games = int(snapshot_games_raw)
                 entry = OpponentEntry(
                     path=Path(str(item.get("path", ""))),
-                    tag=str(item.get("tag", "")),
+                    tag=tag,
                     rating=env.create_rating(
                         mu=float(item.get("mu", 25.0)),
                         sigma=float(item.get("sigma", 25.0 / 3.0)),
                     ),
                     n_games=int(item.get("n_games", 0)),
+                    snapshot_games=snapshot_games,
                 )
                 pool.entries.append(entry)
         return pool
@@ -181,8 +193,23 @@ class SnapshotSchedule:
 
 
 def snapshot_tag(threshold: int, total_episodes: int) -> str:
+    """Tag a snapshot by absolute games count plus a (then-current) pct hint.
+
+    The leading ``g{games}`` segment is the canonical, schedule-independent
+    identifier — it survives extending a run by raising ``--episodes``.
+    The trailing ``p{pct}`` is purely a human-readable hint at the moment
+    the snapshot was taken; it must not be parsed for scheduling.
+    """
     pct = 100.0 * threshold / max(1, total_episodes)
-    return f"p{pct:05.1f}"
+    return f"g{int(threshold):06d}_p{pct:05.1f}"
+
+
+def snapshot_games_from_tag(tag: str) -> int | None:
+    """Parse the absolute game count from a ``g{games}_p{pct}`` snapshot tag."""
+    import re
+
+    match = re.match(r"g(\d+)", tag)
+    return int(match.group(1)) if match is not None else None
 
 
 def opponent_policy_state_dict(policy: torch.nn.Module) -> dict[str, torch.Tensor]:

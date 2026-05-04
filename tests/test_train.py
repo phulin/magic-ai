@@ -25,7 +25,9 @@ from scripts.train import (
     RetrospectiveLogSchedule,
     SlotTrainingBackend,
     TrainingResumeState,
+    _build_opponent_schedules,
     _current_transcript_snapshot,
+    _prune_pool_to_schedule,
     _restore_opponent_pool,
     append_sample_game_log,
     build_slot_backend,
@@ -1319,6 +1321,64 @@ class TrainPPOTests(unittest.TestCase):
         # New snapshot seeds from the previous entry's mean, but not confidence.
         self.assertAlmostEqual(pool.entries[1].rating.mu, 31.0)
         self.assertAlmostEqual(pool.entries[1].rating.sigma, 25.0 / 3.0)
+
+    def test_prune_pool_to_schedule_keeps_entries_closest_to_new_thresholds(self) -> None:
+        pool = OpponentPool()
+        # Original 1M-episode run: 1%/2%/4%/6%/... -> at 10k, 20k, 40k, 60k, 80k.
+        for games in (10_000, 20_000, 40_000, 60_000, 80_000, 100_000):
+            pool.add_snapshot(
+                Path(f"snapshot_g{games:06d}.pt"),
+                f"g{games:06d}_p001.0",
+                snapshot_games=games,
+            )
+
+        # Extending to 2M episodes: new schedule is 20k, 40k, 80k, 120k, 160k, ...
+        # At completed_games=100k, new thresholds <= completed are 20k, 40k, 80k.
+        # Closest existing: 20k -> 20000, 40k -> 40000, 80k -> 80000.
+        new_schedule = SnapshotSchedule.build(2_000_000)
+        _prune_pool_to_schedule(pool, new_schedule, completed_games=100_000)
+
+        kept_games = [e.snapshot_games for e in pool.entries]
+        self.assertEqual(kept_games, [20_000, 40_000, 80_000])
+
+    def test_build_opponent_schedules_resets_next_idx_for_extended_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot_dir = Path(tmpdir) / "opponent_pool"
+            snapshot_dir.mkdir(parents=True)
+            checkpoint = {
+                "training_state": {
+                    "completed_games": 100_000,
+                    "snapshot_schedule_next_idx": 999,  # stale; from old --episodes
+                    "retrospective_schedule_next_idx": 999,
+                    "opponent_pool": {
+                        "entries": [
+                            {
+                                "path": str(snapshot_dir / f"snapshot_g{g:06d}.pt"),
+                                "tag": f"g{g:06d}_p001.0",
+                                "mu": 25.0,
+                                "sigma": 8.0,
+                                "n_games": 0,
+                                "snapshot_games": g,
+                            }
+                            for g in (10_000, 20_000, 40_000, 60_000, 80_000, 100_000)
+                        ],
+                    },
+                }
+            }
+            args = Namespace(
+                episodes=2_000_000,
+                opponent_pool_dir=snapshot_dir,
+                disable_opponent_pool=False,
+            )
+            pool, snap_sched, retro_sched = _build_opponent_schedules(args, checkpoint)
+
+        assert pool is not None and snap_sched is not None and retro_sched is not None
+        # snap thresholds at 2M: 20k, 40k, 80k, 120k, ... -> 3 are <= 100k
+        self.assertEqual(snap_sched.next_idx, 3)
+        # Pool pruned to those three closest entries.
+        self.assertEqual([e.snapshot_games for e in pool.entries], [20_000, 40_000, 80_000])
+        # Retro thresholds at 2M (5% step): 100k, 200k, ... -> exactly 1 <= 100k.
+        self.assertEqual(retro_sched.next_idx, 1)
 
     def test_validate_args_requires_no_validate_for_torch_compile(self) -> None:
         args = Namespace(
