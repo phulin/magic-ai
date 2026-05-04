@@ -255,6 +255,9 @@ class ReplayCore(nn.Module):
         *,
         trace_kind_id: Tensor,
         decision_count: Tensor,
+        decision_count_host: tuple[int, ...] | None = None,
+        total_decision_groups: int | None = None,
+        total_stored_decision_groups: int | None = None,
         decision_option_idx: Tensor,
         decision_target_idx: Tensor,
         decision_mask: Tensor,
@@ -273,6 +276,9 @@ class ReplayCore(nn.Module):
             start,
             end,
             decision_count=decision_count,
+            decision_count_host=decision_count_host,
+            total_decision_groups=total_decision_groups,
+            total_stored_decision_groups=total_stored_decision_groups,
             decision_option_idx=decision_option_idx,
             decision_target_idx=decision_target_idx,
             decision_mask=decision_mask,
@@ -436,6 +442,9 @@ class ReplayCore(nn.Module):
         row_end: int,
         *,
         decision_count: Tensor,
+        decision_count_host: tuple[int, ...] | None = None,
+        total_decision_groups: int | None = None,
+        total_stored_decision_groups: int | None = None,
         decision_option_idx: Tensor,
         decision_target_idx: Tensor,
         decision_mask: Tensor,
@@ -446,8 +455,18 @@ class ReplayCore(nn.Module):
         batch_size = row_end - row_start
         if int(counts.shape[0]) != batch_size:
             raise ValueError("decision_count length must match appended row count")
+        if decision_count_host is not None and len(decision_count_host) != batch_size:
+            raise ValueError("decision_count_host length must match appended row count")
         stored_counts = counts.clamp(max=self.max_decision_groups)
-        total_stored = int(stored_counts.sum().item())
+        total_stored = (
+            int(total_stored_decision_groups)
+            if total_stored_decision_groups is not None
+            else (
+                sum(min(int(c), self.max_decision_groups) for c in decision_count_host)
+                if decision_count_host is not None
+                else int(stored_counts.sum().item())
+            )
+        )
         start = self._allocate_decision_range(total_stored)
         starts = torch.cumsum(stored_counts, dim=0) - stored_counts + start
         self.decision_start[row_start:row_end] = starts
@@ -455,39 +474,82 @@ class ReplayCore(nn.Module):
         if total_stored == 0:
             return stored_counts
 
-        total_source = int(decision_option_idx.shape[0])
-        if total_source < int(counts.sum().item()):
+        total_source = (
+            int(total_decision_groups)
+            if total_decision_groups is not None
+            else int(decision_option_idx.shape[0])
+        )
+        required_source = (
+            sum(int(c) for c in decision_count_host)
+            if decision_count_host is not None
+            else int(counts.sum().item())
+        )
+        if total_source < required_source:
             raise ValueError("decision tensors do not contain decision_count groups")
+        if int(decision_option_idx.shape[0]) < total_source:
+            raise ValueError("decision_option_idx has fewer rows than total_decision_groups")
         step_for_source = torch.repeat_interleave(
-            torch.arange(batch_size, device=self.device), counts
+            torch.arange(batch_size, device=self.device),
+            counts,
+            output_size=total_source,
         )
         source_group_starts = torch.cumsum(counts, dim=0) - counts
         group_in_step = (
             torch.arange(total_source, device=self.device) - source_group_starts[step_for_source]
         )
-        keep = group_in_step < self.max_decision_groups
-        if not bool(keep.any().item()):
-            return stored_counts
-        kept_source = keep.nonzero(as_tuple=False).squeeze(-1)
-        kept_steps = step_for_source[kept_source]
-        kept_groups = group_in_step[kept_source]
-        dest = starts[kept_steps] + kept_groups
+        valid = group_in_step < self.max_decision_groups
+        relative_dest = starts[step_for_source] - start + group_in_step
+        dummy_dest = relative_dest.new_full((), total_stored)
+        relative_dest = torch.where(valid, relative_dest, dummy_dest)
 
-        self.decision_option_idx[dest] = decision_option_idx[kept_source].to(
-            device=self.device, dtype=self.index_dtype
+        option_tmp = torch.full(
+            (total_stored + 1, self.max_cached_choices),
+            -1,
+            dtype=self.index_dtype,
+            device=self.device,
         )
-        self.decision_target_idx[dest] = decision_target_idx[kept_source].to(
-            device=self.device, dtype=self.index_dtype
+        target_tmp = torch.full_like(option_tmp, -1)
+        mask_tmp = torch.zeros(
+            total_stored + 1,
+            self.max_cached_choices,
+            dtype=torch.bool,
+            device=self.device,
         )
-        self.decision_mask[dest] = decision_mask[kept_source].to(
-            device=self.device, dtype=torch.bool
+        none_tmp = torch.zeros(total_stored + 1, dtype=torch.bool, device=self.device)
+        selected_tmp = torch.full(
+            (total_stored + 1,),
+            -1,
+            dtype=self.index_dtype,
+            device=self.device,
         )
-        self.uses_none_head[dest] = uses_none_head[kept_source].to(
-            device=self.device, dtype=torch.bool
+
+        option_tmp[relative_dest] = decision_option_idx[:total_source].to(
+            device=self.device,
+            dtype=self.index_dtype,
         )
-        self.selected_indices[dest] = selected_indices[kept_source].to(
-            device=self.device, dtype=self.index_dtype
+        target_tmp[relative_dest] = decision_target_idx[:total_source].to(
+            device=self.device,
+            dtype=self.index_dtype,
         )
+        mask_tmp[relative_dest] = decision_mask[:total_source].to(
+            device=self.device,
+            dtype=torch.bool,
+        )
+        none_tmp[relative_dest] = uses_none_head[:total_source].to(
+            device=self.device,
+            dtype=torch.bool,
+        )
+        selected_tmp[relative_dest] = selected_indices[:total_source].to(
+            device=self.device,
+            dtype=self.index_dtype,
+        )
+
+        end = start + total_stored
+        self.decision_option_idx[start:end] = option_tmp[:-1]
+        self.decision_target_idx[start:end] = target_tmp[:-1]
+        self.decision_mask[start:end] = mask_tmp[:-1]
+        self.uses_none_head[start:end] = none_tmp[:-1]
+        self.selected_indices[start:end] = selected_tmp[:-1]
         return stored_counts
 
     def _append_row_index(self) -> int:
@@ -540,7 +602,11 @@ class ReplayCore(nn.Module):
                 torch.empty(0, dtype=torch.long, device=self.device),
                 None,
             )
-        step_pos = torch.repeat_interleave(torch.arange(batch_size, device=self.device), counts)
+        step_pos = torch.repeat_interleave(
+            torch.arange(batch_size, device=self.device),
+            counts,
+            output_size=total,
+        )
         group_pos = torch.arange(total, device=self.device) - gathered_starts[step_pos]
         source = starts[step_pos] + group_pos
         return starts, counts, gathered_starts, step_pos, source

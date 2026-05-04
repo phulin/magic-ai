@@ -17,6 +17,7 @@ from magic_ai.text_encoder.batch import (
 )
 from magic_ai.text_encoder.replay_triton import (
     append_batch_encoded_triton,
+    append_staged_encoded_triton,
     gather_decisions_triton,
     gather_encoded_triton,
     gather_sequence_layout_triton,
@@ -119,6 +120,7 @@ class TextReplayBuffer:
             (self.capacity,), -1, dtype=torch.int32, device=self.device
         )
         self.row_token_length = torch.zeros(self.capacity, dtype=torch.int32, device=self.device)
+        self.row_token_length_host = [0] * self.capacity
         self._token_cursor = 0
         self.card_ref_positions = torch.full(
             (self.capacity, self.max_card_refs), -1, dtype=torch.int32, device=self.device
@@ -189,6 +191,7 @@ class TextReplayBuffer:
         self.core.reset()
         self.row_token_start.fill_(-1)
         self.row_token_length.zero_()
+        self.row_token_length_host[:] = [0] * self.capacity
         self._token_cursor = 0
 
     def write_ppo_targets(
@@ -281,12 +284,26 @@ class TextReplayBuffer:
         self._write_packed_encoded_row(row, encoded, batch_index)
         return row
 
+    def _packed_seq_lengths_host(self, encoded: PackedTextBatch) -> list[int]:
+        batch_size = int(encoded.seq_lengths.shape[0])
+        if encoded.seq_lengths_host is not None:
+            lengths = list(encoded.seq_lengths_host)
+            if len(lengths) != batch_size:
+                raise ValueError("encoded.seq_lengths_host length must match batch size")
+            return [int(x) for x in lengths]
+        if encoded.seq_lengths.device.type == "cpu":
+            return [int(x) for x in encoded.seq_lengths.to(dtype=torch.long).tolist()]
+        return [int(x) for x in encoded.seq_lengths.detach().cpu().to(dtype=torch.long).tolist()]
+
     def append_batch(
         self,
         *,
         encoded: PackedTextBatch,
         trace_kind_id: Tensor,
         decision_count: Tensor,
+        decision_count_host: tuple[int, ...] | None = None,
+        total_decision_groups: int | None = None,
+        total_stored_decision_groups: int | None = None,
         decision_option_idx: Tensor,
         decision_target_idx: Tensor,
         decision_mask: Tensor,
@@ -310,6 +327,7 @@ class TextReplayBuffer:
             if max_seq_length > self.max_tokens:
                 raise ValueError("encoded packed row token width exceeds buffer max_tokens")
         total_tokens = int(encoded.token_ids.numel())
+        seq_lengths_host = self._packed_seq_lengths_host(encoded)
         token_start = self._token_cursor
         token_end = token_start + total_tokens
         if token_end > int(self.packed_token_ids.numel()):
@@ -330,6 +348,9 @@ class TextReplayBuffer:
             rows = self.core.append_batch(
                 trace_kind_id=trace_kind_id,
                 decision_count=decision_count,
+                decision_count_host=decision_count_host,
+                total_decision_groups=total_decision_groups,
+                total_stored_decision_groups=total_stored_decision_groups,
                 decision_option_idx=decision_option_idx,
                 decision_target_idx=decision_target_idx,
                 decision_mask=decision_mask,
@@ -344,6 +365,9 @@ class TextReplayBuffer:
             )
         except RuntimeError as exc:
             raise RuntimeError("TextReplayBuffer is full") from exc
+
+        row_start = self.size - batch_size
+        self.row_token_length_host[row_start : row_start + batch_size] = seq_lengths_host
 
         wrote_encoded_with_triton = False
         if self.use_triton_append:
@@ -416,6 +440,177 @@ class TextReplayBuffer:
 
         return rows
 
+    def append_staged_batch(
+        self,
+        *,
+        flat_env: Tensor,
+        flat_step: Tensor,
+        token_ids: Tensor,
+        seq_lengths: Tensor,
+        seq_lengths_host: tuple[int, ...],
+        card_ref_positions: Tensor,
+        option_positions: Tensor,
+        option_mask: Tensor,
+        target_positions: Tensor,
+        target_mask: Tensor,
+        trace_kind_id: Tensor,
+        decision_count: Tensor,
+        decision_count_host: tuple[int, ...] | None = None,
+        total_decision_groups: int | None = None,
+        total_stored_decision_groups: int | None = None,
+        decision_option_idx: Tensor,
+        decision_target_idx: Tensor,
+        decision_mask: Tensor,
+        uses_none_head: Tensor,
+        selected_indices: Tensor,
+        may_selected: Tensor,
+        old_log_prob: Tensor,
+        value: Tensor,
+        perspective_player_idx: Tensor,
+        lstm_h_in: Tensor | None = None,
+        lstm_c_in: Tensor | None = None,
+    ) -> Tensor:
+        """Append replay rows directly from padded native staging tensors."""
+
+        batch_size = int(seq_lengths.shape[0])
+        if batch_size == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        if len(seq_lengths_host) != batch_size:
+            raise ValueError("seq_lengths_host length must match batch size")
+        if self.capacity - self.size < batch_size:
+            raise RuntimeError("TextReplayBuffer is full")
+        seq_lengths = seq_lengths.to(device=self.device)
+        if self.validate:
+            max_seq_length = max(seq_lengths_host, default=0)
+            if max_seq_length > self.max_tokens:
+                raise ValueError("encoded staged row token width exceeds buffer max_tokens")
+        total_tokens = sum(int(x) for x in seq_lengths_host)
+        token_start = self._token_cursor
+        token_end = token_start + total_tokens
+        if token_end > int(self.packed_token_ids.numel()):
+            raise RuntimeError("TextReplayBuffer packed token arena is full")
+        self._token_cursor = token_end
+        if self.lstm_h_in is not None and self.lstm_c_in is not None:
+            if lstm_h_in is None or lstm_c_in is None:
+                raise ValueError("h_in and c_in are required for recurrent text replay")
+            h_store = lstm_h_in.permute(1, 0, 2)
+            c_store = lstm_c_in.permute(1, 0, 2)
+        elif lstm_h_in is not None or lstm_c_in is not None:
+            raise ValueError("buffer was constructed without recurrent state storage")
+        else:
+            h_store = None
+            c_store = None
+
+        try:
+            rows = self.core.append_batch(
+                trace_kind_id=trace_kind_id,
+                decision_count=decision_count,
+                decision_count_host=decision_count_host,
+                total_decision_groups=total_decision_groups,
+                total_stored_decision_groups=total_stored_decision_groups,
+                decision_option_idx=decision_option_idx,
+                decision_target_idx=decision_target_idx,
+                decision_mask=decision_mask,
+                uses_none_head=uses_none_head,
+                selected_indices=selected_indices,
+                may_selected=may_selected,
+                old_log_prob=old_log_prob,
+                value=value,
+                perspective_player_idx=perspective_player_idx,
+                lstm_h_in=h_store,
+                lstm_c_in=c_store,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError("TextReplayBuffer is full") from exc
+
+        row_start = self.size - batch_size
+        self.row_token_length_host[row_start : row_start + batch_size] = [
+            int(x) for x in seq_lengths_host
+        ]
+
+        cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
+        cu_seqlens[1:] = seq_lengths.cumsum(0).to(dtype=torch.int32)
+        wrote_encoded_with_triton = False
+        if self.use_triton_append:
+            wrote_encoded_with_triton = append_staged_encoded_triton(
+                flat_env=flat_env.to(device=self.device),
+                flat_step=flat_step.to(device=self.device),
+                token_ids=token_ids,
+                seq_lengths=seq_lengths,
+                cu_seqlens=cu_seqlens,
+                card_ref_positions=card_ref_positions,
+                option_positions=option_positions,
+                option_mask=option_mask,
+                target_positions=target_positions,
+                target_mask=target_mask,
+                rows=rows,
+                packed_token_ids=self.packed_token_ids,
+                row_token_start=self.row_token_start,
+                row_token_length=self.row_token_length,
+                dst_card_ref_positions=self.card_ref_positions,
+                dst_option_positions=self.option_positions,
+                dst_option_mask=self.option_mask,
+                dst_target_positions=self.target_positions,
+                dst_target_mask=self.target_mask,
+                dst_seq_lengths=self.seq_lengths,
+                token_start=token_start,
+            )
+
+        if not wrote_encoded_with_triton:
+            flat_env = flat_env.to(device=self.device, dtype=torch.long)
+            flat_step = flat_step.to(device=self.device, dtype=torch.long)
+            self.row_token_start[rows] = -1
+            self.row_token_length[rows] = 0
+            self.card_ref_positions.index_fill_(0, rows, -1)
+            self.option_positions.index_fill_(0, rows, -1)
+            self.option_mask.index_fill_(0, rows, 0)
+            self.target_positions.index_fill_(0, rows, -1)
+            self.target_mask.index_fill_(0, rows, 0)
+            row_tokens = token_ids[flat_env, flat_step]
+            if total_tokens > 0:
+                seq_id = torch.repeat_interleave(
+                    torch.arange(batch_size, dtype=torch.int32, device=self.device),
+                    seq_lengths,
+                    output_size=total_tokens,
+                )
+                repeated_starts = torch.repeat_interleave(
+                    cu_seqlens[:-1],
+                    seq_lengths,
+                    output_size=total_tokens,
+                )
+                pos_in_seq = (
+                    torch.arange(total_tokens, dtype=torch.int32, device=self.device)
+                    - repeated_starts
+                )
+                self.packed_token_ids[token_start:token_end] = row_tokens[
+                    seq_id.to(dtype=torch.long), pos_in_seq.to(dtype=torch.long)
+                ].to(dtype=torch.int32)
+            self.row_token_start[rows] = token_start + cu_seqlens[:-1]
+            seq_lengths_i32 = seq_lengths.to(dtype=torch.int32)
+            self.row_token_length[rows] = seq_lengths_i32
+            self.seq_lengths[rows] = seq_lengths_i32
+            self.card_ref_positions[rows] = card_ref_positions[flat_env, flat_step].to(
+                device=self.device, dtype=torch.int32
+            )
+            option_width = min(int(option_positions.shape[2]), self.max_options)
+            target_width = min(int(target_positions.shape[3]), self.max_targets_per_option)
+            if option_width > 0:
+                self.option_positions[rows, :option_width] = option_positions[
+                    flat_env, flat_step, :option_width
+                ].to(device=self.device, dtype=torch.int32)
+                self.option_mask[rows, :option_width] = option_mask[
+                    flat_env, flat_step, :option_width
+                ].to(device=self.device, dtype=torch.bool)
+            if option_width > 0 and target_width > 0:
+                self.target_positions[rows, :option_width, :target_width] = target_positions[
+                    flat_env, flat_step, :option_width, :target_width
+                ].to(device=self.device, dtype=torch.int32)
+                self.target_mask[rows, :option_width, :target_width] = target_mask[
+                    flat_env, flat_step, :option_width, :target_width
+                ].to(device=self.device, dtype=torch.bool)
+
+        return rows
+
     def _write_row_packed_tokens(self, row: int, token_ids: Tensor) -> None:
         token_count = int(token_ids.numel())
         token_start = self._token_cursor
@@ -425,6 +620,7 @@ class TextReplayBuffer:
         self._token_cursor = token_end
         self.row_token_start[row] = token_start
         self.row_token_length[row] = token_count
+        self.row_token_length_host[row] = token_count
         if token_count > 0:
             self.packed_token_ids[token_start:token_end] = token_ids
 
@@ -433,10 +629,21 @@ class TextReplayBuffer:
             if int(replay_rows.numel()) == 0:
                 raise ValueError("replay_rows must not be empty")
             idx = replay_rows.to(device=self.device)
+            idx_host = (
+                [int(x) for x in replay_rows.to(dtype=torch.long).tolist()]
+                if replay_rows.device.type == "cpu"
+                else None
+            )
         else:
             if not replay_rows:
                 raise ValueError("replay_rows must not be empty")
             idx = torch.tensor(replay_rows, dtype=torch.long, device=self.device)
+            idx_host = [int(x) for x in replay_rows]
+        total_tokens_host = (
+            sum(self.row_token_length_host[row] for row in idx_host)
+            if idx_host is not None
+            else None
+        )
         if self.validate:
             in_range = (idx >= 0) & (idx < self.capacity)
             if not bool(in_range.all().item()):
@@ -451,7 +658,10 @@ class TextReplayBuffer:
             )
         if gathered_layout is None:
             seq_lengths = self.row_token_length[idx]
-            cu_seqlens, state_positions, seq_id, pos_in_seq = packed_sequence_layout(seq_lengths)
+            cu_seqlens, state_positions, seq_id, pos_in_seq = packed_sequence_layout(
+                seq_lengths,
+                total_tokens=total_tokens_host,
+            )
         else:
             seq_lengths, cu_seqlens = gathered_layout
             state_positions = cu_seqlens[:-1]
@@ -470,12 +680,16 @@ class TextReplayBuffer:
                 cu_seqlens=cu_seqlens,
                 packed_token_ids=self.packed_token_ids,
                 row_token_start=self.row_token_start,
+                total_tokens=total_tokens_host,
                 include_seq_id=self.materialize_gather_seq_id,
             )
 
         if gathered_encoded is None:
             if seq_id.numel() == 0 and pos_in_seq.numel() == 0:
-                _, _, seq_id, pos_in_seq = packed_sequence_layout(seq_lengths)
+                _, _, seq_id, pos_in_seq = packed_sequence_layout(
+                    seq_lengths,
+                    total_tokens=total_tokens_host,
+                )
             token_starts = self.row_token_start[idx]
             token_offsets = token_starts[seq_id] + pos_in_seq
             token_ids = self.packed_token_ids[token_offsets]
@@ -576,6 +790,10 @@ class TextReplayBuffer:
             option_mask=option_mask,
             target_positions=target_positions,
             target_mask=target_mask,
+            total_tokens=int(token_ids.numel()) if total_tokens_host is None else total_tokens_host,
+            seq_lengths_host=tuple(self.row_token_length_host[row] for row in idx_host)
+            if idx_host is not None
+            else None,
         )
         return TextReplayBatch(
             encoded=encoded,

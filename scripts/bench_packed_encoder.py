@@ -49,6 +49,8 @@ def _build_padded(seq_lengths: list[int], vocab_size: int) -> TextEncodedBatch:
         target_positions=target_positions,
         target_mask=target_positions >= 0,
         seq_lengths=torch.as_tensor(seq_lengths, dtype=torch.int64),
+        total_tokens=sum(seq_lengths),
+        seq_lengths_host=tuple(seq_lengths),
     )
 
 
@@ -65,6 +67,8 @@ def _move_padded(batch: TextEncodedBatch, device: torch.device) -> TextEncodedBa
         target_positions=to(batch.target_positions),
         target_mask=to(batch.target_mask),
         seq_lengths=to(batch.seq_lengths),
+        total_tokens=batch.total_tokens,
+        seq_lengths_host=batch.seq_lengths_host,
     )
 
 
@@ -86,6 +90,9 @@ def _move_packed(batch, device):  # type: ignore[no-untyped-def]
         option_mask=to(batch.option_mask),
         target_positions=to(batch.target_positions),
         target_mask=to(batch.target_mask),
+        total_tokens=batch.total_tokens,
+        seq_lengths_host=batch.seq_lengths_host,
+        max_seqlen=batch.max_seqlen,
     )
 
 

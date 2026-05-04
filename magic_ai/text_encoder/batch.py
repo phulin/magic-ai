@@ -60,6 +60,11 @@ class TextEncodedBatch:
     target_positions: Tensor  # [B, max_opts, max_targets] int64, -1 = absent
     target_mask: Tensor  # [B, max_opts, max_targets] bool
     seq_lengths: Tensor  # [B] int64
+    # Optional host-side count of live tokens. Producers should populate this
+    # before moving tensors to CUDA so packed layouts do not need a device->host
+    # read of ``seq_lengths.sum()``.
+    total_tokens: int | None = None
+    seq_lengths_host: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -84,6 +89,11 @@ class PackedTextBatch:
     option_mask: Tensor  # [B, max_opts] bool
     target_positions: Tensor  # [B, max_opts, max_targets] int32
     target_mask: Tensor  # [B, max_opts, max_targets] bool
+    # Host-side count of live tokens in ``token_ids`` / ``seq_id`` /
+    # ``pos_in_seq``. This avoids reading ``cu_seqlens[-1]`` from CUDA just to
+    # size derived metadata.
+    total_tokens: int | None = None
+    seq_lengths_host: tuple[int, ...] | None = None
     # Optional host-side upper bound on per-row sequence length, used to size
     # flash_attn_varlen tiling. None falls back to the encoder's static config
     # max. Producers that know the batch's true max (the native assembler does)
@@ -91,7 +101,11 @@ class PackedTextBatch:
     max_seqlen: int | None = None
 
 
-def packed_sequence_layout(seq_lengths: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+def packed_sequence_layout(
+    seq_lengths: Tensor,
+    *,
+    total_tokens: int | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Build packed sequence offsets and token coordinates from row lengths."""
 
     seq_lens = seq_lengths.to(torch.int32)
@@ -100,14 +114,16 @@ def packed_sequence_layout(seq_lengths: Tensor) -> tuple[Tensor, Tensor, Tensor,
     batch_size = int(seq_lens.numel())
     cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=seq_lens.device)
     cu_seqlens[1:] = seq_lens.cumsum(0)
-    total_tokens = int(cu_seqlens[-1].item())
+    if total_tokens is None:
+        total_tokens = int(cu_seqlens[-1].item())
     state_positions = cu_seqlens[:-1]
     seq_id = torch.repeat_interleave(
         torch.arange(batch_size, dtype=torch.int32, device=seq_lens.device),
         seq_lens,
+        output_size=total_tokens,
     )
     pos_in_seq = torch.arange(total_tokens, dtype=torch.int32, device=seq_lens.device) - (
-        state_positions.repeat_interleave(seq_lens)
+        state_positions.repeat_interleave(seq_lens, output_size=total_tokens)
     )
     return cu_seqlens, state_positions, seq_id, pos_in_seq
 
@@ -144,16 +160,14 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
     """
 
     seq_lens = padded.seq_lengths.to(torch.int32)
-    cu, state_positions, seq_id, pos_in_seq = packed_sequence_layout(seq_lens)
-    t_packed = int(cu[-1].item())
-
-    live = padded.attention_mask.to(torch.bool)
-    token_ids = padded.token_ids[live].to(torch.int32)
-    if int(token_ids.numel()) != t_packed:
-        raise ValueError(
-            "attention_mask live-count mismatch with seq_lengths "
-            f"({int(token_ids.numel())} vs {t_packed})"
-        )
+    total_tokens = padded.total_tokens
+    if total_tokens is None:
+        total_tokens = int(seq_lens.sum().item())
+    cu, state_positions, seq_id, pos_in_seq = packed_sequence_layout(
+        seq_lens,
+        total_tokens=total_tokens,
+    )
+    token_ids = padded.token_ids[seq_id.to(torch.long), pos_in_seq.to(torch.long)].to(torch.int32)
 
     return PackedTextBatch(
         token_ids=token_ids,
@@ -167,6 +181,8 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
         target_positions=add_packed_offsets(padded.target_positions, state_positions),
         option_mask=padded.option_mask.to(torch.bool),
         target_mask=padded.target_mask.to(torch.bool),
+        total_tokens=total_tokens,
+        seq_lengths_host=padded.seq_lengths_host,
     )
 
 
@@ -339,4 +355,6 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
         target_positions=target_positions,
         target_mask=target_mask,
         seq_lengths=torch.as_tensor(seq_lengths, dtype=torch.int64),
+        total_tokens=sum(seq_lengths),
+        seq_lengths_host=tuple(seq_lengths),
     )

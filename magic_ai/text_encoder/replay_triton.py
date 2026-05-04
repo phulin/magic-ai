@@ -22,6 +22,8 @@ tl: Any = _tl
 TRITON_AVAILABLE = triton is not None and tl is not None
 
 _copy_packed_tokens_kernel: Any = None
+_copy_staged_tokens_kernel: Any = None
+_write_staged_fields_kernel: Any = None
 _write_rebased_fields_kernel: Any = None
 _clear_decision_rows_kernel: Any = None
 _write_decision_rows_kernel: Any = None
@@ -53,6 +55,171 @@ if TRITON_AVAILABLE and not TYPE_CHECKING:
         mask = offsets < total_tokens
         values = tl.load(src + offsets, mask=mask, other=0)
         tl.store(dst + token_start + offsets, values, mask=mask)
+
+    @triton.jit(
+        do_not_specialize=[
+            "token_start",
+            "max_steps",
+        ]
+    )
+    def _copy_staged_tokens_kernel(
+        flat_env,
+        flat_step,
+        cu_seqlens,
+        seq_lengths,
+        staged_token_ids,
+        packed_token_ids,
+        token_start,
+        max_steps,
+        max_tokens: tl.constexpr,
+        block: tl.constexpr,
+    ):
+        b = tl.program_id(0)
+        offsets = tl.program_id(1) * block + tl.arange(0, block)
+        length = tl.load(seq_lengths + b)
+        mask = offsets < length
+        env = tl.load(flat_env + b)
+        step = tl.load(flat_step + b)
+        src_row = (env * max_steps + step) * max_tokens
+        dst_row = token_start + tl.load(cu_seqlens + b)
+        values = tl.load(staged_token_ids + src_row + offsets, mask=mask, other=0)
+        tl.store(packed_token_ids + dst_row + offsets, values, mask=mask)
+
+    @triton.jit(
+        do_not_specialize=[
+            "batch_size",
+            "max_steps",
+            "total_card",
+            "total_option",
+            "total_target",
+            "max_total",
+        ]
+    )
+    def _write_staged_fields_kernel(
+        flat_env,
+        flat_step,
+        rows,
+        cu_seqlens,
+        seq_lengths,
+        card_pos,
+        option_pos,
+        option_mask,
+        target_pos,
+        target_mask,
+        row_token_start,
+        row_token_length,
+        seq_lengths_out,
+        dst_card_pos,
+        dst_option_pos,
+        dst_option_mask,
+        dst_target_pos,
+        dst_target_mask,
+        token_start,
+        batch_size,
+        max_steps,
+        card_width: tl.constexpr,
+        dst_card_width: tl.constexpr,
+        src_options: tl.constexpr,
+        src_targets: tl.constexpr,
+        dst_options: tl.constexpr,
+        dst_targets: tl.constexpr,
+        total_card,
+        total_option,
+        total_target,
+        max_total,
+        block: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * block + tl.arange(0, block)
+
+        row_mask = offsets < batch_size
+        row_values = tl.load(rows + offsets, mask=row_mask, other=0)
+        starts = token_start + tl.load(cu_seqlens + offsets, mask=row_mask, other=0)
+        lengths = tl.load(seq_lengths + offsets, mask=row_mask, other=0)
+        tl.store(row_token_start + row_values, starts, mask=row_mask)
+        tl.store(row_token_length + row_values, lengths, mask=row_mask)
+        tl.store(seq_lengths_out + row_values, lengths, mask=row_mask)
+
+        card_mask = offsets < total_card
+        card_b = offsets // card_width
+        card_col = offsets - card_b * card_width
+        card_env = tl.load(flat_env + card_b, mask=card_mask, other=0)
+        card_step = tl.load(flat_step + card_b, mask=card_mask, other=0)
+        card_row = tl.load(rows + card_b, mask=card_mask, other=0)
+        card_src = (card_env * max_steps + card_step) * card_width + card_col
+        card_value = tl.load(card_pos + card_src, mask=card_mask, other=-1)
+        tl.store(
+            dst_card_pos + card_row * dst_card_width + card_col,
+            card_value,
+            mask=card_mask,
+        )
+
+        option_mask_offsets = offsets < total_option
+        option_b = offsets // dst_options
+        option_col = offsets - option_b * dst_options
+        option_env = tl.load(flat_env + option_b, mask=option_mask_offsets, other=0)
+        option_step = tl.load(flat_step + option_b, mask=option_mask_offsets, other=0)
+        option_row = tl.load(rows + option_b, mask=option_mask_offsets, other=0)
+        option_in_src = option_col < src_options
+        option_src = (option_env * max_steps + option_step) * src_options + option_col
+        option_value = tl.load(
+            option_pos + option_src,
+            mask=option_mask_offsets & option_in_src,
+            other=-1,
+        )
+        option_valid = tl.load(
+            option_mask + option_src,
+            mask=option_mask_offsets & option_in_src,
+            other=0,
+        )
+        option_dst = option_row * dst_options + option_col
+        tl.store(
+            dst_option_pos + option_dst,
+            tl.where(option_in_src, option_value, -1),
+            mask=option_mask_offsets,
+        )
+        tl.store(
+            dst_option_mask + option_dst,
+            tl.where(option_in_src, option_valid, 0),
+            mask=option_mask_offsets,
+        )
+
+        target_mask_offsets = offsets < total_target
+        target_row_area = dst_options * dst_targets
+        target_src_area = src_options * src_targets
+        target_b = offsets // target_row_area
+        target_in_row = offsets - target_b * target_row_area
+        target_opt = target_in_row // dst_targets
+        target_col = target_in_row - target_opt * dst_targets
+        target_env = tl.load(flat_env + target_b, mask=target_mask_offsets, other=0)
+        target_step = tl.load(flat_step + target_b, mask=target_mask_offsets, other=0)
+        target_row = tl.load(rows + target_b, mask=target_mask_offsets, other=0)
+        target_in_src = (target_opt < src_options) & (target_col < src_targets)
+        target_src = (
+            (target_env * max_steps + target_step) * target_src_area
+            + target_opt * src_targets
+            + target_col
+        )
+        target_value = tl.load(
+            target_pos + target_src,
+            mask=target_mask_offsets & target_in_src,
+            other=-1,
+        )
+        target_valid = tl.load(
+            target_mask + target_src,
+            mask=target_mask_offsets & target_in_src,
+            other=0,
+        )
+        target_dst = target_row * target_row_area + target_opt * dst_targets + target_col
+        tl.store(
+            dst_target_pos + target_dst,
+            tl.where(target_in_src, target_value, -1),
+            mask=target_mask_offsets,
+        )
+        tl.store(
+            dst_target_mask + target_dst,
+            tl.where(target_in_src, target_valid, 0),
+            mask=target_mask_offsets,
+        )
 
     @triton.jit(
         do_not_specialize=[
@@ -880,6 +1047,122 @@ def append_batch_encoded_triton(
     return True
 
 
+def append_staged_encoded_triton(
+    *,
+    flat_env: Tensor,
+    flat_step: Tensor,
+    token_ids: Tensor,
+    seq_lengths: Tensor,
+    cu_seqlens: Tensor,
+    card_ref_positions: Tensor,
+    option_positions: Tensor,
+    option_mask: Tensor,
+    target_positions: Tensor,
+    target_mask: Tensor,
+    rows: Tensor,
+    packed_token_ids: Tensor,
+    row_token_start: Tensor,
+    row_token_length: Tensor,
+    dst_card_ref_positions: Tensor,
+    dst_option_positions: Tensor,
+    dst_option_mask: Tensor,
+    dst_target_positions: Tensor,
+    dst_target_mask: Tensor,
+    dst_seq_lengths: Tensor,
+    token_start: int,
+) -> bool:
+    """Write replay encoded fields directly from padded staging storage with Triton."""
+
+    if not TRITON_AVAILABLE or not rows.is_cuda:
+        return False
+
+    batch_size = int(seq_lengths.shape[0])
+    if batch_size == 0:
+        return True
+
+    inputs = (
+        flat_env,
+        flat_step,
+        token_ids,
+        seq_lengths,
+        cu_seqlens,
+        card_ref_positions,
+        option_positions,
+        option_mask,
+        target_positions,
+        target_mask,
+    )
+    if not all(t.is_cuda and t.is_contiguous() for t in inputs):
+        return False
+
+    block = 512
+    max_tokens = int(token_ids.shape[2])
+    max_steps = int(token_ids.shape[1])
+    max_seq_length = int(max_tokens)
+    if max_seq_length > 0:
+        _launch(
+            _copy_staged_tokens_kernel,
+            (batch_size, _cdiv(max_seq_length, block)),
+            flat_env,
+            flat_step,
+            cu_seqlens,
+            seq_lengths,
+            token_ids,
+            packed_token_ids,
+            token_start,
+            max_steps,
+            max_tokens,
+            block,
+        )
+
+    card_width = int(card_ref_positions.shape[2])
+    src_options = int(option_positions.shape[2])
+    dst_options = int(dst_option_positions.shape[1])
+    src_targets = int(target_positions.shape[3])
+    dst_targets = int(dst_target_positions.shape[2])
+    total_card = batch_size * card_width
+    total_option = batch_size * dst_options
+    total_target = batch_size * dst_options * dst_targets
+    max_total = max(batch_size, total_card, total_option, total_target)
+    _launch(
+        _write_staged_fields_kernel,
+        (_cdiv(max_total, block),),
+        flat_env,
+        flat_step,
+        rows,
+        cu_seqlens,
+        seq_lengths,
+        card_ref_positions,
+        option_positions,
+        option_mask,
+        target_positions,
+        target_mask,
+        row_token_start,
+        row_token_length,
+        dst_seq_lengths,
+        dst_card_ref_positions,
+        dst_option_positions,
+        dst_option_mask,
+        dst_target_positions,
+        dst_target_mask,
+        token_start,
+        batch_size,
+        max_steps,
+        card_width,
+        int(dst_card_ref_positions.shape[1]),
+        src_options,
+        src_targets,
+        dst_options,
+        dst_targets,
+        total_card,
+        total_option,
+        total_target,
+        max_total,
+        block,
+    )
+    return True
+
+
 def clear_append_decisions_triton(
     *,
     rows: Tensor,
@@ -1066,6 +1349,7 @@ def gather_encoded_triton(
     cu_seqlens: Tensor,
     packed_token_ids: Tensor,
     row_token_start: Tensor,
+    total_tokens: int | None = None,
     include_seq_id: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor] | None:
     """Gather packed token sequences with Triton (token copy only)."""
@@ -1079,9 +1363,7 @@ def gather_encoded_triton(
     batch_size = int(seq_lengths.shape[0])
     if batch_size == 0:
         return None
-    total_tokens = cu_seqlens[-1]
-
-    token_count = cast(Any, total_tokens)
+    token_count = cast(Any, cu_seqlens[-1] if total_tokens is None else total_tokens)
     token_ids = torch.empty(token_count, dtype=packed_token_ids.dtype, device=rows.device)
     seq_id = (
         torch.empty(token_count, dtype=torch.int32, device=rows.device)
@@ -1631,6 +1913,7 @@ def gather_flat_triton(
 __all__ = [
     "TRITON_AVAILABLE",
     "append_batch_encoded_triton",
+    "append_staged_encoded_triton",
     "clear_append_decisions_triton",
     "gather_decisions_triton",
     "gather_encoded_triton",

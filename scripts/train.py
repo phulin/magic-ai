@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, cast
+from typing import Any, TextIO, cast
 
 import numpy as np
 import torch
@@ -101,7 +101,6 @@ from magic_ai.text_encoder.assembler import (  # noqa: E402
     assemble_batch,
     build_assembler_tokens,
 )
-from magic_ai.text_encoder.batch import PackedTextBatch  # noqa: E402
 from magic_ai.text_encoder.card_cache import (  # noqa: E402
     DEFAULT_ORACLE_DB_PATH,
     CardTokenCache,
@@ -158,6 +157,53 @@ def _record_phase(name: str, t0: float) -> None:
     rec = _subphase_record
     if rec is not None:
         rec(name, time.perf_counter() - t0)
+
+
+def _maybe_install_sync_debug() -> None:
+    """Activate torch.cuda.set_sync_debug_mode and route warnings to stderr
+    with a Python traceback, gated by ``MAGIC_AI_SYNC_DEBUG=warn|error``.
+
+    Each unique (file, lineno) site fires once.
+    """
+
+    import os as _os
+    import traceback as _tb
+    import warnings as _warn
+
+    mode = _os.environ.get("MAGIC_AI_SYNC_DEBUG", "").strip().lower()
+    if mode not in {"warn", "error"}:
+        return
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.set_sync_debug_mode(mode)
+    _warn.simplefilter("always")
+    _seen: set[tuple[str, int]] = set()
+
+    def _show(
+        message: Warning | str,
+        category: type[Warning],
+        filename: str,
+        lineno: int,
+        file: TextIO | None = None,
+        line: str | None = None,
+    ) -> None:
+        del file, line
+        key = (str(filename), int(lineno))
+        if key in _seen:
+            return
+        _seen.add(key)
+        print(
+            f"\n[sync-debug:{category.__name__}] {filename}:{lineno}: {message}",
+            flush=True,
+        )
+        _tb.print_stack(limit=30)
+
+    _warn.showwarning = cast(Any, _show)
+    print(
+        f"[sync-debug] torch.cuda.set_sync_debug_mode({mode!r}) installed; "
+        "Python traceback will be printed once per call site.",
+        flush=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -343,8 +389,10 @@ class NativeTextTrajectoryBuffer:
 
         shape = (self.num_envs, self.max_steps)
         self.step_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.step_count_host = [0 for _ in range(self.num_envs)]
         self.token_ids = torch.zeros(*shape, self.max_tokens, dtype=torch.int32, device=self.device)
         self.seq_lengths = torch.zeros(*shape, dtype=torch.int32, device=self.device)
+        self.seq_lengths_host = [[0 for _ in range(self.max_steps)] for _ in range(self.num_envs)]
         self.card_ref_positions = torch.full(
             (*shape, self.max_card_refs), -1, dtype=torch.int32, device=self.device
         )
@@ -369,6 +417,9 @@ class NativeTextTrajectoryBuffer:
         )
         self.trace_kind_id = torch.zeros(*shape, dtype=torch.int8, device=self.device)
         self.decision_count = torch.zeros(*shape, dtype=torch.int16, device=self.device)
+        self.decision_count_host = [
+            [0 for _ in range(self.max_steps)] for _ in range(self.num_envs)
+        ]
         decision_shape = (*shape, self.max_decision_groups, self.max_cached_choices)
         self.decision_option_idx = torch.full(
             decision_shape, -1, dtype=torch.int16, device=self.device
@@ -407,7 +458,9 @@ class NativeTextTrajectoryBuffer:
             )
 
     def reset_env(self, env_idx: int) -> None:
-        self.step_count[int(env_idx)] = 0
+        env_idx = int(env_idx)
+        self.step_count[env_idx] = 0
+        self.step_count_host[env_idx] = 0
 
     def stage_batch(
         self,
@@ -418,14 +471,22 @@ class NativeTextTrajectoryBuffer:
             return
         batch_size = len(env_indices)
         env_t = torch.tensor(env_indices, dtype=torch.long, device=self.device)
-        step_t = self.step_count[env_t]
-        if self.validate and bool((step_t >= self.max_steps).any().item()):
-            env_idx = int(env_t[step_t >= self.max_steps][0].item())
+        step_host = [self.step_count_host[int(env_idx)] for env_idx in env_indices]
+        if self.validate and any(step >= self.max_steps for step in step_host):
+            env_idx = next(
+                int(env_idx)
+                for env_idx, step in zip(env_indices, step_host, strict=True)
+                if step >= self.max_steps
+            )
             raise RuntimeError(f"native text staging buffer is full for env {env_idx}")
+        step_t = torch.tensor(step_host, dtype=torch.long, device=self.device)
 
         encoded = payload.encoded
         seq_lengths = encoded.seq_lengths.to(device=self.device, dtype=torch.long)
-        if self.validate and int(seq_lengths.max().item()) > self.max_tokens:
+        seq_lengths_host = encoded.seq_lengths_host
+        if seq_lengths_host is None:
+            seq_lengths_host = tuple(int(x) for x in encoded.seq_lengths.detach().cpu().tolist())
+        if self.validate and max(seq_lengths_host, default=0) > self.max_tokens:
             raise ValueError("encoded packed row token width exceeds staging max_tokens")
         row_tokens = torch.zeros(batch_size, self.max_tokens, dtype=torch.int32, device=self.device)
         row_tokens[
@@ -434,6 +495,8 @@ class NativeTextTrajectoryBuffer:
         ] = encoded.token_ids.to(device=self.device, dtype=torch.int32)
         self.token_ids[env_t, step_t] = row_tokens
         self.seq_lengths[env_t, step_t] = seq_lengths.to(dtype=torch.int32)
+        for env_idx, step, seq_len in zip(env_indices, step_host, seq_lengths_host, strict=True):
+            self.seq_lengths_host[int(env_idx)][step] = int(seq_len)
 
         base = encoded.state_positions.to(device=self.device, dtype=torch.int32)
 
@@ -471,47 +534,85 @@ class NativeTextTrajectoryBuffer:
             ].to(device=self.device, dtype=torch.bool)
 
         decision_count = payload.decision_count.to(device=self.device, dtype=torch.long)
+        decision_count_host = payload.decision_count_host
+        if decision_count_host is None:
+            decision_count_host = tuple(int(x) for x in payload.decision_count.cpu().tolist())
         stored_count = decision_count.clamp(max=self.max_decision_groups)
+        stored_count_host = tuple(
+            min(int(x), self.max_decision_groups) for x in decision_count_host
+        )
         self.trace_kind_id[env_t, step_t] = payload.trace_kind_id.to(
             device=self.device, dtype=torch.int8
         )
         self.decision_count[env_t, step_t] = stored_count.to(dtype=torch.int16)
+        for env_idx, step, count in zip(env_indices, step_host, stored_count_host, strict=True):
+            self.decision_count_host[int(env_idx)][step] = int(count)
         self.decision_option_idx[env_t, step_t].fill_(-1)
         self.decision_target_idx[env_t, step_t].fill_(-1)
         self.decision_mask[env_t, step_t].zero_()
         self.uses_none_head[env_t, step_t].zero_()
         self.selected_indices[env_t, step_t].fill_(-1)
-        # Always run the scatter path; empty intermediates make every op a
-        # no-op and avoid the host sync that ``int(decision_count.sum().item())``
-        # would force per inference batch.
+        decision_rows = (
+            int(payload.total_decision_groups)
+            if payload.total_decision_groups is not None
+            else int(payload.decision_option_idx.shape[0])
+        )
         step_for_group = torch.repeat_interleave(
-            torch.arange(batch_size, device=self.device), decision_count
+            torch.arange(batch_size, device=self.device),
+            decision_count,
+            output_size=decision_rows,
         )
         group_starts = torch.cumsum(decision_count, dim=0) - decision_count
         group_in_step = (
-            torch.arange(step_for_group.shape[0], device=self.device) - group_starts[step_for_group]
+            torch.arange(decision_rows, device=self.device) - group_starts[step_for_group]
         )
-        keep = group_in_step < self.max_decision_groups
-        flat_keep = keep.nonzero(as_tuple=False).squeeze(-1)
-        kept_steps = step_for_group[keep]
-        replay_env = env_t[kept_steps]
-        replay_step = step_t[kept_steps]
-        replay_group = group_in_step[keep]
-        self.decision_option_idx[replay_env, replay_step, replay_group] = (
-            payload.decision_option_idx[flat_keep].to(device=self.device, dtype=torch.int16)
+        flat_slots = batch_size * self.max_decision_groups
+        dummy_slot = flat_slots
+        valid_group = group_in_step < self.max_decision_groups
+        dest = step_for_group * self.max_decision_groups + group_in_step
+        dest = torch.where(valid_group, dest, dest.new_full((), dummy_slot))
+
+        option_tmp = torch.full(
+            (flat_slots + 1, self.max_cached_choices),
+            -1,
+            dtype=torch.int16,
+            device=self.device,
         )
-        self.decision_target_idx[replay_env, replay_step, replay_group] = (
-            payload.decision_target_idx[flat_keep].to(device=self.device, dtype=torch.int16)
+        target_tmp = torch.full_like(option_tmp, -1)
+        mask_tmp = torch.zeros(
+            flat_slots + 1,
+            self.max_cached_choices,
+            dtype=torch.bool,
+            device=self.device,
         )
-        self.decision_mask[replay_env, replay_step, replay_group] = payload.decision_mask[
-            flat_keep
-        ].to(device=self.device, dtype=torch.bool)
-        self.uses_none_head[replay_env, replay_step, replay_group] = payload.uses_none_head[
-            flat_keep
-        ].to(device=self.device, dtype=torch.bool)
-        self.selected_indices[replay_env, replay_step, replay_group] = payload.selected_indices[
-            flat_keep
-        ].to(device=self.device, dtype=torch.int16)
+        none_tmp = torch.zeros(flat_slots + 1, dtype=torch.bool, device=self.device)
+        selected_tmp = torch.full(
+            (flat_slots + 1,),
+            -1,
+            dtype=torch.int16,
+            device=self.device,
+        )
+        option_tmp[dest] = payload.decision_option_idx.to(device=self.device, dtype=torch.int16)
+        target_tmp[dest] = payload.decision_target_idx.to(device=self.device, dtype=torch.int16)
+        mask_tmp[dest] = payload.decision_mask.to(device=self.device, dtype=torch.bool)
+        none_tmp[dest] = payload.uses_none_head.to(device=self.device, dtype=torch.bool)
+        selected_tmp[dest] = payload.selected_indices.to(device=self.device, dtype=torch.int16)
+
+        slot_shape = (batch_size, self.max_decision_groups)
+        self.decision_option_idx[env_t, step_t] = option_tmp[:-1].view(
+            *slot_shape,
+            self.max_cached_choices,
+        )
+        self.decision_target_idx[env_t, step_t] = target_tmp[:-1].view(
+            *slot_shape,
+            self.max_cached_choices,
+        )
+        self.decision_mask[env_t, step_t] = mask_tmp[:-1].view(
+            *slot_shape,
+            self.max_cached_choices,
+        )
+        self.uses_none_head[env_t, step_t] = none_tmp[:-1].view(*slot_shape)
+        self.selected_indices[env_t, step_t] = selected_tmp[:-1].view(*slot_shape)
 
         self.may_selected[env_t, step_t] = payload.may_selected.to(
             device=self.device, dtype=torch.float32
@@ -535,6 +636,8 @@ class NativeTextTrajectoryBuffer:
                 device=self.device, dtype=torch.bfloat16
             )
         self.step_count[env_t] = step_t + 1
+        for env_idx, step in zip(env_indices, step_host, strict=True):
+            self.step_count_host[int(env_idx)] = step + 1
 
     def _append_envs_to_replay_core(
         self,
@@ -543,11 +646,9 @@ class NativeTextTrajectoryBuffer:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Append finished episodes from the staging buffer to ``replay_buffer``
         and reset the staging slots. Returns ``(flat_rows, counts_all)``
-        on-device. The internal ``int(... .item())`` syncs are unchanged
-        from :meth:`append_envs_to_replay` — they're needed by the packed
-        text-batch shape — but the per-env host conversions at the end of
-        the legacy method are dropped: callers that don't need host lists
-        get just two device tensors.
+        on-device. Host-side mirrors carry the per-env, per-row lengths used
+        to build packed token and decision layouts without rediscovering them
+        through device masks.
         """
 
         device = self.device
@@ -555,69 +656,69 @@ class NativeTextTrajectoryBuffer:
             empty = torch.zeros(0, dtype=torch.long, device=device)
             return empty, empty
 
-        env_t_all = torch.tensor(env_indices, dtype=torch.long, device=device)
-        counts_all = self.step_count[env_t_all]
-        # Skip the early-exit ``all-zero`` short-circuit: the active_mask path
-        # below produces correct empty outputs for that case without forcing
-        # a host sync per call.
+        counts_host = [self.step_count_host[int(env_idx)] for env_idx in env_indices]
+        counts_all = torch.tensor(counts_host, dtype=torch.long, device=device)
+        flat_pairs = [
+            (int(env_idx), step)
+            for env_idx, count in zip(env_indices, counts_host, strict=True)
+            for step in range(count)
+        ]
+        if not flat_pairs:
+            env_t_all = torch.tensor(env_indices, dtype=torch.long, device=device)
+            self.step_count[env_t_all] = 0
+            for env_idx in env_indices:
+                self.step_count_host[int(env_idx)] = 0
+            return torch.zeros(0, dtype=torch.long, device=device), counts_all
 
-        active_mask = counts_all > 0
-        active_env = env_t_all[active_mask]
-        active_counts = counts_all[active_mask]
-        step_pos = torch.arange(self.max_steps, device=self.device).unsqueeze(0)
-        valid_steps = step_pos < active_counts[:, None]
-        flat_env = active_env[:, None].expand(len(active_env), self.max_steps)[valid_steps]
-        flat_step = step_pos.expand(len(active_env), self.max_steps)[valid_steps]
+        flat_env_host = [env_idx for env_idx, _step in flat_pairs]
+        flat_step_host = [step for _env_idx, step in flat_pairs]
+        flat_env = torch.tensor(flat_env_host, dtype=torch.long, device=device)
+        flat_step = torch.tensor(flat_step_host, dtype=torch.long, device=device)
 
         seq_lengths = self.seq_lengths[flat_env, flat_step].to(dtype=torch.long)
-        state_positions = torch.cat([seq_lengths.new_zeros(1), seq_lengths.cumsum(0)[:-1]]).to(
-            dtype=torch.int32
+        seq_lengths_host = tuple(
+            self.seq_lengths_host[env_idx][step]
+            for env_idx, step in zip(flat_env_host, flat_step_host, strict=True)
         )
-        token_mask = (
-            torch.arange(self.max_tokens, device=self.device).unsqueeze(0) < seq_lengths[:, None]
-        )
-        token_ids = self.token_ids[flat_env, flat_step][token_mask]
         row_count = int(seq_lengths.numel())
-        seq_id = torch.repeat_interleave(
-            torch.arange(row_count, dtype=torch.int32, device=self.device), seq_lengths
-        )
-        repeated_state_positions = torch.repeat_interleave(state_positions, seq_lengths)
-        pos_in_seq = (
-            torch.arange(repeated_state_positions.shape[0], dtype=torch.int32, device=self.device)
-            - repeated_state_positions
-        )
-        cu_seqlens = torch.zeros(row_count + 1, dtype=torch.int32, device=self.device)
-        cu_seqlens[1:] = seq_lengths.cumsum(0).to(dtype=torch.int32)
-
-        def pack_positions(pos: torch.Tensor, view_shape: tuple[int, ...]) -> torch.Tensor:
-            valid = pos >= 0
-            shifted = pos.to(torch.int32) + state_positions.view(view_shape)
-            return torch.where(valid, shifted, pos.to(torch.int32))
-
-        encoded = PackedTextBatch(
-            token_ids=token_ids,
-            seq_id=seq_id,
-            pos_in_seq=pos_in_seq,
-            cu_seqlens=cu_seqlens,
-            seq_lengths=seq_lengths.to(dtype=torch.int32),
-            state_positions=state_positions,
-            card_ref_positions=pack_positions(
-                self.card_ref_positions[flat_env, flat_step], (row_count, 1)
-            ),
-            option_positions=pack_positions(
-                self.option_positions[flat_env, flat_step], (row_count, 1)
-            ),
-            option_mask=self.option_mask[flat_env, flat_step],
-            target_positions=pack_positions(
-                self.target_positions[flat_env, flat_step], (row_count, 1, 1)
-            ),
-            target_mask=self.target_mask[flat_env, flat_step],
-        )
         decision_count = self.decision_count[flat_env, flat_step].to(dtype=torch.long)
-        group_mask = (
-            torch.arange(self.max_decision_groups, device=self.device).unsqueeze(0)
-            < decision_count[:, None]
+        decision_count_host = tuple(
+            self.decision_count_host[env_idx][step]
+            for env_idx, step in zip(flat_env_host, flat_step_host, strict=True)
         )
+        total_decision_groups = sum(decision_count_host)
+        if total_decision_groups:
+            step_for_group = torch.repeat_interleave(
+                torch.arange(row_count, device=self.device),
+                decision_count,
+                output_size=total_decision_groups,
+            )
+            group_starts = torch.cumsum(decision_count, dim=0) - decision_count
+            group_in_step = (
+                torch.arange(total_decision_groups, device=self.device)
+                - group_starts[step_for_group]
+            )
+            option_idx = self.decision_option_idx[flat_env, flat_step][
+                step_for_group, group_in_step
+            ].to(dtype=torch.long)
+            target_idx = self.decision_target_idx[flat_env, flat_step][
+                step_for_group, group_in_step
+            ].to(dtype=torch.long)
+            decision_mask = self.decision_mask[flat_env, flat_step][step_for_group, group_in_step]
+            uses_none = self.uses_none_head[flat_env, flat_step][step_for_group, group_in_step]
+            selected_indices = self.selected_indices[flat_env, flat_step][
+                step_for_group, group_in_step
+            ].to(dtype=torch.long)
+        else:
+            option_idx = torch.empty(
+                (0, self.max_cached_choices), dtype=torch.long, device=self.device
+            )
+            target_idx = torch.empty_like(option_idx)
+            decision_mask = torch.empty(
+                (0, self.max_cached_choices), dtype=torch.bool, device=self.device
+            )
+            uses_none = torch.empty(0, dtype=torch.bool, device=self.device)
+            selected_indices = torch.empty(0, dtype=torch.long, device=self.device)
         lstm_h = (
             self.lstm_h_in[flat_env, flat_step].permute(1, 0, 2)
             if self.lstm_h_in is not None
@@ -628,21 +729,27 @@ class NativeTextTrajectoryBuffer:
             if self.lstm_c_in is not None
             else None
         )
-        rows = replay_buffer.append_batch(
-            encoded=encoded,
+        rows = replay_buffer.append_staged_batch(
+            flat_env=flat_env,
+            flat_step=flat_step,
+            token_ids=self.token_ids,
+            seq_lengths=seq_lengths,
+            seq_lengths_host=seq_lengths_host,
+            card_ref_positions=self.card_ref_positions,
+            option_positions=self.option_positions,
+            option_mask=self.option_mask,
+            target_positions=self.target_positions,
+            target_mask=self.target_mask,
             trace_kind_id=self.trace_kind_id[flat_env, flat_step],
             decision_count=decision_count,
-            decision_option_idx=self.decision_option_idx[flat_env, flat_step][group_mask].to(
-                dtype=torch.long
-            ),
-            decision_target_idx=self.decision_target_idx[flat_env, flat_step][group_mask].to(
-                dtype=torch.long
-            ),
-            decision_mask=self.decision_mask[flat_env, flat_step][group_mask],
-            uses_none_head=self.uses_none_head[flat_env, flat_step][group_mask],
-            selected_indices=self.selected_indices[flat_env, flat_step][group_mask].to(
-                dtype=torch.long
-            ),
+            decision_count_host=decision_count_host,
+            total_decision_groups=total_decision_groups,
+            total_stored_decision_groups=total_decision_groups,
+            decision_option_idx=option_idx,
+            decision_target_idx=target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none,
+            selected_indices=selected_indices,
             may_selected=self.may_selected[flat_env, flat_step],
             old_log_prob=self.old_log_prob[flat_env, flat_step],
             value=self.value[flat_env, flat_step],
@@ -657,7 +764,10 @@ class NativeTextTrajectoryBuffer:
 
         # Reset all targeted env slots in one scatter (resetting an already-
         # empty slot to 0 is a no-op).
+        env_t_all = torch.tensor(env_indices, dtype=torch.long, device=device)
         self.step_count[env_t_all] = 0
+        for env_idx in env_indices:
+            self.step_count_host[int(env_idx)] = 0
         return rows, counts_all
 
     def append_envs_to_replay(
@@ -1728,6 +1838,7 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
     initialize_game_log(game_log_path(args))
+    _maybe_install_sync_debug()
     if args.learning_rate is None:
         args.learning_rate = 5e-5 if args.trainer == "rnad" else 3e-4
     deck_pool = load_deck_pool(args.deck_json, args.deck_dir, args.jumpstart_dir)
@@ -4409,6 +4520,13 @@ def train_text_native_batched_envs(
         last_progress_state = (completed_games, pending_step_count, next_episode_idx)
         watchdog_threshold_s = float(getattr(args, "actor_watchdog_seconds", 60.0))
 
+        import os as _os
+
+        _profile_secs = float(_os.environ.get("MAGIC_AI_PROFILE_RL_SECONDS", "0") or 0.0)
+        _profile_out = _os.environ.get("MAGIC_AI_PROFILE_RL_OUTPUT", "/tmp/rl_profile.json.gz")
+        _profile_state: dict[str, Any] = {"prof": None, "started_at": None, "done": False}
+        _updates_seen = 0
+
         try:
             while active_actors > 0:
                 if actor_errors:
@@ -4519,6 +4637,66 @@ def train_text_native_batched_envs(
                     server.pause()
                     run_update()
                     server.resume()
+                    _updates_seen += 1
+                    # Start torch.profiler after the first post-compile update
+                    # (one full rollout + update has triggered torch.compile
+                    # for both the inference forward and the update path).
+                    if (
+                        _profile_secs > 0
+                        and _profile_state["prof"] is None
+                        and not _profile_state["done"]
+                        and _updates_seen >= 1
+                    ):
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        prof = torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                            ],
+                            record_shapes=False,
+                            with_stack=False,
+                            profile_memory=False,
+                        )
+                        prof.start()
+                        _profile_state["prof"] = prof
+                        _profile_state["started_at"] = time.monotonic()
+                        print(
+                            cli_step_prefix(),
+                            f"[profile] torch.profiler started; will run for "
+                            f"{_profile_secs:.0f}s, output={_profile_out}",
+                            flush=True,
+                        )
+
+                _profile_started_at = _profile_state["started_at"]
+                if (
+                    _profile_state["prof"] is not None
+                    and not _profile_state["done"]
+                    and _profile_started_at is not None
+                    and time.monotonic() - float(_profile_started_at) >= _profile_secs
+                ):
+                    prof = _profile_state["prof"]
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    prof.stop()
+                    out_path = Path(_profile_out)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    prof.export_chrome_trace(str(out_path))
+                    print(
+                        cli_step_prefix(),
+                        f"[profile] torch.profiler stopped; trace written to {out_path}",
+                        flush=True,
+                    )
+                    try:
+                        print(
+                            prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25),
+                            flush=True,
+                        )
+                    except Exception as _e:
+                        print(f"[profile] key_averages table failed: {_e}", flush=True)
+                    _profile_state["done"] = True
+                    _profile_state["prof"] = None
+                    raise SystemExit(0)
 
                 # Save / snapshot / retrospective (mirrors the legacy loop).
                 if (

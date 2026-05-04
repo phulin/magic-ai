@@ -910,4 +910,6 @@ def assemble_batch(
         target_positions=target_positions,
         target_mask=target_mask,
         seq_lengths=torch.as_tensor(seq_lengths, dtype=torch.int64),
+        total_tokens=sum(seq_lengths),
+        seq_lengths_host=tuple(seq_lengths),
     )

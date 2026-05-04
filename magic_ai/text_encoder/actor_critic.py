@@ -34,7 +34,6 @@ from magic_ai.replay_decisions import (
     ReplayPerChoice,
     ReplayScoringForward,
     direct_decision_logits_from_forward,
-    direct_flat_decision_distribution_from_forward,
     score_may_decisions_from_forward,
 )
 from magic_ai.slot_encoder.model import _clone_detaching_buffer
@@ -92,6 +91,9 @@ class NativeTextReplayPayload:
     encoded: PackedTextBatch
     trace_kind_id: Tensor
     decision_count: Tensor
+    decision_count_host: tuple[int, ...] | None
+    total_decision_groups: int | None
+    total_stored_decision_groups: int | None
     decision_option_idx: Tensor
     decision_target_idx: Tensor
     decision_mask: Tensor
@@ -613,7 +615,9 @@ class TextActorCritic(nn.Module):
                     device, dtype=torch.bool, non_blocking=device.type == "cuda"
                 )
                 step_for_group = torch.repeat_interleave(
-                    torch.arange(batch_size, device=device), decision_count
+                    torch.arange(batch_size, device=device),
+                    decision_count,
+                    output_size=decision_rows,
                 )
                 logits = _direct_decision_logits_batched(
                     output,
@@ -685,11 +689,22 @@ class TextActorCritic(nn.Module):
             step_entropies = step_entropies + may_entropy * may_mask_f
             del step_entropies
 
+        decision_count_host = tuple(int(x) for x in native_batch.decision_count.tolist())
+        max_stored_decision_groups = (
+            self.rollout_buffer.max_decision_groups if self.rollout_buffer is not None else None
+        )
         replay_payload = (
             NativeTextReplayPayload(
                 encoded=replay_encoded,
                 trace_kind_id=trace_kind_id.detach(),
                 decision_count=decision_count.detach(),
+                decision_count_host=decision_count_host,
+                total_decision_groups=decision_rows,
+                total_stored_decision_groups=(
+                    sum(min(x, max_stored_decision_groups) for x in decision_count_host)
+                    if max_stored_decision_groups is not None
+                    else None
+                ),
                 decision_option_idx=option_idx.detach(),
                 decision_target_idx=target_idx.detach(),
                 decision_mask=decision_mask.detach(),
@@ -719,6 +734,15 @@ class TextActorCritic(nn.Module):
                 encoded=replay_encoded,
                 trace_kind_id=trace_kind_id,
                 decision_count=decision_count,
+                decision_count_host=decision_count_host,
+                total_decision_groups=decision_rows,
+                total_stored_decision_groups=(
+                    sum(
+                        min(x, self.rollout_buffer.max_decision_groups) for x in decision_count_host
+                    )
+                    if self.rollout_buffer is not None
+                    else None
+                ),
                 decision_option_idx=option_idx,
                 decision_target_idx=target_idx,
                 decision_mask=decision_mask,
@@ -1267,33 +1291,32 @@ class TextActorCritic(nn.Module):
             ).squeeze(-1)
             per_group_entropy = -entropy_terms.sum(dim=-1)
         else:
-            group_idx, choice_cols, _flat_logits, flat_log_probs, per_group_entropy = (
-                direct_flat_decision_distribution_from_forward(
-                    forward,
-                    step_positions=steps_t,
-                    option_idx=flat_option_idx,
-                    target_idx=flat_target_idx,
-                    masks=effective_mask,
-                    uses_none=flat_uses_none,
-                )
+            all_logits = direct_decision_logits_from_forward(
+                forward,
+                step_positions=steps_t,
+                option_idx=flat_option_idx,
+                target_idx=flat_target_idx,
+                masks=flat_masks,
+                uses_none=flat_uses_none,
             )
-            group_has_visible_1d = group_has_visible.squeeze(-1)
-            valid_counts = effective_mask.sum(dim=-1).to(dtype=flat_log_probs.dtype)
-            fallback_flat = ~group_has_visible_1d[group_idx]
-            fallback_log_probs = -valid_counts[group_idx].log()
-            flat_log_probs = torch.where(fallback_flat, fallback_log_probs, flat_log_probs)
-            per_group_entropy = torch.where(
-                group_has_visible_1d,
-                per_group_entropy,
-                valid_counts.log(),
+            safe_logits = torch.where(
+                group_has_visible,
+                all_logits,
+                torch.zeros_like(all_logits),
             )
-            is_selected = choice_cols == flat_selected[group_idx]
-            per_group_log_prob = output.values.new_zeros(g_total)
-            per_group_log_prob.scatter_add_(
-                0,
-                group_idx[is_selected],
-                flat_log_probs[is_selected].to(per_group_log_prob.dtype),
+            masked_logits = safe_logits.masked_fill(~effective_mask, float("-inf"))
+            log_probs_dense = torch.log_softmax(masked_logits, dim=-1)
+            probs_dense = log_probs_dense.exp()
+            safe_log_probs = torch.where(
+                effective_mask,
+                log_probs_dense,
+                log_probs_dense.new_zeros(()),
             )
+            per_group_log_prob = log_probs_dense.gather(
+                -1,
+                flat_selected.unsqueeze(-1),
+            ).squeeze(-1)
+            per_group_entropy = -(probs_dense * safe_log_probs).sum(dim=-1)
 
         log_probs = log_probs.scatter_add(0, steps_t, per_group_log_prob)
         entropies = entropies.scatter_add(0, steps_t, per_group_entropy)
@@ -1655,6 +1678,8 @@ def _dense_from_packed_batch(
         target_positions=subtract_packed_offsets(batch.target_positions, batch.state_positions),
         target_mask=batch.target_mask,
         seq_lengths=batch.seq_lengths,
+        total_tokens=batch.total_tokens,
+        seq_lengths_host=batch.seq_lengths_host,
     )
 
 
@@ -1680,6 +1705,8 @@ def _move_text_batch(batch: TextEncodedBatch, device: torch.device) -> TextEncod
         target_positions=batch.target_positions.to(device, non_blocking=nb),
         target_mask=target_mask,
         seq_lengths=batch.seq_lengths.to(device, non_blocking=nb),
+        total_tokens=batch.total_tokens,
+        seq_lengths_host=batch.seq_lengths_host,
     )
 
 
@@ -1694,7 +1721,10 @@ def _move_packed_text_batch(batch: PackedTextBatch, device: torch.device) -> Pac
     seq_lengths = batch.seq_lengths.to(device, non_blocking=nb)
     cu_seqlens = batch.cu_seqlens.to(device, non_blocking=nb)
     if batch.seq_id.numel() == 0 and batch.pos_in_seq.numel() == 0:
-        _, _, seq_id, pos_in_seq = packed_sequence_layout(seq_lengths)
+        _, _, seq_id, pos_in_seq = packed_sequence_layout(
+            seq_lengths,
+            total_tokens=batch.total_tokens,
+        )
     else:
         seq_id = batch.seq_id.to(device, non_blocking=nb)
         pos_in_seq = batch.pos_in_seq.to(device, non_blocking=nb)
@@ -1710,6 +1740,9 @@ def _move_packed_text_batch(batch: PackedTextBatch, device: torch.device) -> Pac
         option_mask=option_mask,
         target_positions=batch.target_positions.to(device, non_blocking=nb),
         target_mask=target_mask,
+        total_tokens=batch.total_tokens,
+        seq_lengths_host=batch.seq_lengths_host,
+        max_seqlen=batch.max_seqlen,
     )
 
 

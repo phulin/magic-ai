@@ -291,7 +291,9 @@ def direct_decision_logits_from_forward(
     has_option = option_idx >= 0
     logits = torch.where(has_target, target_choice_logits, option_choice_logits)
     logits = torch.where(has_option, logits, torch.full_like(logits, -torch.inf))
-    logits[uses_none, 0] = forward.none_logits[step_positions[uses_none]]
+    col0 = torch.arange(option_idx.shape[1], device=option_idx.device).eq(0)
+    none_mask = uses_none.unsqueeze(-1) & col0.unsqueeze(0)
+    logits = torch.where(none_mask, forward.none_logits[step_positions].unsqueeze(-1), logits)
     return logits.masked_fill(~masks, -torch.inf)
 
 

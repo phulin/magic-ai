@@ -86,6 +86,54 @@ def _packed_to_device(batch: PackedTextBatch, device: torch.device) -> PackedTex
     )
 
 
+def _staged_encoded_kwargs(
+    encoded: TextEncodedBatch,
+    *,
+    device: torch.device,
+) -> dict[str, Any]:
+    envs = 3
+    steps = 2
+    flat_env = torch.tensor([2, 1], dtype=torch.long, device=device)
+    flat_step = torch.tensor([0, 1], dtype=torch.long, device=device)
+    token_ids = torch.zeros(envs, steps, 5, dtype=torch.int32, device=device)
+    seq_lengths = torch.zeros(envs, steps, dtype=torch.int32, device=device)
+    card_ref_positions = torch.full(
+        (envs, steps, MAX_CARD_REFS), -1, dtype=torch.int32, device=device
+    )
+    option_positions = torch.full((envs, steps, 3), -1, dtype=torch.int32, device=device)
+    option_mask = torch.zeros(envs, steps, 3, dtype=torch.bool, device=device)
+    target_positions = torch.full((envs, steps, 3, 2), -1, dtype=torch.int32, device=device)
+    target_mask = torch.zeros(envs, steps, 3, 2, dtype=torch.bool, device=device)
+    for row, (env_idx, step_idx) in enumerate(zip([2, 1], [0, 1], strict=True)):
+        token_ids[env_idx, step_idx] = encoded.token_ids[row].to(device=device, dtype=torch.int32)
+        seq_lengths[env_idx, step_idx] = encoded.seq_lengths[row].to(
+            device=device, dtype=torch.int32
+        )
+        card_ref_positions[env_idx, step_idx] = encoded.card_ref_positions[row].to(
+            device=device, dtype=torch.int32
+        )
+        option_positions[env_idx, step_idx] = encoded.option_positions[row].to(
+            device=device, dtype=torch.int32
+        )
+        option_mask[env_idx, step_idx] = encoded.option_mask[row].to(device=device)
+        target_positions[env_idx, step_idx] = encoded.target_positions[row].to(
+            device=device, dtype=torch.int32
+        )
+        target_mask[env_idx, step_idx] = encoded.target_mask[row].to(device=device)
+    return {
+        "flat_env": flat_env,
+        "flat_step": flat_step,
+        "token_ids": token_ids,
+        "seq_lengths": seq_lengths[flat_env, flat_step].to(dtype=torch.long),
+        "seq_lengths_host": tuple(int(x) for x in encoded.seq_lengths.tolist()),
+        "card_ref_positions": card_ref_positions,
+        "option_positions": option_positions,
+        "option_mask": option_mask,
+        "target_positions": target_positions,
+        "target_mask": target_mask,
+    }
+
+
 def _assert_replay_batch_close(
     test: unittest.TestCase,
     actual,
@@ -633,6 +681,157 @@ class TextReplayBufferTests(unittest.TestCase):
 
         rows_triton = triton_buffer.append_batch(**kwargs)
         rows_torch = torch_buffer.append_batch(**kwargs)
+        _assert_replay_batch_close(
+            self,
+            triton_buffer.gather(rows_triton),
+            torch_buffer.gather(rows_torch),
+        )
+
+    def test_append_staged_batch_matches_packed_append_torch_path(self) -> None:
+        device = torch.device("cpu")
+        encoded_dense = _encoded_batch()
+        encoded = pack_batch(encoded_dense)
+        staged_kwargs = _staged_encoded_kwargs(encoded_dense, device=device)
+        meta: dict[str, Any] = dict(
+            trace_kind_id=torch.tensor([1, 2], device=device),
+            decision_count=torch.tensor([2, 4], device=device),
+            decision_count_host=(2, 4),
+            total_decision_groups=6,
+            total_stored_decision_groups=5,
+            decision_option_idx=torch.tensor(
+                [
+                    [0, 1, -1, -1],
+                    [2, -1, -1, -1],
+                    [1, -1, -1, -1],
+                    [0, 2, -1, -1],
+                    [3, -1, -1, -1],
+                    [2, 1, -1, -1],
+                ],
+                device=device,
+            ),
+            decision_target_idx=torch.tensor(
+                [
+                    [-1, 0, -1, -1],
+                    [1, -1, -1, -1],
+                    [0, -1, -1, -1],
+                    [-1, 1, -1, -1],
+                    [2, -1, -1, -1],
+                    [0, 2, -1, -1],
+                ],
+                device=device,
+            ),
+            decision_mask=torch.tensor(
+                [
+                    [True, True, False, False],
+                    [True, False, False, False],
+                    [True, False, False, False],
+                    [True, True, False, False],
+                    [True, False, False, False],
+                    [True, True, False, False],
+                ],
+                device=device,
+            ),
+            uses_none_head=torch.tensor([False, True, True, False, True, False], device=device),
+            selected_indices=torch.tensor([1, 0, 0, 1, 0, 1], device=device),
+            may_selected=torch.tensor([0.0, 1.0], device=device),
+            old_log_prob=torch.tensor([-0.25, -0.5], device=device),
+            value=torch.tensor([0.75, -0.125], device=device),
+            perspective_player_idx=torch.tensor([0, 1], device=device),
+            lstm_h_in=torch.arange(12, dtype=torch.float32, device=device).reshape(1, 2, 6),
+            lstm_c_in=torch.arange(100, 112, dtype=torch.float32, device=device).reshape(1, 2, 6),
+        )
+        staged_buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            recurrent_layers=1,
+            recurrent_hidden_dim=6,
+            device=device,
+            use_triton_append=False,
+            use_triton_gather=False,
+        )
+        packed_buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            recurrent_layers=1,
+            recurrent_hidden_dim=6,
+            device=device,
+            use_triton_append=False,
+            use_triton_gather=False,
+        )
+
+        rows_staged = staged_buffer.append_staged_batch(**staged_kwargs, **meta)
+        rows_packed = packed_buffer.append_batch(encoded=encoded, **meta)
+        _assert_replay_batch_close(
+            self,
+            staged_buffer.gather(rows_staged),
+            packed_buffer.gather(rows_packed),
+        )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and TRITON_AVAILABLE,
+        "requires CUDA and Triton",
+    )
+    def test_append_staged_batch_triton_matches_torch_path(self) -> None:
+        device = torch.device("cuda")
+        encoded_dense = _encoded_batch()
+        staged_kwargs = _staged_encoded_kwargs(encoded_dense, device=device)
+        meta: dict[str, Any] = dict(
+            trace_kind_id=torch.tensor([1, 2], device=device),
+            decision_count=torch.tensor([1, 1], device=device),
+            decision_count_host=(1, 1),
+            total_decision_groups=2,
+            total_stored_decision_groups=2,
+            decision_option_idx=torch.tensor(
+                [[0, 1, -1, -1], [2, -1, -1, -1]],
+                device=device,
+            ),
+            decision_target_idx=torch.tensor(
+                [[-1, 0, -1, -1], [1, -1, -1, -1]],
+                device=device,
+            ),
+            decision_mask=torch.tensor(
+                [[True, True, False, False], [True, False, False, False]],
+                device=device,
+            ),
+            uses_none_head=torch.tensor([False, True], device=device),
+            selected_indices=torch.tensor([1, 0], device=device),
+            may_selected=torch.tensor([0.0, 1.0], device=device),
+            old_log_prob=torch.tensor([-0.25, -0.5], device=device),
+            value=torch.tensor([0.75, -0.125], device=device),
+            perspective_player_idx=torch.tensor([0, 1], device=device),
+        )
+        triton_buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            device=device,
+            use_triton_append=True,
+        )
+        torch_buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            device=device,
+            use_triton_append=False,
+            use_triton_gather=False,
+        )
+
+        rows_triton = triton_buffer.append_staged_batch(**staged_kwargs, **meta)
+        rows_torch = torch_buffer.append_staged_batch(**staged_kwargs, **meta)
         _assert_replay_batch_close(
             self,
             triton_buffer.gather(rows_triton),

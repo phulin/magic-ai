@@ -90,7 +90,10 @@ def ppo_update(
         raise ValueError("minibatch_max_tokens_per_row must be positive when set")
 
     device = next(policy.parameters()).device
-    replay_rows = replay_rows.to(device=device, dtype=torch.long)
+    # Keep row indices on CPU. Text replay uses a host row-length mirror to
+    # size packed minibatches without syncing on ``seq_lengths.sum()``; policies
+    # move indices to their storage device at gather sites.
+    replay_rows = replay_rows.to(device=torch.device("cpu"), dtype=torch.long)
     returns = returns.to(device=device, dtype=torch.float32)
     old_log_probs, old_values = policy.gather_replay_old_log_prob_value(replay_rows)
     old_log_probs = old_log_probs.to(device=device, dtype=torch.float32)
@@ -126,7 +129,7 @@ def ppo_update(
         minibatch_max_tokens_per_row=minibatch_max_tokens_per_row,
     )
     for epoch_idx in range(epochs):
-        permutation = torch.randperm(n_steps, device=device)
+        permutation = torch.randperm(n_steps)
         shuffled_replay_rows = replay_rows[permutation]
         for batch_slice in _iter_minibatch_slices(
             n_steps,

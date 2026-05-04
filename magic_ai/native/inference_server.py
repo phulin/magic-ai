@@ -66,6 +66,11 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
 
     seq_lengths = torch.cat([b.seq_lengths for b in batches], dim=0)
     token_ids = torch.cat([b.token_ids for b in batches], dim=0)
+    seq_lengths_host: tuple[int, ...] | None = None
+    if all(b.seq_lengths_host is not None for b in batches):
+        seq_lengths_host = tuple(
+            n for b in batches for n in cast(tuple[int, ...], b.seq_lengths_host)
+        )
 
     # Per-batch token offset (cumulative live-token count of preceding shards).
     token_totals = torch.tensor(
@@ -115,6 +120,8 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
         option_mask=torch.cat([b.option_mask for b in batches], dim=0),
         target_positions=_shift_anchor("target_positions"),
         target_mask=torch.cat([b.target_mask for b in batches], dim=0),
+        total_tokens=int(token_ids.shape[0]),
+        seq_lengths_host=seq_lengths_host,
     )
 
 

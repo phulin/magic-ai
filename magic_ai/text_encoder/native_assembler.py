@@ -136,14 +136,16 @@ class NativePackedAssemblerOutputs:
         target_mask_full = self.target_mask[:active_n]
 
         total = int(cu_seqlens[-1].item()) if cu_seqlens.numel() else 0
+        seq_lengths_host = tuple(int(x) for x in seq_lengths.tolist())
         token_ids = self.token_ids[:total]
         if derive_token_metadata:
             seq_id = torch.repeat_interleave(
                 torch.arange(active_n, dtype=torch.int32, device=seq_lengths.device),
                 seq_lengths,
+                output_size=total,
             )
             pos_in_seq = torch.arange(total, dtype=torch.int32, device=seq_lengths.device) - (
-                cu_seqlens[:-1].repeat_interleave(seq_lengths)
+                cu_seqlens[:-1].repeat_interleave(seq_lengths, output_size=total)
             )
         else:
             seq_id = self.token_ids[:0]
@@ -188,6 +190,8 @@ class NativePackedAssemblerOutputs:
             option_mask=option_mask.bool(),
             target_positions=target_positions,
             target_mask=target_mask.bool(),
+            total_tokens=total,
+            seq_lengths_host=seq_lengths_host,
             max_seqlen=max_seqlen,
         )
 

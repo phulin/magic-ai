@@ -6,6 +6,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -55,10 +56,16 @@ def _make_packed_batch(
     cu_seqlens[1:] = seq_lengths.cumsum(0)
     total_tokens = int(cu_seqlens[-1].item())
     token_ids = torch.randint(1, 50_000, (total_tokens,), dtype=torch.int64, device=device)
-    seq_id = torch.repeat_interleave(torch.arange(batch_size, device=device), seq_lengths)
+    seq_id = torch.repeat_interleave(
+        torch.arange(batch_size, device=device),
+        seq_lengths,
+        output_size=total_tokens,
+    )
     state_positions = cu_seqlens[:-1]
     pos_in_seq = torch.arange(total_tokens, device=device) - torch.repeat_interleave(
-        state_positions, seq_lengths
+        state_positions,
+        seq_lengths,
+        output_size=total_tokens,
     )
     card_ref_positions = _random_abs_positions(
         (batch_size, MAX_CARD_REFS),
@@ -92,6 +99,8 @@ def _make_packed_batch(
         option_mask=option_mask,
         target_positions=target_positions,
         target_mask=target_mask,
+        total_tokens=total_tokens,
+        seq_lengths_host=tuple(int(x) for x in seq_lengths.detach().cpu().tolist()),
     )
 
 
@@ -131,7 +140,7 @@ def _run(
     *,
     use_triton: bool,
     encoded: PackedTextBatch,
-    meta: dict[str, torch.Tensor],
+    meta: dict[str, Any],
     iterations: int,
     max_tokens: int,
     max_options: int,
@@ -169,7 +178,7 @@ def _run_gather(
     *,
     use_triton: bool,
     encoded: PackedTextBatch,
-    meta: dict[str, torch.Tensor],
+    meta: dict[str, Any],
     iterations: int,
     max_tokens: int,
     max_options: int,
