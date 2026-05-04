@@ -340,6 +340,26 @@ class TextActorCritic(nn.Module):
                     if trace_kind == "choice_index"
                     else None
                 )
+                inline_choice_color_sample = (
+                    _sample_inline_choice_index_for_step(
+                        output,
+                        inline_batch,
+                        step_idx=step_idx,
+                        deterministic=deterministic,
+                    )
+                    if trace_kind == "choice_color"
+                    else None
+                )
+                if inline_choice_color_sample is not None:
+                    selected_tensors, log_prob, entropy = inline_choice_color_sample
+                    per_step_log_prob.append(log_prob)
+                    per_step_entropy.append(entropy)
+                    per_step_value.append(value)
+                    per_step_may_sample.append(may_sample_t)
+                    per_step_trace_kind.append(trace_kind)
+                    per_step_layout.append(layout)
+                    per_step_selected_tensors.append(selected_tensors)
+                    continue
                 if inline_choice_index_sample is not None:
                     selected_tensors, log_prob, entropy = inline_choice_index_sample
                     per_step_log_prob.append(log_prob)
@@ -1275,6 +1295,16 @@ class TextActorCritic(nn.Module):
                 output,
                 batch,
                 return_per_choice=return_per_choice,
+                trace_kind_id=TRACE_KIND_TO_ID["choice_index"],
+            )
+        )
+        color_log_probs, color_entropies, color_group_mask, color_per_choice = (
+            _evaluate_inline_choice_index_replay_groups(
+                output,
+                batch,
+                return_per_choice=return_per_choice,
+                trace_kind_id=TRACE_KIND_TO_ID["choice_color"],
+                group_skip_mask=choice_group_mask,
             )
         )
         priority_log_probs, priority_entropies, priority_group_mask, priority_per_choice = (
@@ -1282,7 +1312,7 @@ class TextActorCritic(nn.Module):
                 output,
                 batch,
                 return_per_choice=return_per_choice,
-                group_skip_mask=choice_group_mask,
+                group_skip_mask=choice_group_mask | color_group_mask,
             )
         )
         blocker_log_probs, blocker_entropies, blocker_group_mask, blocker_per_choice = (
@@ -1290,19 +1320,29 @@ class TextActorCritic(nn.Module):
                 output,
                 batch,
                 return_per_choice=return_per_choice,
-                group_skip_mask=choice_group_mask | priority_group_mask,
+                group_skip_mask=choice_group_mask | color_group_mask | priority_group_mask,
             )
         )
-        log_probs = log_probs + choice_log_probs + priority_log_probs + blocker_log_probs
-        entropies = entropies + choice_entropies + priority_entropies + blocker_entropies
+        log_probs = (
+            log_probs + choice_log_probs + color_log_probs + priority_log_probs + blocker_log_probs
+        )
+        entropies = (
+            entropies + choice_entropies + color_entropies + priority_entropies + blocker_entropies
+        )
 
-        inline_group_mask = choice_group_mask | priority_group_mask | blocker_group_mask
+        inline_group_mask = (
+            choice_group_mask | color_group_mask | priority_group_mask | blocker_group_mask
+        )
         if return_per_choice:
             assert choice_per_choice is not None
+            assert color_per_choice is not None
             assert priority_per_choice is not None
             assert blocker_per_choice is not None
             inline_per_choice = _concat_replay_per_choice(
-                _concat_replay_per_choice(choice_per_choice, priority_per_choice),
+                _concat_replay_per_choice(
+                    _concat_replay_per_choice(choice_per_choice, color_per_choice),
+                    priority_per_choice,
+                ),
                 blocker_per_choice,
             )
         else:
@@ -2251,6 +2291,8 @@ def _evaluate_inline_choice_index_replay_groups(
     batch: TextReplayBatch,
     *,
     return_per_choice: bool,
+    trace_kind_id: int,
+    group_skip_mask: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice | None]:
     decision_count = batch.decision_count
     n = int(decision_count.shape[0])
@@ -2309,13 +2351,15 @@ def _evaluate_inline_choice_index_replay_groups(
         else torch.zeros_like(selected_legal)
     )
     group_mask = (
-        (trace_kind[steps_t] == TRACE_KIND_TO_ID["choice_index"])
+        (trace_kind[steps_t] == int(trace_kind_id))
         & (match_count == 1)
         & selected_in_range
         & selected_in_decision_range
         & selected_legal
         & selected_engine_valid
     )
+    if group_skip_mask is not None:
+        group_mask = group_mask & ~group_skip_mask.to(device=device, dtype=torch.bool)
 
     row_logits = blank_logits[steps_t, blank_idx]
     dummy_mask = torch.zeros_like(row_mask)

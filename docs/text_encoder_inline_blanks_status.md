@@ -23,7 +23,7 @@ the eight-step migration. Update at every step boundary.
 | 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired behind `TextEncoderConfig.use_inline_blanks`. |
 | 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ✅ done       | `<choose-block>` render/batch/model path, live sampler/action adapter, replay storage, and replay scoring landed. |
-| 7 | Targets / modes / mays / X / mana sources  | 🚧 mana renderer | Targets, may, and modes are wired; number/X and mana-color choices render inline blanks. |
+| 7 | Targets / modes / mays / X / mana sources  | ✅ done       | Targets, may, modes, number/X, and mana-color choices are inline-blank wired. |
 | 8 | Delete legacy option/target heads          | ⏳ blocked-by 7 |  |
 
 ## What landed in each completed step
@@ -207,8 +207,7 @@ without treating the accuracy gate as a blocker.
 
 ## Next steps
 
-1. **Step 7** — wire mana-color blanks into live/replay scoring.
-2. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
+1. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
    `target_*` batch fields, the legacy renderer branch, and the
    `use_inline_blanks` flag. Bump replay-buffer on-disk version.
 
@@ -301,3 +300,12 @@ without treating the accuracy gate as a blocker.
   now resolves and passes the mana-token ids to the renderer.
 - `tests/test_text_render.py`, `tests/test_text_policy.py` — coverage for
   render placement, legal id order, batch propagation, and forward logits.
+
+### Step 7 — Mana-color sampler/scoring slice (`/home/user/magic-ai-inline-blanks`)
+
+- `magic_ai/text_encoder/actor_critic.py` — live `choice_color` sampling now
+  consumes the inline mana-color blank when present; replay evaluation scores
+  `choice_color` decision groups from stored blank logits and falls back to
+  legacy option scoring otherwise.
+- `tests/test_text_actor_critic.py` — coverage for mana-color replay log-prob
+  reconstruction and per-choice output shape.
