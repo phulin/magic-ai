@@ -6,8 +6,6 @@ import torch
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.model import (
     InlineBlankPolicy,
-    PolicyHead,
-    TargetHead,
     TextEncoderConfig,
     TextStateEncoder,
     ValueHead,
@@ -99,33 +97,20 @@ def test_text_encoder_forward_pooling_heads_backward() -> None:
     assert state_vec.shape == (2, cfg.d_model)
     assert torch.allclose(state_vec, hidden[:, 0, :])
 
-    # Heads.
-    policy = PolicyHead(cfg.d_model)
-    target = TargetHead(cfg.d_model)
+    # Value head.
     value = ValueHead(cfg.d_model)
-
-    policy_logits = policy(opt_vecs, state_vec, opt_mask)
-    assert policy_logits.shape == (2, 4)
-    assert (policy_logits[~opt_mask] == float("-inf")).all()
-    assert torch.isfinite(policy_logits[opt_mask]).all()
-
-    target_logits = target(tgt_vecs, opt_vecs, state_vec, tgt_mask)
-    assert target_logits.shape == (2, 4, 3)
-    assert (target_logits[~tgt_mask] == float("-inf")).all()
-    assert torch.isfinite(target_logits[tgt_mask]).all()
 
     values = value(state_vec)
     assert values.shape == (2,)
     assert torch.isfinite(values).all()
 
     # Backward smoke.
-    valid_policy = policy_logits[opt_mask]
-    loss = values.sum() + valid_policy.sum() + target_logits[tgt_mask].sum()
+    loss = values.sum() + opt_vecs[opt_mask].sum() + tgt_vecs[tgt_mask].sum()
     loss.backward()
 
     grad_norms = [
         p.grad.detach().abs().sum().item()
-        for p in list(encoder.parameters()) + list(policy.parameters()) + list(value.parameters())
+        for p in list(encoder.parameters()) + list(value.parameters())
         if p.grad is not None
     ]
     assert any(g > 0 for g in grad_norms)

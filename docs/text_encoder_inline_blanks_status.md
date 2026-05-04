@@ -323,3 +323,5 @@ without treating the accuracy gate as a blocker.
 - `magic_ai/text_encoder/policy.py` — `TextPolicy` no longer owns or trains
   the legacy option/target heads; it returns mask-shaped placeholder logits
   while downstream replay paths are migrated off the old fields.
+- `magic_ai/text_encoder/model.py` — deleted the unused `PolicyHead` and
+  `TargetHead` classes from the model module.
