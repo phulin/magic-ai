@@ -333,3 +333,6 @@ without treating the accuracy gate as a blocker.
   same inline groups as the uncached path.
 - `magic_ai/replay_decisions.py` — removed direct option/target-logit replay
   helper APIs that existed only for the deleted text-head fallback.
+- `magic_ai/text_encoder/actor_critic.py` — removed Python live sampling
+  fallback through direct option/target logits; non-may live decisions must be
+  sampled from inline blank metadata.
