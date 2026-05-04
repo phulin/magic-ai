@@ -368,3 +368,6 @@ without treating the accuracy gate as a blocker.
   `render_snapshot(...)` are inline-only; the public `use_inline_blanks`
   switch is removed and pending decisions always render as blank anchors plus
   `<choices>`.
+- `magic_ai/text_encoder/render.py` — deleted legacy `OptionAnchor` /
+  `TargetAnchor` output and the unreachable `<actions><option>...` renderer
+  helpers.

@@ -25,7 +25,6 @@ from magic_ai.game_state import (
     PendingOptionState,
     PlayerState,
     StackObjectState,
-    TargetState,
 )
 from magic_ai.text_encoder.tokenizer import (
     _CARD_TYPE_WORDS,
@@ -99,17 +98,6 @@ class CardRefAnchor:
 
 
 @dataclass(frozen=True)
-class OptionAnchor:
-    """Position of an ``<option>`` block."""
-
-    option_index: int
-    kind: str
-    char_start: int  # offset of '<' in <option>
-    char_end: int  # offset just past '>' of </option>
-    target_anchors: tuple[TargetAnchor, ...] = ()
-
-
-@dataclass(frozen=True)
 class BlankAnchor:
     """Position of an inline-blank ``<choose-*>`` token in the rendered string.
 
@@ -135,23 +123,11 @@ class BlankAnchor:
     option_index: int
 
 
-@dataclass(frozen=True)
-class TargetAnchor:
-    """Position of a ``<target>`` block inside an option."""
-
-    option_index: int
-    target_index: int
-    referenced_card_ref: int | None  # K from <card-ref:K> if the target binds to one
-    char_start: int
-    char_end: int
-
-
 @dataclass
 class RenderedSnapshot:
     text: str
     card_refs: dict[str, int] = field(default_factory=dict)
     card_ref_anchors: list[CardRefAnchor] = field(default_factory=list)
-    option_anchors: list[OptionAnchor] = field(default_factory=list)
     blank_anchors: list[BlankAnchor] = field(default_factory=list)
 
 
@@ -809,125 +785,6 @@ class SnapshotRenderer:
             buf.append(f"<card> {card_ref_token(ref_idx)} {name} </card>")
         else:
             buf.append(f"<card> {name} </card>")
-
-    # -- actions -----------------------------------------------------------
-
-    def _render_actions(
-        self,
-        buf: list[str],
-        result: RenderedSnapshot,
-        actions: Sequence[PendingOptionState],
-        card_refs: dict[str, int],
-    ) -> None:
-        buf.append("<actions>")
-        for opt_idx, option in enumerate(actions):
-            self._render_option(buf, result, opt_idx, option, card_refs)
-        buf.append("</actions>")
-
-    def _render_option(
-        self,
-        buf: list[str],
-        result: RenderedSnapshot,
-        option_index: int,
-        option: PendingOptionState,
-        card_refs: dict[str, int],
-    ) -> None:
-        char_start = sum(len(s) for s in buf)
-        buf.append("<option>")
-
-        kind = (option.get("kind") or "").lower()
-        card_id = option.get("card_id") or option.get("permanent_id") or ""
-        card_name = option.get("card_name") or ""
-        targets = option.get("valid_targets") or []
-        target_anchors: list[TargetAnchor] = []
-
-        def emit_card(cid: str, fallback_name: str) -> None:
-            ref = card_refs.get(cid)
-            if ref is not None:
-                buf.append(card_ref_token(ref))
-            elif fallback_name:
-                buf.append(fallback_name)
-
-        if kind in ("cast", "cast_spell", "play", "play_land"):
-            buf.append("<play>" if kind in ("play", "play_land") else "<cast>")
-            emit_card(card_id, card_name)
-        elif kind in ("activate", "activate_ability", "activated_ability"):
-            buf.append("<activate>")
-            emit_card(card_id, card_name)
-            ability_idx = option.get("ability_index")
-            if ability_idx is not None:
-                buf.append(f" ability {int(ability_idx)}")
-        elif kind == "pass":
-            buf.append("<pass>")
-        elif kind == "attack":
-            buf.append("<attack>")
-            emit_card(card_id, card_name)
-        elif kind == "block":
-            buf.append("<block>")
-            emit_card(card_id, card_name)
-        elif kind == "mulligan":
-            buf.append("<mulligan>")
-        elif kind == "keep":
-            buf.append("<keep>")
-        else:
-            # Generic fallback: kind + label (label retained verbatim).
-            label = option.get("label") or ""
-            if kind:
-                buf.append(kind)
-            if label:
-                if kind:
-                    buf.append(" ")
-                buf.append(label)
-
-        for target_idx, target in enumerate(targets):
-            self._render_target(buf, target_anchors, option_index, target_idx, target, card_refs)
-
-        buf.append("</option>")
-        char_end = sum(len(s) for s in buf)
-        result.option_anchors.append(
-            OptionAnchor(
-                option_index=option_index,
-                kind=kind,
-                char_start=char_start,
-                char_end=char_end,
-                target_anchors=tuple(target_anchors),
-            )
-        )
-
-    def _render_target(
-        self,
-        buf: list[str],
-        target_anchors: list[TargetAnchor],
-        option_index: int,
-        target_index: int,
-        target: TargetState,
-        card_refs: dict[str, int],
-    ) -> None:
-        tid = target.get("id", "")
-        ref = card_refs.get(tid)
-        char_start = sum(len(s) for s in buf)
-        buf.append("<target>")
-        if ref is not None:
-            buf.append(card_ref_token(ref))
-        elif tid and tid == self._cur_self_id:
-            buf.append("<self>")
-        elif tid and tid == self._cur_opp_id:
-            buf.append("<opp>")
-        else:
-            label = target.get("label") or tid
-            if label:
-                buf.append(label)
-        buf.append("</target>")
-        char_end = sum(len(s) for s in buf)
-        target_anchors.append(
-            TargetAnchor(
-                option_index=option_index,
-                target_index=target_index,
-                referenced_card_ref=ref,
-                char_start=char_start,
-                char_end=char_end,
-            )
-        )
 
     # -- inline-blank helpers ---------------------------------------------
 

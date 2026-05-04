@@ -595,7 +595,6 @@ def test_inline_blanks_are_default(oracle: dict[str, OracleEntry]) -> None:
     assert "<use-ability>" in rendered.text
     assert "<choices>" in rendered.text
     assert len(rendered.blank_anchors) == 3
-    assert rendered.option_anchors == []
 
 
 def test_inline_blanks_emits_anchors_and_choices_block(

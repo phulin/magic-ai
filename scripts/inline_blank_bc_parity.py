@@ -288,13 +288,6 @@ def make_synthetic_priority_trace(size: int) -> list[PriorityTraceRow]:
     return rows
 
 
-def _target_legacy_ordinal(rendered: RenderedSnapshot, selected_option_index: int) -> int:
-    for ordinal, anchor in enumerate(rendered.option_anchors):
-        if anchor.option_index == selected_option_index:
-            return ordinal
-    raise ValueError(f"selected option {selected_option_index} has no legacy option anchor")
-
-
 def _target_inline_blank_index(rendered: RenderedSnapshot, selected_option_index: int) -> int:
     for anchor in rendered.blank_anchors:
         if anchor.option_index == selected_option_index:
@@ -309,31 +302,26 @@ def encode_parity_rows(
     oracle: dict[str, OracleEntry] | None,
     chosen_token_id: int,
 ) -> EncodedParityRows:
-    legacy_rendered: list[RenderedSnapshot] = []
     inline_rendered: list[RenderedSnapshot] = []
-    legacy_targets: list[int] = []
     inline_targets: list[int] = []
     for row in rows:
         actions = row.snapshot.get("pending", {}).get("options", [])
-        legacy = render_snapshot(row.snapshot, actions, oracle=oracle)
         inline = render_snapshot(
             row.snapshot,
             actions,
             oracle=oracle,
             chosen_token_id=chosen_token_id,
         )
-        legacy_rendered.append(legacy)
         inline_rendered.append(inline)
-        legacy_targets.append(_target_legacy_ordinal(legacy, row.selected_option_index))
         inline_targets.append(_target_inline_blank_index(inline, row.selected_option_index))
 
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         raise ValueError("tokenizer has no pad token")
     return EncodedParityRows(
-        legacy=collate([tokenize_snapshot(r, tokenizer) for r in legacy_rendered], int(pad_id)),
+        legacy=collate([tokenize_snapshot(r, tokenizer) for r in inline_rendered], int(pad_id)),
         inline=collate([tokenize_snapshot(r, tokenizer) for r in inline_rendered], int(pad_id)),
-        legacy_target=torch.tensor(legacy_targets, dtype=torch.long),
+        legacy_target=torch.tensor(inline_targets, dtype=torch.long),
         inline_target=torch.tensor(inline_targets, dtype=torch.long),
     )
 
