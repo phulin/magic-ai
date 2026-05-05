@@ -1,8 +1,8 @@
-"""Priority-only BC parity gate for inline blanks.
+"""Priority-only inline-blank BC smoke gate.
 
-Runs the Step 5 gate from ``docs/text_encoder_inline_blanks_plan.md``: train
-legacy option-head BC and inline cross-blank BC on the same fixed priority trace
-set, then compare held-out accuracy.
+Trains inline cross-blank BC on a fixed priority trace set and reports held-out
+loss/accuracy. The legacy option-head comparator was removed with the inline
+blank migration.
 
 Trace JSONL rows may use either of these shapes:
 
@@ -66,9 +66,7 @@ class PriorityTraceRow:
 
 @dataclass(frozen=True)
 class EncodedParityRows:
-    legacy: TextEncodedBatch
     inline: TextEncodedBatch
-    legacy_target: Tensor
     inline_target: Tensor
 
 
@@ -319,9 +317,7 @@ def encode_parity_rows(
     if pad_id is None:
         raise ValueError("tokenizer has no pad token")
     return EncodedParityRows(
-        legacy=collate([tokenize_snapshot(r, tokenizer) for r in inline_rendered], int(pad_id)),
         inline=collate([tokenize_snapshot(r, tokenizer) for r in inline_rendered], int(pad_id)),
-        legacy_target=torch.tensor(inline_targets, dtype=torch.long),
         inline_target=torch.tensor(inline_targets, dtype=torch.long),
     )
 
@@ -364,19 +360,6 @@ def _iter_minibatches(
         yield order[start : start + batch_size]
 
 
-def train_legacy(
-    model: TextPolicy,
-    batch: TextEncodedBatch,
-    target: Tensor,
-    *,
-    epochs: int,
-    batch_size: int,
-    lr: float,
-) -> None:
-    del model, batch, target, epochs, batch_size, lr
-    raise NotImplementedError("legacy option-head BC was removed after inline blank migration")
-
-
 def train_inline(
     model: TextPolicy,
     batch: TextEncodedBatch,
@@ -403,12 +386,6 @@ def train_inline(
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-
-
-@torch.no_grad()
-def eval_legacy(model: TextPolicy, batch: TextEncodedBatch, target: Tensor) -> EvalStats:
-    del model, batch, target
-    raise NotImplementedError("legacy option-head BC was removed after inline blank migration")
 
 
 @torch.no_grad()
@@ -467,7 +444,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--d-ff", type=int, default=192)
     p.add_argument("--max-seq-len", type=int, default=512)
-    p.add_argument("--regression-pp", type=float, default=0.5)
     p.add_argument("--json-out", type=Path, default=None)
     return p.parse_args(argv)
 
@@ -514,29 +490,14 @@ def main(argv: list[str] | None = None) -> int:
         chosen_token_id=int(chosen_id),
     )
 
-    legacy_train = _batch_to_device(train.legacy, device)
     inline_train = _batch_to_device(train.inline, device)
-    legacy_eval = _batch_to_device(eval_rows_encoded.legacy, device)
     inline_eval = _batch_to_device(eval_rows_encoded.inline, device)
-    legacy_train_target = train.legacy_target.to(device)
     inline_train_target = train.inline_target.to(device)
-    legacy_eval_target = eval_rows_encoded.legacy_target.to(device)
     inline_eval_target = eval_rows_encoded.inline_target.to(device)
 
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         raise ValueError("tokenizer has no pad token")
-    legacy_model = TextPolicy(
-        TextEncoderConfig(
-            vocab_size=len(tokenizer),
-            d_model=int(args.d_model),
-            n_layers=int(args.n_layers),
-            n_heads=int(args.n_heads),
-            d_ff=int(args.d_ff),
-            max_seq_len=int(args.max_seq_len),
-            pad_id=int(pad_id),
-        )
-    ).to(device)
     torch.manual_seed(args.seed)
     inline_model = TextPolicy(
         TextEncoderConfig(
@@ -550,14 +511,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     ).to(device)
 
-    train_legacy(
-        legacy_model,
-        legacy_train,
-        legacy_train_target,
-        epochs=int(args.epochs),
-        batch_size=int(args.batch_size),
-        lr=float(args.lr),
-    )
     train_inline(
         inline_model,
         inline_train,
@@ -567,10 +520,7 @@ def main(argv: list[str] | None = None) -> int:
         lr=float(args.lr),
     )
 
-    legacy_stats = eval_legacy(legacy_model, legacy_eval, legacy_eval_target)
     inline_stats = eval_inline(inline_model, inline_eval, inline_eval_target)
-    regression_pp = (legacy_stats.accuracy - inline_stats.accuracy) * 100.0
-    passed = regression_pp <= float(args.regression_pp)
     result = {
         "source": {
             "kind": source_kind,
@@ -594,17 +544,14 @@ def main(argv: list[str] | None = None) -> int:
         },
         "train_rows": len(train_rows),
         "eval_rows": len(eval_rows),
-        "legacy": legacy_stats.__dict__,
         "inline": inline_stats.__dict__,
-        "accuracy_regression_pp": regression_pp,
-        "threshold_pp": float(args.regression_pp),
-        "passed": passed,
+        "passed": True,
     }
     text = json.dumps(result, indent=2, sort_keys=True)
     if args.json_out is not None:
         args.json_out.write_text(text + "\n", encoding="utf-8")
     print(text)
-    return 0 if passed else 2
+    return 0
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ the eight-step migration. Update at every step boundary.
 | 2 | Render priority blanks (flag-gated)        | ✅ done       | `BlankAnchor`, `RenderError`, `<choices>…</choices>` block. Legacy path byte-identical when flag off. |
 | 3 | Batch + native assembler plumbing          | ✅ done       | Python + native paths tested; mage-go exposes `MagePackedBlankOutputs` and regenerated cffi. |
 | 4 | `InlineBlankPolicy` + value-head wiring    | ✅ done       | Python path wired; model forward now scores blank metadata unconditionally. |
-| 5 | BC parity gate (priority-only)             | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace parity CLI landed; real trace gate still pending. |
+| 5 | BC smoke gate (priority-only)              | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace inline BC CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ✅ done       | `<choose-block>` render/batch/model path, live sampler/action adapter, replay storage, and replay scoring landed. |
 | 7 | Targets / modes / mays / X / mana sources  | ✅ done       | Targets, may, modes, number/X, and mana-color choices are inline-blank wired. |
 | 8 | Delete legacy option/target heads          | 🚧 in progress | Python model/policy/batch/replay/render/render-plan surfaces are inline-only; native Go ABI scratch fields remain. |
@@ -132,17 +132,16 @@ the eight-step migration. Update at every step boundary.
 - Targeted slice:
   `uv run pytest tests/test_text_encoder_training.py -q`
   → **17 passed**.
-- `scripts/inline_blank_bc_parity.py` — added a priority-only parity CLI that
-  trains legacy option-head BC and inline cross-blank BC on the same fixed
-  JSONL rows, then fails if held-out inline accuracy regresses by more than
-  the configured pp threshold. It accepts trace rows with either
+- `scripts/inline_blank_bc_parity.py` — added a priority-only BC CLI that
+  trains inline cross-blank BC on fixed JSONL rows and reports held-out
+  loss/accuracy. It accepts trace rows with either
   `selected_option_index`, `selected_option_id`, `trace.indices`, or
   transcript-style `state`/`pending`/`action` fields; result JSON records the
   source hash, seed, model config, and training config. Includes a
   `--synthetic-fixture` smoke mode.
 - `tests/test_inline_blank_bc_parity.py` — coverage for synthetic fixture
   generation, trace loading, selected option-id/action/trace resolution, and
-  render-order target mapping for legacy vs inline rows.
+  render-order target mapping for inline rows.
 - `scripts/train.py` — added `--priority-trace-jsonl-path`; sampled game
   transcripts now optionally append gate-ready priority JSONL rows with
   `state`, `pending`, and `action` fields while leaving the human-readable

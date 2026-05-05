@@ -1,4 +1,4 @@
-"""Tests for the inline-blank BC parity gate script."""
+"""Tests for the inline-blank priority BC smoke gate script."""
 
 from __future__ import annotations
 
