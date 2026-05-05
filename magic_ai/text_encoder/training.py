@@ -1,22 +1,19 @@
-"""Supervised value pretrain + BC distillation training scaffolding.
+"""Supervised value pretrain + inline-blank BC training scaffolding.
 
-Implements §7 steps 3 & 4 of ``docs/text_encoder_plan.md`` at the *plumbing*
-level: pure-PyTorch loss functions plus a thin :class:`TextEncoderTrainer`
-that drives a :class:`RecurrentTextPolicy` through a single optimizer step.
+Implements pure-PyTorch loss functions plus a thin
+:class:`TextEncoderTrainer` that drives a :class:`RecurrentTextPolicy`
+through a single optimizer step.
 
-Out of scope here: data loading. Real data sources (rollout buffer for value
-pretrain, slot-policy teacher for BC distillation) are plugged in later via
-``Dataset`` objects that yield ``TextEncodedBatch`` plus the relevant labels;
-the trainer API is shaped so swapping in real data is purely a Dataset-level
-change.
+Out of scope here: data loading. Real data sources are plugged in via
+``Dataset`` objects that yield ``TextEncodedBatch`` plus the relevant labels.
 
 Conventions:
 
-* Each call to :meth:`TextEncoderTrainer.value_step` /
-  :meth:`TextEncoderTrainer.distill_step` resets the LSTM state. We treat
-  every batch as an independent episode tail; multi-step BPTT is a follow-up.
-* All losses honour the option / target masks emitted by
-  :class:`magic_ai.text_encoder.batch.TextEncodedBatch`. Padding rows do not
+* Each call to :meth:`TextEncoderTrainer.value_step` resets the LSTM state.
+  We treat every batch as an independent episode tail; multi-step BPTT is a
+  follow-up.
+* Inline-blank losses honour blank metadata emitted by
+  :class:`magic_ai.text_encoder.batch.TextEncodedBatch`; padded blanks do not
   contribute gradient.
 """
 
@@ -59,100 +56,6 @@ def value_loss(values: Tensor, targets: Tensor, mask: Tensor | None = None) -> T
     m = mask.to(sq.dtype)
     denom = m.sum().clamp(min=1.0)
     return (sq * m).sum() / denom
-
-
-def _masked_log_softmax(logits: Tensor, mask: Tensor, dim: int) -> Tensor:
-    """log_softmax restricted to positions where ``mask`` is True.
-
-    Positions where ``mask`` is False are forced to ``-inf`` *before* the
-    softmax, so they contribute zero probability and zero gradient.
-    """
-
-    neg_inf = torch.full_like(logits, float("-inf"))
-    masked = torch.where(mask, logits, neg_inf)
-    return F.log_softmax(masked, dim=dim)
-
-
-def _masked_softmax(logits: Tensor, mask: Tensor, dim: int) -> Tensor:
-    neg_inf = torch.full_like(logits, float("-inf"))
-    masked = torch.where(mask, logits, neg_inf)
-    return F.softmax(masked, dim=dim)
-
-
-def policy_distillation_loss(
-    student_logits: Tensor, teacher_logits: Tensor, mask: Tensor
-) -> Tensor:
-    """Masked KL(teacher || student) over the option dimension.
-
-    Shapes: ``student_logits``, ``teacher_logits`` both ``[B, max_opts]``;
-    ``mask`` ``[B, max_opts]`` bool. Rows where no option is valid contribute
-    zero loss; padded option slots within a row contribute zero (their
-    softmax probability is zero on both sides).
-    """
-
-    if student_logits.shape != teacher_logits.shape:
-        raise ValueError(
-            "policy_distillation_loss: student/teacher logits shape mismatch "
-            f"{tuple(student_logits.shape)} vs {tuple(teacher_logits.shape)}"
-        )
-    if mask.shape != student_logits.shape:
-        raise ValueError(
-            "policy_distillation_loss: mask shape mismatch "
-            f"{tuple(mask.shape)} vs {tuple(student_logits.shape)}"
-        )
-
-    log_student = _masked_log_softmax(student_logits, mask, dim=-1)
-    log_teacher = _masked_log_softmax(teacher_logits, mask, dim=-1)
-    teacher_p = log_teacher.exp()
-
-    # KL(teacher || student) = sum_i teacher_p_i * (log_teacher_i - log_student_i)
-    # Masked positions have teacher_p = 0 so they drop out cleanly. Replace any
-    # NaNs introduced by 0 * -inf with zeros.
-    diff = log_teacher - log_student
-    contrib = teacher_p * diff
-    contrib = torch.nan_to_num(contrib, nan=0.0, posinf=0.0, neginf=0.0)
-
-    per_row_kl = contrib.sum(dim=-1)
-    has_any = mask.any(dim=-1)
-    if not has_any.any():
-        return per_row_kl.sum() * 0.0
-    return per_row_kl[has_any].mean()
-
-
-def target_distillation_loss(
-    student_logits: Tensor, teacher_logits: Tensor, mask: Tensor
-) -> Tensor:
-    """Per-option masked KL on the target axis.
-
-    Shapes: ``student_logits``, ``teacher_logits`` both
-    ``[B, max_opts, max_targets]``; ``mask`` ``[B, max_opts, max_targets]``
-    bool. KL is computed along the targets axis for each (batch, option),
-    then averaged over options where at least one target is valid.
-    """
-
-    if student_logits.shape != teacher_logits.shape:
-        raise ValueError(
-            "target_distillation_loss: student/teacher logits shape mismatch "
-            f"{tuple(student_logits.shape)} vs {tuple(teacher_logits.shape)}"
-        )
-    if mask.shape != student_logits.shape:
-        raise ValueError(
-            "target_distillation_loss: mask shape mismatch "
-            f"{tuple(mask.shape)} vs {tuple(student_logits.shape)}"
-        )
-
-    log_student = _masked_log_softmax(student_logits, mask, dim=-1)
-    log_teacher = _masked_log_softmax(teacher_logits, mask, dim=-1)
-    teacher_p = log_teacher.exp()
-
-    contrib = teacher_p * (log_teacher - log_student)
-    contrib = torch.nan_to_num(contrib, nan=0.0, posinf=0.0, neginf=0.0)
-    per_option_kl = contrib.sum(dim=-1)  # [B, max_opts]
-
-    valid_options = mask.any(dim=-1)  # [B, max_opts]
-    if not valid_options.any():
-        return per_option_kl.sum() * 0.0
-    return per_option_kl[valid_options].mean()
 
 
 def _validate_inline_priority_shapes(
@@ -458,30 +361,6 @@ class TextEncoderTrainer:
         gn = self._step_with_clip(loss)
         return {"value_loss": float(loss.detach().item()), "grad_norm": gn}
 
-    def distill_step(
-        self,
-        batch: TextEncodedBatch,
-        teacher_policy_logits: Tensor,
-        teacher_target_logits: Tensor,
-        value_targets: Tensor | None = None,
-        policy_weight: float = 1.0,
-        target_weight: float = 1.0,
-        value_weight: float = 0.5,
-    ) -> dict[str, float]:
-        del (
-            batch,
-            teacher_policy_logits,
-            teacher_target_logits,
-            value_targets,
-            policy_weight,
-            target_weight,
-            value_weight,
-        )
-        raise NotImplementedError(
-            "legacy option/target distillation is no longer supported; "
-            "use inline blank pretraining losses instead"
-        )
-
 
 __all__ = [
     "TextEncoderTrainer",
@@ -489,7 +368,5 @@ __all__ = [
     "inline_blank_per_blank_loss",
     "inline_blank_priority_accuracy",
     "inline_blank_priority_loss",
-    "policy_distillation_loss",
-    "target_distillation_loss",
     "value_loss",
 ]
