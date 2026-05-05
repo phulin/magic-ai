@@ -24,7 +24,7 @@ the eight-step migration. Update at every step boundary.
 | 5 | BC smoke gate (priority-only)              | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace inline BC CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ✅ done       | `<choose-block>` render/batch/model path, live sampler/action adapter, replay storage, and replay scoring landed. |
 | 7 | Targets / modes / mays / X / mana sources  | ✅ done       | Targets, may, modes, number/X, and mana-color choices are inline-blank wired. |
-| 8 | Delete legacy option/target heads          | 🚧 in progress | Python model/policy/batch/replay/render/render-plan surfaces are inline-only; native Go ABI scratch fields remain. |
+| 8 | Delete legacy option/target heads          | 🚧 in progress | Python model/policy/batch/replay/render/render-plan surfaces are inline-only; native token-table/assembler ABI compatibility fields remain until mage-go is updated. |
 
 ## What landed in each completed step
 
@@ -206,9 +206,14 @@ without treating the accuracy gate as a blocker.
 
 ## Next steps
 
-1. **Step 8** — delete `PolicyHead`, `TargetHead`, `option_*` /
-   `target_*` batch fields, the legacy renderer branch, and the
-   `use_inline_blanks` flag. Bump replay-buffer on-disk version.
+1. **Native ABI cleanup** — update mage-go to remove retired action-list
+   render-plan handling plus legacy token-table and packed-output scratch
+   fields, then regenerate/reinstall the Python extension. The documented
+   `/home/user/mage-go/.claude/worktrees/inline-blanks` worktree is not
+   present; `/home/user/mage-go` is on branch `awesome`.
+2. **Replay persistence** — no text replay-buffer on-disk version hook was
+   found in this repo, so there is nothing local to bump unless a persistence
+   format is added later.
 
 ### Step 7 — Target renderer slice (`/home/user/magic-ai-inline-blanks`)
 
