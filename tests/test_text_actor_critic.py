@@ -348,6 +348,83 @@ class TextActorCriticTests(unittest.TestCase):
         torch.testing.assert_close(per_choice.step_for_decision_group, torch.tensor([0]))
         self.assertFalse(bool(per_choice.may_is_active[0]))
 
+    def test_rnad_per_choice_fallback_logits_are_finite(self) -> None:
+        torch.manual_seed(0)
+        model = _model()
+        replay = TextReplayBuffer(
+            capacity=4,
+            max_tokens=4,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            recurrent_layers=1,
+            recurrent_hidden_dim=8,
+        )
+        model.rollout_buffer = replay
+        row = replay.append(
+            encoded=_batch(batch_size=2),
+            batch_index=1,
+            trace_kind_id=0,
+            decision_option_idx=torch.tensor([[1, 1]]),
+            decision_target_idx=torch.tensor([[-1, -1]]),
+            decision_mask=torch.tensor([[True, True]]),
+            uses_none_head=torch.tensor([False]),
+            selected_indices=torch.tensor([0]),
+            may_selected=0.0,
+            old_log_prob=-0.5,
+            value=0.1,
+            perspective_player_idx=0,
+            lstm_h_in=torch.zeros(1, 8),
+            lstm_c_in=torch.zeros(1, 8),
+        )
+
+        log_probs, entropies, _values, per_choice = model.evaluate_replay_batch_per_choice([row])
+
+        self.assertTrue(torch.isfinite(log_probs).all())
+        self.assertTrue(torch.isfinite(entropies).all())
+        self.assertTrue(torch.isfinite(per_choice.flat_logits).all())
+        self.assertTrue(torch.isfinite(per_choice.flat_log_probs).all())
+
+    def test_rnad_per_choice_partially_visible_group_excludes_invisible_choices(self) -> None:
+        torch.manual_seed(0)
+        model = _model()
+        replay = TextReplayBuffer(
+            capacity=4,
+            max_tokens=4,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            recurrent_layers=1,
+            recurrent_hidden_dim=8,
+        )
+        model.rollout_buffer = replay
+        row = replay.append(
+            encoded=_batch(batch_size=2),
+            batch_index=1,
+            trace_kind_id=0,
+            decision_option_idx=torch.tensor([[0, 1]]),
+            decision_target_idx=torch.tensor([[-1, -1]]),
+            decision_mask=torch.tensor([[True, True]]),
+            uses_none_head=torch.tensor([False]),
+            selected_indices=torch.tensor([0]),
+            may_selected=0.0,
+            old_log_prob=-0.5,
+            value=0.1,
+            perspective_player_idx=0,
+            lstm_h_in=torch.zeros(1, 8),
+            lstm_c_in=torch.zeros(1, 8),
+        )
+
+        log_probs, entropies, _values, per_choice = model.evaluate_replay_batch_per_choice([row])
+
+        self.assertTrue(torch.isfinite(log_probs).all())
+        self.assertTrue(torch.isfinite(entropies).all())
+        self.assertTrue(torch.isfinite(per_choice.flat_logits).all())
+        self.assertTrue(torch.isfinite(per_choice.flat_log_probs).all())
+        torch.testing.assert_close(per_choice.choice_cols, torch.tensor([0]))
+
     def test_recompute_lstm_states_and_outputs_for_rnad(self) -> None:
         torch.manual_seed(0)
         model = _model()
