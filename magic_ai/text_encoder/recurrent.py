@@ -21,6 +21,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.fx._symbolic_trace import is_fx_symbolic_tracing
 
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
@@ -146,7 +147,7 @@ class RecurrentTextPolicy(nn.Module):
                 ],
                 torch.compile(self._forward_packed_impl, dynamic=True),
             )
-        if self._compiled_forward_packed is not None:
+        if self._compiled_forward_packed is not None and not is_fx_symbolic_tracing():
             return self._compiled_forward_packed(batch, h_in, c_in, state_hidden_override)
         return self._forward_packed_impl(batch, h_in, c_in, state_hidden_override)
 

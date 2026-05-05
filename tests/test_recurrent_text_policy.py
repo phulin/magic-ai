@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import magic_ai.text_encoder.recurrent as recurrent_module
 import torch
-from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch, pack_batch
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
     RecurrentTextPolicyConfig,
+    RecurrentTextPolicyOutput,
 )
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -151,3 +153,24 @@ def test_recurrent_init_state_zeros() -> None:
     assert torch.all(c == 0)
     assert h.device == device
     assert c.device == device
+
+
+def test_forward_packed_bypasses_compiled_callable_during_fx_trace(monkeypatch) -> None:
+    policy = _make_policy()
+    packed = pack_batch(_make_batch())
+
+    def compiled_wrapper(
+        _batch: PackedTextBatch,
+        _h_in: torch.Tensor | None,
+        _c_in: torch.Tensor | None,
+        _state_hidden_override: torch.Tensor | None,
+    ) -> tuple[RecurrentTextPolicyOutput, tuple[torch.Tensor, torch.Tensor]]:
+        raise AssertionError("compiled callable should not be used while FX is tracing")
+
+    policy._compiled_forward_packed = compiled_wrapper
+    monkeypatch.setattr(recurrent_module, "is_fx_symbolic_tracing", lambda: True)
+
+    out, _ = policy.forward_packed(packed)
+
+    assert out.policy_logits.shape == packed.option_mask.shape
+    assert torch.isfinite(out.values).all()
