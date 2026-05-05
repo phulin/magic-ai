@@ -27,16 +27,21 @@ state and are NOT averaged or copied across policies:
 ## 2. Per-policy recurrent-state recomputation in R-NaD updates
 
 The rollout buffer stores the LSTM input hidden state at each step under the
-*behavior* policy. Evaluating target or reg from those stored states would
-silently mix policies. Each policy now re-runs the LSTM scan from zero through
-the replayed episode under its own parameters via
-`PPOPolicy.recompute_lstm_states_for_episode` and passes the resulting per-
-step `(h_in, c_in)` to `evaluate_replay_batch_per_choice` as
-`lstm_state_override`.
+*behavior* policy. Evaluating online, target, or reg from those stored states
+would silently mix policies. R-NaD replay evaluation therefore recomputes the
+recurrent trajectory under each policy's own parameters, starting from h=c=0 at
+episode boundaries.
 
-The scan does features-batched + LSTM-cell-sequential (T iterations of a
-single-step LSTM cell), so the cost is one batched embedding pass plus T
-small recurrent-cell ops per policy per episode.
+The current hot path performs this recompute in batched form:
+
+- slot policy: `recompute_lstm_outputs_for_episodes` produces per-step
+  `h_out`, passed to `evaluate_replay_batch_per_choice` as `hidden_override`.
+- text policy: `precompute_replay_forward` fuses encoder forward + per-player
+  LSTM recompute and reuses the cached forward in replay scoring.
+
+The older single-episode `recompute_lstm_states_for_episode` /
+`lstm_state_override` path remains as a compatibility/reference path, but the
+trainer normally uses the batched `h_out` / cached-forward path.
 
 ## 3. Production NeuRD is always full per-action
 
@@ -59,15 +64,23 @@ paper-faithful step for NeuRD purposes:
 The trajectory-level pieces (v-trace, reward transform, critic) stay at step
 granularity since the reward is delivered at the joint step, not per group.
 
-**Resolved behavior-policy storage.** New replay rows store the rollout-time
-sampled per-group log-prob alongside each decision group. R-NaD's per-action Q
-correction now uses that stored value as `mu_k`, so Polyak lag between online
-and target no longer biases the per-group sampled correction. The joint
-v-trace IS ratio still uses the stored joint `logp_mu` from rollout time.
+**Resolved behavior-policy storage for decision groups.** New replay rows store
+the rollout-time sampled per-group log-prob alongside each decision group.
+R-NaD's per-action Q correction now uses that stored value as `mu_k`, so Polyak
+lag between online and target no longer biases the decision-group sampled
+correction. The joint v-trace IS ratio still uses the stored joint `logp_mu`
+from rollout time.
 
 `ReplayPerChoice` requires this per-group behavior field. Direct test or
 utility callers must provide it explicitly; there is no target-policy
 substitution fallback.
+
+**Known remaining approximation: may-head `mu`.** The optional `may`
+Bernoulli is not backed by a stored rollout-time branch probability. Its
+sampled-correction term currently recomputes `mu` from the current target
+policy. This can reintroduce target-lag bias for may decisions, especially with
+larger Polyak drift or asynchronous rollout/update delay. Decision groups do
+not have this issue.
 
 ## 5. Bernoulli may head: true two-action NeuRD
 
@@ -82,6 +95,10 @@ d(loss)/dl = -[(1 - p) · Clip(Q_accept, c) - p · Clip(Q_decline, c)]
 The trainer constructs `Q_accept` and `Q_decline` separately, each carrying
 its own `-eta · log(pi/pi_reg)` regularization term. The previous 1-logit
 form regularized only the sampled branch.
+
+The sampled-correction scale for this head still uses the target policy's
+current branch probability rather than a stored rollout-time probability; see
+the known approximation in issue 4.
 
 ## 6. 1/mu clip default is loose
 
@@ -113,7 +130,9 @@ decisions.
 ## 8. Other deliberate deviations carried over from earlier passes
 
 - **The opponent pool is not used for R-NaD self-play.** Opponents are the
-  current target. Snapshots still land in the pool for TrueSkill evaluation
+  current target: the slot and text rollout paths sample from the R-NaD target
+  policy, while the online policy owns the replay buffer and receives the
+  gradient update. Snapshots still land in the pool for TrueSkill evaluation
   against PPO baselines.
 - **Stratego-specific heuristics absent**: e.g. piece-revealing belief tracker,
   perfect-information critic warmup. None of these are MTG-portable.
@@ -121,7 +140,8 @@ decisions.
   rollout-batch cadence (paper: 768 TPU nodes, 7.21M steps;
   `RNaDConfig.delta_m=1_000`, `num_outer_iterations=50`). Increase
   proportionally with rollout-batch size.
-- **Draw handling**: `winner_idx = -1` skips the terminal reward (zero-sum
-  rewards remain zero everywhere) — a permissible interpretation but it
-  loses the "pressure to break draws" signal that an explicit small negative
-  draw reward would inject. Configurable in future work.
+- **Draw handling**: engine-declared draws (`winner_idx = -1` and not a
+  timeout) use a symmetric terminal reward of `-draw_penalty` for both players
+  (`zero_sum=False`). The default `--draw-penalty=0.0` still makes true engine
+  draws neutral unless the operator opts into draw pressure. Step-cap timeouts
+  are not treated as draws; they use a zero-sum life-total tiebreak.
