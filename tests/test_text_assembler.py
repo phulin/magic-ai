@@ -19,15 +19,12 @@ from magic_ai.text_encoder.render import (
     load_oracle_text,
 )
 from magic_ai.text_encoder.render_plan import (
-    OP_CLOSE_ACTIONS,
     OP_CLOSE_STATE,
     OP_CLOSE_ZONE,
     OP_LIFE,
     OP_MANA,
-    OP_OPEN_ACTIONS,
     OP_OPEN_STATE,
     OP_OPEN_ZONE,
-    OP_OPTION,
     OP_PLACE_CARD,
     OP_TURN,
     OWNER_SELF,
@@ -184,14 +181,6 @@ def test_structured_go_plan_decodes_without_literal_tokens(cache, tokenizer, nam
             STATUS_TAPPED,
             0,
             OP_CLOSE_ZONE,
-            OP_OPEN_ACTIONS,
-            OP_OPTION,
-            2,  # cast
-            bears_row,
-            0,
-            -1,
-            -1,
-            OP_CLOSE_ACTIONS,
             OP_CLOSE_STATE,
         ],
         dtype=torch.int32,
@@ -207,7 +196,8 @@ def test_structured_go_plan_decodes_without_literal_tokens(cache, tokenizer, nam
     # Card names are anonymized in the body — assert the structural surface
     # instead. Grizzly Bears is a vanilla 2/2 with no oracle text.
     assert "<pt>2/2</pt>" in decoded
-    assert "<cast>" in decoded
+    assert "<actions>" not in decoded
+    assert "<cast>" not in decoded
     assert int(batch.card_ref_positions[0, 0]) >= 0
 
 

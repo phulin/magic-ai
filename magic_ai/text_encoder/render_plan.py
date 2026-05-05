@@ -10,7 +10,7 @@ Design note (deviates from the v0 ABI doc, see §13/§ABI updates)
 
 The §3 renderer emits free-form text mixed with structural special tokens —
 ``" turn=3 step=Precombat Main "``, ``" life=20 mana={W}{W} "``,
-``" count=53 "``, plus the action verbs ``cast``/``activate``/``attack``/...
+``" count=53 "``, plus other bounded scalar fragments.
 None of these are reasonable to assemble at runtime without re-running BPE,
 which the §13 hot path forbids.
 
@@ -23,7 +23,7 @@ memcpy.
 When PR 13-D swaps the emitter from Python to Go, the Go side has two
 options:
   1. Carry the same BPE table and emit ``OP_LITERAL_TOKENS`` slices for the
-     variable scalars (turn/life/count/step/action verbs / mana symbols).
+     variable scalars (turn/life/count/step/mana symbols).
   2. Replace the variable scalars with structured opcodes whose token
      decoding lives entirely in the assembler (e.g. ``OP_LIFE`` already
      gets a structured form per the ABI), and stop emitting
@@ -43,10 +43,8 @@ import torch
 from magic_ai.game_state import (
     GameCardState,
     GameStateSnapshot,
-    PendingOptionState,
     PlayerState,
     StackObjectState,
-    TargetState,
 )
 from magic_ai.text_encoder.render import (
     _MANA_COLOR_TO_SYMBOL,
@@ -74,10 +72,6 @@ OP_CLOSE_ZONE: Final = 9
 OP_PLACE_CARD: Final = 10
 OP_COUNTER: Final = 11
 OP_ATTACHED_TO: Final = 12
-OP_OPEN_ACTIONS: Final = 13
-OP_CLOSE_ACTIONS: Final = 14
-OP_OPTION: Final = 15
-OP_TARGET: Final = 16
 # PR 13-C extension: variable-length literal-token slice produced by the
 # emitter. Header is ``(opcode, length, tok0, tok1, …, tok_{length-1})``.
 OP_LITERAL_TOKENS: Final = 17
@@ -168,10 +162,6 @@ OPCODE_ARITY: Final[dict[int, int]] = {
     OP_PLACE_CARD: 4,
     OP_COUNTER: 2,
     OP_ATTACHED_TO: 1,
-    OP_OPEN_ACTIONS: 0,
-    OP_CLOSE_ACTIONS: 0,
-    OP_OPTION: 5,
-    OP_TARGET: 3,
     OP_LITERAL_TOKENS: -1,  # variable
     OP_END_CARD: 0,
     OP_OPEN_RAW_CARD: 1,
@@ -267,17 +257,11 @@ class RenderPlanWriter:
     def emit_close_zone(self) -> None:
         self._buf.append(OP_CLOSE_ZONE)
 
-    def emit_open_actions(self) -> None:
-        self._buf.append(OP_OPEN_ACTIONS)
-
-    def emit_close_actions(self) -> None:
-        self._buf.append(OP_CLOSE_ACTIONS)
-
     def write(self, *words: int) -> None:
         """Generic opcode + payload write — mirrors the Go ``writer.write`` API."""
         self._buf.extend(int(w) for w in words)
 
-    # -- card / option / target -------------------------------------------
+    # -- card --------------------------------------------------------------
 
     def emit_place_card(
         self, slot_idx: int, card_row_id: int, status_bits: int, uuid_idx: int
@@ -300,28 +284,6 @@ class RenderPlanWriter:
 
     def emit_attached_to(self, target_uuid_idx: int) -> None:
         self._buf.extend((OP_ATTACHED_TO, int(target_uuid_idx)))
-
-    def emit_option(
-        self,
-        kind_id: int,
-        source_card_row: int,
-        source_uuid_idx: int,
-        mana_cost_id: int,
-        ability_idx: int,
-    ) -> None:
-        self._buf.extend(
-            (
-                OP_OPTION,
-                int(kind_id),
-                int(source_card_row),
-                int(source_uuid_idx),
-                int(mana_cost_id),
-                int(ability_idx),
-            )
-        )
-
-    def emit_target(self, target_card_row: int, target_uuid_idx: int, target_kind: int) -> None:
-        self._buf.extend((OP_TARGET, int(target_card_row), int(target_uuid_idx), int(target_kind)))
 
     def emit_open_raw_card(self, uuid_idx: int) -> None:
         self._buf.extend((OP_OPEN_RAW_CARD, int(uuid_idx)))
@@ -520,7 +482,7 @@ def _status_bits_from_card(card: GameCardState) -> int:
 
 def emit_render_plan(
     snapshot: GameStateSnapshot,
-    actions: Sequence[PendingOptionState] | None = None,
+    actions: Sequence[object] | None = None,
     *,
     card_row_lookup: CardRowLookup,
     tokenize: Callable[[str], list[int]],
@@ -528,11 +490,11 @@ def emit_render_plan(
     max_card_refs: int = MAX_CARD_REFS,
     dedup_card_bodies: bool = False,
 ) -> torch.Tensor:
-    """Walk ``snapshot`` (and ``actions``) and emit a render-plan int32 tensor.
+    """Walk ``snapshot`` and emit a render-plan int32 tensor.
 
-    The traversal exactly matches :class:`SnapshotRenderer.render` so that
-    the assembler's reconstruction is byte-equal to ``tokenize_snapshot
-    (render_snapshot(snapshot, actions))``.
+    ``actions`` is accepted for legacy call-site compatibility, but render
+    plans no longer emit legacy ``<actions><option>`` sections. Inline
+    decisions are represented by explicit blank opcodes.
 
     Parameters
     ----------
@@ -670,19 +632,6 @@ def emit_render_plan(
         w.write(OP_COMMAND_OPEN)
         w.write(OP_COMMAND_CLOSE)
 
-    # Actions.
-    if actions is None:
-        pending = snapshot.get("pending")
-        actions = pending.get("options", []) if pending is not None else []
-    w.emit_literal_tokens(tokenize("<actions>"))
-    w.emit_open_actions()  # bookkeeping
-    self_id = str(self_player.get("ID", "")) if self_player else ""
-    opp_id = str(opp_player.get("ID", "")) if opp_player else ""
-    for option in actions:
-        _emit_option(w, option, refs, tokenize, self_id=self_id, opp_id=opp_id)
-    w.emit_close_actions()
-    w.emit_literal_tokens(tokenize("</actions>"))
-
     w.emit_literal_tokens(tokenize("</state><eos>"))
     w.emit_close_state()
 
@@ -710,94 +659,3 @@ def _emit_stack_object(
         w.emit_literal_tokens(tokenize(f"<card> <card-ref:{ref_idx}> {name} </card>"))
     else:
         w.emit_literal_tokens(tokenize(f"<card> {name} </card>"))
-
-
-def _emit_option(
-    w: RenderPlanWriter,
-    option: PendingOptionState,
-    refs: dict[str, int],
-    tokenize: Callable[[str], list[int]],
-    *,
-    self_id: str = "",
-    opp_id: str = "",
-) -> None:
-    """Emit a single option as a literal-tokens block.
-
-    The renderer's per-option formatting (`cast <card-ref:K> cost {R}`,
-    `pass`, `attack with <card-ref:K>`, etc.) lives in one helper here so
-    the byte-for-byte match is obvious.
-    """
-
-    kind = (option.get("kind") or "").lower()
-    card_id = option.get("card_id") or option.get("permanent_id") or ""
-    card_name = option.get("card_name") or ""
-    targets = option.get("valid_targets") or []
-
-    parts: list[str] = ["<option>"]
-
-    def emit_card_token(cid: str, fallback: str) -> None:
-        ref = refs.get(cid)
-        if ref is not None:
-            parts.append(f"<card-ref:{ref}>")
-        elif fallback:
-            parts.append(fallback)
-
-    if kind in ("cast", "cast_spell", "play", "play_land"):
-        parts.append("<play>" if kind in ("play", "play_land") else "<cast>")
-        emit_card_token(card_id, card_name)
-    elif kind in ("activate", "activate_ability", "activated_ability"):
-        parts.append("<activate>")
-        emit_card_token(card_id, card_name)
-        ability_idx = option.get("ability_index")
-        if ability_idx is not None:
-            parts.append(f" ability {int(ability_idx)}")
-    elif kind == "pass":
-        parts.append("<pass>")
-    elif kind == "attack":
-        parts.append("<attack>")
-        emit_card_token(card_id, card_name)
-    elif kind == "block":
-        parts.append("<block>")
-        emit_card_token(card_id, card_name)
-    elif kind == "mulligan":
-        parts.append("<mulligan>")
-    elif kind == "keep":
-        parts.append("<keep>")
-    else:
-        label = option.get("label") or ""
-        if kind:
-            parts.append(kind)
-        if label:
-            if kind:
-                parts.append(" ")
-            parts.append(label)
-
-    for target in targets:
-        _append_target_text(parts, target, refs, self_id=self_id, opp_id=opp_id)
-
-    parts.append("</option>")
-    w.emit_literal_tokens(tokenize("".join(parts)))
-
-
-def _append_target_text(
-    parts: list[str],
-    target: TargetState,
-    refs: dict[str, int],
-    *,
-    self_id: str = "",
-    opp_id: str = "",
-) -> None:
-    tid = target.get("id", "")
-    ref = refs.get(tid)
-    parts.append("<target>")
-    if ref is not None:
-        parts.append(f"<card-ref:{ref}>")
-    elif tid and tid == self_id:
-        parts.append("<self>")
-    elif tid and tid == opp_id:
-        parts.append("<opp>")
-    else:
-        label = target.get("label") or tid
-        if label:
-            parts.append(label)
-    parts.append("</target>")

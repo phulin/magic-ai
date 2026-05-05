@@ -25,7 +25,6 @@ from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.card_cache import CardTokenCache
 from magic_ai.text_encoder.render_plan import (
     OP_ATTACHED_TO,
-    OP_CLOSE_ACTIONS,
     OP_CLOSE_DICT,
     OP_CLOSE_PLAYER,
     OP_CLOSE_RAW_CARD,
@@ -42,18 +41,15 @@ from magic_ai.text_encoder.render_plan import (
     OP_LIFE,
     OP_LITERAL_TOKENS,
     OP_MANA,
-    OP_OPEN_ACTIONS,
     OP_OPEN_DICT,
     OP_OPEN_PLAYER,
     OP_OPEN_RAW_CARD,
     OP_OPEN_STATE,
     OP_OPEN_ZONE,
-    OP_OPTION,
     OP_PLACE_CARD,
     OP_PLACE_CARD_REF,
     OP_STACK_CLOSE,
     OP_STACK_OPEN,
-    OP_TARGET,
     OP_TURN,
     OPCODE_ARITY,
     STATUS_TAPPED,
@@ -105,15 +101,6 @@ _ZONE_TAGS: dict[int, str] = {
     ZONE_STACK: "stack",
     ZONE_COMMAND: "command",
 }
-_ACTION_KINDS: dict[int, str] = {
-    0: "pass",
-    1: "play",
-    2: "cast",
-    3: "activate",
-    4: "attack with",
-    5: "block with",
-    6: "choice",
-}
 
 
 @dataclass
@@ -124,9 +111,6 @@ class AssemblerTokens:
     """
 
     pad_id: int
-    option_id: int
-    target_open_id: int
-    target_close_id: int
     tapped_id: int
     untapped_id: int
     card_ref_ids: list[int]  # length MAX_CARD_REFS
@@ -144,8 +128,6 @@ class AssemblerTokens:
     stack_close_id: int = 0
     command_open_id: int = 0
     command_close_id: int = 0
-    self_id: int = 0
-    opp_id: int = 0
     # ref_id -> K reverse map for the literal-tokens walker, which would
     # otherwise scan card_ref_ids per token.
     card_ref_id_to_k: dict[int, int] = field(default_factory=dict)
@@ -153,7 +135,7 @@ class AssemblerTokens:
     _status_untapped: list[int] = field(default_factory=list)
     # Memoized per-fragment token-id lists. Populated at init for all known
     # static fragments and small bounded vocabularies; dynamic-but-low-arity
-    # strings (turn=N, life=N, ability N) fill in lazily on first encounter.
+    # strings (turn=N, life=N) fill in lazily on first encounter.
     fragment_ids: dict[str, list[int]] = field(default_factory=dict)
     # Cached mana glyph per color id (e.g. "{W}" -> [tok_ids...]).
     mana_glyph_ids: list[list[int]] = field(default_factory=list)
@@ -193,9 +175,6 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     toks = AssemblerTokens(
         pad_id=int(pad),
-        option_id=_single_id(tokenizer, "<option>"),
-        target_open_id=_single_id(tokenizer, "<target>"),
-        target_close_id=_single_id(tokenizer, "</target>"),
         tapped_id=_single_id(tokenizer, "<tapped>"),
         untapped_id=_single_id(tokenizer, "<untapped>"),
         card_ref_ids=[_single_id(tokenizer, f"<card-ref:{k}>") for k in range(MAX_CARD_REFS)],
@@ -210,8 +189,6 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
         stack_close_id=_single_id(tokenizer, "</stack>"),
         command_open_id=_single_id(tokenizer, "<command>"),
         command_close_id=_single_id(tokenizer, "</command>"),
-        self_id=_single_id(tokenizer, "<self>"),
-        opp_id=_single_id(tokenizer, "<opp>"),
     )
     toks.card_ref_id_to_k = {ref_id: k for k, ref_id in enumerate(toks.card_ref_ids)}
     toks._tokenizer = tokenizer
@@ -226,12 +203,7 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
         "</state><eos>",
         " </self>",
         " </opp>",
-        " </option>",
-        "<actions>",
-        "</actions>",
-        " <target>",
         " ",
-        "target",
         "<self> mana=",
         "<opp> mana=",
     ):
@@ -248,9 +220,6 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
             close_s = f"</{tag}></{owner_tag}>"
             frags[open_s] = _encode(tokenizer, open_s)
             frags[close_s] = _encode(tokenizer, close_s)
-    # Action verbs (with leading space, as emitted).
-    for verb in _ACTION_KINDS.values():
-        frags[f" {verb}"] = _encode(tokenizer, f" {verb}")
     # Mana glyph per color id.
     toks.mana_glyph_ids = [_encode(tokenizer, f"{{{sym}}}") for sym in _MANA_SYMBOLS]
     return toks
@@ -354,15 +323,12 @@ def _assemble_one(
     frag_table = tables.structural
     zone_open_table = tables.zone_open
     zone_close_table = tables.zone_close
-    action_verb_table = tables.action_verb
     turn_step_table = tables.turn_step
     life_owner_table = tables.life_owner
-    ability_table = tables.ability
     out: list[int] = []
     card_ref_positions: dict[int, int] = {}
 
     scalar_owner_open: int | None = None
-    option_open = False
     blank_positions: list[int] = []
     blank_kind_ids: list[int] = []
     blank_group_ids: list[int] = []
@@ -374,11 +340,7 @@ def _assemble_one(
     # Detect literal-tokens mode by walking the opcode stream — naive
     # ``np.any(plan == OP_LITERAL_TOKENS)`` scans payload ints too and
     # spuriously flips when any payload happens to equal the opcode id
-    # (slot indices, card-row ids, and mana amounts routinely do). When
-    # the flag mis-fires, OP_OPTION / OP_TARGET / OP_OPEN_ACTIONS fall
-    # through to the bookkeeping fallback and the encoded batch ends up
-    # with empty option/target positions, which then crashes downstream
-    # gather (or returns CUDA-garbage NaN at sample time).
+    # (slot indices, card-row ids, and mana amounts routinely do).
     structured_plan = True
     _scan_i = 0
     while _scan_i < plan_len:
@@ -412,12 +374,6 @@ def _assemble_one(
             return
         out.extend(frag_table[Frag.CLOSE_SELF if scalar_owner_open == 0 else Frag.CLOSE_OPP])
         scalar_owner_open = None
-
-    def close_option() -> None:
-        nonlocal option_open
-        if option_open:
-            out.extend(frag_table[Frag.CLOSE_OPTION])
-            option_open = False
 
     i = 0
     n = plan_len
@@ -458,7 +414,6 @@ def _assemble_one(
                 continue
 
             if op == OP_CLOSE_STATE:
-                close_option()
                 close_scalar_owner()
                 out.extend(frag_table[Frag.CLOSE_STATE_EOS])
                 i += 1
@@ -509,7 +464,6 @@ def _assemble_one(
                 continue
 
             if op == OP_OPEN_ZONE:
-                close_option()
                 zone = plan_list[i + 1]
                 owner = plan_list[i + 2]
                 zone_stack.append((zone, owner))
@@ -518,76 +472,10 @@ def _assemble_one(
                 continue
 
             if op == OP_CLOSE_ZONE:
-                close_option()
                 if zone_stack:
                     zone, owner = zone_stack.pop()
                     out.extend(zone_close_table[(zone, owner)])
                 i += 1
-                continue
-
-            if op == OP_OPEN_ACTIONS:
-                out.extend(frag_table[Frag.OPEN_ACTIONS])
-                i += 1
-                continue
-
-            if op == OP_CLOSE_ACTIONS:
-                close_option()
-                out.extend(frag_table[Frag.CLOSE_ACTIONS])
-                i += 1
-                continue
-
-            if op == OP_OPTION:
-                close_option()
-                kind_id = plan_list[i + 1]
-                source_row = plan_list[i + 2]
-                source_uuid_idx = plan_list[i + 3]
-                _mana_cost_id = plan_list[i + 4]
-                ability_idx = plan_list[i + 5]
-                out.append(toks.option_id)
-                option_open = True
-                # ``action_verb_table`` already folds in the leading space, so
-                # the dispatch is one ``out.extend`` per action verb. An
-                # unknown ``kind_id`` falls through to a one-shot encode of
-                # the literal " unknown" string — not reachable on a well-
-                # formed plan but kept for legacy parity.
-                verb_ids_opt = action_verb_table.get(kind_id)
-                kind_known = verb_ids_opt is not None
-                verb_ids = verb_ids_opt if verb_ids_opt is not None else _fragment(toks, " unknown")
-                out.extend(verb_ids)
-                # ``kind_id`` 0 (pass) and 6 (choice) skip the source-row /
-                # ability suffix, matching the legacy "verb in (pass, choice,
-                # unknown)" guard.
-                if kind_known and kind_id not in (0, 6):
-                    if not emit_card_ref(source_uuid_idx) and (0 <= source_row < len(name_lists)):
-                        out.extend(name_lists[source_row])
-                if ability_idx >= 0 and kind_id == 3:
-                    ab = ability_table.get(ability_idx)
-                    if ab is None:
-                        raise ValueError(
-                            f"OP_OPTION out of bounds: ability_idx={ability_idx} "
-                            f"(allowed range {tables.ability_min}..{tables.ability_max})"
-                        )
-                    out.extend(ab)
-                i += 1 + arity
-                continue
-
-            if op == OP_TARGET:
-                target_row = plan_list[i + 1]
-                target_uuid_idx = plan_list[i + 2]
-                target_kind = plan_list[i + 3]
-                out.append(toks.target_open_id)
-                # target_kind 0 = player target. target_row is the owner index
-                # (0=self, 1=opp). Other kinds resolve to a card-ref or a
-                # cached display-name span.
-                if target_kind == 0:
-                    out.append(toks.self_id if target_row == 0 else toks.opp_id)
-                elif not emit_card_ref(target_uuid_idx):
-                    if 0 <= target_row < len(name_lists):
-                        out.extend(name_lists[target_row])
-                    else:
-                        out.extend(frag_table[Frag.TARGET_FALLBACK])
-                out.append(toks.target_close_id)
-                i += 1 + arity
                 continue
 
         if op == OP_COUNT:
@@ -751,14 +639,10 @@ def _assemble_one(
             OP_CLOSE_STATE,
             OP_OPEN_ZONE,
             OP_CLOSE_ZONE,
-            OP_OPEN_ACTIONS,
-            OP_CLOSE_ACTIONS,
             OP_OPEN_PLAYER,
             OP_CLOSE_PLAYER,
             OP_COUNTER,
             OP_ATTACHED_TO,
-            OP_OPTION,
-            OP_TARGET,
             OP_TURN,
             OP_LIFE,
             OP_MANA,
