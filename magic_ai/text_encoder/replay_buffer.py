@@ -546,16 +546,14 @@ class TextReplayBuffer:
             selected_indices = decision_batch.selected_indices
             step_for_decision_group = decision_batch.step_for_group
         else:
-            (
-                decision_start,
-                decision_count,
-                decision_option_idx,
-                decision_target_idx,
-                decision_mask,
-                uses_none_head,
-                selected_indices,
-                step_for_decision_group,
-            ) = gathered_decisions
+            decision_start = gathered_decisions.decision_start
+            decision_count = gathered_decisions.decision_count
+            decision_option_idx = gathered_decisions.decision_option_idx
+            decision_target_idx = gathered_decisions.decision_target_idx
+            decision_mask = gathered_decisions.decision_mask
+            uses_none_head = gathered_decisions.uses_none_head
+            selected_indices = gathered_decisions.selected_indices
+            step_for_decision_group = gathered_decisions.step_for_group
         encoded = PackedTextBatch(
             token_ids=token_ids,
             seq_id=seq_id,
