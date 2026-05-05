@@ -1070,6 +1070,7 @@ def append_staged_encoded_triton(
     dst_target_mask: Tensor,
     dst_seq_lengths: Tensor,
     token_start: int,
+    max_seq_length: int,
 ) -> bool:
     """Write replay encoded fields directly from padded staging storage with Triton."""
 
@@ -1098,7 +1099,6 @@ def append_staged_encoded_triton(
     block = 512
     max_tokens = int(token_ids.shape[2])
     max_steps = int(token_ids.shape[1])
-    max_seq_length = int(max_tokens)
     if max_seq_length > 0:
         _launch(
             _copy_staged_tokens_kernel,

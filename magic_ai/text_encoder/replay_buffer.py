@@ -564,6 +564,7 @@ class TextReplayBuffer:
                 dst_target_mask=self.target_mask,
                 dst_seq_lengths=self.seq_lengths,
                 token_start=token_start,
+                max_seq_length=max(seq_lengths_host, default=0),
             )
 
         if not wrote_encoded_with_triton:
