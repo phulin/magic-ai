@@ -221,7 +221,7 @@ class TextRolloutActor:
         ready_env_indices = [int(env.slot_idx) for env in ready_envs]
 
         native_batch, nat_outputs = self._encode_packed(ready_games, ready_players)
-        packed = nat_outputs.to_packed_text_batch(trim=False, derive_token_metadata=False)
+        packed = nat_outputs.to_packed_text_batch(trim=True, derive_token_metadata=False)
 
         future = self.inference_server.submit(
             TextInferenceRequest(

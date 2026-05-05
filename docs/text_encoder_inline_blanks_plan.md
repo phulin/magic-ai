@@ -14,6 +14,33 @@ same closed vocabulary), makes compound decisions like block assignments
 first-class, and removes the separate gather pools and dedicated heads for
 options/targets.
 
+## Current implementation snapshot
+
+The migration is currently inline-only on the Python policy side: legacy
+text-policy option/target heads and batch fields have been removed, and live
+native text rollout uses `MageEncodeTokensPacked` blank outputs. Native
+option/target ABI buffers remain as scratch compatibility fields until the
+mage-go ABI is cleaned up.
+
+Implemented blank surfaces:
+
+- `CROSS_BLANK`: `<choose-play>`, `<use-ability>`, and `<pass>` priority
+  anchors scored with singleton `<chosen>` legal vocabularies and one softmax
+  across the anchor positions.
+- `PER_BLANK`: `<choose-target>`, `<choose-may>`, `<choose-mode>`,
+  `<choose-x-digit>` for bounded `number` choices, and
+  `<choose-mana-source>` for `mana_color`.
+- `CONSTRAINED`: `<choose-block>` with `<none>` plus legal attacker
+  `<card-ref:K>` ids.
+
+Known fidelity gaps before this is a complete representation of all game
+choices: damage assignment order is not wired; targets are currently limited
+to visible card refs; arbitrary multi-target cardinality/constraints are not
+fully modeled; X is a bounded single blank rather than a digit sequence;
+mana-color blanks choose colors rather than source objects; several engine
+pending kinds still need dedicated or generic blank encodings. The detailed
+live status and gap list lives in `docs/text_encoder_inline_blanks_status.md`.
+
 ## Motivation
 
 The current architecture (`magic_ai/text_encoder/model.py`) uses
@@ -99,6 +126,11 @@ decision kinds:
 `blank_group_kind ∈ {PER_BLANK, CROSS_BLANK, CONSTRAINED}` rides
 alongside `blank_group` in the batch.
 
+The current implementation carries `blank_group_kind` but only a subset of
+constraint semantics are enforced. Complete Magic-fidelity requires richer
+constraint metadata or an engine-backed legality filter for compound choices
+whose legal sets shrink as earlier blanks are filled.
+
 ## Data flow
 
 ```
@@ -119,8 +151,9 @@ TextEncodedBatch:
     ▼  model.py
 hidden = trunk(tokens)                            # [B, T, D]
 blank_h = gather(hidden, blank_positions)         # [B, K, D]
-full_logits = mlm_head(blank_h)                   # [B, K, V]
-logits = full_logits.gather(-1, blank_legal_ids)  # [B, K, V_max]
+blank_h = mlm decoder pre-projection(blank_h)      # [B, K, D]
+legal_emb = token_embedding(blank_legal_ids)       # [B, K, V_max, D]
+logits = dot(legal_emb, blank_h)                   # [B, K, V_max]
 logits = logits.masked_fill(~blank_legal_mask, -inf)
 value = value_head(global_pool(hidden))
     │

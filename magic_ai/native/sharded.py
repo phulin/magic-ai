@@ -149,6 +149,15 @@ def _merge_packed_outputs(
             _add_token_offset(shard.card_ref_positions[:shard_n], token_cursor)
         )
         output.token_overflow[batch_cursor:next_batch].copy_(shard.token_overflow[:shard_n])
+        output.blank_positions[batch_cursor:next_batch].copy_(
+            _add_token_offset(shard.blank_positions[:shard_n], token_cursor)
+        )
+        output.blank_kind[batch_cursor:next_batch].copy_(shard.blank_kind[:shard_n])
+        output.blank_group[batch_cursor:next_batch].copy_(shard.blank_group[:shard_n])
+        output.blank_group_kind[batch_cursor:next_batch].copy_(shard.blank_group_kind[:shard_n])
+        output.blank_legal_ids[batch_cursor:next_batch].copy_(shard.blank_legal_ids[:shard_n])
+        output.blank_legal_mask[batch_cursor:next_batch].copy_(shard.blank_legal_mask[:shard_n])
+        output.blank_overflow[batch_cursor:next_batch].copy_(shard.blank_overflow[:shard_n])
 
         batch_cursor = next_batch
         token_cursor = next_token
@@ -345,6 +354,8 @@ class ShardedNativeBatchEncoder:
                     max_options=max_options,
                     max_targets=max_targets,
                     max_card_refs=max_card_refs,
+                    max_blanks=64,
+                    max_legal_per_blank=64,
                 )
                 self._packed_token_outputs_spec = (
                     capacity,
@@ -384,6 +395,8 @@ class ShardedNativeBatchEncoder:
                 max_options=max_options,
                 max_targets=max_targets,
                 max_card_refs=max_card_refs,
+                max_blanks=64,
+                max_legal_per_blank=64,
             )
             self._packed_token_outputs_spec = (
                 capacity,
@@ -410,6 +423,8 @@ class ShardedNativeBatchEncoder:
                     max_options=max_options,
                     max_targets=max_targets,
                     max_card_refs=max_card_refs,
+                    max_blanks=64,
+                    max_legal_per_blank=64,
                 )
                 current_spec = (capacity, max_tokens, max_options, max_targets, max_card_refs)
                 self._packed_token_shard_outputs[idx] = current

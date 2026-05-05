@@ -4749,7 +4749,7 @@ def train_text_native_batched_envs(
                     max_card_refs=256,
                 )
                 packed_text_batch = nat_outputs.to_packed_text_batch(
-                    trim=False, derive_token_metadata=False
+                    trim=True, derive_token_metadata=False
                 )
             else:
                 native_batch = native_encoder.encode_handles(

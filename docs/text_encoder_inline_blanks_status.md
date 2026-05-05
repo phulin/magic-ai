@@ -165,6 +165,101 @@ the eight-step migration. Update at every step boundary.
 None for Steps 1-4. Step 5 still has harnesses but the migration is proceeding
 without treating the accuracy gate as a blocker.
 
+## Current inline-blank representation
+
+The Python policy, recurrent wrapper, actor-critic live sampler, text replay
+buffer, and native packed-token rollout path are inline-only. The old
+option/target text-policy heads have been deleted; native legacy option/target
+ABI fields still exist only as mage-go compatibility scratch.
+
+Implemented blank kinds and current wire shapes:
+
+| Decision surface | Rendered token(s) | Group kind | Legal vocabulary | Notes |
+|---|---|---|---|---|
+| Priority play/cast | `<choose-play>` next to the source card | `CROSS_BLANK` | singleton `<chosen>` | Softmax is across all priority anchors, not within the singleton legal list. |
+| Priority ability | `<use-ability>` next to the source permanent | `CROSS_BLANK` | singleton `<chosen>` | Shares the priority cross-blank group with play/cast/pass anchors. |
+| Pass priority | `<pass>` in trailing `<choices>` | `CROSS_BLANK` | singleton `<chosen>` | Uses the existing action-kind `<pass>` token as the blank anchor. |
+| Target choice | `<choose-target>` immediately after the source action blank | `PER_BLANK` | visible target `<card-ref:K>` ids | Currently card-target only; targets without visible card refs are not represented by this blank. |
+| Block choice | `<choose-block>` next to the potential blocker | `CONSTRAINED` | `<none>` plus legal attacker `<card-ref:K>` ids | Maps sampled legal slot back to the existing blocker action payload. |
+| May choice | `<choose-may>` in trailing `<choices>` | `PER_BLANK` | `<no>, <yes>` | Legal-slot order matches `may_selected` labels. |
+| Mode choice | `<choose-mode>` in trailing `<choices>` | `PER_BLANK` | `<num:0>...<num:N-1>` | One bounded choice over the engine's mode options. |
+| Number / X choice | `<choose-x-digit>` in trailing `<choices>` | `PER_BLANK` | `<num:0>...<num:N-1>` | Currently implemented as one bounded numeric-option choice, not a multi-digit sequence. |
+| Mana color | `<choose-mana-source>` in trailing `<choices>` | `PER_BLANK` | `<mana:W>, <mana:U>, <mana:B>, <mana:R>, <mana:G>, <mana:C>` | Represents color selection; does not yet identify an individual mana source object. |
+
+Native packed rollout now calls `to_packed_text_batch(trim=True)` on the live
+sampling/eval paths so inline scoring sees the per-call live `K,V` widths
+instead of the fixed native `64,64` blank slab. The inference server pads
+trimmed actor requests back to batch-local maxima while preserving all blank
+metadata. Sharded native packed assembly allocates blank capacity and merges
+blank tensors with token-offset rebasing.
+
+## Fidelity gaps for perfect game-choice representation
+
+The current representation is sufficient for the inline-only migration path
+for priority, common targeted choices, blockers, may, mode, bounded number,
+and mana-color decisions. It is not yet a perfectly faithful representation of
+every choice the engine can ask the player to make. Remaining gaps:
+
+1. **Damage assignment order is declared but not wired.** `<choose-damage-order>`
+   exists in the tokenizer, but current renderer/native sampling paths do not
+   emit or decode ordered blocker permutations for multi-block combat damage.
+2. **Targets are card-ref only.** `<choose-target>` legal vocabularies are
+   built from visible target object ids that have `<card-ref:K>` entries.
+   Player targets, zones, spells/abilities on stack without card refs, "any
+   target" player choices, and other non-card target classes need explicit
+   answer tokens or structured target handles.
+3. **Multi-target cardinality and constraints are incomplete.** Current
+   targeted priority handling emits a target blank tied to a source option,
+   but it does not fully model "choose any number", "up to N", repeated target
+   slots, "no two share a controller", or targets with shrinking legal sets as
+   earlier slots are filled.
+4. **X / number is a bounded option index, not arbitrary numeric entry.**
+   The plan's digit-sequence design (`<choose-x-digit>` plus `<x-end>`) is not
+   implemented. Current `number` decisions rely on the engine exposing a
+   bounded list of options and map directly to `<num:0..N-1>`.
+5. **Mana payment identity is not faithful.** The `mana_color` blank chooses a
+   color token. It does not choose which land/treasure/permanent/ability paid a
+   pip, does not represent alternative costs, and cannot distinguish multiple
+   sources producing the same color.
+6. **Non-priority choice kinds are only partially covered.** `may`, `mode`,
+   `number`, and `mana_color` are wired. Other engine pending kinds such as
+   mulligan/keep, attack declaration, ordering choices, replacement/prevention
+   choices, and any bespoke prompt kinds need either dedicated blank kinds or a
+   generic structured choice blank before the representation is complete.
+7. **Hidden/ambiguous option identity still depends on engine columns.**
+   `blank_option_index` is stored so sampled blanks can map back to the native
+   engine's selected-column API. That is pragmatic for training now, but a
+   fully self-describing text representation would include enough structured
+   answer identity to decode without relying on the parallel native decision
+   layout.
+8. **Overflow/truncation policy needs hardening.** Native blank buffers are
+   capped by `max_blanks` and `max_legal_per_blank` (currently 64 each on the
+   live native path). Faithful representation requires deterministic overflow
+   handling, telemetry, and probably larger or ragged storage for pathological
+   board states.
+9. **Legality projection is still shallow.** `CONSTRAINED` marks block choices,
+   but the sampler does not yet implement every cross-blank legality rule that
+   Magic can impose. Perfect fidelity needs per-group constraint metadata or an
+   engine-backed legality filter for sampled compound assignments.
+10. **Python render-plan parity is obsolete.** The native packed assembler is
+    the active path. Tests that compare through the old Python render-plan
+    assembler can fail on stale opcode support and should not be treated as
+    inline-fidelity evidence unless that path is refreshed.
+
+## Performance notes
+
+- The live native path now trims `K,V` before scoring, avoiding the worst
+  `[B,64,64,D]` legal-embedding materialization for normal batches.
+- `InlineBlankPolicy` still materializes `legal_emb = embed(blank_legal_ids)`
+  with shape `[B,K,V,D]` and performs an elementwise multiply/sum. This is the
+  main remaining inline-blank scoring cost. A packed/ragged legal-candidate
+  representation or grouped gather-scatter scoring would be the next major
+  optimization.
+- `to_packed_text_batch(trim=True)` performs CPU reductions over the native
+  pinned blank mask to discover live `K,V`. This is not a CUDA sync, but it is
+  extra per-batch CPU work; keep an eye on it if rollout CPU time becomes
+  limiting.
+
 ### Step 6 — Combat block renderer slice (`/home/user/magic-ai-inline-blanks`)
 
 - `magic_ai/text_encoder/render.py` — inline mode now classifies `block`
