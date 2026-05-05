@@ -108,6 +108,7 @@ class NativeTrajectoryBuffer(nn.Module):
         _reg("decision_mask", decision_shape + (max_cached_choices,), torch.bool)
         _reg("uses_none_head", decision_shape, torch.bool)
         _reg("selected_indices", decision_shape, torch.long)
+        _reg("behavior_action_log_prob", decision_shape, torch.float32)
 
         _reg("step_count", (num_envs,), torch.long)
         _reg("decision_cursor", (num_envs,), torch.long)
@@ -143,6 +144,7 @@ class NativeTrajectoryBuffer(nn.Module):
     decision_mask: Tensor
     uses_none_head: Tensor
     selected_indices: Tensor
+    behavior_action_log_prob: Tensor
     step_count: Tensor
     decision_cursor: Tensor
 
@@ -163,6 +165,7 @@ class NativeTrajectoryBuffer(nn.Module):
         native_batch: NativeEncodedBatch,
         *,
         selected_choice_cols_flat: Tensor,
+        behavior_action_log_probs_flat: Tensor,
         may_selected: list[int],
         old_log_probs: Tensor,
         values: Tensor,
@@ -190,6 +193,10 @@ class NativeTrajectoryBuffer(nn.Module):
         max_decisions = max(decision_counts) if decision_counts else 0
         if int(selected_choice_cols_flat.numel()) != total_decisions:
             raise ValueError("selected_choice_cols_flat length must match total decision_count")
+        if int(behavior_action_log_probs_flat.numel()) != total_decisions:
+            raise ValueError(
+                "behavior_action_log_probs_flat length must match total decision_count"
+            )
 
         device = self.device
         env_idx_t = torch.tensor(env_indices, dtype=torch.long, device=device)
@@ -200,6 +207,7 @@ class NativeTrajectoryBuffer(nn.Module):
         counts_t = native_batch.decision_count.to(device=device)
         starts_t = self.decision_cursor[env_idx_t]
         selected_choice_cols_flat = selected_choice_cols_flat.to(device=device)
+        behavior_action_log_probs_flat = behavior_action_log_probs_flat.to(device=device)
 
         self.slot_card_rows[env_idx_t, step_idx_t] = native_batch.slot_card_rows.to(device)
         self.slot_occupied[env_idx_t, step_idx_t] = native_batch.slot_occupied.to(device)
@@ -277,6 +285,9 @@ class NativeTrajectoryBuffer(nn.Module):
             self.decision_mask[decision_env, dest_rows] = native_decision_mask[source_rows]
             self.uses_none_head[decision_env, dest_rows] = native_uses_none_head[source_rows]
             self.selected_indices[decision_env, dest_rows] = selected_choice_cols_flat
+            self.behavior_action_log_prob[decision_env, dest_rows] = (
+                behavior_action_log_probs_flat.to(dtype=torch.float32)
+            )
 
         self.step_count[env_idx_t] = step_idx_t + 1
         self.decision_cursor[env_idx_t] = starts_t + counts_t
@@ -380,6 +391,7 @@ class RolloutBuffer(nn.Module):
         self.decision_mask = self.core.decision_mask
         self.uses_none_head = self.core.uses_none_head
         self.selected_indices = self.core.selected_indices
+        self.behavior_action_log_prob = self.core.behavior_action_log_prob
 
     # Declared so type checkers see buffer Tensors as Tensors.
     slot_card_rows: Tensor
@@ -419,6 +431,7 @@ class RolloutBuffer(nn.Module):
     decision_mask: Tensor
     uses_none_head: Tensor
     selected_indices: Tensor
+    behavior_action_log_prob: Tensor
 
     @property
     def device(self) -> torch.device:
@@ -616,6 +629,7 @@ class RolloutBuffer(nn.Module):
             decision_mask = staging.decision_mask[decision_env, source_rows]
             uses_none_head = staging.uses_none_head[decision_env, source_rows]
             selected_indices = staging.selected_indices[decision_env, source_rows]
+            behavior_action_log_prob = staging.behavior_action_log_prob[decision_env, source_rows]
         else:
             decision_option_idx = torch.empty(
                 (0, staging.decision_option_idx.shape[-1]), dtype=torch.long, device=device
@@ -626,6 +640,7 @@ class RolloutBuffer(nn.Module):
             )
             uses_none_head = torch.empty(0, dtype=torch.bool, device=device)
             selected_indices = torch.empty(0, dtype=torch.long, device=device)
+            behavior_action_log_prob = torch.empty(0, dtype=torch.float32, device=device)
         h_in = staging.lstm_h_in[src_env, src_step] if self.lstm_h_in is not None else None
         c_in = staging.lstm_c_in[src_env, src_step] if self.lstm_c_in is not None else None
         step_indices = self.core.append_batch(
@@ -636,6 +651,7 @@ class RolloutBuffer(nn.Module):
             decision_mask=decision_mask,
             uses_none_head=uses_none_head,
             selected_indices=selected_indices,
+            behavior_action_log_prob=behavior_action_log_prob,
             may_selected=staging.may_selected[src_env, src_step],
             old_log_prob=staging.old_log_prob[src_env, src_step],
             value=staging.value[src_env, src_step],

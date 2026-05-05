@@ -627,6 +627,7 @@ class PPOPolicy(nn.Module):
         per_step_log_prob_sum: Tensor | None = None
         per_step_entropy_sum: Tensor | None = None
         decision_selected_cpu: list[int] = []
+        decision_log_probs_cpu: list[float] = []
         if group_step_positions:
             pos_t = torch.tensor(group_step_positions, dtype=torch.long, device=device)
             idx_t = torch.tensor(group_decision_indices, dtype=torch.long, device=device)
@@ -661,6 +662,7 @@ class PPOPolicy(nn.Module):
             per_step_log_prob_sum.scatter_add_(0, pos_t, decision_log_probs)
             per_step_entropy_sum.scatter_add_(0, pos_t, group_entropies)
             decision_selected_cpu = decision_selected.detach().cpu().tolist()
+            decision_log_probs_cpu = [float(x) for x in decision_log_probs.detach().cpu().tolist()]
 
         # Unbind once into Python lists so the per-env loop below indexes into
         # plain lists instead of issuing N aten::select calls per tensor field.
@@ -713,6 +715,7 @@ class PPOPolicy(nn.Module):
                 continue
 
             step_selected = decision_selected_cpu[offset : offset + decision_count]
+            step_action_log_probs = decision_log_probs_cpu[offset : offset + decision_count]
             offset += decision_count
             trace, action = self._trace_action_without_pending(trace_kind, step_selected)
             results.append(
@@ -724,6 +727,7 @@ class PPOPolicy(nn.Module):
                     entropy=per_step_entropy_sum_list[step_idx],
                     replay_idx=None,
                     selected_choice_cols=tuple(step_selected),
+                    selected_action_log_probs=tuple(step_action_log_probs),
                 )
             )
         return results
@@ -794,6 +798,7 @@ class PPOPolicy(nn.Module):
         per_step_log_prob_sum: Tensor | None = None
         per_step_entropy_sum: Tensor | None = None
         decision_selected_cpu: list[int] = []
+        decision_log_probs_cpu: list[float] = []
         if group_step_positions:
             pos_t = torch.tensor(group_step_positions, dtype=torch.long, device=device)
             idx_t = torch.tensor(group_decision_indices, dtype=torch.long, device=device)
@@ -827,7 +832,9 @@ class PPOPolicy(nn.Module):
             per_step_log_prob_sum.scatter_add_(0, pos_t, decision_log_probs)
             per_step_entropy_sum.scatter_add_(0, pos_t, group_entropies)
             decision_selected_cpu = decision_selected.detach().cpu().tolist()
+            decision_log_probs_cpu = [float(x) for x in decision_log_probs.detach().cpu().tolist()]
             rb.selected_indices[idx_t] = decision_selected
+            rb.behavior_action_log_prob[idx_t] = decision_log_probs.detach()
 
         may_lookup = {step_idx: pos for pos, step_idx in enumerate(may_positions)}
         results: list[PolicyStep] = []
@@ -877,6 +884,7 @@ class PPOPolicy(nn.Module):
 
             assert per_step_log_prob_sum is not None and per_step_entropy_sum is not None
             step_selected = decision_selected_cpu[offset : offset + decision_count]
+            step_action_log_probs = decision_log_probs_cpu[offset : offset + decision_count]
             offset += decision_count
             if pending:
                 trace, action = self._decode_action(trace_kind, pending, step_selected)
@@ -891,6 +899,7 @@ class PPOPolicy(nn.Module):
                     entropy=per_step_entropy_sum[step_idx],
                     replay_idx=replay_idx,
                     selected_choice_cols=tuple(step_selected),
+                    selected_action_log_probs=tuple(step_action_log_probs),
                 )
             )
         return results
@@ -1354,6 +1363,7 @@ class PPOPolicy(nn.Module):
         is_sampled_flat_out = torch.zeros(0, dtype=torch.bool, device=device)
         decision_group_id_flat_out = torch.zeros(0, dtype=torch.long, device=device)
         step_for_decision_group_out = torch.zeros(0, dtype=torch.long, device=device)
+        behavior_lp_per_group = forward.values.new_zeros(0)
 
         if active_mask.any():
             pos_t = active_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -1406,6 +1416,7 @@ class PPOPolicy(nn.Module):
             is_sampled_flat_out = selected_mask
             decision_group_id_flat_out = group_idx
             step_for_decision_group_out = pos_t_flat
+            behavior_lp_per_group = rb.behavior_action_log_prob[idx_t]
 
         per_choice = ReplayPerChoice(
             flat_logits=flat_logits,
@@ -1418,6 +1429,7 @@ class PPOPolicy(nn.Module):
             may_is_active=may_mask,
             may_logits_per_step=may_logits_per_step,
             may_selected_per_step=may_selected_per_step,
+            behavior_action_log_prob_per_decision_group=behavior_lp_per_group,
         )
         return log_probs, entropies, forward.values, per_choice
 

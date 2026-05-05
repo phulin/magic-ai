@@ -1098,6 +1098,24 @@ def _gather_sampled_scalar(pc: Any, may_logp: Tensor) -> Tensor:
     return out
 
 
+def _per_group_behavior_log_prob(
+    pc_online: Any,
+    *,
+    n_groups: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Tensor:
+    """Rollout-time sampled log-prob per decision group."""
+
+    stored = pc_online.behavior_action_log_prob_per_decision_group.to(device=device, dtype=dtype)
+    if tuple(stored.shape) != (n_groups,):
+        raise ValueError(
+            "behavior_action_log_prob_per_decision_group must have shape "
+            f"({n_groups},), got {tuple(stored.shape)}"
+        )
+    return stored
+
+
 def rnad_trajectory_loss(
     *,
     online: Any,
@@ -1135,13 +1153,10 @@ def rnad_trajectory_loss(
     critic) stay at step granularity since the reward is delivered at the
     joint step, not per group.
 
-    **Behavior policy approximation.** Per-group rollout-time log-prob is
-    not stored in the buffer; we substitute the *target* policy's per-group
-    log-prob at the sampled action as ``mu_k``. This is consistent with the
-    rnad_trainer simplification "rollouts effectively follow target via
-    Polyak tracking" and means ``mu_k = pi_target(a_k* | o, a_<k)``. The
-    joint v-trace IS ratio still uses the stored joint ``logp_mu`` from
-    rollout time. See ``docs/rnad_design.md`` deviations section.
+    **Behavior policy storage.** Replay rows store the rollout-time sampled
+    per-group log-prob, and the per-action Q estimator uses that stored value
+    as ``mu_k``. The joint v-trace IS ratio still uses the stored joint
+    ``logp_mu`` from rollout time. See ``docs/rnad_deviations.md``.
 
     **May head two-action NeuRD (issue 5).** The Bernoulli ``may`` is
     expanded to a 2-action softmax with logits ``(l, 0)``; both branches
@@ -1249,17 +1264,11 @@ def _trajectory_loss_from_forwards(
             pc_online.decision_group_id_flat,
             torch.where(is_sampled_flat, log_ratio_flat, torch.zeros_like(log_ratio_flat)),
         )
-        # Target per-group sampled log-prob (= log mu_k under the
-        # rollouts-follow-target approximation). At training time, target's
-        # per-flat log-prob is pc_tgt.flat_log_probs; the same is_sampled_flat
-        # (selected from buffer.selected_indices, policy-independent) picks
-        # out the sampled cell per group.
-        lp_tgt_flat = pc_tgt.flat_log_probs.to(dtype=dtype)
-        per_group_lp_mu = torch.zeros(n_groups, dtype=dtype, device=device)
-        per_group_lp_mu.scatter_add_(
-            0,
-            pc_online.decision_group_id_flat,
-            torch.where(is_sampled_flat, lp_tgt_flat, torch.zeros_like(lp_tgt_flat)),
+        per_group_lp_mu = _per_group_behavior_log_prob(
+            pc_online,
+            n_groups=n_groups,
+            dtype=dtype,
+            device=device,
         )
         # 1/mu_k clipped to ``q_corr_rho_bar`` (issue 6: per-group decomposition
         # makes blow-up far less likely than the joint 1/mu_t ever was, so the
@@ -1595,12 +1604,11 @@ def _batched_trajectory_loss_from_forwards(
             pc_online.decision_group_id_flat,
             torch.where(is_sampled_flat, log_ratio_flat, torch.zeros_like(log_ratio_flat)),
         )
-        lp_tgt_flat = pc_tgt.flat_log_probs.to(dtype=dtype)
-        per_group_lp_mu = torch.zeros(n_groups, dtype=dtype, device=device)
-        per_group_lp_mu.scatter_add_(
-            0,
-            pc_online.decision_group_id_flat,
-            torch.where(is_sampled_flat, lp_tgt_flat, torch.zeros_like(lp_tgt_flat)),
+        per_group_lp_mu = _per_group_behavior_log_prob(
+            pc_online,
+            n_groups=n_groups,
+            dtype=dtype,
+            device=device,
         )
         inv_mu_per_group_pre = (-per_group_lp_mu).exp()
         inv_mu_per_group = inv_mu_per_group_pre.clamp(max=config.q_corr_rho_bar)

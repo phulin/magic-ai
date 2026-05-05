@@ -59,12 +59,15 @@ paper-faithful step for NeuRD purposes:
 The trajectory-level pieces (v-trace, reward transform, critic) stay at step
 granularity since the reward is delivered at the joint step, not per group.
 
-**Behavior policy approximation.** Per-group rollout-time log-prob is not
-stored in the buffer; we substitute the *target* policy's per-group log-prob
-at the sampled action as `mu_k`. This is consistent with the rnad_trainer
-simplification that under Polyak tracking inside one outer iteration target ≈
-behavior, and it means `mu_k = pi_target(a_k* | o, a_<k)`. The joint v-trace
-IS ratio still uses the stored joint `logp_mu` from rollout time.
+**Resolved behavior-policy storage.** New replay rows store the rollout-time
+sampled per-group log-prob alongside each decision group. R-NaD's per-action Q
+correction now uses that stored value as `mu_k`, so Polyak lag between online
+and target no longer biases the per-group sampled correction. The joint
+v-trace IS ratio still uses the stored joint `logp_mu` from rollout time.
+
+`ReplayPerChoice` requires this per-group behavior field. Direct test or
+utility callers must provide it explicitly; there is no target-policy
+substitution fallback.
 
 ## 5. Bernoulli may head: true two-action NeuRD
 
@@ -84,9 +87,9 @@ form regularized only the sampled branch.
 
 `q_corr_rho_bar = 100` (default) bounds the per-group sampled-correction
 magnitude without aggressively biasing the estimator. Under the per-group
-decomposition (issue 4), `1/mu_k <= 1/min_a pi_target_k(a)` is bounded by a
-single group's softmax confidence, not by the multiplicative
-`1/∏_k mu_k` of the joint formulation.
+decomposition (issue 4), `1/mu_k` is bounded by one decision group's sampled
+behavior probability, not by the multiplicative `1/∏_k mu_k` of the joint
+formulation.
 
 `run_rnad_update` logs `q_clip_fraction` (the fraction of per-action Q values
 clamped by `[-neurd_clip, +neurd_clip]` in the per-choice NeuRD loss). A high

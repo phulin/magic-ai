@@ -611,6 +611,7 @@ class _StubPolicy(nn.Module):
                 may_is_active=torch.zeros(n, dtype=torch.bool),
                 may_logits_per_step=torch.zeros(n),
                 may_selected_per_step=torch.zeros(n),
+                behavior_action_log_prob_per_decision_group=logp.detach(),
             ),
         )
 
@@ -816,6 +817,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
                         may_is_active=torch.ones(n, dtype=torch.bool),
                         may_logits_per_step=self.may_logits[idx],
                         may_selected_per_step=torch.ones(n),
+                        behavior_action_log_prob_per_decision_group=torch.zeros(0),
                     ),
                 )
 
@@ -954,6 +956,7 @@ class MayTwoActionNeuRDTests(unittest.TestCase):
                         may_is_active=torch.ones(n, dtype=torch.bool),
                         may_logits_per_step=self.may_logits[idx],
                         may_selected_per_step=torch.ones(n),  # always sample "accept"
+                        behavior_action_log_prob_per_decision_group=torch.zeros(0),
                     ),
                 )
 
@@ -1070,6 +1073,9 @@ class FactoredAutoregressiveTests(unittest.TestCase):
                         may_is_active=torch.zeros(n, dtype=torch.bool),
                         may_logits_per_step=torch.zeros(n),
                         may_selected_per_step=torch.zeros(n),
+                        behavior_action_log_prob_per_decision_group=torch.full(
+                            (n * k,), math.log(0.5)
+                        ),
                     ),
                 )
 
@@ -1105,6 +1111,73 @@ class FactoredAutoregressiveTests(unittest.TestCase):
         # extra groups participating but bound it well below the joint
         # blow-up (16x).
         self.assertLess(results[6] / max(results[2], 1e-9), 4.0)
+
+    def test_per_group_correction_uses_stored_behavior_not_target_policy(self) -> None:
+        from magic_ai.replay_decisions import ReplayPerChoice
+        from magic_ai.rnad import rnad_trajectory_loss
+
+        class TwoChoiceStub(nn.Module):
+            def __init__(self, target_bias: float = 0.0) -> None:
+                super().__init__()
+                self.values = nn.Parameter(torch.zeros(2))
+                self.logits = nn.Parameter(torch.tensor([[target_bias, 0.0], [target_bias, 0.0]]))
+
+            def evaluate_replay_batch_per_choice(self, rows: list[int], **_: Any):  # type: ignore[no-untyped-def]
+                idx = torch.tensor(rows, dtype=torch.long)
+                logits = self.logits[idx]
+                flat_log_probs = torch.log_softmax(logits, dim=-1).reshape(-1)
+                n = int(idx.numel())
+                return (
+                    flat_log_probs.reshape(n, 2)[:, 0],
+                    torch.zeros(n),
+                    self.values[idx],
+                    ReplayPerChoice(
+                        flat_logits=logits.reshape(-1),
+                        flat_log_probs=flat_log_probs,
+                        group_idx=torch.arange(n).repeat_interleave(2),
+                        choice_cols=torch.tensor([0, 1] * n),
+                        is_sampled_flat=torch.tensor([True, False] * n),
+                        may_is_active=torch.zeros(n, dtype=torch.bool),
+                        may_logits_per_step=torch.zeros(n),
+                        may_selected_per_step=torch.zeros(n),
+                        decision_group_id_flat=torch.arange(n).repeat_interleave(2),
+                        step_for_decision_group=torch.arange(n),
+                        behavior_action_log_prob_per_decision_group=torch.full(
+                            (n,), math.log(0.25)
+                        ),
+                    ),
+                )
+
+        online = TwoChoiceStub()
+        reg_cur = TwoChoiceStub()
+        reg_prev = TwoChoiceStub()
+        loss_a = rnad_trajectory_loss(
+            online=cast(Any, online),
+            target=cast(Any, TwoChoiceStub(-3.0)),
+            reg_cur=cast(Any, reg_cur),
+            reg_prev=cast(Any, reg_prev),
+            replay_rows=[0, 1],
+            perspective_player_idx=[0, 0],
+            terminal_reward_p0=1.0,
+            zero_sum=True,
+            logp_mu=torch.full((2,), math.log(0.25)),
+            config=RNaDConfig(eta=0.0, neurd_beta=100.0, q_corr_rho_bar=1e9),
+            alpha=1.0,
+        )
+        loss_b = rnad_trajectory_loss(
+            online=cast(Any, online),
+            target=cast(Any, TwoChoiceStub(3.0)),
+            reg_cur=cast(Any, reg_cur),
+            reg_prev=cast(Any, reg_prev),
+            replay_rows=[0, 1],
+            perspective_player_idx=[0, 0],
+            terminal_reward_p0=1.0,
+            zero_sum=True,
+            logp_mu=torch.full((2,), math.log(0.25)),
+            config=RNaDConfig(eta=0.0, neurd_beta=100.0, q_corr_rho_bar=1e9),
+            alpha=1.0,
+        )
+        torch.testing.assert_close(loss_a.pl_sum, loss_b.pl_sum)
 
 
 class PerPolicyLSTMRecomputeTests(unittest.TestCase):

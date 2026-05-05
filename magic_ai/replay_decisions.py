@@ -30,6 +30,7 @@ class ReplayPerChoice:
     may_selected_per_step: Tensor
     decision_group_id_flat: Tensor
     step_for_decision_group: Tensor
+    behavior_action_log_prob_per_decision_group: Tensor
 
 
 @dataclass(frozen=True)

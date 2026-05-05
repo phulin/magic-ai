@@ -1040,6 +1040,7 @@ class PolicyStep(NamedTuple):
     replay_idx: int | None = None
     selected_choice_cols: tuple[int, ...] = ()
     may_selected: int = 0
+    selected_action_log_probs: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)

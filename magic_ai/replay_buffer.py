@@ -19,6 +19,7 @@ class DecisionLayoutBatch:
     decision_mask: Tensor
     uses_none_head: Tensor
     selected_indices: Tensor
+    behavior_action_log_prob: Tensor
     step_for_group: Tensor
 
 
@@ -168,6 +169,11 @@ class ReplayCore(nn.Module):
             torch.full((self.decision_capacity,), -1, dtype=self.index_dtype, device=device_t),
             persistent=False,
         )
+        self.register_buffer(
+            "behavior_action_log_prob",
+            torch.zeros(self.decision_capacity, dtype=torch.float32, device=device_t),
+            persistent=False,
+        )
         self._row_cursor = 0
         self._decision_cursor = 0
 
@@ -193,6 +199,7 @@ class ReplayCore(nn.Module):
     decision_mask: Tensor
     uses_none_head: Tensor
     selected_indices: Tensor
+    behavior_action_log_prob: Tensor
     lstm_h_in: Tensor | None
     lstm_c_in: Tensor | None
 
@@ -226,6 +233,7 @@ class ReplayCore(nn.Module):
         old_log_prob: float,
         value: float,
         perspective_player_idx: int,
+        behavior_action_log_prob: Tensor | None = None,
         lstm_h_in: Tensor | None = None,
         lstm_c_in: Tensor | None = None,
     ) -> int:
@@ -237,6 +245,7 @@ class ReplayCore(nn.Module):
             decision_mask=decision_mask,
             uses_none_head=uses_none_head,
             selected_indices=selected_indices,
+            behavior_action_log_prob=behavior_action_log_prob,
         )
         self._write_common_row(
             row,
@@ -263,6 +272,7 @@ class ReplayCore(nn.Module):
         decision_mask: Tensor,
         uses_none_head: Tensor,
         selected_indices: Tensor,
+        behavior_action_log_prob: Tensor | None = None,
         may_selected: Tensor | None = None,
         old_log_prob: Tensor | None = None,
         value: Tensor | None = None,
@@ -284,6 +294,7 @@ class ReplayCore(nn.Module):
             decision_mask=decision_mask,
             uses_none_head=uses_none_head,
             selected_indices=selected_indices,
+            behavior_action_log_prob=behavior_action_log_prob,
         )
         self.trace_kind_id[start:end] = trace_kind_id.to(
             device=self.device, dtype=self.trace_kind_id.dtype
@@ -402,6 +413,7 @@ class ReplayCore(nn.Module):
         decision_mask: Tensor,
         uses_none_head: Tensor,
         selected_indices: Tensor,
+        behavior_action_log_prob: Tensor | None,
     ) -> int:
         count = int(decision_option_idx.shape[0])
         stored_count = min(count, self.max_decision_groups)
@@ -417,6 +429,9 @@ class ReplayCore(nn.Module):
             decision_mask[:stored_count],
             uses_none_head[:stored_count],
             selected_indices[:stored_count],
+            behavior_action_log_prob[:stored_count]
+            if behavior_action_log_prob is not None
+            else None,
         )
         end = start + stored_count
         self.decision_option_idx[start:end] = decision_option_idx[:stored_count].to(
@@ -434,6 +449,12 @@ class ReplayCore(nn.Module):
         self.selected_indices[start:end] = selected_indices[:stored_count].to(
             device=self.device, dtype=self.index_dtype
         )
+        if behavior_action_log_prob is not None:
+            self.behavior_action_log_prob[start:end] = behavior_action_log_prob[:stored_count].to(
+                device=self.device, dtype=torch.float32
+            )
+        else:
+            self.behavior_action_log_prob[start:end].zero_()
         return stored_count
 
     def _write_decision_batch(
@@ -450,6 +471,7 @@ class ReplayCore(nn.Module):
         decision_mask: Tensor,
         uses_none_head: Tensor,
         selected_indices: Tensor,
+        behavior_action_log_prob: Tensor | None,
     ) -> Tensor:
         counts = decision_count.to(device=self.device)
         batch_size = row_end - row_start
@@ -522,6 +544,7 @@ class ReplayCore(nn.Module):
             dtype=self.index_dtype,
             device=self.device,
         )
+        behavior_lp_tmp = torch.zeros(total_stored + 1, dtype=torch.float32, device=self.device)
 
         option_tmp[relative_dest] = decision_option_idx[:total_source].to(
             device=self.device,
@@ -543,6 +566,10 @@ class ReplayCore(nn.Module):
             device=self.device,
             dtype=self.index_dtype,
         )
+        if behavior_action_log_prob is not None:
+            behavior_lp_tmp[relative_dest] = behavior_action_log_prob[:total_source].to(
+                device=self.device, dtype=torch.float32
+            )
 
         end = start + total_stored
         self.decision_option_idx[start:end] = option_tmp[:-1]
@@ -550,6 +577,7 @@ class ReplayCore(nn.Module):
         self.decision_mask[start:end] = mask_tmp[:-1]
         self.uses_none_head[start:end] = none_tmp[:-1]
         self.selected_indices[start:end] = selected_tmp[:-1]
+        self.behavior_action_log_prob[start:end] = behavior_lp_tmp[:-1]
         return stored_counts
 
     def _append_row_index(self) -> int:
@@ -631,6 +659,7 @@ class ReplayCore(nn.Module):
                 ),
                 uses_none_head=torch.empty(0, dtype=torch.bool, device=self.device),
                 selected_indices=torch.empty(0, dtype=index_dtype, device=self.device),
+                behavior_action_log_prob=torch.empty(0, dtype=torch.float32, device=self.device),
                 step_for_group=torch.empty(0, dtype=torch.long, device=self.device),
             )
         return DecisionLayoutBatch(
@@ -641,8 +670,17 @@ class ReplayCore(nn.Module):
             decision_mask=self.decision_mask[source],
             uses_none_head=self.uses_none_head[source],
             selected_indices=self.selected_indices[source].to(dtype=index_dtype),
+            behavior_action_log_prob=self.behavior_action_log_prob[source],
             step_for_group=step_pos,
         )
+
+    def gather_decision_behavior_action_log_prob(self, rows: Tensor) -> Tensor:
+        """Return rollout-time sampled log-prob for gathered decision groups."""
+
+        _starts, _counts, _gathered_starts, _step_pos, source = self._decision_sources(rows)
+        if source is None:
+            return torch.empty(0, dtype=torch.float32, device=self.device)
+        return self.behavior_action_log_prob[source]
 
     def valid_choice_count(self, rows: Tensor) -> Tensor:
         _starts, _counts, _gathered_starts, _step_pos, source = self._decision_sources(rows)
@@ -658,6 +696,7 @@ class ReplayCore(nn.Module):
         decision_mask: Tensor,
         uses_none_head: Tensor,
         selected_indices: Tensor,
+        behavior_action_log_prob: Tensor | None = None,
     ) -> None:
         expected = (count, self.max_cached_choices)
         if tuple(decision_option_idx.shape) != expected:
@@ -670,6 +709,10 @@ class ReplayCore(nn.Module):
             raise ValueError(f"uses_none_head must have shape {(count,)}")
         if tuple(selected_indices.shape) != (count,):
             raise ValueError(f"selected_indices must have shape {(count,)}")
+        if behavior_action_log_prob is not None and tuple(behavior_action_log_prob.shape) != (
+            count,
+        ):
+            raise ValueError(f"behavior_action_log_prob must have shape {(count,)}")
 
 
 __all__ = ["DecisionLayoutBatch", "FlatDecisionBatch", "ReplayCommonBatch", "ReplayCore"]

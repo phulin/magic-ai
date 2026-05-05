@@ -37,6 +37,7 @@ class TextReplayBatch:
     decision_mask: Tensor
     uses_none_head: Tensor
     selected_indices: Tensor
+    behavior_action_log_prob: Tensor
     step_for_decision_group: Tensor
     may_selected: Tensor
     old_log_prob: Tensor
@@ -182,6 +183,7 @@ class TextReplayBuffer:
         self.decision_mask = self.core.decision_mask
         self.uses_none_head = self.core.uses_none_head
         self.selected_indices = self.core.selected_indices
+        self.behavior_action_log_prob = self.core.behavior_action_log_prob
 
     @property
     def size(self) -> int:
@@ -221,6 +223,7 @@ class TextReplayBuffer:
         old_log_prob: float,
         value: float,
         perspective_player_idx: int,
+        behavior_action_log_prob: Tensor | None = None,
         lstm_h_in: Tensor | None = None,
         lstm_c_in: Tensor | None = None,
     ) -> int:
@@ -233,6 +236,7 @@ class TextReplayBuffer:
                 decision_mask=decision_mask,
                 uses_none_head=uses_none_head,
                 selected_indices=selected_indices,
+                behavior_action_log_prob=behavior_action_log_prob,
                 may_selected=may_selected,
                 old_log_prob=old_log_prob,
                 value=value,
@@ -260,6 +264,7 @@ class TextReplayBuffer:
         old_log_prob: float,
         value: float,
         perspective_player_idx: int,
+        behavior_action_log_prob: Tensor | None = None,
         lstm_h_in: Tensor | None = None,
         lstm_c_in: Tensor | None = None,
     ) -> int:
@@ -272,6 +277,7 @@ class TextReplayBuffer:
                 decision_mask=decision_mask,
                 uses_none_head=uses_none_head,
                 selected_indices=selected_indices,
+                behavior_action_log_prob=behavior_action_log_prob,
                 may_selected=may_selected,
                 old_log_prob=old_log_prob,
                 value=value,
@@ -313,6 +319,7 @@ class TextReplayBuffer:
         old_log_prob: Tensor,
         value: Tensor,
         perspective_player_idx: Tensor,
+        behavior_action_log_prob: Tensor | None = None,
         lstm_h_in: Tensor | None = None,
         lstm_c_in: Tensor | None = None,
     ) -> Tensor:
@@ -356,6 +363,7 @@ class TextReplayBuffer:
                 decision_mask=decision_mask,
                 uses_none_head=uses_none_head,
                 selected_indices=selected_indices,
+                behavior_action_log_prob=behavior_action_log_prob,
                 may_selected=may_selected,
                 old_log_prob=old_log_prob,
                 value=value,
@@ -467,6 +475,7 @@ class TextReplayBuffer:
         old_log_prob: Tensor,
         value: Tensor,
         perspective_player_idx: Tensor,
+        behavior_action_log_prob: Tensor | None = None,
         lstm_h_in: Tensor | None = None,
         lstm_c_in: Tensor | None = None,
     ) -> Tensor:
@@ -513,6 +522,7 @@ class TextReplayBuffer:
                 decision_mask=decision_mask,
                 uses_none_head=uses_none_head,
                 selected_indices=selected_indices,
+                behavior_action_log_prob=behavior_action_log_prob,
                 may_selected=may_selected,
                 old_log_prob=old_log_prob,
                 value=value,
@@ -766,6 +776,7 @@ class TextReplayBuffer:
             decision_mask = decision_batch.decision_mask
             uses_none_head = decision_batch.uses_none_head
             selected_indices = decision_batch.selected_indices
+            behavior_action_log_prob = decision_batch.behavior_action_log_prob
             step_for_decision_group = decision_batch.step_for_group
         else:
             (
@@ -778,6 +789,7 @@ class TextReplayBuffer:
                 selected_indices,
                 step_for_decision_group,
             ) = gathered_decisions
+            behavior_action_log_prob = self.core.gather_decision_behavior_action_log_prob(idx)
         encoded = PackedTextBatch(
             token_ids=token_ids,
             seq_id=seq_id,
@@ -805,6 +817,7 @@ class TextReplayBuffer:
             decision_mask=decision_mask,
             uses_none_head=uses_none_head,
             selected_indices=selected_indices,
+            behavior_action_log_prob=behavior_action_log_prob,
             step_for_decision_group=step_for_decision_group,
             may_selected=may_selected,
             old_log_prob=old_log_prob,

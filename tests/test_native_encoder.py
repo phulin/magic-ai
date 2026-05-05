@@ -222,6 +222,10 @@ class NativeEncoderTests(unittest.TestCase):
             env_indices,
             native_batch,
             selected_choice_cols_flat=torch.tensor(selected_cols, dtype=torch.long),
+            behavior_action_log_probs_flat=torch.tensor(
+                [lp for step in policy_steps for lp in step.selected_action_log_probs],
+                dtype=torch.float32,
+            ),
             may_selected=[policy_step.may_selected for policy_step in policy_steps],
             old_log_probs=torch.stack([policy_step.log_prob for policy_step in policy_steps]),
             values=torch.stack([policy_step.value for policy_step in policy_steps]),
@@ -296,6 +300,10 @@ class NativeEncoderTests(unittest.TestCase):
                 env_indices,
                 native_batch,
                 selected_choice_cols_flat=torch.tensor(selected_cols, dtype=torch.long),
+                behavior_action_log_probs_flat=torch.tensor(
+                    [lp for step in policy_steps for lp in step.selected_action_log_probs],
+                    dtype=torch.float32,
+                ),
                 may_selected=[step.may_selected for step in policy_steps],
                 old_log_probs=torch.stack([step.log_prob for step in policy_steps]),
                 values=torch.stack([step.value for step in policy_steps]),

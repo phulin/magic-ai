@@ -432,6 +432,9 @@ class NativeTextTrajectoryBuffer:
         self.selected_indices = torch.full(
             (*shape, self.max_decision_groups), -1, dtype=torch.int16, device=self.device
         )
+        self.behavior_action_log_prob = torch.zeros(
+            *shape, self.max_decision_groups, dtype=torch.float32, device=self.device
+        )
         self.may_selected = torch.zeros(*shape, dtype=torch.float32, device=self.device)
         self.old_log_prob = torch.zeros(*shape, dtype=torch.float32, device=self.device)
         self.value = torch.zeros(*shape, dtype=torch.float32, device=self.device)
@@ -552,6 +555,7 @@ class NativeTextTrajectoryBuffer:
         self.decision_mask[env_t, step_t].zero_()
         self.uses_none_head[env_t, step_t].zero_()
         self.selected_indices[env_t, step_t].fill_(-1)
+        self.behavior_action_log_prob[env_t, step_t].zero_()
         decision_rows = (
             int(payload.total_decision_groups)
             if payload.total_decision_groups is not None
@@ -592,11 +596,16 @@ class NativeTextTrajectoryBuffer:
             dtype=torch.int16,
             device=self.device,
         )
+        behavior_lp_tmp = torch.zeros(flat_slots + 1, dtype=torch.float32, device=self.device)
         option_tmp[dest] = payload.decision_option_idx.to(device=self.device, dtype=torch.int16)
         target_tmp[dest] = payload.decision_target_idx.to(device=self.device, dtype=torch.int16)
         mask_tmp[dest] = payload.decision_mask.to(device=self.device, dtype=torch.bool)
         none_tmp[dest] = payload.uses_none_head.to(device=self.device, dtype=torch.bool)
         selected_tmp[dest] = payload.selected_indices.to(device=self.device, dtype=torch.int16)
+        if payload.behavior_action_log_prob is not None:
+            behavior_lp_tmp[dest] = payload.behavior_action_log_prob.to(
+                device=self.device, dtype=torch.float32
+            )
 
         slot_shape = (batch_size, self.max_decision_groups)
         self.decision_option_idx[env_t, step_t] = option_tmp[:-1].view(
@@ -613,6 +622,7 @@ class NativeTextTrajectoryBuffer:
         )
         self.uses_none_head[env_t, step_t] = none_tmp[:-1].view(*slot_shape)
         self.selected_indices[env_t, step_t] = selected_tmp[:-1].view(*slot_shape)
+        self.behavior_action_log_prob[env_t, step_t] = behavior_lp_tmp[:-1].view(*slot_shape)
 
         self.may_selected[env_t, step_t] = payload.may_selected.to(
             device=self.device, dtype=torch.float32
@@ -709,6 +719,9 @@ class NativeTextTrajectoryBuffer:
             selected_indices = self.selected_indices[flat_env, flat_step][
                 step_for_group, group_in_step
             ].to(dtype=torch.long)
+            behavior_action_log_prob = self.behavior_action_log_prob[flat_env, flat_step][
+                step_for_group, group_in_step
+            ]
         else:
             option_idx = torch.empty(
                 (0, self.max_cached_choices), dtype=torch.long, device=self.device
@@ -719,6 +732,7 @@ class NativeTextTrajectoryBuffer:
             )
             uses_none = torch.empty(0, dtype=torch.bool, device=self.device)
             selected_indices = torch.empty(0, dtype=torch.long, device=self.device)
+            behavior_action_log_prob = torch.empty(0, dtype=torch.float32, device=self.device)
         lstm_h = (
             self.lstm_h_in[flat_env, flat_step].permute(1, 0, 2)
             if self.lstm_h_in is not None
@@ -750,6 +764,7 @@ class NativeTextTrajectoryBuffer:
             decision_mask=decision_mask,
             uses_none_head=uses_none,
             selected_indices=selected_indices,
+            behavior_action_log_prob=behavior_action_log_prob,
             may_selected=self.may_selected[flat_env, flat_step],
             old_log_prob=self.old_log_prob[flat_env, flat_step],
             value=self.value[flat_env, flat_step],
@@ -3214,6 +3229,10 @@ def train_native_batched_envs(
             selected_choice_cols_flat = torch.tensor(selected_cols, dtype=torch.long).to(
                 policy.device, non_blocking=True
             )
+            behavior_action_log_probs_flat = torch.tensor(
+                [lp for s in policy_steps for lp in s.selected_action_log_probs],
+                dtype=torch.float32,
+            ).to(policy.device, non_blocking=True)
             _record_phase("build_cols", _t)
 
             _t = time.perf_counter()
@@ -3249,6 +3268,7 @@ def train_native_batched_envs(
                 ready_env_indices,
                 parsed_batch,
                 selected_choice_cols_flat=selected_choice_cols_flat,
+                behavior_action_log_probs_flat=behavior_action_log_probs_flat,
                 may_selected=may_selected,
                 old_log_probs=log_probs,
                 values=values,

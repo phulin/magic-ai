@@ -106,6 +106,7 @@ class NativeTextReplayPayload:
     lstm_h_in: Tensor
     lstm_c_in: Tensor
     projected_state: Tensor | None = None
+    behavior_action_log_prob: Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -298,11 +299,13 @@ class TextActorCritic(nn.Module):
         per_step_trace_kind: list[TraceKind] = []
         per_step_layout: list[TextDecisionLayout] = []
         per_step_selected_tensors: list[list[Tensor]] = []
+        per_step_selected_log_prob_tensors: list[list[Tensor]] = []
         for step_idx, layout in enumerate(layouts):
             trace_kind = layout.trace_kind
             value = output.values[step_idx]
             may_sample_t: Tensor | None = None
             selected_tensors: list[Tensor] = []
+            selected_log_prob_tensors: list[Tensor] = []
 
             if trace_kind == "may":
                 may_logit = may_logits[step_idx]
@@ -405,6 +408,7 @@ class TextActorCritic(nn.Module):
                             selected_tensors.append(
                                 torch.zeros((), device=self.device, dtype=torch.long)
                             )
+                            selected_log_prob_tensors.append(output.values.new_zeros(()))
                             continue
                         n_valid = engine_cols.numel()
                         if deterministic:
@@ -421,6 +425,7 @@ class TextActorCritic(nn.Module):
                         )
                         log_prob = log_prob + uniform_log_prob
                         selected_tensors.append(chosen)
+                        selected_log_prob_tensors.append(uniform_log_prob)
                         continue
                     valid_logits = logits[valid_cols]
                     dist = Categorical(logits=valid_logits)
@@ -428,9 +433,11 @@ class TextActorCritic(nn.Module):
                         selected_t = torch.argmax(valid_logits)
                     else:
                         selected_t = dist.sample()
-                    log_prob = log_prob + dist.log_prob(selected_t)
+                    sampled_log_prob = dist.log_prob(selected_t)
+                    log_prob = log_prob + sampled_log_prob
                     entropy = entropy + dist.entropy()
                     selected_tensors.append(valid_cols[selected_t])
+                    selected_log_prob_tensors.append(sampled_log_prob)
 
             per_step_log_prob.append(log_prob)
             per_step_entropy.append(entropy)
@@ -439,6 +446,7 @@ class TextActorCritic(nn.Module):
             per_step_trace_kind.append(trace_kind)
             per_step_layout.append(layout)
             per_step_selected_tensors.append(selected_tensors)
+            per_step_selected_log_prob_tensors.append(selected_log_prob_tensors)
 
         # Phase 2: one batched GPU→CPU sync to materialize everything.
         flat_selected: list[Tensor] = [t for sublist in per_step_selected_tensors for t in sublist]
@@ -446,6 +454,13 @@ class TextActorCritic(nn.Module):
             selected_flat_cpu = torch.stack(flat_selected).detach().cpu().tolist()
         else:
             selected_flat_cpu = []
+        flat_selected_log_prob: list[Tensor] = [
+            t for sublist in per_step_selected_log_prob_tensors for t in sublist
+        ]
+        if flat_selected_log_prob:
+            selected_log_prob_flat_cpu = torch.stack(flat_selected_log_prob).detach().cpu().tolist()
+        else:
+            selected_log_prob_flat_cpu = []
         log_prob_cpu = torch.stack(per_step_log_prob).detach().cpu().tolist()
         value_cpu = torch.stack(per_step_value).detach().cpu().tolist()
         may_sample_cpu: list[float | None] = []
@@ -478,6 +493,7 @@ class TextActorCritic(nn.Module):
             value = per_step_value[step_idx]
             num_selected = len(per_step_selected_tensors[step_idx])
             selected_cols = selected_flat_cpu[cursor : cursor + num_selected]
+            selected_log_probs = selected_log_prob_flat_cpu[cursor : cursor + num_selected]
             cursor += num_selected
 
             may_selected = 0
@@ -490,7 +506,7 @@ class TextActorCritic(nn.Module):
             else:
                 trace, action = _decode_text_action(trace_kind, layout.pending, selected_cols)
 
-            append_kwargs = {
+            append_kwargs: dict[str, Any] = {
                 "batch_index": step_idx,
                 "trace_kind_id": TRACE_KIND_TO_ID[trace_kind],
                 "decision_option_idx": layout.decision_option_idx,
@@ -498,6 +514,7 @@ class TextActorCritic(nn.Module):
                 "decision_mask": layout.decision_mask,
                 "uses_none_head": layout.uses_none_head,
                 "selected_indices": torch.tensor(selected_cols, dtype=torch.long),
+                "behavior_action_log_prob": torch.tensor(selected_log_probs, dtype=torch.float32),
                 "may_selected": float(may_selected),
                 "old_log_prob": float(log_prob_cpu[step_idx]),
                 "value": float(value_cpu[step_idx]),
@@ -525,6 +542,7 @@ class TextActorCritic(nn.Module):
                     replay_idx=replay_idx,
                     selected_choice_cols=tuple(selected_cols),
                     may_selected=may_selected,
+                    selected_action_log_probs=tuple(float(x) for x in selected_log_probs),
                 )
             )
         if (
@@ -666,6 +684,7 @@ class TextActorCritic(nn.Module):
                 )
                 uses_none = torch.empty(0, dtype=torch.bool, device=device)
                 selected = torch.empty(0, dtype=torch.long, device=device)
+                group_log_probs = output.values.new_zeros(0)
 
             may_mask = trace_kind_id == TRACE_KIND_TO_ID["may"]
             if deterministic:
@@ -710,6 +729,7 @@ class TextActorCritic(nn.Module):
                 decision_mask=decision_mask.detach(),
                 uses_none_head=uses_none.detach(),
                 selected_indices=selected.detach(),
+                behavior_action_log_prob=group_log_probs.detach(),
                 may_selected=may_selected_t.detach(),
                 old_log_prob=step_log_probs.detach(),
                 value=output.values.detach(),
@@ -748,6 +768,7 @@ class TextActorCritic(nn.Module):
                 decision_mask=decision_mask,
                 uses_none_head=uses_none,
                 selected_indices=selected,
+                behavior_action_log_prob=group_log_probs.detach(),
                 may_selected=may_selected_t,
                 old_log_prob=step_log_probs.detach(),
                 value=output.values.detach(),
@@ -941,6 +962,9 @@ class TextActorCritic(nn.Module):
             may_selected_per_step=may_selected_per_step,
             decision_group_id_flat=per_choice.decision_group_id_flat,
             step_for_decision_group=per_choice.step_for_decision_group,
+            behavior_action_log_prob_per_decision_group=(
+                per_choice.behavior_action_log_prob_per_decision_group
+            ),
         )
         return log_probs, entropies, output.values, per_choice
 
@@ -1199,6 +1223,7 @@ class TextActorCritic(nn.Module):
                     may_selected_per_step=output.values.new_zeros(n),
                     decision_group_id_flat=empty_long,
                     step_for_decision_group=empty_long,
+                    behavior_action_log_prob_per_decision_group=output.values.new_zeros(0),
                 ),
             )
 
@@ -1325,11 +1350,22 @@ class TextActorCritic(nn.Module):
             return log_probs, entropies
 
         # ``nonzero`` returns row-major (group, col-ascending), matching the
-        # original per-group ``mask.nonzero()`` concatenation order.
-        flat_indices = flat_masks.nonzero(as_tuple=False)
+        # original per-group ``mask.nonzero()`` concatenation order. Use the
+        # effective replay mask here, not the raw engine mask: raw masks can
+        # include choices that were legal in the engine but invisible to the
+        # text policy because the corresponding option/target token was not
+        # rendered. Those columns have ``-inf`` model logits and are excluded
+        # from replay log-prob scoring above, so R-NaD must exclude them from
+        # per-choice NeuRD as well.
+        flat_indices = effective_mask.nonzero(as_tuple=False)
         decision_group_id_flat = flat_indices[:, 0]
         choice_cols = flat_indices[:, 1]
-        flat_logits = all_logits[decision_group_id_flat, choice_cols]
+        # R-NaD consumes these per-choice tensors directly in NeuRD. Use the
+        # same finite fallback logits/log-probs that the sampled replay path
+        # used above; returning raw ``all_logits`` can leak -inf for invisible
+        # choices, and NeuRD's ``-logit * q * gate`` then becomes
+        # ``inf * 0 == nan``.
+        flat_logits = masked_logits[decision_group_id_flat, choice_cols]
         flat_log_probs = log_probs_dense[decision_group_id_flat, choice_cols]
         is_sampled_flat = choice_cols == flat_selected[decision_group_id_flat]
         group_idx_out = steps_t[decision_group_id_flat]
@@ -1348,6 +1384,9 @@ class TextActorCritic(nn.Module):
                 may_selected_per_step=output.values.new_zeros(n),
                 decision_group_id_flat=decision_group_id_flat,
                 step_for_decision_group=steps_t,
+                behavior_action_log_prob_per_decision_group=batch.behavior_action_log_prob.to(
+                    device=device, dtype=output.values.dtype
+                ),
             ),
         )
 
