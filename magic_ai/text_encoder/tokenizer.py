@@ -145,9 +145,9 @@ CARD_FIELD_TOKENS: tuple[str, ...] = (
 )
 
 # ---------------------------------------------------------------------------
-# Action-kind tokens — one atomic id per option ``kind`` the engine emits.
-# Replaces the literal text verbs (``"cast "``, ``"pass"``, ``"attack with "``)
-# the renderer used to splice into each ``<option>`` block.
+# Action-kind answer tokens used by inline blank legal vocabularies.
+# The legacy ``<option>`` blocks are gone, but these ids remain stable because
+# snapshots and checkpoints may still refer to the tokens.
 # ---------------------------------------------------------------------------
 
 ACTION_KIND_TOKENS: tuple[str, ...] = (

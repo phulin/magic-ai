@@ -6,9 +6,9 @@ into a single text string laced with custom tokens (mana symbols, status flags,
 zone delimiters, intra-snapshot card references). The output is consumed by the
 tokenizer in a follow-up PR; this module deliberately stops at ``str``.
 
-Anchor positions (string indices for ``<card-ref:K>``, ``<option>``,
-``<target>``) are returned alongside the text so downstream code can map them
-to token ids and to per-card / per-option / per-target pooling slots.
+Anchor positions for ``<card-ref:K>`` and inline ``<choose-*>`` blanks are
+returned alongside the text so downstream code can map them to token ids,
+per-card pooling slots, and per-blank legal-token metadata.
 """
 
 from __future__ import annotations

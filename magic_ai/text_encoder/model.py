@@ -1,9 +1,8 @@
-"""Text-encoder model: ModernBERT-shaped scratch trunk + pooling + heads.
+"""Text-encoder model: ModernBERT-shaped scratch trunk + inline blank heads.
 
-Implements PR #3 from ``docs/text_encoder_plan.md``: a bidirectional
-transformer encoder that consumes pre-tokenized state/action text and
-produces (a) per-card / per-option / per-target / global state vectors via
-position-anchored gather pools, and (b) policy / target / value head logits.
+Implements a bidirectional transformer encoder that consumes pre-tokenized
+state text and produces card/global pooled vectors, value logits, and
+legal-token scores for inline decision blanks.
 """
 
 from __future__ import annotations

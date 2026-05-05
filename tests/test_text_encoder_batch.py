@@ -216,7 +216,7 @@ def test_collate_shapes_and_masks(
     assert pad_id is not None
 
     examples: list[TextEncodedExample] = []
-    # Three differing-length examples, with different option/target counts.
+    # Three differing-length examples, with different inline blank layouts.
     examples.append(
         tokenize_snapshot(
             render_snapshot(_basic_snapshot(real_card_name, hand_size=1), oracle=oracle), tokenizer
