@@ -592,6 +592,9 @@ class TextActorCritic(nn.Module):
             self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
 
             trace_kind_id = native_batch.trace_kind_id.to(self.device)
+            has_may_decision = bool(
+                (native_batch.trace_kind_id[:batch_size] == TRACE_KIND_TO_ID["may"]).any().item()
+            )
             decision_count = native_batch.decision_count.to(self.device)
             decision_rows = int(native_batch.decision_rows_written)
             max_cached_choices = int(native_batch.decision_mask.shape[1])
@@ -616,9 +619,7 @@ class TextActorCritic(nn.Module):
                 decision_mask = native_batch.decision_mask[:decision_rows].to(
                     device, dtype=torch.bool, non_blocking=device.type == "cuda"
                 )
-                uses_none = native_batch.uses_none_head[:decision_rows].to(
-                    device, dtype=torch.bool, non_blocking=device.type == "cuda"
-                )
+                uses_none = torch.empty(0, dtype=torch.bool, device=device)
                 priority_fast = (
                     _sample_inline_priority_batch(
                         output,
@@ -639,6 +640,9 @@ class TextActorCritic(nn.Module):
                     step_log_probs = step_log_probs + log_prob
                     step_entropies = step_entropies + entropy
                 else:
+                    uses_none = native_batch.uses_none_head[:decision_rows].to(
+                        device, dtype=torch.bool, non_blocking=device.type == "cuda"
+                    )
                     id_to_trace = {int(v): k for k, v in TRACE_KIND_TO_ID.items()}
                     selected_chunks: list[Tensor] = []
                     cursor = 0
@@ -808,42 +812,52 @@ class TextActorCritic(nn.Module):
                 uses_none = torch.empty(0, dtype=torch.bool, device=device)
                 selected = torch.empty(0, dtype=torch.long, device=device)
             group_log_probs = output.values.new_zeros(decision_rows)
+            needs_replay_metadata = return_replay_payload or (
+                append_replay and self.rollout_buffer is not None
+            )
+            if needs_replay_metadata and int(uses_none.shape[0]) != decision_rows:
+                uses_none = native_batch.uses_none_head[:decision_rows].to(
+                    device, dtype=torch.bool, non_blocking=device.type == "cuda"
+                )
 
             may_mask = trace_kind_id == TRACE_KIND_TO_ID["may"]
-            inline_may_sample = _sample_inline_may_batch(
-                output,
-                inline_batch,
-                may_mask=may_mask,
-                deterministic=deterministic,
-            )
-            if inline_may_sample is not None:
-                selected_may, log_prob, entropy, inline_may_active = inline_may_sample
-                may_selected_t = torch.where(inline_may_active, selected_may, may_selected_t)
-                active_f = inline_may_active.to(dtype=output.values.dtype)
-                step_log_probs = step_log_probs + log_prob * active_f
-                step_entropies = step_entropies + entropy * active_f
+            if has_may_decision:
+                inline_may_sample = _sample_inline_may_batch(
+                    output,
+                    inline_batch,
+                    may_mask=may_mask,
+                    deterministic=deterministic,
+                )
+                if inline_may_sample is not None:
+                    selected_may, log_prob, entropy, inline_may_active = inline_may_sample
+                    may_selected_t = torch.where(inline_may_active, selected_may, may_selected_t)
+                    active_f = inline_may_active.to(dtype=output.values.dtype)
+                    step_log_probs = step_log_probs + log_prob * active_f
+                    step_entropies = step_entropies + entropy * active_f
 
-            fallback_may_mask = may_mask & ~inline_may_active
-            if deterministic:
-                fallback_may_selected = (may_logits >= 0).to(dtype=output.values.dtype)
-            else:
-                fallback_may_selected = torch.bernoulli(torch.sigmoid(may_logits))
-            may_selected_t = torch.where(fallback_may_mask, fallback_may_selected, may_selected_t)
-            may_log_prob = -torch.nn.functional.binary_cross_entropy_with_logits(
-                may_logits,
-                fallback_may_selected,
-                reduction="none",
-            )
-            with torch.autocast(device_type=device_type, enabled=False):
-                may_prob = torch.sigmoid(may_logits.float())
-                may_entropy = torch.nn.functional.binary_cross_entropy(
-                    may_prob,
-                    may_prob,
+                fallback_may_mask = may_mask & ~inline_may_active
+                if deterministic:
+                    fallback_may_selected = (may_logits >= 0).to(dtype=output.values.dtype)
+                else:
+                    fallback_may_selected = torch.bernoulli(torch.sigmoid(may_logits))
+                may_selected_t = torch.where(
+                    fallback_may_mask, fallback_may_selected, may_selected_t
+                )
+                may_log_prob = -torch.nn.functional.binary_cross_entropy_with_logits(
+                    may_logits,
+                    fallback_may_selected,
                     reduction="none",
                 )
-            may_mask_f = fallback_may_mask.to(dtype=output.values.dtype)
-            step_log_probs = step_log_probs + may_log_prob * may_mask_f
-            step_entropies = step_entropies + may_entropy * may_mask_f
+                with torch.autocast(device_type=device_type, enabled=False):
+                    may_prob = torch.sigmoid(may_logits.float())
+                    may_entropy = torch.nn.functional.binary_cross_entropy(
+                        may_prob,
+                        may_prob,
+                        reduction="none",
+                    )
+                may_mask_f = fallback_may_mask.to(dtype=output.values.dtype)
+                step_log_probs = step_log_probs + may_log_prob * may_mask_f
+                step_entropies = step_entropies + may_entropy * may_mask_f
             del step_entropies
 
         replay_payload = (
@@ -912,6 +926,7 @@ class TextActorCritic(nn.Module):
                 step_log_probs.detach(),
                 output.values.detach(),
                 replay_rows.to(dtype=torch.float32),
+                selected.to(dtype=torch.float32),
             ]
         ).cpu()
         b = batch_size
@@ -920,7 +935,7 @@ class TextActorCritic(nn.Module):
         old_log_prob = host[2 * b : 3 * b].tolist()
         value = host[3 * b : 4 * b].tolist()
         replay_rows_cpu = host[4 * b : 5 * b].tolist()
-        selected_choice_cols = selected.detach().cpu().tolist()
+        selected_choice_cols = host[5 * b :].tolist()
         return NativeTextSampleBatch(
             decision_counts=[int(x) for x in decision_counts],
             selected_choice_cols=[int(x) for x in selected_choice_cols],
@@ -1925,13 +1940,21 @@ def _sample_inline_priority_batch(
         torch.zeros_like(priority_scores),
     )
     priority_logits = safe_priority_scores.masked_fill(~effective_priority, float("-inf"))
-    priority_dist = Categorical(logits=priority_logits)
     chosen_priority = (
-        torch.argmax(priority_logits, dim=-1) if deterministic else priority_dist.sample()
+        torch.argmax(priority_logits, dim=-1)
+        if deterministic
+        else torch.multinomial(torch.softmax(priority_logits, dim=-1), 1).squeeze(1)
     )
+    priority_log_probs = torch.log_softmax(priority_logits, dim=-1)
+    priority_probs = priority_log_probs.exp()
+    safe_priority_log_probs = torch.where(
+        effective_priority,
+        priority_log_probs,
+        priority_log_probs.new_zeros(()),
+    )
+    priority_entropy = -(priority_probs * safe_priority_log_probs).sum(dim=-1)
     chosen_option_idx = row_option_index.gather(1, chosen_priority.unsqueeze(1)).squeeze(1)
-    priority_log_prob = priority_dist.log_prob(chosen_priority)
-    priority_entropy = priority_dist.entropy()
+    priority_log_prob = priority_log_probs.gather(1, chosen_priority.unsqueeze(1)).squeeze(1)
 
     option_idx = option_idx.to(device=device, dtype=torch.long)
     target_idx = target_idx.to(device=device, dtype=torch.long)
@@ -1945,6 +1968,9 @@ def _sample_inline_priority_batch(
     selected = no_target_col
     log_prob = priority_log_prob
     entropy = priority_entropy
+    if not bool(target_required.any().item()):
+        active = eligible & has_priority & has_candidate
+        return selected.to(dtype=torch.long), log_prob, entropy, active
 
     target_support = (
         (row_group_kind == BLANK_GROUP_PER_BLANK)
