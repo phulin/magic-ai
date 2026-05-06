@@ -1141,16 +1141,22 @@ class SnapshotRenderer:
     def _mana_color_legal_token_ids(self, actions: Sequence[PendingOptionState]) -> tuple[int, ...]:
         color_to_idx = {
             "white": 0,
+            "White": 0,
             "W": 0,
             "blue": 1,
+            "Blue": 1,
             "U": 1,
             "black": 2,
+            "Black": 2,
             "B": 2,
             "red": 3,
+            "Red": 3,
             "R": 3,
             "green": 4,
+            "Green": 4,
             "G": 4,
             "colorless": 5,
+            "Colorless": 5,
             "C": 5,
         }
         legal_ids: list[int] = []

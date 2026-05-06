@@ -234,8 +234,8 @@ def lstm_recompute_per_step_h_out(
         out_packed, (h_out, c_out) = runner(packed, (h_in, c_in))
         # Detach state crossing the chunk boundary so the next chunk's
         # backward stops here. Within a chunk, BPTT is full.
-        h_state.index_copy_(1, active_idx_t, h_out.detach())
-        c_state.index_copy_(1, active_idx_t, c_out.detach())
+        h_state.index_copy_(1, active_idx_t, h_out.detach().to(dtype=h_state.dtype))
+        c_state.index_copy_(1, active_idx_t, c_out.detach().to(dtype=c_state.dtype))
         padded, chunk_lengths = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True)
         for i_local, ep_idx in enumerate(active_idx):
             t_chunk = int(chunk_lengths[i_local])

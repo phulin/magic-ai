@@ -946,8 +946,8 @@ def test_inline_blanks_mana_color_emits_mana_source_blank(
             "kind": "mana_color",
             "player_idx": 0,
             "options": [
-                cast(PendingOptionState, {"id": "green", "kind": "choice"}),
-                cast(PendingOptionState, {"id": "blue", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "Green", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "Blue", "kind": "choice"}),
             ],
         },
     )
