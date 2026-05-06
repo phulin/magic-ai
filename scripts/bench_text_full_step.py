@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -25,6 +26,7 @@ import mage
 import torch
 from magic_ai.game_state import PendingState
 from magic_ai.native.sharded import ShardedNativeBatchEncoder, ShardedNativeRolloutDriver
+from magic_ai.slot_encoder.native_encoder import TRACE_KIND_VALUES
 from magic_ai.text_encoder.actor_critic import TextActorCritic
 from magic_ai.text_encoder.card_cache import build_card_cache, load_card_cache
 from magic_ai.text_encoder.model import TextEncoderConfig
@@ -43,14 +45,27 @@ class PhaseTimer:
     def __init__(self) -> None:
         self.totals: dict[str, float] = {}
         self.counts: dict[str, int] = {}
+        self.samples: dict[str, list[float]] = {}
 
     def add(self, name: str, elapsed: float) -> None:
         self.totals[name] = self.totals.get(name, 0.0) + elapsed
         self.counts[name] = self.counts.get(name, 0) + 1
+        self.samples.setdefault(name, []).append(1000.0 * elapsed)
 
     def mean_ms(self, name: str) -> float:
         count = max(1, self.counts.get(name, 0))
         return 1000.0 * self.totals.get(name, 0.0) / count
+
+    def percentile_ms(self, name: str, q: float) -> float:
+        return percentile(self.samples.get(name, []), q)
+
+
+def percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, math.ceil((q / 100.0) * len(ordered)) - 1))
+    return float(ordered[idx])
 
 
 def sync(device: torch.device) -> None:
@@ -116,6 +131,20 @@ def run() -> None:
         action="store_true",
         help="recreate all games after each measured step to keep batches at initial priority",
     )
+    parser.add_argument(
+        "--card-body-dedup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "emit each unique card body once and reference per-zone occurrences by "
+            "compact dict slot"
+        ),
+    )
+    parser.add_argument(
+        "--profile-sample-components",
+        action="store_true",
+        help="synchronize inside sample_native_tensor_batch and report sub-stage timings",
+    )
     args = parser.parse_args()
 
     mage.load()
@@ -157,6 +186,7 @@ def run() -> None:
         validate=False,
         workers=args.workers,
         pool=pool,
+        dedup_card_bodies=args.card_body_dedup,
         shard_packed_tokens=args.shard_packed_tokens,
     )
     native_rollout = ShardedNativeRolloutDriver.for_mage(mage, workers=args.workers, pool=pool)
@@ -194,6 +224,10 @@ def run() -> None:
     measured_steps = 0
     measured_ready = 0
     measured_iters = 0
+    measured_tokens: list[float] = []
+    measured_max_seq: list[float] = []
+    measured_trace_counts = {name: 0 for name in TRACE_KIND_VALUES}
+    sample_component = PhaseTimer()
 
     try:
         total_iters = args.warmup_iters + args.measure_iters
@@ -260,6 +294,12 @@ def run() -> None:
                 max_card_refs=args.max_card_refs,
             )
             phase.add("encode", time.perf_counter() - start) if measuring else None
+            if measuring:
+                trace_ids = native_batch.trace_kind_id[: len(ready_indices)].tolist()
+                for trace_id in trace_ids:
+                    idx = int(trace_id)
+                    if 0 <= idx < len(TRACE_KIND_VALUES):
+                        measured_trace_counts[TRACE_KIND_VALUES[idx]] += 1
 
             start = time.perf_counter()
             packed = nat_outputs.to_packed_text_batch(
@@ -267,9 +307,15 @@ def run() -> None:
                 derive_token_metadata=args.derive_token_metadata,
             )
             phase.add("pack", time.perf_counter() - start) if measuring else None
+            if measuring:
+                measured_tokens.append(float(packed.total_tokens))
+                measured_max_seq.append(float(packed.max_seqlen or 0))
 
             sync(device)
             start = time.perf_counter()
+            sample_profile: dict[str, float] | None = (
+                {} if measuring and args.profile_sample_components else None
+            )
             with torch.inference_mode():
                 policy_batch = policy.sample_native_tensor_batch(
                     native_batch=native_batch,
@@ -279,9 +325,13 @@ def run() -> None:
                     deterministic=False,
                     append_replay=False,
                     return_replay_payload=False,
+                    profile_timings=sample_profile,
                 )
             sync(device)
             phase.add("sample", time.perf_counter() - start) if measuring else None
+            if sample_profile is not None:
+                for name, elapsed in sample_profile.items():
+                    sample_component.add(name, elapsed)
 
             start = time.perf_counter()
             counts = policy_batch.decision_counts
@@ -330,15 +380,62 @@ def run() -> None:
             "d_model": args.d_model,
             "derive_token_metadata": args.derive_token_metadata,
             "reset_each_iter": args.reset_each_iter,
+            "card_body_dedup": args.card_body_dedup,
             "shard_packed_tokens": args.shard_packed_tokens,
         }
     )
-    print(f"{'phase':>14} {'mean_ms':>10} {'pct_iter':>9}")
+    print(
+        {
+            "tokens_p50": round(percentile(measured_tokens, 50.0), 1),
+            "tokens_p90": round(percentile(measured_tokens, 90.0), 1),
+            "tokens_max": round(max(measured_tokens, default=0.0), 1),
+            "max_seq_p50": round(percentile(measured_max_seq, 50.0), 1),
+            "max_seq_p90": round(percentile(measured_max_seq, 90.0), 1),
+            "max_seq_max": round(max(measured_max_seq, default=0.0), 1),
+        }
+    )
+    print({"trace_counts": measured_trace_counts})
+    print(f"{'phase':>14} {'mean_ms':>10} {'p50_ms':>10} {'p90_ms':>10} {'pct_iter':>9}")
     for name in ("poll", "recycle", "encode", "pack", "sample", "prepare_step", "step"):
         mean = phase.mean_ms(name)
+        p50 = phase.percentile_ms(name, 50.0)
+        p90 = phase.percentile_ms(name, 90.0)
         pct = 100.0 * phase.totals.get(name, 0.0) / max(total_s, 1e-9)
-        print(f"{name:>14} {mean:>10.3f} {pct:>8.1f}%")
-    print(f"{'total_iter':>14} {phase.mean_ms('total_iter'):>10.3f} {100.0:>8.1f}%")
+        print(f"{name:>14} {mean:>10.3f} {p50:>10.3f} {p90:>10.3f} {pct:>8.1f}%")
+    print(
+        f"{'total_iter':>14} {phase.mean_ms('total_iter'):>10.3f} "
+        f"{phase.percentile_ms('total_iter', 50.0):>10.3f} "
+        f"{phase.percentile_ms('total_iter', 90.0):>10.3f} {100.0:>8.1f}%"
+    )
+    if args.profile_sample_components:
+        print(f"{'sample_part':>24} {'mean_ms':>10} {'p50_ms':>10} {'p90_ms':>10}")
+        for name in (
+            "move_text",
+            "lstm_state_in",
+            "forward",
+            "lstm_state_out",
+            "native_metadata_to_device",
+            "decision_init",
+            "decision_tensors_to_device",
+            "decision_full_layout",
+            "decision_inline_fast",
+            "decision_sampling",
+            "decision_priority_batch",
+            "decision_choice_batch",
+            "decision_binary_batch",
+            "decision_merge_batch",
+            "decision_accept_check",
+            "decision_post_decision",
+            "decision_may",
+            "replay_payload",
+            "append_replay",
+            "host_return",
+        ):
+            print(
+                f"{name:>24} {sample_component.mean_ms(name):>10.3f} "
+                f"{sample_component.percentile_ms(name, 50.0):>10.3f} "
+                f"{sample_component.percentile_ms(name, 90.0):>10.3f}"
+            )
 
 
 if __name__ == "__main__":

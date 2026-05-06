@@ -13,6 +13,7 @@ from magic_ai.text_encoder.actor_critic import (
     _evaluate_inline_priority_replay_groups,
     _sample_inline_blockers_for_step,
     _sample_inline_choice_index_for_step,
+    _sample_inline_combat_groups_batch,
     _sample_inline_may_for_step,
     _sample_inline_priority_batch,
     _sample_inline_priority_for_step,
@@ -82,6 +83,53 @@ def _model() -> TextActorCritic:
 
 
 class TextActorCriticTests(unittest.TestCase):
+    def test_inline_combat_group_batch_vectorizes_multi_attacker_row(self) -> None:
+        output = RecurrentTextPolicyOutput(
+            values=torch.zeros(1),
+            state_hidden=torch.zeros(1, 8),
+            card_vectors=torch.empty(1, MAX_CARD_REFS, 8),
+            card_mask=torch.zeros(1, MAX_CARD_REFS, dtype=torch.bool),
+            blank_logits=torch.tensor([[[0.0, 3.0], [4.0, 1.0]]]),
+        )
+        batch = PackedTextBatch(
+            token_ids=torch.tensor([1, 2], dtype=torch.int32),
+            seq_id=torch.tensor([0, 0], dtype=torch.int32),
+            pos_in_seq=torch.tensor([0, 1], dtype=torch.int32),
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            seq_lengths=torch.tensor([2], dtype=torch.int32),
+            state_positions=torch.tensor([0], dtype=torch.int32),
+            card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.int32),
+            blank_positions=torch.tensor([[0, 1]], dtype=torch.int32),
+            blank_kind=torch.ones(1, 2, dtype=torch.int32),
+            blank_group=torch.zeros(1, 2, dtype=torch.int32),
+            blank_group_kind=torch.full((1, 2), BLANK_GROUP_PER_BLANK, dtype=torch.int32),
+            blank_option_index=torch.tensor([[5, 6]], dtype=torch.int32),
+            blank_legal_ids=torch.ones(1, 2, 2, dtype=torch.int32),
+            blank_legal_mask=torch.ones(1, 2, 2, dtype=torch.bool),
+        )
+
+        sampled = _sample_inline_combat_groups_batch(
+            output,
+            batch,
+            option_idx=torch.tensor([[5, -1], [6, -1]]),
+            decision_mask=torch.ones(2, 2, dtype=torch.bool),
+            trace_kind_id=torch.tensor([TRACE_KIND_TO_ID["attackers"]]),
+            decision_count=torch.tensor([2]),
+            group_steps=torch.tensor([0, 0]),
+            deterministic=True,
+        )
+
+        assert sampled is not None
+        selected, log_prob, entropy, active = sampled
+        torch.testing.assert_close(selected, torch.tensor([1, 0]))
+        torch.testing.assert_close(active, torch.tensor([True, True]))
+        blank_logits = output.blank_logits
+        assert blank_logits is not None
+        expected = torch.log_softmax(blank_logits[0, 0], dim=0)[1]
+        expected = expected + torch.log_softmax(blank_logits[0, 1], dim=0)[0]
+        torch.testing.assert_close(log_prob[0], expected)
+        torch.testing.assert_close(entropy, torch.zeros(1))
+
     def test_live_state_gather_scatter_is_per_env_and_player(self) -> None:
         model = _model()
         model.init_lstm_env_states(2)
