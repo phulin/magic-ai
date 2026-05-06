@@ -620,23 +620,41 @@ class TextActorCritic(nn.Module):
                     device, dtype=torch.bool, non_blocking=device.type == "cuda"
                 )
                 uses_none = torch.empty(0, dtype=torch.bool, device=device)
-                priority_fast = (
-                    _sample_inline_priority_batch(
+                single_group_batch = decision_rows <= batch_size and bool(
+                    (native_batch.decision_count[:batch_size] <= 1).all().item()
+                )
+                inline_fast = None
+                if single_group_batch:
+                    decision_row_mask = decision_count > 0
+                    full_option_idx = torch.full(
+                        (batch_size, max_cached_choices),
+                        -1,
+                        dtype=option_idx.dtype,
+                        device=device,
+                    )
+                    full_target_idx = torch.full_like(full_option_idx, -1)
+                    full_decision_mask = torch.zeros(
+                        (batch_size, max_cached_choices), dtype=torch.bool, device=device
+                    )
+                    full_option_idx[decision_row_mask] = option_idx
+                    full_target_idx[decision_row_mask] = target_idx
+                    full_decision_mask[decision_row_mask] = decision_mask
+                    inline_fast = _sample_inline_decision_batch(
                         output,
                         inline_batch,
-                        option_idx=option_idx,
-                        target_idx=target_idx,
-                        decision_mask=decision_mask,
+                        option_idx=full_option_idx,
+                        target_idx=full_target_idx,
+                        decision_mask=full_decision_mask,
                         trace_kind_id=trace_kind_id,
                         decision_count=decision_count,
-                        decision_rows=decision_rows,
+                        decision_rows=batch_size,
                         deterministic=deterministic,
                     )
-                    if decision_rows == batch_size
-                    else None
-                )
-                if priority_fast is not None and bool(priority_fast[3].all().item()):
-                    selected, log_prob, entropy, _active = priority_fast
+                if inline_fast is not None and bool(
+                    (inline_fast[3] | ~decision_row_mask).all().item()
+                ):
+                    selected_by_row, log_prob, entropy, _active = inline_fast
+                    selected = selected_by_row[decision_row_mask]
                     step_log_probs = step_log_probs + log_prob
                     step_entropies = step_entropies + entropy
                 else:
@@ -1808,12 +1826,18 @@ def _sample_inline_choice_index_for_step(
     if batch.blank_option_index.numel() == 0:
         return None
     row_group_kind = batch.blank_group_kind[step_idx].to(device=blank_logits.device)
+    row_positions = (
+        batch.blank_positions[step_idx].to(device=blank_logits.device)
+        if batch.blank_positions.numel() > 0
+        else torch.zeros_like(row_group_kind)
+    )
     row_option_index = batch.blank_option_index[step_idx].to(device=blank_logits.device)
     row_legal_mask = batch.blank_legal_mask[step_idx].to(
         device=blank_logits.device, dtype=torch.bool
     )
     support = (
-        (row_group_kind == BLANK_GROUP_PER_BLANK)
+        (row_positions >= 0)
+        & (row_group_kind == BLANK_GROUP_PER_BLANK)
         & (row_option_index < 0)
         & row_legal_mask.any(dim=-1)
     )
@@ -1888,6 +1912,200 @@ def _score_inline_may_decisions(
         active, selected.to(dtype=selected_per_step.dtype), selected_per_step
     )
     return log_probs, entropies, active, logits_per_step, selected_per_step
+
+
+def _sample_inline_decision_batch(
+    output: RecurrentTextPolicyOutput,
+    batch: TextEncodedBatch | PackedTextBatch,
+    *,
+    option_idx: Tensor,
+    target_idx: Tensor,
+    decision_mask: Tensor,
+    trace_kind_id: Tensor,
+    decision_count: Tensor,
+    decision_rows: int,
+    deterministic: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+    priority = _sample_inline_priority_batch(
+        output,
+        batch,
+        option_idx=option_idx,
+        target_idx=target_idx,
+        decision_mask=decision_mask,
+        trace_kind_id=trace_kind_id,
+        decision_count=decision_count,
+        decision_rows=decision_rows,
+        deterministic=deterministic,
+    )
+    choice = _sample_inline_choice_batch(
+        output,
+        batch,
+        decision_mask=decision_mask,
+        trace_kind_id=trace_kind_id,
+        decision_count=decision_count,
+        decision_rows=decision_rows,
+        deterministic=deterministic,
+    )
+    attacker = _sample_inline_per_blank_binary_batch(
+        output,
+        batch,
+        option_idx=option_idx,
+        decision_mask=decision_mask,
+        trace_kind_id=trace_kind_id,
+        decision_count=decision_count,
+        decision_rows=decision_rows,
+        deterministic=deterministic,
+    )
+    outputs = [sample for sample in (priority, choice, attacker) if sample is not None]
+    if not outputs:
+        return None
+    selected, log_prob, entropy, active = outputs[0]
+    for next_selected, next_log_prob, next_entropy, next_active in outputs[1:]:
+        selected = torch.where(next_active, next_selected, selected)
+        log_prob = torch.where(next_active, next_log_prob, log_prob)
+        entropy = torch.where(next_active, next_entropy, entropy)
+        active = active | next_active
+    return selected, log_prob, entropy, active
+
+
+def _sample_inline_choice_batch(
+    output: RecurrentTextPolicyOutput,
+    batch: TextEncodedBatch | PackedTextBatch,
+    *,
+    decision_mask: Tensor,
+    trace_kind_id: Tensor,
+    decision_count: Tensor,
+    decision_rows: int,
+    deterministic: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+    blank_logits = output.blank_logits
+    if blank_logits is None or blank_logits.numel() == 0:
+        return None
+    if batch.blank_option_index.numel() == 0:
+        return None
+    n = int(trace_kind_id.shape[0])
+    if decision_rows != n:
+        return None
+    device = blank_logits.device
+    row_positions = batch.blank_positions.to(device=device)
+    row_group_kind = batch.blank_group_kind.to(device=device, dtype=torch.long)
+    row_option_index = batch.blank_option_index.to(device=device, dtype=torch.long)
+    row_legal_mask = batch.blank_legal_mask.to(device=device, dtype=torch.bool)
+    if int(row_group_kind.shape[1]) == 0 or int(row_legal_mask.shape[2]) == 0:
+        return None
+
+    trace_kind = trace_kind_id.to(device=device)
+    choice_trace = (
+        (trace_kind == TRACE_KIND_TO_ID["choice_index"])
+        | (trace_kind == TRACE_KIND_TO_ID["choice_ids"])
+        | (trace_kind == TRACE_KIND_TO_ID["choice_color"])
+    )
+    eligible = choice_trace & (decision_count.to(device=device) == 1)
+    support = (
+        (row_positions >= 0)
+        & (row_group_kind == BLANK_GROUP_PER_BLANK)
+        & (row_option_index < 0)
+        & row_legal_mask.any(dim=-1)
+    )
+    match_count = support.sum(dim=-1)
+    blank_idx = support.to(dtype=torch.long).argmax(dim=-1)
+    row_idx = torch.arange(n, dtype=torch.long, device=device)
+    legal_mask = row_legal_mask[row_idx, blank_idx]
+    logits = blank_logits[row_idx, blank_idx]
+    dummy_mask = torch.zeros_like(legal_mask)
+    dummy_mask[:, 0] = True
+    active = eligible & (match_count == 1)
+    effective_mask = torch.where(active.unsqueeze(1), legal_mask, dummy_mask)
+    safe_logits = torch.where(active.unsqueeze(1), logits, torch.zeros_like(logits))
+    masked_logits = safe_logits.masked_fill(~effective_mask, float("-inf"))
+    chosen = (
+        torch.argmax(masked_logits, dim=-1)
+        if deterministic
+        else (masked_logits - torch.empty_like(masked_logits).exponential_().log()).argmax(dim=-1)
+    )
+    log_probs = torch.log_softmax(masked_logits, dim=-1)
+    log_prob = log_probs.gather(1, chosen.unsqueeze(1)).squeeze(1)
+    decision_mask = decision_mask.to(device=device, dtype=torch.bool)
+    choice_width = int(decision_mask.shape[1])
+    selected_in_range = chosen < choice_width
+    safe_selected = chosen.clamp(max=max(choice_width - 1, 0))
+    selected_valid = (
+        decision_mask.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
+        if choice_width > 0
+        else torch.zeros_like(active)
+    )
+    active = active & selected_in_range & selected_valid
+    entropy = torch.zeros_like(log_prob)
+    return chosen.to(dtype=torch.long), log_prob, entropy, active
+
+
+def _sample_inline_per_blank_binary_batch(
+    output: RecurrentTextPolicyOutput,
+    batch: TextEncodedBatch | PackedTextBatch,
+    *,
+    option_idx: Tensor,
+    decision_mask: Tensor,
+    trace_kind_id: Tensor,
+    decision_count: Tensor,
+    decision_rows: int,
+    deterministic: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+    blank_logits = output.blank_logits
+    if blank_logits is None or blank_logits.numel() == 0:
+        return None
+    if batch.blank_option_index.numel() == 0:
+        return None
+    n = int(trace_kind_id.shape[0])
+    if decision_rows != n:
+        return None
+    device = blank_logits.device
+    row_positions = batch.blank_positions.to(device=device)
+    row_group_kind = batch.blank_group_kind.to(device=device, dtype=torch.long)
+    row_option_index = batch.blank_option_index.to(device=device, dtype=torch.long)
+    row_legal_mask = batch.blank_legal_mask.to(device=device, dtype=torch.bool)
+    if int(row_group_kind.shape[1]) == 0 or int(row_legal_mask.shape[2]) < 2:
+        return None
+
+    trace_kind = trace_kind_id.to(device=device)
+    binary_trace = (trace_kind == TRACE_KIND_TO_ID["attackers"]) | (
+        trace_kind == TRACE_KIND_TO_ID["blockers"]
+    )
+    eligible = binary_trace & (decision_count.to(device=device) == 1)
+    option_idx = option_idx.to(device=device, dtype=torch.long)
+    decision_mask = decision_mask.to(device=device, dtype=torch.bool)
+    valid_option = torch.where(option_idx >= 0, option_idx, torch.full_like(option_idx, 2**30))
+    first_option = valid_option.min(dim=-1).values
+    has_option = first_option < 2**30
+    support = (
+        (row_positions >= 0)
+        & (row_group_kind == BLANK_GROUP_PER_BLANK)
+        & (row_option_index == first_option.unsqueeze(1))
+        & row_legal_mask[..., :2].all(dim=-1)
+    )
+    match_count = support.sum(dim=-1)
+    blank_idx = support.to(dtype=torch.long).argmax(dim=-1)
+    row_idx = torch.arange(n, dtype=torch.long, device=device)
+    logits = blank_logits[row_idx, blank_idx, :2]
+    active = eligible & has_option & (match_count == 1)
+    safe_logits = torch.where(active.unsqueeze(1), logits, torch.zeros_like(logits))
+    chosen = (
+        torch.argmax(safe_logits, dim=-1)
+        if deterministic
+        else (safe_logits - torch.empty_like(safe_logits).exponential_().log()).argmax(dim=-1)
+    )
+    log_probs = torch.log_softmax(safe_logits, dim=-1)
+    log_prob = log_probs.gather(1, chosen.unsqueeze(1)).squeeze(1)
+    choice_width = int(decision_mask.shape[1])
+    selected_in_range = chosen < choice_width
+    safe_selected = chosen.clamp(max=max(choice_width - 1, 0))
+    selected_valid = (
+        decision_mask.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
+        if choice_width > 0
+        else torch.zeros_like(active)
+    )
+    active = active & selected_in_range & selected_valid
+    entropy = torch.zeros_like(log_prob)
+    return chosen.to(dtype=torch.long), log_prob, entropy, active
 
 
 def _sample_inline_priority_batch(

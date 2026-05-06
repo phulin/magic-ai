@@ -442,6 +442,41 @@ class TextActorCriticTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(log_prob))
         self.assertTrue(torch.isfinite(entropy))
 
+    def test_inline_choice_index_sampler_ignores_stale_dead_blank_tail(self) -> None:
+        output = RecurrentTextPolicyOutput(
+            values=torch.zeros(1),
+            state_hidden=torch.zeros(1, 8),
+            card_vectors=torch.empty(1, MAX_CARD_REFS, 8),
+            card_mask=torch.zeros(1, MAX_CARD_REFS, dtype=torch.bool),
+            blank_logits=torch.tensor([[[0.0, 4.0, 1.0], [9.0, 0.0, 0.0]]]),
+        )
+        batch = TextEncodedBatch(
+            token_ids=torch.tensor([[1, 2]]),
+            attention_mask=torch.ones(1, 2, dtype=torch.long),
+            card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
+            seq_lengths=torch.tensor([2]),
+            blank_positions=torch.tensor([[1, -1]]),
+            blank_group_kind=torch.tensor(
+                [[BLANK_GROUP_PER_BLANK, BLANK_GROUP_PER_BLANK]], dtype=torch.int32
+            ),
+            blank_option_index=torch.tensor([[-1, -1]], dtype=torch.int32),
+            blank_legal_mask=torch.tensor([[[True, True, True], [True, False, False]]]),
+        )
+
+        sampled = _sample_inline_choice_index_for_step(
+            output,
+            batch,
+            step_idx=0,
+            deterministic=True,
+        )
+
+        assert sampled is not None
+        selected, log_prob, entropy = sampled
+        self.assertEqual([int(t.item()) for t in selected], [1])
+        expected = torch.log_softmax(torch.tensor([0.0, 4.0, 1.0]), dim=0)[1]
+        torch.testing.assert_close(log_prob, expected)
+        self.assertTrue(torch.isfinite(entropy))
+
     def test_inline_blocker_replay_scoring_uses_blank_logits(self) -> None:
         output = RecurrentTextPolicyOutput(
             values=torch.zeros(1),
