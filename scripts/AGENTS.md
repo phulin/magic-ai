@@ -5,6 +5,7 @@ Utility scripts for building data pipelines, evaluating card embeddings, pretrai
 ## Files
 
 - `bench_packed_encoder.py` — Benchmark padded vs packed forward+backward performance on varying sequence-length distributions.
+- `bench_text_full_step.py` — Benchmark full native text rollout step phases: poll, token encode, packed batch construction, policy sample, and step_by_choice.
 - `bench_text_replay_append.py` — Benchmark text replay-buffer append_batch/gather with and without the optional Triton kernels.
 - `build_card_embeddings.py` — Download Magic card oracle text from Scryfall and compute embeddings using a transformer model.
 - `build_text_card_embeddings.py` — Extract per-card embeddings by pooling card-ref hidden states from the text encoder.
