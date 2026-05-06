@@ -16,6 +16,7 @@ from magic_ai.text_encoder.value_pretrain import (
     ValueLabeledBinDataset,
     ValuePretrainConfig,
     ValuePretrainTrainer,
+    _stable_eval_bucket,
 )
 
 
@@ -80,6 +81,7 @@ def test_value_dataset_eval_split_is_deterministic(tmp_path: Path) -> None:
     eval_ = ValueLabeledBinDataset(tmp_path, seq_len=64, split="eval", eval_fraction=0.25)
     assert train.n_games + eval_.n_games == 40
     assert eval_.n_games > 0
+    assert eval_.n_games == sum(_stable_eval_bucket(f"g{i:02d}", 4) == 0 for i in range(40))
 
 
 def test_value_pretrain_trainer_smoke_trains_loss_down(tmp_path: Path) -> None:

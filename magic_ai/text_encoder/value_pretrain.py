@@ -29,6 +29,7 @@ scalar label.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -47,6 +48,13 @@ from magic_ai.text_encoder.model import (
     ValueHead,
     gather_state_vector,
 )
+
+
+def _stable_eval_bucket(game_id: str, bucket: int) -> int:
+    """Return a process-stable split bucket for ``game_id``."""
+
+    digest = hashlib.blake2b(game_id.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=False) % bucket
 
 
 @dataclass
@@ -82,9 +90,9 @@ class ValueLabeledBinDataset:
     ``seq_len`` (preserving the ``<bos>`` prefix); spans shorter than
     ``seq_len`` are right-padded with ``pad_token_id``.
 
-    Held-out eval shard is selected deterministically via
-    ``hash(game_id) % bucket == 0`` so the same game always lands in the
-    same split.
+    Held-out eval shard is selected deterministically via a stable hash so
+    the same game always lands in the same split, including across Python
+    processes.
     """
 
     def __init__(
@@ -121,7 +129,7 @@ class ValueLabeledBinDataset:
             meta = json.loads(json_path.read_text())
             game_id = str(meta.get("game_id") or path.stem)
             if bucket > 0 and split != "all":
-                in_eval = (hash(game_id) % bucket) == 0
+                in_eval = _stable_eval_bucket(game_id, bucket) == 0
                 if split == "train" and in_eval:
                     n_skipped_split += 1
                     continue
@@ -327,4 +335,5 @@ __all__ = [
     "ValueLabeledBinDataset",
     "ValuePretrainConfig",
     "ValuePretrainTrainer",
+    "_stable_eval_bucket",
 ]
