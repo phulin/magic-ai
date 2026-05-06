@@ -26,9 +26,12 @@ from scripts.train import (
     SlotTrainingBackend,
     TrainingResumeState,
     _build_opponent_schedules,
+    _checkpoint_has_policy,
     _current_transcript_snapshot,
     _prune_pool_to_schedule,
     _restore_opponent_pool,
+    _should_run_mlm_pretrain,
+    _should_run_value_pretrain,
     append_sample_game_log,
     build_slot_backend,
     build_text_backend,
@@ -86,6 +89,32 @@ class TrainPPOTests(unittest.TestCase):
             "policy snapshot, not a training checkpoint",
         ):
             validate_checkpoint_encoder(args, checkpoint)
+
+    def test_checkpoint_has_policy_detects_training_checkpoints(self) -> None:
+        self.assertFalse(_checkpoint_has_policy(None))
+        self.assertFalse(_checkpoint_has_policy({"state_dict": {}}))
+        self.assertTrue(_checkpoint_has_policy({"policy": {}}))
+
+    def test_pretrain_gates_skip_full_policy_checkpoint(self) -> None:
+        args = Namespace(pretrain_mlm_dir=Path("mlm"), pretrain_value_dir=Path("value"))
+        checkpoint = {"policy": {}, "metadata": {"encoder": "text"}}
+
+        self.assertFalse(_should_run_mlm_pretrain(args, checkpoint))
+        self.assertFalse(_should_run_value_pretrain(args, checkpoint))
+
+    def test_pretrain_gates_allow_value_after_post_mlm_checkpoint(self) -> None:
+        args = Namespace(pretrain_mlm_dir=Path("mlm"), pretrain_value_dir=Path("value"))
+        checkpoint = {"policy": {}, "metadata": {"encoder": "text", "post_mlm": True}}
+
+        self.assertFalse(_should_run_mlm_pretrain(args, checkpoint))
+        self.assertTrue(_should_run_value_pretrain(args, checkpoint))
+
+    def test_pretrain_gates_skip_post_value_checkpoint(self) -> None:
+        args = Namespace(pretrain_mlm_dir=Path("mlm"), pretrain_value_dir=Path("value"))
+        checkpoint = {"policy": {}, "metadata": {"encoder": "text", "post_value": True}}
+
+        self.assertFalse(_should_run_mlm_pretrain(args, checkpoint))
+        self.assertFalse(_should_run_value_pretrain(args, checkpoint))
 
     def test_validate_checkpoint_encoder_rejects_text_config_mismatch(self) -> None:
         args = Namespace(

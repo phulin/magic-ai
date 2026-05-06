@@ -927,6 +927,8 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             max_seq_len=args.text_max_tokens,
             trust_remote_code=args.text_hf_trust_remote_code,
         )
+        if getattr(args, "skip_text_hf_init", False):
+            cfg = replace(cfg, hf_model_name=None)
     else:
         cfg = TextEncoderConfig(
             vocab_size=len(tokenizer),
@@ -1175,6 +1177,24 @@ def _is_post_value_checkpoint(checkpoint: dict[str, Any] | None) -> bool:
 def _checkpoint_wandb_run_id(checkpoint: dict[str, Any] | None) -> str | None:
     run_id = _checkpoint_metadata(checkpoint).get("wandb_run_id")
     return str(run_id) if isinstance(run_id, str) and run_id else None
+
+
+def _checkpoint_has_policy(checkpoint: dict[str, Any] | None) -> bool:
+    return isinstance(checkpoint, dict) and isinstance(checkpoint.get("policy"), dict)
+
+
+def _should_run_mlm_pretrain(args: argparse.Namespace, checkpoint: dict[str, Any] | None) -> bool:
+    return getattr(args, "pretrain_mlm_dir", None) is not None and not _checkpoint_has_policy(
+        checkpoint
+    )
+
+
+def _should_run_value_pretrain(args: argparse.Namespace, checkpoint: dict[str, Any] | None) -> bool:
+    if getattr(args, "pretrain_value_dir", None) is None:
+        return False
+    if _is_post_value_checkpoint(checkpoint):
+        return False
+    return not (_checkpoint_has_policy(checkpoint) and not _is_post_mlm_checkpoint(checkpoint))
 
 
 def checkpoint_encoder_kind(checkpoint: dict[str, Any] | None) -> str:
@@ -1906,6 +1926,7 @@ def main() -> None:
         policy = slot_backend.policy
         batch_pool = slot_backend.batch_pool
     else:
+        args.skip_text_hf_init = _checkpoint_has_policy(checkpoint_cpu)
         text_backend = build_text_backend(args, device)
         policy = text_backend.policy
         batch_pool = getattr(text_backend, "batch_pool", None)
@@ -1933,6 +1954,7 @@ def main() -> None:
 
     resumed_post_mlm = _is_post_mlm_checkpoint(checkpoint_cpu)
     resumed_post_value = _is_post_value_checkpoint(checkpoint_cpu)
+    resumed_policy_checkpoint = _checkpoint_has_policy(checkpoint_cpu)
     if resumed_post_value:
         print(
             "[value] resuming from post-value-pretrain checkpoint "
@@ -1943,16 +1965,19 @@ def main() -> None:
             "[mlm] resuming from post-MLM checkpoint "
             f"{args.checkpoint}: skipping MLM pretraining, opponent pool starts empty"
         )
-    run_mlm_now = (
+    elif resumed_policy_checkpoint and (
         getattr(args, "pretrain_mlm_dir", None) is not None
-        and not resumed_post_mlm
-        and not resumed_post_value
-    )
+        or getattr(args, "pretrain_value_dir", None) is not None
+    ):
+        print(
+            "[resume] checkpoint contains saved policy weights: skipping MLM and value pretraining"
+        )
+    run_mlm_now = _should_run_mlm_pretrain(args, checkpoint_cpu)
     if run_mlm_now:
         if encoder_kind != "text" or text_backend is None:
             raise ValueError("--pretrain-mlm-dir requires --encoder text")
         run_mlm_pretrain(args, text_backend, device)
-    run_value_now = getattr(args, "pretrain_value_dir", None) is not None and not resumed_post_value
+    run_value_now = _should_run_value_pretrain(args, checkpoint_cpu)
     if run_value_now:
         if encoder_kind != "text" or text_backend is None:
             raise ValueError("--pretrain-value-dir requires --encoder text")
