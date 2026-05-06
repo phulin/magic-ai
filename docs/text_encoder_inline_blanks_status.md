@@ -10,8 +10,8 @@ the eight-step migration. Update at every step boundary.
   lives here. Main checkout at `/home/user/magic-ai` is reserved for
   unrelated work.
 - **mage-go**: `/home/user/mage-go/.claude/worktrees/inline-blanks` on
-  branch `text-encoder-inline-blanks` (commit `a773863`). All native ABI
-  work lives here.
+  branch `text-encoder-inline-blanks` (commit `f0edc8e`). Recreated from
+  `/home/user/mage-go` branch `awesome`; all native ABI work lives here.
 
 ## Step status
 
@@ -193,6 +193,13 @@ trimmed actor requests back to batch-local maxima while preserving all blank
 metadata. Sharded native packed assembly allocates blank capacity and merges
 blank tensors with token-offset rebasing.
 
+Mage-go commit `f0edc8e` extends native render-plan inline blank emission to
+match the implemented Python surfaces for priority targets, blockers, may,
+mode, bounded number, and mana-color choices. `go test ./cmd/pylib` and the
+Python native packed inline blank smoke pass against the rebuilt worktree
+install. The full mage-go suite passes with three known Jumpstart failures
+marked skipped/xfail.
+
 ## Fidelity gaps for perfect game-choice representation
 
 The current representation is sufficient for the inline-only migration path
@@ -303,9 +310,7 @@ every choice the engine can ask the player to make. Remaining gaps:
 
 1. **Native ABI cleanup** — update mage-go to remove retired action-list
    render-plan handling plus legacy token-table and packed-output scratch
-   fields, then regenerate/reinstall the Python extension. The documented
-   `/home/user/mage-go/.claude/worktrees/inline-blanks` worktree is not
-   present; `/home/user/mage-go` is on branch `awesome`.
+   fields, then regenerate/reinstall the Python extension.
 2. **Replay persistence** — no text replay-buffer on-disk version hook was
    found in this repo, so there is nothing local to bump unless a persistence
    format is added later.
