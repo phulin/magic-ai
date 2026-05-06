@@ -946,12 +946,8 @@ def test_inline_blanks_mana_color_emits_mana_source_blank(
             "kind": "mana_color",
             "player_idx": 0,
             "options": [
-                cast(PendingOptionState, {"id": "white", "kind": "choice"}),
-                cast(PendingOptionState, {"id": "blue", "kind": "choice"}),
-                cast(PendingOptionState, {"id": "black", "kind": "choice"}),
-                cast(PendingOptionState, {"id": "red", "kind": "choice"}),
                 cast(PendingOptionState, {"id": "green", "kind": "choice"}),
-                cast(PendingOptionState, {"id": "colorless", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "blue", "kind": "choice"}),
             ],
         },
     )
@@ -966,7 +962,7 @@ def test_inline_blanks_mana_color_emits_mana_source_blank(
     [anchor] = rendered.blank_anchors
     assert anchor.kind == "<choose-mana-source>"
     assert anchor.group_kind == "PER_BLANK"
-    assert anchor.legal_token_ids == MANA_FAKE_IDS
+    assert anchor.legal_token_ids == (MANA_FAKE_IDS[4], MANA_FAKE_IDS[1])
     assert anchor.option_index == -1
 
 
