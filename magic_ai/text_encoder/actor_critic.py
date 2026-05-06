@@ -1943,16 +1943,11 @@ def _sample_inline_priority_batch(
     chosen_priority = (
         torch.argmax(priority_logits, dim=-1)
         if deterministic
-        else torch.multinomial(torch.softmax(priority_logits, dim=-1), 1).squeeze(1)
+        else (priority_logits - torch.empty_like(priority_logits).exponential_().log()).argmax(
+            dim=-1
+        )
     )
     priority_log_probs = torch.log_softmax(priority_logits, dim=-1)
-    priority_probs = priority_log_probs.exp()
-    safe_priority_log_probs = torch.where(
-        effective_priority,
-        priority_log_probs,
-        priority_log_probs.new_zeros(()),
-    )
-    priority_entropy = -(priority_probs * safe_priority_log_probs).sum(dim=-1)
     chosen_option_idx = row_option_index.gather(1, chosen_priority.unsqueeze(1)).squeeze(1)
     priority_log_prob = priority_log_probs.gather(1, chosen_priority.unsqueeze(1)).squeeze(1)
 
@@ -1967,7 +1962,7 @@ def _sample_inline_priority_batch(
     no_target_col = candidate_mask.to(dtype=torch.long).argmax(dim=-1)
     selected = no_target_col
     log_prob = priority_log_prob
-    entropy = priority_entropy
+    entropy = torch.zeros_like(priority_log_prob)
     if not bool(target_required.any().item()):
         active = eligible & has_priority & has_candidate
         return selected.to(dtype=torch.long), log_prob, entropy, active
@@ -2009,7 +2004,6 @@ def _sample_inline_priority_batch(
         log_prob + target_dist.log_prob(chosen_in_legal),
         log_prob,
     )
-    entropy = torch.where(target_required, entropy + target_dist.entropy(), entropy)
     active = (
         eligible
         & has_priority
