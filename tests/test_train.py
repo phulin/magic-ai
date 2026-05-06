@@ -67,6 +67,13 @@ class TrainPPOTests(unittest.TestCase):
         assert checkpoint is not None
         self.assertEqual(checkpoint["args"]["output"], Path("checkpoints/ppo.pt"))
 
+    def test_load_training_checkpoint_rejects_missing_explicit_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "missing.pt"
+
+            with self.assertRaisesRegex(FileNotFoundError, "--checkpoint path does not exist"):
+                load_training_checkpoint(checkpoint_path)
+
     def test_legacy_checkpoint_defaults_to_slots_encoder(self) -> None:
         self.assertEqual(checkpoint_encoder_kind({"metadata": {}}), "slots")
 

@@ -1144,8 +1144,10 @@ def load_training_checkpoint(
     *,
     map_location: torch.device | str = "cpu",
 ) -> dict[str, Any] | None:
-    if path is None or not path.exists():
+    if path is None:
         return None
+    if not path.exists():
+        raise FileNotFoundError(f"--checkpoint path does not exist: {path}")
     return cast(
         dict[str, Any],
         torch.load(path, map_location=map_location, weights_only=False),
