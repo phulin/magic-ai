@@ -211,6 +211,8 @@ class TokenTables:
     no_id: int = 0
     none_id: int = 0
     x_end_id: int = 0
+    mulligan_id: int = 0
+    keep_id: int = 0
     num_ids: list[int] = field(default_factory=list)
 
     structural: dict[Frag, list[int]] = field(default_factory=dict)
@@ -311,6 +313,8 @@ def build_token_tables(
         no_id=_single(tokenizer, "<no>"),
         none_id=_single(tokenizer, "<none>"),
         x_end_id=_single(tokenizer, "<x-end>"),
+        mulligan_id=_single(tokenizer, "<mulligan>"),
+        keep_id=_single(tokenizer, "<keep>"),
         num_ids=[_single(tokenizer, f"<num:{k}>") for k in range(MAX_NUM)],
     )
 

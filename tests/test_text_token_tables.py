@@ -209,6 +209,8 @@ _INLINE_BLANK_SINGLETON_FIELDS: tuple[tuple[str, str], ...] = (
     ("no_id", "<no>"),
     ("none_id", "<none>"),
     ("x_end_id", "<x-end>"),
+    ("mulligan_id", "<mulligan>"),
+    ("keep_id", "<keep>"),
 )
 
 

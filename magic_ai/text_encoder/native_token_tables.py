@@ -122,6 +122,8 @@ class _Packed:
     no_id: int = 0
     none_id: int = 0
     x_end_id: int = 0
+    mulligan_id: int = 0
+    keep_id: int = 0
     struct: Any = field(default=None)
 
 
@@ -272,6 +274,8 @@ def register_native_token_tables(tables: TokenTables) -> None:
         no_id=tables.no_id,
         none_id=tables.none_id,
         x_end_id=tables.x_end_id,
+        mulligan_id=tables.mulligan_id,
+        keep_id=tables.keep_id,
     )
 
     struct = ffi.new(
@@ -352,6 +356,8 @@ def register_native_token_tables(tables: TokenTables) -> None:
             "no_id": tables.no_id,
             "none_id": tables.none_id,
             "x_end_id": tables.x_end_id,
+            "mulligan_id": tables.mulligan_id,
+            "keep_id": tables.keep_id,
             "num_count": num_ids.numel(),
             "num_ids": _i32_ptr(ffi, num_ids),
         },

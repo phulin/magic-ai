@@ -344,11 +344,8 @@ def test_emit_blank_legal_outside_blank_raises(cache, tokenizer) -> None:
 def test_blank_singletons_round_trip_via_packed(tokenizer) -> None:
     """Inline-blank singletons + num_ids surface through the held-alive _Packed.
 
-    The currently-shipped libmage cffi ``MageTokenTables`` struct does not yet
-    include the new fields (the wheel needs a rebuild with mage-go's
-    ``cmd/pylib/abi.h`` and matching ``_CDEF`` updated; see Step 3 mage-go
-    wiring TODO). The Python-side mirror still holds the data so this is the
-    parity gate available today.
+    This catches regressions where new singleton fields are built in
+    ``TokenTables`` but omitted from the packed registration object.
     """
     from magic_ai.text_encoder.native_token_tables import (
         active_packed,
@@ -376,6 +373,8 @@ def test_blank_singletons_round_trip_via_packed(tokenizer) -> None:
         "no_id",
         "none_id",
         "x_end_id",
+        "mulligan_id",
+        "keep_id",
     ):
         assert getattr(packed, attr) == getattr(tables, attr), attr
     assert packed.num_ids.tolist() == list(tables.num_ids)

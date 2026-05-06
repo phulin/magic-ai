@@ -621,7 +621,7 @@ def emit_render_plan(
     # Stack (shared).
     w.write(OP_STACK_OPEN)
     for stack_obj in snapshot.get("stack") or []:
-        _emit_stack_object(w, stack_obj, refs, tokenize)
+        _emit_stack_object(w, stack_obj, refs, card_row_lookup)
     w.write(OP_STACK_CLOSE)
 
     # Command zone (shared) — only emit when non-empty. The snapshot's command
@@ -650,12 +650,11 @@ def _emit_stack_object(
     w: RenderPlanWriter,
     obj: StackObjectState,
     refs: dict[str, int],
-    tokenize: Callable[[str], list[int]],
+    card_row_lookup: CardRowLookup,
 ) -> None:
     cid = obj.get("id", "")
     name = obj.get("name", "") or ""
     ref_idx = refs.get(cid, -1) if cid else -1
-    if ref_idx >= 0:
-        w.emit_literal_tokens(tokenize(f"<card> <card-ref:{ref_idx}> {name} </card>"))
-    else:
-        w.emit_literal_tokens(tokenize(f"<card> {name} </card>"))
+    row = card_row_lookup(name)
+    w.emit_place_card(0, row, 0, ref_idx)
+    w.emit_end_card()

@@ -305,7 +305,8 @@ def test_stack_renders(oracle: dict[str, OracleEntry]) -> None:
     snap_with_stack = cast(GameStateSnapshot, {**snap, "stack": stack})
     rendered = render_snapshot(snap_with_stack, oracle=oracle)
     assert "<stack>" in rendered.text
-    assert "Lightning Bolt" in rendered.text
+    assert "<card-name> deals 3 damage to any target." in rendered.text
+    assert "s1" in rendered.card_refs
 
 
 def test_renderer_class_accepts_injected_oracle() -> None:
@@ -549,9 +550,78 @@ YES_FAKE_ID = 99997
 NO_FAKE_ID = 99996
 SELF_FAKE_ID = 99995
 OPP_FAKE_ID = 99994
+MULLIGAN_FAKE_ID = 99993
+KEEP_FAKE_ID = 99992
 CARD_REF_FAKE_IDS = tuple(88000 + k for k in range(MAX_CARD_REFS))
 NUM_FAKE_IDS = tuple(77000 + k for k in range(16))
 MANA_FAKE_IDS = tuple(66000 + k for k in range(6))
+
+
+def test_inline_blanks_stack_target_uses_stack_card_ref(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = _basic_snapshot()
+    source_id = snap["players"][0]["Hand"][0]["ID"]
+    pending = cast(
+        PendingState,
+        {
+            "kind": "priority",
+            "player_idx": 0,
+            "options": [
+                cast(
+                    PendingOptionState,
+                    {
+                        "id": "counter",
+                        "kind": "cast_spell",
+                        "card_id": source_id,
+                        "card_name": "Lightning Bolt",
+                        "valid_targets": [
+                            cast(TargetState, {"id": "stack-bolt", "label": "Lightning Bolt"})
+                        ],
+                    },
+                )
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(
+            GameStateSnapshot,
+            {
+                **snap,
+                "stack": [cast(StackObjectState, {"id": "stack-bolt", "name": "Lightning Bolt"})],
+                "pending": pending,
+            },
+        ),
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        card_ref_token_ids=CARD_REF_FAKE_IDS,
+    )
+    target_anchor = rendered.blank_anchors[1]
+    assert target_anchor.kind == "<choose-target>"
+    assert target_anchor.legal_token_ids == (CARD_REF_FAKE_IDS[rendered.card_refs["stack-bolt"]],)
+
+
+def test_inline_blanks_mulligan_keep_choice(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = cast(
+        GameStateSnapshot,
+        {
+            **_basic_snapshot(),
+            "pending": cast(PendingState, {"kind": "mulligan", "player_idx": 0, "options": []}),
+        },
+    )
+    rendered = render_snapshot(
+        snap,
+        oracle=oracle,
+        mulligan_token_id=MULLIGAN_FAKE_ID,
+        keep_token_id=KEEP_FAKE_ID,
+    )
+    assert "<choices><choose-may></choices>" in rendered.text
+    assert len(rendered.blank_anchors) == 1
+    anchor = rendered.blank_anchors[0]
+    assert anchor.kind == "<choose-may>"
+    assert anchor.legal_token_ids == (MULLIGAN_FAKE_ID, KEEP_FAKE_ID)
 
 
 def _priority_snapshot() -> GameStateSnapshot:

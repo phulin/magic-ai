@@ -45,6 +45,7 @@ PENDING_KINDS = (
     "may",
     "mode",
     "number",
+    "mulligan",
     "unknown",
 )
 TARGET_TYPES = ("player", "permanent", "card", "unknown", "empty")

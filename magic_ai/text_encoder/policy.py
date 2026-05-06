@@ -221,6 +221,14 @@ class TextPolicy(nn.Module):
         if isinstance(no_tid, list):
             raise TypeError("convert_tokens_to_ids('<no>') returned a list")
         no_token_id = int(no_tid)
+        mulligan_tid = tokenizer.convert_tokens_to_ids("<mulligan>")
+        if isinstance(mulligan_tid, list):
+            raise TypeError("convert_tokens_to_ids('<mulligan>') returned a list")
+        mulligan_token_id = int(mulligan_tid)
+        keep_tid = tokenizer.convert_tokens_to_ids("<keep>")
+        if isinstance(keep_tid, list):
+            raise TypeError("convert_tokens_to_ids('<keep>') returned a list")
+        keep_token_id = int(keep_tid)
         self_tid = tokenizer.convert_tokens_to_ids("<self>")
         if isinstance(self_tid, list):
             raise TypeError("convert_tokens_to_ids('<self>') returned a list")
@@ -256,6 +264,8 @@ class TextPolicy(nn.Module):
                 none_token_id=none_token_id,
                 yes_token_id=yes_token_id,
                 no_token_id=no_token_id,
+                mulligan_token_id=mulligan_token_id,
+                keep_token_id=keep_token_id,
                 self_token_id=self_token_id,
                 opp_token_id=opp_token_id,
                 num_token_ids=num_token_ids,

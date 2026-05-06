@@ -17,7 +17,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from magic_ai.game_state import (
     GameCardState,
@@ -527,6 +527,8 @@ class SnapshotRenderer:
         none_token_id: int | None = None,
         yes_token_id: int | None = None,
         no_token_id: int | None = None,
+        mulligan_token_id: int | None = None,
+        keep_token_id: int | None = None,
         self_token_id: int | None = None,
         opp_token_id: int | None = None,
         num_token_ids: Sequence[int] | None = None,
@@ -539,6 +541,8 @@ class SnapshotRenderer:
         self._none_token_id = none_token_id
         self._yes_token_id = yes_token_id
         self._no_token_id = no_token_id
+        self._mulligan_token_id = mulligan_token_id
+        self._keep_token_id = keep_token_id
         self._self_token_id = self_token_id
         self._opp_token_id = opp_token_id
         self._num_token_ids = tuple(int(tid) for tid in num_token_ids or ())
@@ -642,7 +646,7 @@ class SnapshotRenderer:
         # Stack
         buf.append("<stack>")
         for stack_obj in snapshot.get("stack") or []:
-            self._render_stack_object(buf, stack_obj, card_refs)
+            self._render_stack_object(buf, result, stack_obj, card_refs)
         buf.append("</stack>")
 
         # Command zone — only emitted when at least one player has a non-empty
@@ -778,17 +782,14 @@ class SnapshotRenderer:
     def _render_stack_object(
         self,
         buf: list[str],
+        result: RenderedSnapshot,
         obj: StackObjectState,
         card_refs: dict[str, int],
     ) -> None:
         cid = obj.get("id", "")
         name = obj.get("name", "") or ""
-        ref_idx = card_refs.get(cid)
-        # Mirror _emit_stack_object exactly: spaces around the inner content.
-        if ref_idx is not None:
-            buf.append(f"<card> {card_ref_token(ref_idx)} {name} </card>")
-        else:
-            buf.append(f"<card> {name} </card>")
+        card = cast(GameCardState, {"ID": cid, "Name": name} if cid else {"Name": name})
+        self._render_card(buf, result, card, card_refs)
 
     # -- inline-blank helpers ---------------------------------------------
 
@@ -1068,6 +1069,21 @@ class SnapshotRenderer:
                 legal_token_ids=priority_legal_ids,
                 group_kind="CROSS_BLANK",
             )
+        if self._pending_kind == "mulligan":
+            mulligan_id = self._mulligan_token_id
+            keep_id = self._keep_token_id
+            if mulligan_id is None or keep_id is None:
+                raise RenderError(
+                    "inline mulligan blanks require mulligan_token_id and keep_token_id"
+                )
+            self._emit_blank(
+                buf,
+                result,
+                "<choose-may>",
+                -1,
+                legal_token_ids=(int(mulligan_id), int(keep_id)),
+                group_kind="PER_BLANK",
+            )
         if self._pending_kind == "may":
             yes_id = self._yes_token_id
             no_id = self._no_token_id
@@ -1137,6 +1153,8 @@ def render_snapshot(
     none_token_id: int | None = None,
     yes_token_id: int | None = None,
     no_token_id: int | None = None,
+    mulligan_token_id: int | None = None,
+    keep_token_id: int | None = None,
     self_token_id: int | None = None,
     opp_token_id: int | None = None,
     num_token_ids: Sequence[int] | None = None,
@@ -1163,6 +1181,8 @@ def render_snapshot(
         none_token_id=none_token_id,
         yes_token_id=yes_token_id,
         no_token_id=no_token_id,
+        mulligan_token_id=mulligan_token_id,
+        keep_token_id=keep_token_id,
         self_token_id=self_token_id,
         opp_token_id=opp_token_id,
         num_token_ids=num_token_ids,
