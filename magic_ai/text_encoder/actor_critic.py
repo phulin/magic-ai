@@ -647,7 +647,7 @@ class TextActorCritic(nn.Module):
                             step_idx=step_idx,
                             deterministic=deterministic,
                         )
-                        if trace_kind in ("choice_index", "choice_color")
+                        if trace_kind in ("choice_index", "choice_ids", "choice_color")
                         else None
                     )
                     inline_priority_sample = (
