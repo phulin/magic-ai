@@ -4,7 +4,7 @@ PR #3/#4 of the text-encoder plan in ``docs/text_encoder_plan.md`` (§5). The
 renderer (``magic_ai.text_encoder.render``) emits a string plus anchor
 metadata at the *string* level. The model wants per-example token-id tensors
 plus *token-position* anchors so it can gather hidden states at every
-``<card-ref:K>``, ``<option>``, and ``<target>`` location.
+``<card-ref:K>`` and inline decision blank location.
 
 This module owns the tokenize-and-collate path:
 
@@ -38,33 +38,68 @@ _CARD_REF_RE = re.compile(r"^<card-ref:(\d+)>$")
 
 @dataclass
 class TextEncodedExample:
-    """Single rendered snapshot tokenized into ids + anchor positions."""
+    """Single rendered snapshot tokenized into ids + anchor positions.
+
+    ``blank_*`` fields hold inline-blank metadata recovered from the rendered
+    snapshot's :attr:`~magic_ai.text_encoder.render.RenderedSnapshot.blank_anchors`
+    by id-equality on the kind tokens. Each list has length equal to the
+    blank count for this example (variable across the batch); collation
+    pads to the per-batch maxima.
+    """
 
     token_ids: list[int]
     attention_mask: list[int]
     card_ref_positions: dict[int, int]
-    option_positions: list[int]
-    target_positions: list[list[int]]
     card_ref_engine_ids: dict[int, str] = field(default_factory=dict)
+    blank_positions: list[int] = field(default_factory=list)
+    blank_kind_ids: list[int] = field(default_factory=list)  # token id of the blank kind
+    blank_group_ids: list[int] = field(default_factory=list)
+    blank_group_kinds: list[int] = field(default_factory=list)  # int enum
+    blank_legal_ids: list[list[int]] = field(default_factory=list)
+    blank_option_indices: list[int] = field(default_factory=list)
 
 
 @dataclass
 class TextEncodedBatch:
-    """Padded batch of :class:`TextEncodedExample` ready for the encoder."""
+    """Padded batch of :class:`TextEncodedExample` ready for the encoder.
+
+    ``blank_*`` fields carry the inline-blank tensors introduced in Step 3 of
+    ``docs/text_encoder_inline_blanks_plan.md``. Rows without decisions use
+    zero-shape ``[B, 0]`` / ``[B, 0, 0]`` tensors.
+    """
 
     token_ids: Tensor  # [B, T] int64, padded with pad_id
     attention_mask: Tensor  # [B, T] int64
     card_ref_positions: Tensor  # [B, MAX_CARD_REFS] int64, -1 = absent
-    option_positions: Tensor  # [B, max_opts] int64, -1 = absent
-    option_mask: Tensor  # [B, max_opts] bool
-    target_positions: Tensor  # [B, max_opts, max_targets] int64, -1 = absent
-    target_mask: Tensor  # [B, max_opts, max_targets] bool
     seq_lengths: Tensor  # [B] int64
     # Optional host-side count of live tokens. Producers should populate this
     # before moving tensors to CUDA so packed layouts do not need a device->host
     # read of ``seq_lengths.sum()``.
     total_tokens: int | None = None
     seq_lengths_host: tuple[int, ...] | None = None
+    # Inline-blank tensors. ``K`` is the per-batch maximum blank count and
+    # ``V_max`` the per-batch maximum legal-id count across blanks.
+    blank_positions: Tensor = field(  # [B, K] int32, -1 = absent
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    blank_kind: Tensor = field(  # [B, K] int32 (kind token id), 0 = absent
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    blank_group: Tensor = field(  # [B, K] int32, -1 = absent
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    blank_group_kind: Tensor = field(  # [B, K] int32, see render_plan.BLANK_GROUP_*
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    blank_option_index: Tensor = field(  # [B, K] int32, -1 = absent / not engine-option-backed
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    blank_legal_ids: Tensor = field(  # [B, K, V_max] int32, 0 = pad
+        default_factory=lambda: torch.zeros((0, 0, 0), dtype=torch.int32)
+    )
+    blank_legal_mask: Tensor = field(  # [B, K, V_max] bool
+        default_factory=lambda: torch.zeros((0, 0, 0), dtype=torch.bool)
+    )
 
 
 @dataclass
@@ -73,8 +108,7 @@ class PackedTextBatch:
 
     Anchor positions are absolute offsets into the packed row (i.e. they
     have already been shifted by ``cu_seqlens[:-1]``). ``-1`` is preserved
-    as the absent-slot sentinel so downstream gather logic is unchanged
-    versus the padded path.
+    as the absent-slot sentinel for inline blanks.
     """
 
     token_ids: Tensor  # [T_packed] int32
@@ -85,15 +119,27 @@ class PackedTextBatch:
 
     state_positions: Tensor  # [B] int32, packed-offset of each row's first token
     card_ref_positions: Tensor  # [B, MAX_CARD_REFS] int32, -1 = absent
-    option_positions: Tensor  # [B, max_opts] int32
-    option_mask: Tensor  # [B, max_opts] bool
-    target_positions: Tensor  # [B, max_opts, max_targets] int32
-    target_mask: Tensor  # [B, max_opts, max_targets] bool
     # Host-side count of live tokens in ``token_ids`` / ``seq_id`` /
     # ``pos_in_seq``. This avoids reading ``cu_seqlens[-1]`` from CUDA just to
     # size derived metadata.
     total_tokens: int | None = None
     seq_lengths_host: tuple[int, ...] | None = None
+    # Inline-blank tensors (Step 3 of inline-blanks plan). Same shapes /
+    # sentinels as :class:`TextEncodedBatch`, but ``blank_positions`` are
+    # absolute packed-row offsets (rebased by ``state_positions``).
+    blank_positions: Tensor = field(default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32))
+    blank_kind: Tensor = field(default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32))
+    blank_group: Tensor = field(default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32))
+    blank_group_kind: Tensor = field(default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32))
+    blank_option_index: Tensor = field(
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    blank_legal_ids: Tensor = field(
+        default_factory=lambda: torch.zeros((0, 0, 0), dtype=torch.int32)
+    )
+    blank_legal_mask: Tensor = field(
+        default_factory=lambda: torch.zeros((0, 0, 0), dtype=torch.bool)
+    )
     # Optional host-side upper bound on per-row sequence length, used to size
     # flash_attn_varlen tiling. None falls back to the encoder's static config
     # max. Producers that know the batch's true max (the native assembler does)
@@ -169,6 +215,10 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
     )
     token_ids = padded.token_ids[seq_id.to(torch.long), pos_in_seq.to(torch.long)].to(torch.int32)
 
+    if padded.blank_positions.numel():
+        blank_positions = add_packed_offsets(padded.blank_positions, state_positions)
+    else:
+        blank_positions = padded.blank_positions
     return PackedTextBatch(
         token_ids=token_ids,
         seq_id=seq_id,
@@ -177,12 +227,15 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
         seq_lengths=seq_lens,
         state_positions=state_positions.clone(),
         card_ref_positions=add_packed_offsets(padded.card_ref_positions, state_positions),
-        option_positions=add_packed_offsets(padded.option_positions, state_positions),
-        target_positions=add_packed_offsets(padded.target_positions, state_positions),
-        option_mask=padded.option_mask.to(torch.bool),
-        target_mask=padded.target_mask.to(torch.bool),
         total_tokens=total_tokens,
         seq_lengths_host=padded.seq_lengths_host,
+        blank_positions=blank_positions,
+        blank_kind=padded.blank_kind,
+        blank_group=padded.blank_group,
+        blank_group_kind=padded.blank_group_kind,
+        blank_option_index=padded.blank_option_index,
+        blank_legal_ids=padded.blank_legal_ids,
+        blank_legal_mask=padded.blank_legal_mask,
     )
 
 
@@ -220,9 +273,6 @@ def tokenize_snapshot(
         if isinstance(tid, list):
             raise TypeError(f"convert_tokens_to_ids({token!r}) returned a list")
         return int(tid)
-
-    option_token_id = _single_id("<option>")
-    target_token_id = _single_id("<target>")
 
     # ----- card-ref positions -------------------------------------------------
     # Map every <card-ref:K> token id to its K. We look up via the tokenizer's
@@ -263,33 +313,71 @@ def tokenize_snapshot(
             f"card-ref id mismatch at pos={pos}: id={tid} parsed={k_parsed}"
         )
 
-    # ----- option / target positions -----------------------------------------
-    option_positions: list[int] = [
-        pos for pos, tid in enumerate(token_ids) if tid == option_token_id
-    ]
-    target_positions: list[list[int]] = [[] for _ in option_positions]
-    if option_positions:
-        # Walk left-to-right and bucket each <target> into the most recent
-        # <option> seen so far.
-        opt_idx = -1
-        for pos, tid in enumerate(token_ids):
-            if tid == option_token_id:
-                opt_idx += 1
-            elif tid == target_token_id and opt_idx >= 0:
-                target_positions[opt_idx].append(pos)
-
     # ----- engine-id mapping (K -> engine card id) ---------------------------
     card_ref_engine_ids: dict[int, str] = {}
     for engine_id, k in rendered.card_refs.items():
         card_ref_engine_ids[int(k)] = engine_id
 
+    # ----- inline-blank anchors ---------------------------------------------
+    # For every BlankAnchor on the rendered snapshot, locate its kind token in
+    # the produced ``token_ids`` stream. Render order is deterministic, so we
+    # scan left-to-right and pair the n-th occurrence of any blank-kind token
+    # with the n-th anchor (across all kinds, in render order).
+    from magic_ai.text_encoder.render_plan import blank_group_kind_id
+
+    blank_positions: list[int] = []
+    blank_kind_ids: list[int] = []
+    blank_group_ids: list[int] = []
+    blank_group_kinds: list[int] = []
+    blank_legal_ids: list[list[int]] = []
+    blank_option_indices: list[int] = []
+    if rendered.blank_anchors:
+        # Pre-resolve each anchor's kind-token id and bucket the anchors by
+        # kind so we don't repeatedly scan the full anchor list per token.
+        anchors = list(rendered.blank_anchors)
+        anchor_kind_tids: list[int] = [_single_id(anchor.kind) for anchor in anchors]
+        kind_tid_set = set(anchor_kind_tids)
+        # Walk tokens and consume anchors in order, requiring the n-th match
+        # to use a kind token id that equals the n-th anchor's kind tid.
+        cursor = 0
+        for pos, tid in enumerate(token_ids):
+            if cursor >= len(anchors):
+                break
+            if tid not in kind_tid_set:
+                continue
+            if tid != anchor_kind_tids[cursor]:
+                # Render order requires anchor[cursor] to come next; if the
+                # tokenizer emitted an unrelated blank-kind token first the
+                # render fixture is broken — surface that as a hard error.
+                raise RuntimeError(
+                    f"blank-anchor render-order mismatch at token pos={pos}: "
+                    f"got tid={tid}, expected {anchor_kind_tids[cursor]} "
+                    f"(blank_index={anchors[cursor].blank_index})"
+                )
+            anchor = anchors[cursor]
+            blank_positions.append(pos)
+            blank_kind_ids.append(tid)
+            blank_group_ids.append(int(anchor.group_id))
+            blank_group_kinds.append(blank_group_kind_id(anchor.group_kind))
+            blank_legal_ids.append([int(t) for t in anchor.legal_token_ids])
+            blank_option_indices.append(int(anchor.option_index))
+            cursor += 1
+        if cursor != len(anchors):
+            raise RuntimeError(
+                f"only {cursor}/{len(anchors)} blank anchors located in token stream"
+            )
+
     return TextEncodedExample(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        target_positions=target_positions,
         card_ref_engine_ids=card_ref_engine_ids,
+        blank_positions=blank_positions,
+        blank_kind_ids=blank_kind_ids,
+        blank_group_ids=blank_group_ids,
+        blank_group_kinds=blank_group_kinds,
+        blank_legal_ids=blank_legal_ids,
+        blank_option_indices=blank_option_indices,
     )
 
 
@@ -306,8 +394,8 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
     * ``card_ref_positions`` is shaped ``[B, MAX_CARD_REFS]`` with ``-1`` for
       absent ref indices (no separate mask: ``-1`` is the sentinel and downstream
       gathers should clamp).
-    * ``option_positions`` / ``target_positions`` are padded to the per-batch
-      maxima with ``-1`` and accompanied by boolean masks.
+    * ``blank_*`` fields are padded to the per-batch maxima with ``-1`` / ``0``
+      sentinels and accompanied by boolean legal masks.
     """
 
     if len(examples) == 0:
@@ -316,19 +404,23 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
     batch_size = len(examples)
     seq_lengths = [len(ex.token_ids) for ex in examples]
     max_t = max(seq_lengths)
-    max_opts = max((len(ex.option_positions) for ex in examples), default=0)
-    max_targets = max(
-        (len(targets) for ex in examples for targets in ex.target_positions),
+    max_blanks = max((len(ex.blank_positions) for ex in examples), default=0)
+    max_legal = max(
+        (len(legal) for ex in examples for legal in ex.blank_legal_ids),
         default=0,
     )
 
     token_ids = torch.full((batch_size, max_t), pad_id, dtype=torch.int64)
     attention_mask = torch.zeros((batch_size, max_t), dtype=torch.int64)
     card_ref_positions = torch.full((batch_size, MAX_CARD_REFS), -1, dtype=torch.int64)
-    option_positions = torch.full((batch_size, max_opts), -1, dtype=torch.int64)
-    option_mask = torch.zeros((batch_size, max_opts), dtype=torch.bool)
-    target_positions = torch.full((batch_size, max_opts, max_targets), -1, dtype=torch.int64)
-    target_mask = torch.zeros((batch_size, max_opts, max_targets), dtype=torch.bool)
+
+    blank_positions = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
+    blank_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
+    blank_group = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
+    blank_group_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
+    blank_option_index = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
+    blank_legal_ids = torch.zeros((batch_size, max_blanks, max_legal), dtype=torch.int32)
+    blank_legal_mask = torch.zeros((batch_size, max_blanks, max_legal), dtype=torch.bool)
 
     for b, ex in enumerate(examples):
         t_i = seq_lengths[b]
@@ -339,22 +431,28 @@ def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedB
             if 0 <= k < MAX_CARD_REFS:
                 card_ref_positions[b, k] = int(pos)
 
-        for o, pos in enumerate(ex.option_positions):
-            option_positions[b, o] = int(pos)
-            option_mask[b, o] = True
-            for t, tpos in enumerate(ex.target_positions[o]):
-                target_positions[b, o, t] = int(tpos)
-                target_mask[b, o, t] = True
+        for k_idx, pos in enumerate(ex.blank_positions):
+            blank_positions[b, k_idx] = int(pos)
+            blank_kind[b, k_idx] = int(ex.blank_kind_ids[k_idx])
+            blank_group[b, k_idx] = int(ex.blank_group_ids[k_idx])
+            blank_group_kind[b, k_idx] = int(ex.blank_group_kinds[k_idx])
+            blank_option_index[b, k_idx] = int(ex.blank_option_indices[k_idx])
+            for v_idx, tid in enumerate(ex.blank_legal_ids[k_idx]):
+                blank_legal_ids[b, k_idx, v_idx] = int(tid)
+                blank_legal_mask[b, k_idx, v_idx] = True
 
     return TextEncodedBatch(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=torch.as_tensor(seq_lengths, dtype=torch.int64),
         total_tokens=sum(seq_lengths),
         seq_lengths_host=tuple(seq_lengths),
+        blank_positions=blank_positions,
+        blank_kind=blank_kind,
+        blank_group=blank_group,
+        blank_group_kind=blank_group_kind,
+        blank_option_index=blank_option_index,
+        blank_legal_ids=blank_legal_ids,
+        blank_legal_mask=blank_legal_mask,
     )

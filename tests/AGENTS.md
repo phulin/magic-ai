@@ -6,6 +6,7 @@ Comprehensive test suite covering text encoding (rendering, tokenization, assemb
 
 - `conftest.py` — Pytest configuration and path setup.
 - `test_card_cache.py` — Card cache build, roundtrip, slice extraction, hash stability, and parity with slow renderer.
+- `test_actions.py` — Tests for shared action decoding helpers and trace/action payload construction.
 - `test_lstm_recompute_strategies.py` — Correctness and performance comparison for LSTM recompute strategies (pad/gather/packed/legacy).
 - `test_native_assembler_parity.py` — Infrastructure for parity gate between Python and native (Go) assembler paths.
 - `test_native_encoder.py` — Unit tests for native batch encoder and decision-layout validation.

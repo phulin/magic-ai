@@ -129,11 +129,11 @@ the assembler validate the stream length deterministically: `sum(1 +
 arity[op]) == render_plan_lengths[i]` is a unit-test invariant.
 
 The Python side stores the arity table as a constant in
-`magic_ai/text_encoder/assembler.py`; PR 13-C ships it.
+`magic_ai/text_encoder/render_plan.py`; PR 13-C ships it.
 
-**Opcode IDs.** Defined as a Go `const` block (suggested file:
-`cmd/pylib/render_plan.go`) and re-exported in C for documentation; the
-authoritative list lives in Go.
+**Opcode IDs.** Defined in Python and mirrored by the native renderer.
+IDs 13-16 were the legacy action-list opcodes and are intentionally retired;
+inline decisions now use `OP_EMIT_BLANK` / `OP_EMIT_BLANK_LEGAL`.
 
 | Opcode | ID | Arity | Payload (int32 fields, in order) | Notes |
 |---|---:|---:|---|---|
@@ -149,10 +149,7 @@ authoritative list lives in Go.
 | `OP_PLACE_CARD`        | 10 | 4 | `slot_idx`, `card_row_id`, `status_bits`, `uuid_idx` | `slot_idx` matches the slot encoder's index. `uuid_idx` is the per-snapshot card-ref index = `<card-ref:K>` K. |
 | `OP_COUNTER`           | 11 | 2 | `kind_id` (§7), `count` | Emitted *after* the `OP_PLACE_CARD` for the same permanent, before the next `OP_PLACE_CARD` / `OP_CLOSE_ZONE`. |
 | `OP_ATTACHED_TO`       | 12 | 1 | `target_uuid_idx` | Same containment rule as `OP_COUNTER`. `-1` if attachment target is not in the current snapshot's UUID table (rare; emit `-1` rather than dropping). |
-| `OP_OPEN_ACTIONS`      | 13 | 0 | — | |
-| `OP_CLOSE_ACTIONS`     | 14 | 0 | — | |
-| `OP_OPTION`            | 15 | 5 | `kind_id` (§7), `source_card_row`, `source_uuid_idx`, `mana_cost_id`, `ability_idx` | `source_uuid_idx == -1` for options whose source isn't on the battlefield (e.g. casting from hand still has a UUID, but a generic "pass" has none). `mana_cost_id` indexes a startup-time interned mana-cost table; `-1` when not applicable. |
-| `OP_TARGET`            | 16 | 3 | `target_card_row`, `target_uuid_idx`, `target_kind` (§7) | Repeated 0..N times after the parent `OP_OPTION`, before the next `OP_OPTION` / `OP_CLOSE_ACTIONS`. |
+| 13-16                  | —  | — | — | Retired legacy action-list opcode IDs. |
 
 All payload fields are `int32`. Indices that have no value use `-1` as the
 sentinel (matching the existing encoder's `optionRefSlotIdx = -1` convention,
@@ -175,11 +172,6 @@ for owner in (self, opp):
             OP_ATTACHED_TO(...)?
         OP_CLOSE_ZONE
     OP_CLOSE_PLAYER
-OP_OPEN_ACTIONS
-for opt in options (= numPresent, capped by maxOptions):
-    OP_OPTION(...)
-    OP_TARGET(...)*  # capped by maxTargetsPerOption
-OP_CLOSE_ACTIONS
 OP_CLOSE_STATE
 ```
 
@@ -262,15 +254,6 @@ them so opcodes can carry just the zone:
 | 3 | R |
 | 4 | G |
 | 5 | C |
-
-**`kind_id` for `OP_OPTION`** — index into `actionKinds` (`encoder.go:47`):
-`0 pass, 1 play_land, 2 cast_spell, 3 activate_ability, 4 attacker, 5 blocker,
-6 choice, 7 unknown`.
-
-**`target_kind` for `OP_TARGET`** — parallels the existing
-`targetTypeIDs` enum used by `fillActionEncoding` (`encoder.go:455`):
-`0 = player, 1 = permanent, 2 = card_in_zone, 3 = unknown`. The existing
-`unknownTargetID = 3` constant (`encoder.go:27`) must be reused as-is.
 
 **`kind_id` for `OP_COUNTER`** — index into `core.CounterType`
 (`pkg/mage/core/counter.go`). Treat the enum's underlying ordering as the
@@ -363,12 +346,9 @@ Worst-case board (drawn from §3 / §13's "busy mid-game" phrasing):
 - Zone wrappers: 7 zones × 2 owners × (open=3 + close=1) = 56 ints.
 - Player wrappers + state header: 2 × (`OP_OPEN_PLAYER`+`OP_CLOSE_PLAYER`)
   + life/mana/turn = ~30 ints.
-- Actions: 50 options × (`OP_OPTION` 6 ints + 3 targets × 4 ints) = 50 ×
-  (6 + 12) = 900 ints.
-- `OP_OPEN_ACTIONS` / `OP_CLOSE_ACTIONS` / `OP_OPEN_STATE` /
-  `OP_CLOSE_STATE`: 4 ints.
+- State header: `OP_OPEN_STATE` / `OP_CLOSE_STATE`: 2 ints.
 
-**Sum:** 24×16 + 70 + 300 + 50 + 56 + 30 + 900 + 4 ≈ **1794 ints** ≈ 7.2 KB
+**Sum:** 24×16 + 70 + 300 + 50 + 56 + 30 + 2 ≈ **892 ints** ≈ 3.6 KB
 per env worst case.
 
 **Recommended default `render_plan_capacity`: 4096 int32** (16 KB/env).
@@ -430,8 +410,7 @@ directory `cmd/pylib/testdata/render_plan/`).
    - Every plan starts with `OP_OPEN_STATE` and ends with
      `OP_CLOSE_STATE`.
    - `OP_OPEN_ZONE` / `OP_CLOSE_ZONE` and `OP_OPEN_PLAYER` /
-     `OP_CLOSE_PLAYER` and `OP_OPEN_ACTIONS` / `OP_CLOSE_ACTIONS` are
-     balanced.
+     `OP_CLOSE_PLAYER` are balanced.
    - `OP_PLACE_CARD.uuid_idx` is unique within a plan and densely packed
      `[0, K)`.
    - `sum(1 + arity[op]) == render_plan_lengths[i]`.

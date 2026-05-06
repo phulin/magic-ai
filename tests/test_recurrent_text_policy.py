@@ -17,8 +17,6 @@ from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 def _make_batch(
     b: int = 2,
     t: int = 20,
-    max_opts: int = 4,
-    max_targets: int = 3,
     vocab_size: int = 1000,
     seed: int = 0,
 ) -> TextEncodedBatch:
@@ -34,25 +32,10 @@ def _make_batch(
     card_ref_positions[0, :3] = torch.tensor([2, 5, 8])
     card_ref_positions[1, :2] = torch.tensor([3, 6])
 
-    option_positions = torch.full((b, max_opts), -1, dtype=torch.int64)
-    option_positions[0, :3] = torch.tensor([10, 13, 16])
-    option_positions[1, :2] = torch.tensor([4, 8])
-    option_mask = option_positions >= 0
-
-    target_positions = torch.full((b, max_opts, max_targets), -1, dtype=torch.int64)
-    target_positions[0, 0, :2] = torch.tensor([11, 12])
-    target_positions[0, 1, :1] = torch.tensor([14])
-    target_positions[1, 0, :3] = torch.tensor([5, 6, 7])
-    target_mask = target_positions >= 0
-
     return TextEncodedBatch(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=seq_lens,
     )
 
@@ -77,18 +60,10 @@ def test_recurrent_forward_and_state_shape() -> None:
     out, (h_out, c_out) = policy(batch, h_in=None, c_in=None)
 
     b = batch.token_ids.shape[0]
-    max_opts = batch.option_positions.shape[1]
-    max_targets = batch.target_positions.shape[2]
     d = policy.cfg.encoder.d_model
 
-    assert out.policy_logits.shape == (b, max_opts)
-    assert out.target_logits.shape == (b, max_opts, max_targets)
     assert out.values.shape == (b,)
     assert out.state_hidden.shape == (b, lstm_hidden)
-    assert out.option_vectors.shape == (b, max_opts, d)
-    assert out.option_mask.shape == (b, max_opts)
-    assert out.target_vectors.shape == (b, max_opts, max_targets, d)
-    assert out.target_mask.shape == (b, max_opts, max_targets)
     assert out.card_vectors.shape == (b, MAX_CARD_REFS, d)
     assert out.card_mask.shape == (b, MAX_CARD_REFS)
 
@@ -97,8 +72,6 @@ def test_recurrent_forward_and_state_shape() -> None:
 
     assert torch.isfinite(out.values).all()
     assert torch.isfinite(out.state_hidden).all()
-    assert torch.isfinite(out.policy_logits[out.option_mask]).all()
-    assert (out.policy_logits[~out.option_mask] == float("-inf")).all()
 
 
 def test_recurrent_state_persists_across_calls() -> None:
@@ -128,7 +101,7 @@ def test_recurrent_backward_smoke() -> None:
     batch = _make_batch(vocab_size=vocab_size)
 
     out, _ = policy(batch)
-    loss = out.values.sum() + out.policy_logits[out.option_mask].sum()
+    loss = out.values.sum()
     loss.backward()
 
     lstm_grads = [
@@ -172,5 +145,6 @@ def test_forward_packed_bypasses_compiled_callable_during_fx_trace(monkeypatch) 
 
     out, _ = policy.forward_packed(packed)
 
-    assert out.policy_logits.shape == packed.option_mask.shape
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == packed.blank_legal_mask.shape
     assert torch.isfinite(out.values).all()

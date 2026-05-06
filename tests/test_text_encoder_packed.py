@@ -2,8 +2,8 @@
 
 The packed path concatenates rows along one sequence axis and uses a
 flex_attention document mask plus per-token RoPE. After gathering at
-the same anchors, the resulting per-card / per-option / per-target /
-state vectors must agree with the padded path to fp tolerance.
+the same anchors, the resulting per-card / state vectors must agree with the
+padded path to fp tolerance.
 """
 
 from __future__ import annotations
@@ -15,12 +15,8 @@ from magic_ai.text_encoder.model import (
     TextStateEncoder,
     gather_card_vectors,
     gather_card_vectors_packed,
-    gather_option_vectors,
-    gather_option_vectors_packed,
     gather_state_vector,
     gather_state_vector_packed,
-    gather_target_vectors,
-    gather_target_vectors_packed,
 )
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -40,28 +36,10 @@ def _make_batch(vocab_size: int = 1000) -> TextEncodedBatch:
     card_ref_positions[1, :2] = torch.tensor([3, 6])
     card_ref_positions[2, :1] = torch.tensor([4])
 
-    max_opts, max_targets = 4, 3
-    option_positions = torch.full((b, max_opts), -1, dtype=torch.int64)
-    option_positions[0, :3] = torch.tensor([10, 13, 16])
-    option_positions[1, :2] = torch.tensor([7, 10])
-    option_positions[2, :1] = torch.tensor([5])
-    option_mask = option_positions >= 0
-
-    target_positions = torch.full((b, max_opts, max_targets), -1, dtype=torch.int64)
-    target_positions[0, 0, :2] = torch.tensor([11, 12])
-    target_positions[0, 1, :1] = torch.tensor([14])
-    target_positions[1, 0, :3] = torch.tensor([8, 9, 10])
-    target_positions[2, 0, :2] = torch.tensor([6, 7])
-    target_mask = target_positions >= 0
-
     return TextEncodedBatch(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=seq_lens,
     )
 
@@ -87,13 +65,13 @@ def test_pack_batch_shapes_and_anchors() -> None:
         assert torch.equal(seg, torch.arange(end - start, dtype=torch.int64))
         assert (packed.seq_id[start:end] == i).all()
 
-    # Anchors get rebased; -1s stay -1.
+    # Card anchors get rebased; -1s stay -1.
     base = expected_cu[:-1]
-    valid = padded.option_positions >= 0
-    expected_opts = torch.where(
-        valid, padded.option_positions + base.unsqueeze(-1), padded.option_positions
+    valid = padded.card_ref_positions >= 0
+    expected_cards = torch.where(
+        valid, padded.card_ref_positions + base.unsqueeze(-1), padded.card_ref_positions
     )
-    assert torch.equal(packed.option_positions, expected_opts)
+    assert torch.equal(packed.card_ref_positions, expected_cards)
 
 
 def test_padded_vs_packed_parity() -> None:
@@ -116,16 +94,6 @@ def test_padded_vs_packed_parity() -> None:
     card_packed, card_mask_packed = gather_card_vectors_packed(hidden_packed, packed)
     assert torch.equal(card_mask_dense, card_mask_packed)
     assert torch.allclose(card_dense, card_packed, atol=1e-5, rtol=1e-4)
-
-    opt_dense, opt_mask_dense = gather_option_vectors(hidden_dense, padded)
-    opt_packed, opt_mask_packed = gather_option_vectors_packed(hidden_packed, packed)
-    assert torch.equal(opt_mask_dense, opt_mask_packed)
-    assert torch.allclose(opt_dense, opt_packed, atol=1e-5, rtol=1e-4)
-
-    tgt_dense, tgt_mask_dense = gather_target_vectors(hidden_dense, padded)
-    tgt_packed, tgt_mask_packed = gather_target_vectors_packed(hidden_packed, packed)
-    assert torch.equal(tgt_mask_dense, tgt_mask_packed)
-    assert torch.allclose(tgt_dense, tgt_packed, atol=1e-5, rtol=1e-4)
 
 
 def test_packed_backward_smoke() -> None:

@@ -4,7 +4,7 @@ PR 13-C from ``docs/text_encoder_plan.md`` §13. Walks the int32 render-plan
 stream produced by either the Python parity emitter or the structured Go
 emitter, memcpys card-body token slices from the :class:`CardTokenCache`,
 and writes the result into a preallocated ``[B, max_tokens]`` token buffer
-alongside ``card_ref_positions`` / ``option_positions`` / ``target_positions``.
+alongside ``card_ref_positions`` and inline-blank metadata.
 
 The Python parity route carries pre-tokenized literal slices. The structured
 Go route tokenizes small scalar/tag fragments in Python until the Go side
@@ -25,7 +25,6 @@ from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.card_cache import CardTokenCache
 from magic_ai.text_encoder.render_plan import (
     OP_ATTACHED_TO,
-    OP_CLOSE_ACTIONS,
     OP_CLOSE_DICT,
     OP_CLOSE_PLAYER,
     OP_CLOSE_RAW_CARD,
@@ -36,22 +35,21 @@ from magic_ai.text_encoder.render_plan import (
     OP_COUNT,
     OP_COUNTER,
     OP_DICT_ENTRY,
+    OP_EMIT_BLANK,
+    OP_EMIT_BLANK_LEGAL,
     OP_END_CARD,
     OP_LIFE,
     OP_LITERAL_TOKENS,
     OP_MANA,
-    OP_OPEN_ACTIONS,
     OP_OPEN_DICT,
     OP_OPEN_PLAYER,
     OP_OPEN_RAW_CARD,
     OP_OPEN_STATE,
     OP_OPEN_ZONE,
-    OP_OPTION,
     OP_PLACE_CARD,
     OP_PLACE_CARD_REF,
     OP_STACK_CLOSE,
     OP_STACK_OPEN,
-    OP_TARGET,
     OP_TURN,
     OPCODE_ARITY,
     STATUS_TAPPED,
@@ -103,15 +101,6 @@ _ZONE_TAGS: dict[int, str] = {
     ZONE_STACK: "stack",
     ZONE_COMMAND: "command",
 }
-_ACTION_KINDS: dict[int, str] = {
-    0: "pass",
-    1: "play",
-    2: "cast",
-    3: "activate",
-    4: "attack with",
-    5: "block with",
-    6: "choice",
-}
 
 
 @dataclass
@@ -122,9 +111,6 @@ class AssemblerTokens:
     """
 
     pad_id: int
-    option_id: int
-    target_open_id: int
-    target_close_id: int
     tapped_id: int
     untapped_id: int
     card_ref_ids: list[int]  # length MAX_CARD_REFS
@@ -142,8 +128,6 @@ class AssemblerTokens:
     stack_close_id: int = 0
     command_open_id: int = 0
     command_close_id: int = 0
-    self_id: int = 0
-    opp_id: int = 0
     # ref_id -> K reverse map for the literal-tokens walker, which would
     # otherwise scan card_ref_ids per token.
     card_ref_id_to_k: dict[int, int] = field(default_factory=dict)
@@ -151,7 +135,7 @@ class AssemblerTokens:
     _status_untapped: list[int] = field(default_factory=list)
     # Memoized per-fragment token-id lists. Populated at init for all known
     # static fragments and small bounded vocabularies; dynamic-but-low-arity
-    # strings (turn=N, life=N, ability N) fill in lazily on first encounter.
+    # strings (turn=N, life=N) fill in lazily on first encounter.
     fragment_ids: dict[str, list[int]] = field(default_factory=dict)
     # Cached mana glyph per color id (e.g. "{W}" -> [tok_ids...]).
     mana_glyph_ids: list[list[int]] = field(default_factory=list)
@@ -191,9 +175,6 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
     pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
     toks = AssemblerTokens(
         pad_id=int(pad),
-        option_id=_single_id(tokenizer, "<option>"),
-        target_open_id=_single_id(tokenizer, "<target>"),
-        target_close_id=_single_id(tokenizer, "</target>"),
         tapped_id=_single_id(tokenizer, "<tapped>"),
         untapped_id=_single_id(tokenizer, "<untapped>"),
         card_ref_ids=[_single_id(tokenizer, f"<card-ref:{k}>") for k in range(MAX_CARD_REFS)],
@@ -208,8 +189,6 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
         stack_close_id=_single_id(tokenizer, "</stack>"),
         command_open_id=_single_id(tokenizer, "<command>"),
         command_close_id=_single_id(tokenizer, "</command>"),
-        self_id=_single_id(tokenizer, "<self>"),
-        opp_id=_single_id(tokenizer, "<opp>"),
     )
     toks.card_ref_id_to_k = {ref_id: k for k, ref_id in enumerate(toks.card_ref_ids)}
     toks._tokenizer = tokenizer
@@ -224,12 +203,7 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
         "</state><eos>",
         " </self>",
         " </opp>",
-        " </option>",
-        "<actions>",
-        "</actions>",
-        " <target>",
         " ",
-        "target",
         "<self> mana=",
         "<opp> mana=",
     ):
@@ -246,9 +220,6 @@ def build_assembler_tokens(tokenizer: PreTrainedTokenizerFast) -> AssemblerToken
             close_s = f"</{tag}></{owner_tag}>"
             frags[open_s] = _encode(tokenizer, open_s)
             frags[close_s] = _encode(tokenizer, close_s)
-    # Action verbs (with leading space, as emitted).
-    for verb in _ACTION_KINDS.values():
-        frags[f" {verb}"] = _encode(tokenizer, f" {verb}")
     # Mana glyph per color id.
     toks.mana_glyph_ids = [_encode(tokenizer, f"{{{sym}}}") for sym in _MANA_SYMBOLS]
     return toks
@@ -324,8 +295,13 @@ def _fragment(toks: AssemblerTokens, text: str) -> list[int]:
 class _AssembledExample:
     token_ids: list[int]
     card_ref_positions: dict[int, int]
-    option_positions: list[int]
-    target_positions: list[list[int]]
+    # Inline-blank metadata (Step 3 of inline-blanks plan). Populated when the
+    # render plan contains OP_EMIT_BLANK opcodes; otherwise these stay empty.
+    blank_positions: list[int] = field(default_factory=list)
+    blank_kind_ids: list[int] = field(default_factory=list)
+    blank_group_ids: list[int] = field(default_factory=list)
+    blank_group_kinds: list[int] = field(default_factory=list)
+    blank_legal_ids: list[list[int]] = field(default_factory=list)
 
 
 def _assemble_one(
@@ -347,29 +323,24 @@ def _assemble_one(
     frag_table = tables.structural
     zone_open_table = tables.zone_open
     zone_close_table = tables.zone_close
-    action_verb_table = tables.action_verb
     turn_step_table = tables.turn_step
     life_owner_table = tables.life_owner
-    ability_table = tables.ability
     out: list[int] = []
     card_ref_positions: dict[int, int] = {}
-    option_positions: list[int] = []
-    target_positions: list[list[int]] = []
 
-    cur_target_bucket: list[int] | None = None
     scalar_owner_open: int | None = None
-    option_open = False
+    blank_positions: list[int] = []
+    blank_kind_ids: list[int] = []
+    blank_group_ids: list[int] = []
+    blank_group_kinds: list[int] = []
+    blank_legal: list[list[int]] = []
     # (zone_id, owner) pushed on OPEN_ZONE / popped on CLOSE_ZONE so we can
     # recover the matching open in O(1) instead of rescanning the plan.
     zone_stack: list[tuple[int, int]] = []
     # Detect literal-tokens mode by walking the opcode stream — naive
     # ``np.any(plan == OP_LITERAL_TOKENS)`` scans payload ints too and
     # spuriously flips when any payload happens to equal the opcode id
-    # (slot indices, card-row ids, and mana amounts routinely do). When
-    # the flag mis-fires, OP_OPTION / OP_TARGET / OP_OPEN_ACTIONS fall
-    # through to the bookkeeping fallback and the encoded batch ends up
-    # with empty option/target positions, which then crashes downstream
-    # gather (or returns CUDA-garbage NaN at sample time).
+    # (slot indices, card-row ids, and mana amounts routinely do).
     structured_plan = True
     _scan_i = 0
     while _scan_i < plan_len:
@@ -404,12 +375,6 @@ def _assemble_one(
         out.extend(frag_table[Frag.CLOSE_SELF if scalar_owner_open == 0 else Frag.CLOSE_OPP])
         scalar_owner_open = None
 
-    def close_option() -> None:
-        nonlocal option_open
-        if option_open:
-            out.extend(frag_table[Frag.CLOSE_OPTION])
-            option_open = False
-
     i = 0
     n = plan_len
     while i < n:
@@ -427,21 +392,13 @@ def _assemble_one(
                 tid = plan_list[j]
                 pos = len(out)
                 out.append(tid)
-                # Anchor recovery while walking literal slices.
-                if tid == toks.option_id:
-                    option_positions.append(pos)
-                    cur_target_bucket = []
-                    target_positions.append(cur_target_bucket)
-                elif tid == toks.target_open_id and cur_target_bucket is not None:
-                    cur_target_bucket.append(pos)
-                else:
-                    # card-ref ids: record first-occurrence position per K.
-                    # O(1) reverse-map lookup; the linear scan over
-                    # MAX_CARD_REFS=256 here used to dominate literal-heavy
-                    # plans.
-                    k = ref_id_to_k.get(tid)
-                    if k is not None and k not in card_ref_positions:
-                        card_ref_positions[k] = pos
+                # card-ref ids: record first-occurrence position per K.
+                # O(1) reverse-map lookup; the linear scan over
+                # MAX_CARD_REFS=256 here used to dominate literal-heavy
+                # plans.
+                k = ref_id_to_k.get(tid)
+                if k is not None and k not in card_ref_positions:
+                    card_ref_positions[k] = pos
             i = slice_end
             continue
 
@@ -457,7 +414,6 @@ def _assemble_one(
                 continue
 
             if op == OP_CLOSE_STATE:
-                close_option()
                 close_scalar_owner()
                 out.extend(frag_table[Frag.CLOSE_STATE_EOS])
                 i += 1
@@ -508,7 +464,6 @@ def _assemble_one(
                 continue
 
             if op == OP_OPEN_ZONE:
-                close_option()
                 zone = plan_list[i + 1]
                 owner = plan_list[i + 2]
                 zone_stack.append((zone, owner))
@@ -517,83 +472,10 @@ def _assemble_one(
                 continue
 
             if op == OP_CLOSE_ZONE:
-                close_option()
                 if zone_stack:
                     zone, owner = zone_stack.pop()
                     out.extend(zone_close_table[(zone, owner)])
                 i += 1
-                continue
-
-            if op == OP_OPEN_ACTIONS:
-                out.extend(frag_table[Frag.OPEN_ACTIONS])
-                i += 1
-                continue
-
-            if op == OP_CLOSE_ACTIONS:
-                close_option()
-                out.extend(frag_table[Frag.CLOSE_ACTIONS])
-                i += 1
-                continue
-
-            if op == OP_OPTION:
-                close_option()
-                kind_id = plan_list[i + 1]
-                source_row = plan_list[i + 2]
-                source_uuid_idx = plan_list[i + 3]
-                _mana_cost_id = plan_list[i + 4]
-                ability_idx = plan_list[i + 5]
-                pos = len(out)
-                out.append(toks.option_id)
-                option_positions.append(pos)
-                cur_target_bucket = []
-                target_positions.append(cur_target_bucket)
-                option_open = True
-                # ``action_verb_table`` already folds in the leading space, so
-                # the dispatch is one ``out.extend`` per action verb. An
-                # unknown ``kind_id`` falls through to a one-shot encode of
-                # the literal " unknown" string — not reachable on a well-
-                # formed plan but kept for legacy parity.
-                verb_ids_opt = action_verb_table.get(kind_id)
-                kind_known = verb_ids_opt is not None
-                verb_ids = verb_ids_opt if verb_ids_opt is not None else _fragment(toks, " unknown")
-                out.extend(verb_ids)
-                # ``kind_id`` 0 (pass) and 6 (choice) skip the source-row /
-                # ability suffix, matching the legacy "verb in (pass, choice,
-                # unknown)" guard.
-                if kind_known and kind_id not in (0, 6):
-                    if not emit_card_ref(source_uuid_idx) and (0 <= source_row < len(name_lists)):
-                        out.extend(name_lists[source_row])
-                if ability_idx >= 0 and kind_id == 3:
-                    ab = ability_table.get(ability_idx)
-                    if ab is None:
-                        raise ValueError(
-                            f"OP_OPTION out of bounds: ability_idx={ability_idx} "
-                            f"(allowed range {tables.ability_min}..{tables.ability_max})"
-                        )
-                    out.extend(ab)
-                i += 1 + arity
-                continue
-
-            if op == OP_TARGET:
-                target_row = plan_list[i + 1]
-                target_uuid_idx = plan_list[i + 2]
-                target_kind = plan_list[i + 3]
-                pos = len(out)
-                out.append(toks.target_open_id)
-                if cur_target_bucket is not None:
-                    cur_target_bucket.append(pos)
-                # target_kind 0 = player target. target_row is the owner index
-                # (0=self, 1=opp). Other kinds resolve to a card-ref or a
-                # cached display-name span.
-                if target_kind == 0:
-                    out.append(toks.self_id if target_row == 0 else toks.opp_id)
-                elif not emit_card_ref(target_uuid_idx):
-                    if 0 <= target_row < len(name_lists):
-                        out.extend(name_lists[target_row])
-                    else:
-                        out.extend(frag_table[Frag.TARGET_FALLBACK])
-                out.append(toks.target_close_id)
-                i += 1 + arity
                 continue
 
         if op == OP_COUNT:
@@ -708,6 +590,38 @@ def _assemble_one(
             i += 1 + arity
             continue
 
+        if op == OP_EMIT_BLANK:
+            kind_id = plan_list[i + 1]
+            group_id = plan_list[i + 2]
+            group_kind = plan_list[i + 3]
+            legal_count = plan_list[i + 4]
+            pos = len(out)
+            out.append(int(kind_id))
+            blank_positions.append(pos)
+            blank_kind_ids.append(int(kind_id))
+            blank_group_ids.append(int(group_id))
+            blank_group_kinds.append(int(group_kind))
+            legal: list[int] = []
+            i += 1 + arity
+            for _ in range(legal_count):
+                if i >= n or plan_list[i] != OP_EMIT_BLANK_LEGAL:
+                    raise ValueError(
+                        f"OP_EMIT_BLANK legal_count={legal_count} but "
+                        f"OP_EMIT_BLANK_LEGAL stream truncated at i={i}"
+                    )
+                legal.append(int(plan_list[i + 1]))
+                i += 1 + OPCODE_ARITY[OP_EMIT_BLANK_LEGAL]
+            blank_legal.append(legal)
+            continue
+
+        if op == OP_EMIT_BLANK_LEGAL:
+            # Stray OP_EMIT_BLANK_LEGAL (without a preceding OP_EMIT_BLANK):
+            # treat as a wire-format error.
+            raise ValueError(
+                f"unexpected OP_EMIT_BLANK_LEGAL at position {i}; "
+                "must follow an OP_EMIT_BLANK header"
+            )
+
         if op == OP_END_CARD:
             out.extend(toks.card_closer_ids)
             i += 1
@@ -725,14 +639,10 @@ def _assemble_one(
             OP_CLOSE_STATE,
             OP_OPEN_ZONE,
             OP_CLOSE_ZONE,
-            OP_OPEN_ACTIONS,
-            OP_CLOSE_ACTIONS,
             OP_OPEN_PLAYER,
             OP_CLOSE_PLAYER,
             OP_COUNTER,
             OP_ATTACHED_TO,
-            OP_OPTION,
-            OP_TARGET,
             OP_TURN,
             OP_LIFE,
             OP_MANA,
@@ -746,8 +656,11 @@ def _assemble_one(
     return _AssembledExample(
         token_ids=out,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        target_positions=target_positions,
+        blank_positions=blank_positions,
+        blank_kind_ids=blank_kind_ids,
+        blank_group_ids=blank_group_ids,
+        blank_group_kinds=blank_group_kinds,
+        blank_legal_ids=blank_legal,
     )
 
 
@@ -824,15 +737,10 @@ def assemble_batch(
     if actual_max > max_tokens:
         if on_overflow == "raise":
             raise ValueError(f"assembled token length {actual_max} exceeds max_tokens={max_tokens}")
-        # Truncate but preserve the option/target index space. Setting
-        # truncated positions to -1 (instead of dropping the entries) keeps
-        # the K↔K invariant the upstream layout relies on: a layout col that
-        # references "the K'th option" still finds slot K — option_mask just
-        # ends up False there, so the model can't score it but the indexing
-        # contract holds. card_ref_positions is keyed by K so it can stay a
-        # filtered dict.
-        truncated_options = 0
-        truncated_targets = 0
+        # Truncate card-ref and blank positions that fall outside the retained
+        # prefix. card_ref_positions is keyed by K so it can stay a filtered
+        # dict; blank tensor shapes preserve the original blank ordinal space.
+        truncated_blanks = 0
         truncated_examples = 0
         for ex in assembled:
             if len(ex.token_ids) > max_tokens:
@@ -840,49 +748,36 @@ def assemble_batch(
                 ex.card_ref_positions = {
                     k: p for k, p in ex.card_ref_positions.items() if p < max_tokens
                 }
-                new_options: list[int] = []
-                new_targets: list[list[int]] = []
-                ex_truncated_opts = 0
-                ex_truncated_tgts = 0
-                for opt_pos, tp in zip(ex.option_positions, ex.target_positions, strict=True):
-                    if opt_pos < max_tokens:
-                        new_options.append(opt_pos)
-                    else:
-                        new_options.append(-1)
-                        ex_truncated_opts += 1
-                    new_targets.append([tpos if tpos < max_tokens else -1 for tpos in tp])
-                    ex_truncated_tgts += sum(1 for tpos in tp if tpos >= max_tokens)
-                ex.option_positions = new_options
-                ex.target_positions = new_targets
-                truncated_options += ex_truncated_opts
-                truncated_targets += ex_truncated_tgts
+                ex.blank_positions = [pos if pos < max_tokens else -1 for pos in ex.blank_positions]
+                truncated_blanks += sum(1 for pos in ex.blank_positions if pos < 0)
                 truncated_examples += 1
         seq_lengths = [len(ex.token_ids) for ex in assembled]
         logger.warning(
             "assemble_batch: truncated %d/%d example(s) to max_tokens=%d "
-            "(masked %d option(s) and %d target(s) past the budget)",
+            "(masked %d blank(s) past the budget)",
             truncated_examples,
             len(assembled),
             max_tokens,
-            truncated_options,
-            truncated_targets,
+            truncated_blanks,
         )
 
     batch_size = len(assembled)
     width = max(seq_lengths)
-    max_opts = max((len(ex.option_positions) for ex in assembled), default=0)
-    max_targets = max(
-        (len(t) for ex in assembled for t in ex.target_positions),
+    max_blanks = max((len(ex.blank_positions) for ex in assembled), default=0)
+    max_legal = max(
+        (len(legal) for ex in assembled for legal in ex.blank_legal_ids),
         default=0,
     )
 
     token_ids = torch.full((batch_size, width), toks.pad_id, dtype=torch.int64)
     attention_mask = torch.zeros((batch_size, width), dtype=torch.int64)
     card_ref_positions = torch.full((batch_size, MAX_CARD_REFS), -1, dtype=torch.int64)
-    option_positions = torch.full((batch_size, max_opts), -1, dtype=torch.int64)
-    option_mask = torch.zeros((batch_size, max_opts), dtype=torch.bool)
-    target_positions = torch.full((batch_size, max_opts, max_targets), -1, dtype=torch.int64)
-    target_mask = torch.zeros((batch_size, max_opts, max_targets), dtype=torch.bool)
+    blank_positions = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
+    blank_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
+    blank_group = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
+    blank_group_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
+    blank_legal_ids = torch.zeros((batch_size, max_blanks, max_legal), dtype=torch.int32)
+    blank_legal_mask = torch.zeros((batch_size, max_blanks, max_legal), dtype=torch.bool)
 
     for b, ex in enumerate(assembled):
         t_i = len(ex.token_ids)
@@ -892,24 +787,26 @@ def assemble_batch(
         for k, pos in ex.card_ref_positions.items():
             if 0 <= k < MAX_CARD_REFS:
                 card_ref_positions[b, k] = int(pos)
-        for o, pos in enumerate(ex.option_positions):
-            if pos >= 0:
-                option_positions[b, o] = int(pos)
-                option_mask[b, o] = True
-            for t, tpos in enumerate(ex.target_positions[o]):
-                if tpos >= 0:
-                    target_positions[b, o, t] = int(tpos)
-                    target_mask[b, o, t] = True
+        for k_idx, pos in enumerate(ex.blank_positions):
+            blank_positions[b, k_idx] = int(pos)
+            blank_kind[b, k_idx] = int(ex.blank_kind_ids[k_idx])
+            blank_group[b, k_idx] = int(ex.blank_group_ids[k_idx])
+            blank_group_kind[b, k_idx] = int(ex.blank_group_kinds[k_idx])
+            for v_idx, tid in enumerate(ex.blank_legal_ids[k_idx]):
+                blank_legal_ids[b, k_idx, v_idx] = int(tid)
+                blank_legal_mask[b, k_idx, v_idx] = True
 
     return TextEncodedBatch(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=torch.as_tensor(seq_lengths, dtype=torch.int64),
         total_tokens=sum(seq_lengths),
         seq_lengths_host=tuple(seq_lengths),
+        blank_positions=blank_positions,
+        blank_kind=blank_kind,
+        blank_group=blank_group,
+        blank_group_kind=blank_group_kind,
+        blank_legal_ids=blank_legal_ids,
+        blank_legal_mask=blank_legal_mask,
     )

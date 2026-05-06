@@ -19,15 +19,12 @@ from magic_ai.text_encoder.render import (
     load_oracle_text,
 )
 from magic_ai.text_encoder.render_plan import (
-    OP_CLOSE_ACTIONS,
     OP_CLOSE_STATE,
     OP_CLOSE_ZONE,
     OP_LIFE,
     OP_MANA,
-    OP_OPEN_ACTIONS,
     OP_OPEN_STATE,
     OP_OPEN_ZONE,
-    OP_OPTION,
     OP_PLACE_CARD,
     OP_TURN,
     OWNER_SELF,
@@ -184,14 +181,6 @@ def test_structured_go_plan_decodes_without_literal_tokens(cache, tokenizer, nam
             STATUS_TAPPED,
             0,
             OP_CLOSE_ZONE,
-            OP_OPEN_ACTIONS,
-            OP_OPTION,
-            2,  # cast
-            bears_row,
-            0,
-            -1,
-            -1,
-            OP_CLOSE_ACTIONS,
             OP_CLOSE_STATE,
         ],
         dtype=torch.int32,
@@ -207,9 +196,9 @@ def test_structured_go_plan_decodes_without_literal_tokens(cache, tokenizer, nam
     # Card names are anonymized in the body — assert the structural surface
     # instead. Grizzly Bears is a vanilla 2/2 with no oracle text.
     assert "<pt>2/2</pt>" in decoded
-    assert "<cast>" in decoded
+    assert "<actions>" not in decoded
+    assert "<cast>" not in decoded
     assert int(batch.card_ref_positions[0, 0]) >= 0
-    assert int(batch.option_positions[0, 0]) >= 0
 
 
 # ---------------------------------------------------------------------------
@@ -253,3 +242,162 @@ def test_unknown_opcode_raises(cache, tokenizer) -> None:
     plan = torch.tensor([999], dtype=torch.int32)
     with pytest.raises(ValueError, match="unknown opcode"):
         assemble_batch([plan], cache, tokenizer, max_tokens=8)
+
+
+# ---------------------------------------------------------------------------
+# Inline-blank opcodes (Step 3 of inline-blanks plan).
+# ---------------------------------------------------------------------------
+
+
+def test_emit_blank_round_trips_through_assembler(cache, tokenizer) -> None:
+    """OP_EMIT_BLANK / OP_EMIT_BLANK_LEGAL populate TextEncodedBatch fields."""
+    from magic_ai.text_encoder.render_plan import (
+        BLANK_GROUP_CROSS_BLANK,
+        OP_EMIT_BLANK,
+        OP_EMIT_BLANK_LEGAL,
+        OPCODE_ARITY,
+    )
+
+    choose_play = int(tokenizer.convert_tokens_to_ids("<choose-play>"))
+    pass_blank = int(tokenizer.convert_tokens_to_ids("<pass>"))
+    chosen = int(tokenizer.convert_tokens_to_ids("<chosen>"))
+
+    w = RenderPlanWriter()
+    w.emit_open_state()
+    w.emit_literal_tokens(_bos_state_ids(tokenizer))
+    w.emit_blank(
+        kind_id=choose_play,
+        group_id=0,
+        group_kind="CROSS_BLANK",
+        legal_token_ids=(chosen,),
+    )
+    w.emit_blank(
+        kind_id=pass_blank,
+        group_id=0,
+        group_kind="CROSS_BLANK",
+        legal_token_ids=(chosen,),
+    )
+    w.emit_literal_tokens(_state_eos_ids(tokenizer))
+    w.emit_close_state()
+    plan = w.finalize()
+
+    assert OPCODE_ARITY[OP_EMIT_BLANK] == 4
+    assert OPCODE_ARITY[OP_EMIT_BLANK_LEGAL] == 1
+
+    batch = assemble_batch([plan], cache, tokenizer, max_tokens=128)
+
+    assert batch.blank_positions.shape == (1, 2)
+    assert batch.blank_kind.tolist() == [[choose_play, pass_blank]]
+    assert batch.blank_group.tolist() == [[0, 0]]
+    assert batch.blank_group_kind.tolist() == [[BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_CROSS_BLANK]]
+    assert batch.blank_legal_ids.shape == (1, 2, 1)
+    assert batch.blank_legal_ids.tolist() == [[[chosen], [chosen]]]
+    assert batch.blank_legal_mask.tolist() == [[[True], [True]]]
+    pos0 = int(batch.blank_positions[0, 0])
+    pos1 = int(batch.blank_positions[0, 1])
+    assert int(batch.token_ids[0, pos0]) == choose_play
+    assert int(batch.token_ids[0, pos1]) == pass_blank
+
+
+def test_blank_legal_padding_across_examples(cache, tokenizer) -> None:
+    """Blank legal-id width pads to the per-batch V_max with mask bits."""
+    from magic_ai.text_encoder.render_plan import BLANK_GROUP_PER_BLANK
+
+    choose_target = int(tokenizer.convert_tokens_to_ids("<choose-target>"))
+    none_id = int(tokenizer.convert_tokens_to_ids("<none>"))
+    cref0 = int(tokenizer.convert_tokens_to_ids("<card-ref:0>"))
+    cref1 = int(tokenizer.convert_tokens_to_ids("<card-ref:1>"))
+
+    def _plan(legal_ids: tuple[int, ...]) -> torch.Tensor:
+        w = RenderPlanWriter()
+        w.emit_open_state()
+        w.emit_literal_tokens(_bos_state_ids(tokenizer))
+        w.emit_blank(
+            kind_id=choose_target,
+            group_id=7,
+            group_kind=BLANK_GROUP_PER_BLANK,
+            legal_token_ids=legal_ids,
+        )
+        w.emit_literal_tokens(_state_eos_ids(tokenizer))
+        w.emit_close_state()
+        return w.finalize()
+
+    plans = [_plan((cref0, none_id)), _plan((cref0, cref1, none_id))]
+    batch = assemble_batch(plans, cache, tokenizer, max_tokens=128)
+
+    assert batch.blank_legal_ids.shape == (2, 1, 3)
+    assert batch.blank_legal_ids[0, 0].tolist() == [cref0, none_id, 0]
+    assert batch.blank_legal_mask[0, 0].tolist() == [True, True, False]
+    assert batch.blank_legal_ids[1, 0].tolist() == [cref0, cref1, none_id]
+    assert batch.blank_legal_mask[1, 0].tolist() == [True, True, True]
+
+
+def test_emit_blank_legal_outside_blank_raises(cache, tokenizer) -> None:
+    """Stray OP_EMIT_BLANK_LEGAL with no preceding header is a wire-format error."""
+    from magic_ai.text_encoder.render_plan import OP_EMIT_BLANK_LEGAL
+
+    plan = torch.tensor([OP_EMIT_BLANK_LEGAL, 1234], dtype=torch.int32)
+    with pytest.raises(ValueError, match="OP_EMIT_BLANK_LEGAL"):
+        assemble_batch([plan], cache, tokenizer, max_tokens=8)
+
+
+def test_blank_singletons_round_trip_via_packed(tokenizer) -> None:
+    """Inline-blank singletons + num_ids surface through the held-alive _Packed.
+
+    This catches regressions where new singleton fields are built in
+    ``TokenTables`` but omitted from the packed registration object.
+    """
+    from magic_ai.text_encoder.native_token_tables import (
+        active_packed,
+        register_native_token_tables,
+    )
+    from magic_ai.text_encoder.token_tables import build_token_tables
+
+    tables = build_token_tables(tokenizer, cache=None)
+    register_native_token_tables(tables)
+    packed = active_packed()
+    assert packed is not None
+
+    for attr in (
+        "choose_target_id",
+        "choose_block_id",
+        "choose_damage_order_id",
+        "choose_mode_id",
+        "choose_may_id",
+        "choose_x_digit_id",
+        "choose_mana_source_id",
+        "choose_play_id",
+        "use_ability_id",
+        "chosen_id",
+        "yes_id",
+        "no_id",
+        "none_id",
+        "x_end_id",
+        "mulligan_id",
+        "keep_id",
+    ):
+        assert getattr(packed, attr) == getattr(tables, attr), attr
+    assert packed.num_ids.tolist() == list(tables.num_ids)
+
+
+def test_native_assembler_blank_output_buffers_allocate() -> None:
+    """Native packed outputs include the Step-3 blank tensor buffers."""
+    from magic_ai.text_encoder.native_assembler import allocate_packed_outputs
+
+    outputs = allocate_packed_outputs(
+        2,
+        max_tokens=16,
+        max_options=3,
+        max_targets=2,
+        max_card_refs=8,
+        max_blanks=5,
+        max_legal_per_blank=7,
+    )
+
+    assert outputs.blank_positions.shape == (2, 5)
+    assert outputs.blank_kind.shape == (2, 5)
+    assert outputs.blank_group.shape == (2, 5)
+    assert outputs.blank_group_kind.shape == (2, 5)
+    assert outputs.blank_legal_ids.shape == (2, 5, 7)
+    assert outputs.blank_legal_mask.shape == (2, 5, 7)
+    assert outputs.blank_overflow.shape == (2,)

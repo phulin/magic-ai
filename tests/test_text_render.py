@@ -24,7 +24,9 @@ from magic_ai.game_state import (
 )
 from magic_ai.text_encoder.render import (
     DEFAULT_ORACLE_PATH,
+    BlankAnchor,
     OracleEntry,
+    RenderError,
     SnapshotRenderer,
     load_oracle_text,
     render_card_body,
@@ -180,16 +182,15 @@ def test_action_target_uses_same_card_ref(oracle: dict[str, OracleEntry]) -> Non
     target_ref = rendered.card_refs[target_id]
     bolt_ref = rendered.card_refs[bolt_id]
     target_token = card_ref_token(target_ref)
-    bolt_token = card_ref_token(bolt_ref)
-    # Cast option references the bolt via card-ref (no leading space, no cost).
-    assert f"<cast>{bolt_token}" in rendered.text
-    # And targets carry the same K used for the opposing creature's <card-ref>.
-    assert f"<target>{target_token}</target>" in rendered.text
-    # Anchors agree.
-    [opt_anchor] = rendered.option_anchors
-    assert opt_anchor.kind == "cast"
-    [tgt_anchor] = opt_anchor.target_anchors
-    assert tgt_anchor.referenced_card_ref == target_ref
+    assert card_ref_token(bolt_ref) in rendered.text
+    assert target_token in rendered.text
+    assert "<choose-play>" in rendered.text
+    assert "<choose-target>" in rendered.text
+    target_blanks = [
+        anchor for anchor in rendered.blank_anchors if anchor.kind == "<choose-target>"
+    ]
+    assert len(target_blanks) == 1
+    assert target_blanks[0].legal_token_ids == (target_ref,)
     # Note: ``bolt`` also appears in the hand (silences ruff F841).
     assert bolt is not None
 
@@ -248,19 +249,19 @@ def test_busy_midgame_length_stats(oracle: dict[str, OracleEntry]) -> None:
     print(
         f"[busy-midgame] chars={char_len} words={word_len} "
         f"card_refs={len(rendered.card_refs)} "
-        f"option_anchors={len(rendered.option_anchors)}"
+        f"blank_anchors={len(rendered.blank_anchors)}"
     )
     # Sanity floor — a busy snapshot should at least exceed the empty snapshot.
     assert char_len > 200
 
 
-def test_render_contains_state_and_actions(oracle: dict[str, OracleEntry]) -> None:
+def test_render_contains_state_and_choices(oracle: dict[str, OracleEntry]) -> None:
     snap = _basic_snapshot()
     rendered = render_snapshot(snap, oracle=oracle)
     assert rendered.text.startswith("<bos><state>")
     assert rendered.text.endswith("</state><eos>")
-    assert "<actions>" in rendered.text
-    assert "</actions>" in rendered.text
+    assert "<actions>" not in rendered.text
+    assert "<choices>" in rendered.text
 
 
 def test_status_flags_only_when_in_snapshot(oracle: dict[str, OracleEntry]) -> None:
@@ -295,7 +296,7 @@ def test_pass_action(oracle: dict[str, OracleEntry]) -> None:
     )
     snap_with_pending = cast(GameStateSnapshot, {**snap, "pending": pending})
     rendered = render_snapshot(snap_with_pending, oracle=oracle)
-    assert "<option><pass></option>" in rendered.text
+    assert "<choices><pass></choices>" in rendered.text
 
 
 def test_stack_renders(oracle: dict[str, OracleEntry]) -> None:
@@ -304,7 +305,8 @@ def test_stack_renders(oracle: dict[str, OracleEntry]) -> None:
     snap_with_stack = cast(GameStateSnapshot, {**snap, "stack": stack})
     rendered = render_snapshot(snap_with_stack, oracle=oracle)
     assert "<stack>" in rendered.text
-    assert "Lightning Bolt" in rendered.text
+    assert "<card-name> deals 3 damage to any target." in rendered.text
+    assert "s1" in rendered.card_refs
 
 
 def test_renderer_class_accepts_injected_oracle() -> None:
@@ -532,3 +534,593 @@ def test_adventure() -> None:
 def test_saga() -> None:
     # TODO: saga chapters need lore counters and chapter pointers.
     raise AssertionError("saga chapter counter not yet rendered")
+
+
+# ---------------------------------------------------------------------------
+# Inline-blank rendering (Step 2 of docs/text_encoder_inline_blanks_plan.md).
+# All priority anchors share a single CROSS_BLANK group whose per-anchor
+# legal vocab is the singleton ``<chosen>`` scoring token; ``CHOSEN_FAKE_ID``
+# is a sentinel id the tests pump through render so they don't depend on a
+# live tokenizer build.
+# ---------------------------------------------------------------------------
+
+CHOSEN_FAKE_ID = 99999
+NONE_FAKE_ID = 99998
+YES_FAKE_ID = 99997
+NO_FAKE_ID = 99996
+SELF_FAKE_ID = 99995
+OPP_FAKE_ID = 99994
+MULLIGAN_FAKE_ID = 99993
+KEEP_FAKE_ID = 99992
+CARD_REF_FAKE_IDS = tuple(88000 + k for k in range(MAX_CARD_REFS))
+NUM_FAKE_IDS = tuple(77000 + k for k in range(16))
+MANA_FAKE_IDS = tuple(66000 + k for k in range(6))
+
+
+def test_inline_blanks_stack_target_uses_stack_card_ref(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = _basic_snapshot()
+    source_id = snap["players"][0]["Hand"][0]["ID"]
+    pending = cast(
+        PendingState,
+        {
+            "kind": "priority",
+            "player_idx": 0,
+            "options": [
+                cast(
+                    PendingOptionState,
+                    {
+                        "id": "counter",
+                        "kind": "cast_spell",
+                        "card_id": source_id,
+                        "card_name": "Lightning Bolt",
+                        "valid_targets": [
+                            cast(TargetState, {"id": "stack-bolt", "label": "Lightning Bolt"})
+                        ],
+                    },
+                )
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(
+            GameStateSnapshot,
+            {
+                **snap,
+                "stack": [cast(StackObjectState, {"id": "stack-bolt", "name": "Lightning Bolt"})],
+                "pending": pending,
+            },
+        ),
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        card_ref_token_ids=CARD_REF_FAKE_IDS,
+    )
+    target_anchor = rendered.blank_anchors[1]
+    assert target_anchor.kind == "<choose-target>"
+    assert target_anchor.legal_token_ids == (CARD_REF_FAKE_IDS[rendered.card_refs["stack-bolt"]],)
+
+
+def test_inline_blanks_mulligan_keep_choice(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = cast(
+        GameStateSnapshot,
+        {
+            **_basic_snapshot(),
+            "pending": cast(PendingState, {"kind": "mulligan", "player_idx": 0, "options": []}),
+        },
+    )
+    rendered = render_snapshot(
+        snap,
+        oracle=oracle,
+        mulligan_token_id=MULLIGAN_FAKE_ID,
+        keep_token_id=KEEP_FAKE_ID,
+    )
+    assert "<choices><choose-may></choices>" in rendered.text
+    assert len(rendered.blank_anchors) == 1
+    anchor = rendered.blank_anchors[0]
+    assert anchor.kind == "<choose-may>"
+    assert anchor.legal_token_ids == (MULLIGAN_FAKE_ID, KEEP_FAKE_ID)
+
+
+def _priority_snapshot() -> GameStateSnapshot:
+    """Snapshot with one playable hand card, one activatable battlefield
+    permanent, and a pass option — exercises all three Step-2 anchors."""
+
+    snap = _basic_snapshot()
+    bolt_id = snap["players"][0]["Hand"][0]["ID"]  # Lightning Bolt
+    elf_id = snap["players"][0]["Battlefield"][0]["ID"]  # Llanowar Elves
+    pending: dict[str, object] = {
+        "kind": "priority",
+        "player_idx": 0,
+        "options": [
+            cast(
+                PendingOptionState,
+                {
+                    "id": "opt-cast",
+                    "kind": "cast",
+                    "card_id": bolt_id,
+                    "card_name": "Lightning Bolt",
+                },
+            ),
+            cast(
+                PendingOptionState,
+                {
+                    "id": "opt-act",
+                    "kind": "activate",
+                    "permanent_id": elf_id,
+                    "ability_index": 0,
+                },
+            ),
+            cast(PendingOptionState, {"id": "opt-pass", "kind": "pass"}),
+        ],
+    }
+    return cast(GameStateSnapshot, {**snap, "pending": cast(PendingState, pending)})
+
+
+def test_inline_blanks_are_default(oracle: dict[str, OracleEntry]) -> None:
+    snap = _priority_snapshot()
+    rendered = render_snapshot(snap, oracle=oracle)
+    assert "<actions>" not in rendered.text
+    assert "<choose-play>" in rendered.text
+    assert "<use-ability>" in rendered.text
+    assert "<choices>" in rendered.text
+    assert len(rendered.blank_anchors) == 3
+
+
+def test_inline_blanks_emits_anchors_and_choices_block(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = _priority_snapshot()
+    rendered = render_snapshot(
+        snap,
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+    )
+    # Inline mode replaces <actions>...</actions> with a trailing <choices>...
+    assert "<actions>" not in rendered.text
+    assert "<choices>" in rendered.text and "</choices>" in rendered.text
+    # All three anchor kinds present.
+    assert rendered.text.count("<choose-play>") == 1
+    assert rendered.text.count("<use-ability>") == 1
+    assert rendered.text.count("<pass>") == 1
+    # The bolt's <choose-play> sits in the hand zone, the elf's <use-ability>
+    # in the battlefield zone, and <pass> in the choices block.
+    hand_segment = rendered.text.split("<hand>", 1)[1].split("</hand>", 1)[0]
+    bf_segment = rendered.text.split("<battlefield>", 1)[1].split("</battlefield>", 1)[0]
+    choices_segment = rendered.text.split("<choices>", 1)[1].split("</choices>", 1)[0]
+    assert "<choose-play>" in hand_segment
+    assert "<use-ability>" in bf_segment
+    assert choices_segment == "<pass>"
+    # Three blank anchors, one CROSS_BLANK group, singleton legal-id list.
+    assert len(rendered.blank_anchors) == 3
+    group_ids = {a.group_id for a in rendered.blank_anchors}
+    assert group_ids == {0}
+    for anchor in rendered.blank_anchors:
+        assert anchor.group_kind == "CROSS_BLANK"
+        assert anchor.legal_token_ids == (CHOSEN_FAKE_ID,)
+        # char_start/char_end bracket the actual kind token in the text.
+        assert rendered.text[anchor.char_start : anchor.char_end] == anchor.kind
+    # Ordinals are dense and start at 0 in render order.
+    assert [a.blank_index for a in rendered.blank_anchors] == [0, 1, 2]
+    # Provenance points back at the original engine-option indices (0, 1, 2
+    # match the order in _priority_snapshot).
+    assert {a.option_index for a in rendered.blank_anchors} == {0, 1, 2}
+
+
+def test_inline_blanks_targeted_priority_option_emits_target_blank(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = _basic_snapshot()
+    bolt_id = snap["players"][0]["Hand"][0]["ID"]
+    target_id = snap["players"][1]["Battlefield"][0]["ID"]
+    pending = cast(
+        PendingState,
+        {
+            "kind": "priority",
+            "player_idx": 0,
+            "options": [
+                cast(
+                    PendingOptionState,
+                    {
+                        "id": "bolt-target",
+                        "kind": "cast",
+                        "card_id": bolt_id,
+                        "card_name": "Lightning Bolt",
+                        "valid_targets": [
+                            cast(TargetState, {"id": target_id, "label": "Serra Angel"})
+                        ],
+                    },
+                )
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        card_ref_token_ids=CARD_REF_FAKE_IDS,
+    )
+
+    hand_segment = rendered.text.split("<hand>", 1)[1].split("</hand>", 1)[0]
+    assert "<choose-play><choose-target>" in hand_segment
+    assert [a.kind for a in rendered.blank_anchors] == ["<choose-play>", "<choose-target>"]
+    priority_anchor, target_anchor = rendered.blank_anchors
+    target_ref = rendered.card_refs[target_id]
+    assert priority_anchor.group_kind == "CROSS_BLANK"
+    assert priority_anchor.legal_token_ids == (CHOSEN_FAKE_ID,)
+    assert target_anchor.group_kind == "PER_BLANK"
+    assert target_anchor.legal_token_ids == (CARD_REF_FAKE_IDS[target_ref],)
+    assert target_anchor.option_index == 0
+
+
+def test_inline_blanks_targeted_priority_option_keeps_player_targets(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = _basic_snapshot()
+    bolt_id = snap["players"][0]["Hand"][0]["ID"]
+    self_id = snap["players"][0]["ID"]
+    opp_id = snap["players"][1]["ID"]
+    pending = cast(
+        PendingState,
+        {
+            "kind": "priority",
+            "player_idx": 0,
+            "options": [
+                cast(
+                    PendingOptionState,
+                    {
+                        "id": "bolt-any-target",
+                        "kind": "cast",
+                        "card_id": bolt_id,
+                        "card_name": "Lightning Bolt",
+                        "valid_targets": [
+                            cast(TargetState, {"id": self_id, "label": "Self"}),
+                            cast(TargetState, {"id": opp_id, "label": "Opp"}),
+                        ],
+                    },
+                )
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        self_token_id=SELF_FAKE_ID,
+        opp_token_id=OPP_FAKE_ID,
+    )
+
+    assert [a.kind for a in rendered.blank_anchors] == ["<choose-play>", "<choose-target>"]
+    target_anchor = rendered.blank_anchors[1]
+    assert target_anchor.group_kind == "PER_BLANK"
+    assert target_anchor.legal_token_ids == (SELF_FAKE_ID, OPP_FAKE_ID)
+
+
+def test_inline_blanks_permanent_choice_uses_visible_card_refs(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = _basic_snapshot()
+    self_perm_id = snap["players"][0]["Battlefield"][0]["ID"]
+    opp_perm_id = snap["players"][1]["Battlefield"][0]["ID"]
+    pending = cast(
+        PendingState,
+        {
+            "kind": "permanent",
+            "player_idx": 0,
+            "options": [
+                cast(PendingOptionState, {"id": self_perm_id, "label": "Llanowar Elves"}),
+                cast(PendingOptionState, {"id": opp_perm_id, "label": "Serra Angel"}),
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        card_ref_token_ids=CARD_REF_FAKE_IDS,
+        num_token_ids=NUM_FAKE_IDS,
+    )
+
+    assert [a.kind for a in rendered.blank_anchors] == ["<choose-target>"]
+    anchor = rendered.blank_anchors[0]
+    assert anchor.group_kind == "PER_BLANK"
+    assert anchor.legal_token_ids == (
+        CARD_REF_FAKE_IDS[rendered.card_refs[self_perm_id]],
+        CARD_REF_FAKE_IDS[rendered.card_refs[opp_perm_id]],
+    )
+
+
+def test_inline_blanks_pass_only_snapshot(oracle: dict[str, OracleEntry]) -> None:
+    snap = _basic_snapshot()
+    pending = cast(
+        PendingState,
+        {
+            "kind": "priority",
+            "player_idx": 0,
+            "options": [cast(PendingOptionState, {"id": "p", "kind": "pass"})],
+        },
+    )
+    snap_with_pending = cast(GameStateSnapshot, {**snap, "pending": pending})
+    rendered = render_snapshot(
+        snap_with_pending,
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+    )
+    assert "<choices><pass></choices>" in rendered.text
+    [anchor] = rendered.blank_anchors
+    assert isinstance(anchor, BlankAnchor)
+    assert anchor.blank_index == 0
+    assert anchor.kind == "<pass>"
+    assert anchor.group_id == 0
+    assert anchor.group_kind == "CROSS_BLANK"
+    assert anchor.legal_token_ids == (CHOSEN_FAKE_ID,)
+
+
+def test_inline_blanks_may_emits_yes_no_blank(oracle: dict[str, OracleEntry]) -> None:
+    snap = _basic_snapshot()
+    pending = cast(PendingState, {"kind": "may", "player_idx": 0, "options": []})
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        yes_token_id=YES_FAKE_ID,
+        no_token_id=NO_FAKE_ID,
+    )
+
+    assert "<choices><choose-may></choices>" in rendered.text
+    [anchor] = rendered.blank_anchors
+    assert anchor.kind == "<choose-may>"
+    assert anchor.group_kind == "PER_BLANK"
+    assert anchor.legal_token_ids == (NO_FAKE_ID, YES_FAKE_ID)
+    assert anchor.option_index == -1
+
+
+def test_inline_blanks_mode_emits_num_blank(oracle: dict[str, OracleEntry]) -> None:
+    snap = _basic_snapshot()
+    pending = cast(
+        PendingState,
+        {
+            "kind": "mode",
+            "player_idx": 0,
+            "options": [
+                cast(PendingOptionState, {"id": "mode-0", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "mode-1", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "mode-2", "kind": "choice"}),
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        num_token_ids=NUM_FAKE_IDS,
+    )
+
+    assert "<choices><choose-mode></choices>" in rendered.text
+    [anchor] = rendered.blank_anchors
+    assert anchor.kind == "<choose-mode>"
+    assert anchor.group_kind == "PER_BLANK"
+    assert anchor.legal_token_ids == NUM_FAKE_IDS[:3]
+    assert anchor.option_index == -1
+
+
+def test_inline_blanks_number_emits_x_digit_blank(oracle: dict[str, OracleEntry]) -> None:
+    snap = _basic_snapshot()
+    pending = cast(
+        PendingState,
+        {
+            "kind": "number",
+            "player_idx": 0,
+            "options": [
+                cast(PendingOptionState, {"id": "x-0", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "x-1", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "x-2", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "x-3", "kind": "choice"}),
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        num_token_ids=NUM_FAKE_IDS,
+    )
+
+    assert "<choices><choose-x-digit></choices>" in rendered.text
+    [anchor] = rendered.blank_anchors
+    assert anchor.kind == "<choose-x-digit>"
+    assert anchor.group_kind == "PER_BLANK"
+    assert anchor.legal_token_ids == NUM_FAKE_IDS[:4]
+    assert anchor.option_index == -1
+
+
+def test_inline_blanks_mana_color_emits_mana_source_blank(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = _basic_snapshot()
+    pending = cast(
+        PendingState,
+        {
+            "kind": "mana_color",
+            "player_idx": 0,
+            "options": [
+                cast(PendingOptionState, {"id": "white", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "blue", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "black", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "red", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "green", "kind": "choice"}),
+                cast(PendingOptionState, {"id": "colorless", "kind": "choice"}),
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        mana_token_ids=MANA_FAKE_IDS,
+    )
+
+    assert "<choices><choose-mana-source></choices>" in rendered.text
+    [anchor] = rendered.blank_anchors
+    assert anchor.kind == "<choose-mana-source>"
+    assert anchor.group_kind == "PER_BLANK"
+    assert anchor.legal_token_ids == MANA_FAKE_IDS
+    assert anchor.option_index == -1
+
+
+def test_inline_blanks_blockers_emit_constrained_block_blanks(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    blocker = _card("blocker-1", "Grizzly Bears", tapped=False)
+    attacker = _card("attacker-1", "Serra Angel", tapped=True)
+    snap = cast(
+        GameStateSnapshot,
+        {
+            "turn": 4,
+            "active_player": "p2",
+            "step": "Declare Blockers",
+            "players": [
+                _player("p1", "Self", battlefield=[blocker]),
+                _player("p2", "Opp", battlefield=[attacker]),
+            ],
+            "pending": cast(
+                PendingState,
+                {
+                    "kind": "blockers",
+                    "player_idx": 0,
+                    "options": [
+                        cast(
+                            PendingOptionState,
+                            {
+                                "id": "block-opt",
+                                "kind": "block",
+                                "permanent_id": blocker["ID"],
+                                "valid_targets": [
+                                    cast(
+                                        TargetState,
+                                        {"id": attacker["ID"], "label": "Serra Angel"},
+                                    )
+                                ],
+                            },
+                        )
+                    ],
+                },
+            ),
+        },
+    )
+
+    rendered = render_snapshot(
+        snap,
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        none_token_id=NONE_FAKE_ID,
+        card_ref_token_ids=CARD_REF_FAKE_IDS,
+    )
+
+    assert "<actions>" not in rendered.text
+    self_bf_segment = rendered.text.split("<self><battlefield>", 1)[1].split(
+        "</battlefield></self>", 1
+    )[0]
+    assert "<choose-block>" in self_bf_segment
+    [anchor] = rendered.blank_anchors
+    attacker_ref = rendered.card_refs[attacker["ID"]]
+    assert anchor.kind == "<choose-block>"
+    assert anchor.group_id == 0
+    assert anchor.group_kind == "CONSTRAINED"
+    assert anchor.legal_token_ids == (NONE_FAKE_ID, CARD_REF_FAKE_IDS[attacker_ref])
+    assert anchor.option_index == 0
+
+
+def test_inline_blanks_attackers_emit_binary_attack_blanks(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    attacker = _card("attacker-1", "Grizzly Bears", tapped=False)
+    snap = cast(
+        GameStateSnapshot,
+        {
+            "turn": 4,
+            "active_player": "p1",
+            "step": "Declare Attackers",
+            "players": [
+                _player("p1", "Self", battlefield=[attacker]),
+                _player("p2", "Opp"),
+            ],
+            "pending": cast(
+                PendingState,
+                {
+                    "kind": "attackers",
+                    "player_idx": 0,
+                    "options": [
+                        cast(
+                            PendingOptionState,
+                            {
+                                "id": "attack-opt",
+                                "kind": "attacker",
+                                "permanent_id": attacker["ID"],
+                            },
+                        )
+                    ],
+                },
+            ),
+        },
+    )
+
+    rendered = render_snapshot(
+        snap,
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        none_token_id=NONE_FAKE_ID,
+        card_ref_token_ids=CARD_REF_FAKE_IDS,
+    )
+
+    assert "<actions>" not in rendered.text
+    self_bf_segment = rendered.text.split("<self><battlefield>", 1)[1].split(
+        "</battlefield></self>", 1
+    )[0]
+    assert "<choose-target>" in self_bf_segment
+    [anchor] = rendered.blank_anchors
+    attacker_ref = rendered.card_refs[attacker["ID"]]
+    assert anchor.kind == "<choose-target>"
+    assert anchor.group_kind == "PER_BLANK"
+    assert anchor.legal_token_ids == (NONE_FAKE_ID, CARD_REF_FAKE_IDS[attacker_ref])
+    assert anchor.option_index == 0
+
+
+def test_inline_blanks_ordinal_parity_under_option_permutation(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    """Render the same logical snapshot twice with the engine option list
+    permuted; per-card render order is fixed by stable sort keys, so blank
+    ordinals must match. This is the "Stable blank numbering" invariant from
+    docs/text_encoder_inline_blanks_plan.md (lines ~205-213)."""
+
+    snap_a = _priority_snapshot()
+    options = list(snap_a["pending"]["options"])  # type: ignore[index]
+    permuted = [options[2], options[0], options[1]]  # pass, cast, activate
+    snap_b = cast(
+        GameStateSnapshot,
+        {
+            **snap_a,
+            "pending": cast(
+                PendingState,
+                {**snap_a["pending"], "options": permuted},  # type: ignore[index]
+            ),
+        },
+    )
+    rendered_a = render_snapshot(snap_a, oracle=oracle, chosen_token_id=CHOSEN_FAKE_ID)
+    rendered_b = render_snapshot(snap_b, oracle=oracle, chosen_token_id=CHOSEN_FAKE_ID)
+    # Text is byte-for-byte identical across permutations: zone-walk order is
+    # fixed and per-card option lists are sorted by stable key.
+    assert rendered_a.text == rendered_b.text
+    # Blank ordinals + kinds + group ids align.
+    assert [(a.blank_index, a.kind, a.group_id) for a in rendered_a.blank_anchors] == [
+        (b.blank_index, b.kind, b.group_id) for b in rendered_b.blank_anchors
+    ]
+
+
+def test_inline_blanks_render_error_exists() -> None:
+    # Sanity: RenderError is exported and is a RuntimeError subclass; downstream
+    # steps will catch it for empty-legal-set / unanchorable-option cases.
+    assert issubclass(RenderError, RuntimeError)

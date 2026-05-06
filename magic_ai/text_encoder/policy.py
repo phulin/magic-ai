@@ -2,7 +2,7 @@
 
 This module is the integration target for the eventual ``policy.encoder =
 "text"`` branch in ``magic_ai/model.py``. It owns one ``TextStateEncoder`` and
-the three heads (policy / target / value), exposes a single ``forward`` that
+the value / inline-blank heads, exposes a single ``forward`` that
 takes a :class:`TextEncodedBatch` and returns every tensor downstream code is
 likely to need, and provides a ``encode_snapshots`` convenience that runs the
 render -> tokenize -> collate pipeline so callers do not have to import four
@@ -29,19 +29,18 @@ from magic_ai.text_encoder.batch import (
     pack_batch,
     tokenize_snapshot,
 )
+from magic_ai.text_encoder.mlm import MLMHead
 from magic_ai.text_encoder.model import (
-    PolicyHead,
-    TargetHead,
+    InlineBlankPolicy,
     TextEncoderConfig,
     TextStateEncoder,
     ValueHead,
     gather_card_vectors_packed,
-    gather_option_vectors_packed,
     gather_state_vector_packed,
-    gather_target_vectors_packed,
     initialize_text_state_encoder_from_hf,
 )
 from magic_ai.text_encoder.render import OracleEntry, render_snapshot
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, MAX_NUM
 
 
 @dataclass
@@ -56,42 +55,35 @@ class EncodedSnapshots:
 
     card_vectors: Tensor
     card_mask: Tensor
-    option_vectors: Tensor
-    option_mask: Tensor
-    target_vectors: Tensor
-    target_mask: Tensor
     state_vector: Tensor
+    blank_logits: Tensor | None = None
 
 
 @dataclass
 class TextPolicyOutput:
     """Bundle of tensors produced by :meth:`TextPolicy.forward`.
 
-    Shapes (B = batch, O = max options, M = max targets, K = ``MAX_CARD_REFS``,
-    D = ``cfg.d_model``):
+    Shapes (B = batch, K = ``MAX_CARD_REFS``, D = ``cfg.d_model``):
 
-    * ``policy_logits``: ``[B, O]``, ``-inf`` at masked-out option slots.
-    * ``target_logits``: ``[B, O, M]``, ``-inf`` at masked-out target slots.
     * ``values``: ``[B]``.
     * ``card_vectors``: ``[B, K, D]``, zero rows where ``card_mask`` is False.
     * ``card_mask``: ``[B, K]`` bool.
-    * ``option_vectors``: ``[B, O, D]``.
-    * ``option_mask``: ``[B, O]`` bool.
-    * ``target_vectors``: ``[B, O, M, D]``.
-    * ``target_mask``: ``[B, O, M]`` bool.
     * ``state_vector``: ``[B, D]`` — pooled at position 0 (``<bos>``).
+    * ``blank_logits``: ``[B, K_blank, V_max]``.
     """
 
-    policy_logits: Tensor
-    target_logits: Tensor
     values: Tensor
     card_vectors: Tensor
     card_mask: Tensor
-    option_vectors: Tensor
-    option_mask: Tensor
-    target_vectors: Tensor
-    target_mask: Tensor
     state_vector: Tensor
+    blank_logits: Tensor | None = None
+    blank_positions: Tensor | None = None
+    blank_kind: Tensor | None = None
+    blank_group: Tensor | None = None
+    blank_group_kind: Tensor | None = None
+    blank_option_index: Tensor | None = None
+    blank_legal_ids: Tensor | None = None
+    blank_legal_mask: Tensor | None = None
 
 
 class TextPolicy(nn.Module):
@@ -103,9 +95,14 @@ class TextPolicy(nn.Module):
         self.encoder = TextStateEncoder(cfg)
         if cfg.hf_model_name is not None:
             initialize_text_state_encoder_from_hf(self.encoder, cfg)
-        self.policy_head = PolicyHead(cfg.d_model)
-        self.target_head = TargetHead(cfg.d_model)
         self.value_head = ValueHead(cfg.d_model)
+        self.mlm_head = MLMHead(self.encoder)
+        self.inline_blank_policy = InlineBlankPolicy(
+            self.encoder.tok_emb,
+            self.mlm_head.dense,
+            self.mlm_head.layer_norm,
+            num_kinds=cfg.vocab_size,
+        )
 
     def encode_only(self, batch: TextEncodedBatch) -> EncodedSnapshots:
         """Run the encoder + pool ops; return raw vectors without head logits.
@@ -128,50 +125,46 @@ class TextPolicy(nn.Module):
 
         hidden = self.encoder.forward_packed(batch)
         card_vecs, card_mask = gather_card_vectors_packed(hidden, batch)
-        option_vecs, option_mask = gather_option_vectors_packed(hidden, batch)
-        target_vecs, target_mask = gather_target_vectors_packed(hidden, batch)
         state_vec = gather_state_vector_packed(hidden, batch)
+        blank_logits = self.inline_blank_policy(
+            hidden,
+            batch.blank_positions,
+            batch.blank_kind,
+            batch.blank_legal_ids,
+            batch.blank_legal_mask,
+        )
         return EncodedSnapshots(
             card_vectors=card_vecs,
             card_mask=card_mask,
-            option_vectors=option_vecs,
-            option_mask=option_mask,
-            target_vectors=target_vecs,
-            target_mask=target_mask,
             state_vector=state_vec,
+            blank_logits=blank_logits,
         )
 
-    def run_heads(
-        self, encoded: EncodedSnapshots, state_vec: Tensor | None = None
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Run the three heads against ``encoded`` using ``state_vec``.
+    def run_heads(self, encoded: EncodedSnapshots, state_vec: Tensor | None = None) -> Tensor:
+        """Run the value head against ``encoded`` using ``state_vec``.
 
         If ``state_vec`` is ``None``, ``encoded.state_vector`` is used.
-        Returns ``(policy_logits, target_logits, values)``.
         """
 
         sv = encoded.state_vector if state_vec is None else state_vec
-        policy_logits = self.policy_head(encoded.option_vectors, sv, encoded.option_mask)
-        target_logits = self.target_head(
-            encoded.target_vectors, encoded.option_vectors, sv, encoded.target_mask
-        )
-        values = self.value_head(sv)
-        return policy_logits, target_logits, values
+        return self.value_head(sv)
 
     def forward(self, batch: TextEncodedBatch) -> TextPolicyOutput:
         encoded = self.encode_only(batch)
-        policy_logits, target_logits, values = self.run_heads(encoded)
+        values = self.run_heads(encoded)
         return TextPolicyOutput(
-            policy_logits=policy_logits,
-            target_logits=target_logits,
             values=values,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,
-            option_vectors=encoded.option_vectors,
-            option_mask=encoded.option_mask,
-            target_vectors=encoded.target_vectors,
-            target_mask=encoded.target_mask,
             state_vector=encoded.state_vector,
+            blank_logits=encoded.blank_logits,
+            blank_positions=batch.blank_positions,
+            blank_kind=batch.blank_kind,
+            blank_group=batch.blank_group,
+            blank_group_kind=batch.blank_group_kind,
+            blank_option_index=batch.blank_option_index,
+            blank_legal_ids=batch.blank_legal_ids,
+            blank_legal_mask=batch.blank_legal_mask,
         )
 
     @staticmethod
@@ -180,6 +173,8 @@ class TextPolicy(nn.Module):
         actions_per_snapshot: Sequence[Sequence[PendingOptionState] | None] | None,
         oracle: dict[str, OracleEntry] | None,
         tokenizer: PreTrainedTokenizerFast,
+        *,
+        chosen_token_id: int | None = None,
     ) -> TextEncodedBatch:
         """Render -> tokenize -> collate convenience.
 
@@ -203,8 +198,80 @@ class TextPolicy(nn.Module):
             action_lists = list(actions_per_snapshot)
 
         examples = []
+        none_token_id: int | None = None
+        yes_token_id: int | None = None
+        no_token_id: int | None = None
+        num_token_ids: list[int] | None = None
+        mana_token_ids: list[int] | None = None
+        card_ref_token_ids: list[int] | None = None
+        if chosen_token_id is None:
+            tid = tokenizer.convert_tokens_to_ids("<chosen>")
+            if isinstance(tid, list):
+                raise TypeError("convert_tokens_to_ids('<chosen>') returned a list")
+            chosen_token_id = int(tid)
+        none_tid = tokenizer.convert_tokens_to_ids("<none>")
+        if isinstance(none_tid, list):
+            raise TypeError("convert_tokens_to_ids('<none>') returned a list")
+        none_token_id = int(none_tid)
+        yes_tid = tokenizer.convert_tokens_to_ids("<yes>")
+        if isinstance(yes_tid, list):
+            raise TypeError("convert_tokens_to_ids('<yes>') returned a list")
+        yes_token_id = int(yes_tid)
+        no_tid = tokenizer.convert_tokens_to_ids("<no>")
+        if isinstance(no_tid, list):
+            raise TypeError("convert_tokens_to_ids('<no>') returned a list")
+        no_token_id = int(no_tid)
+        mulligan_tid = tokenizer.convert_tokens_to_ids("<mulligan>")
+        if isinstance(mulligan_tid, list):
+            raise TypeError("convert_tokens_to_ids('<mulligan>') returned a list")
+        mulligan_token_id = int(mulligan_tid)
+        keep_tid = tokenizer.convert_tokens_to_ids("<keep>")
+        if isinstance(keep_tid, list):
+            raise TypeError("convert_tokens_to_ids('<keep>') returned a list")
+        keep_token_id = int(keep_tid)
+        self_tid = tokenizer.convert_tokens_to_ids("<self>")
+        if isinstance(self_tid, list):
+            raise TypeError("convert_tokens_to_ids('<self>') returned a list")
+        self_token_id = int(self_tid)
+        opp_tid = tokenizer.convert_tokens_to_ids("<opp>")
+        if isinstance(opp_tid, list):
+            raise TypeError("convert_tokens_to_ids('<opp>') returned a list")
+        opp_token_id = int(opp_tid)
+        num_token_ids = []
+        for k in range(MAX_NUM):
+            tid = tokenizer.convert_tokens_to_ids(f"<num:{k}>")
+            if isinstance(tid, list):
+                raise TypeError(f"convert_tokens_to_ids('<num:{k}>') returned a list")
+            num_token_ids.append(int(tid))
+        mana_token_ids = []
+        for symbol in ("W", "U", "B", "R", "G", "C"):
+            tid = tokenizer.convert_tokens_to_ids(f"<mana:{symbol}>")
+            if isinstance(tid, list):
+                raise TypeError(f"convert_tokens_to_ids('<mana:{symbol}>') returned a list")
+            mana_token_ids.append(int(tid))
+        card_ref_token_ids = []
+        for k in range(MAX_CARD_REFS):
+            tid = tokenizer.convert_tokens_to_ids(f"<card-ref:{k}>")
+            if isinstance(tid, list):
+                raise TypeError(f"convert_tokens_to_ids('<card-ref:{k}>') returned a list")
+            card_ref_token_ids.append(int(tid))
         for snap, actions in zip(snapshots, action_lists, strict=True):
-            rendered = render_snapshot(snap, actions, oracle=oracle)
+            rendered = render_snapshot(
+                snap,
+                actions,
+                oracle=oracle,
+                chosen_token_id=chosen_token_id,
+                none_token_id=none_token_id,
+                yes_token_id=yes_token_id,
+                no_token_id=no_token_id,
+                mulligan_token_id=mulligan_token_id,
+                keep_token_id=keep_token_id,
+                self_token_id=self_token_id,
+                opp_token_id=opp_token_id,
+                num_token_ids=num_token_ids,
+                mana_token_ids=mana_token_ids,
+                card_ref_token_ids=card_ref_token_ids,
+            )
             examples.append(tokenize_snapshot(rendered, tokenizer))
 
         pad_id = tokenizer.pad_token_id

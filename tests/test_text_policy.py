@@ -171,6 +171,137 @@ def _snapshot_simple(names: list[str]) -> GameStateSnapshot:
     return cast(GameStateSnapshot, snap)
 
 
+def _snapshot_with_blockers(names: list[str]) -> GameStateSnapshot:
+    blocker_name, attacker_name = names[0], names[1]
+    blocker = _card("blocker-1", blocker_name, tapped=False)
+    attacker = _card("attacker-1", attacker_name, tapped=True)
+    snap: dict[str, object] = {
+        "turn": 4,
+        "active_player": "p2",
+        "step": "Declare Blockers",
+        "players": [
+            _player("p1", "Self", battlefield=[blocker]),
+            _player("p2", "Opp", battlefield=[attacker]),
+        ],
+        "pending": cast(
+            PendingState,
+            {
+                "kind": "blockers",
+                "player_idx": 0,
+                "options": [
+                    cast(
+                        PendingOptionState,
+                        {
+                            "id": "block-opt",
+                            "kind": "block",
+                            "permanent_id": blocker["ID"],
+                            "valid_targets": [
+                                cast(TargetState, {"id": attacker["ID"], "label": attacker_name})
+                            ],
+                        },
+                    )
+                ],
+            },
+        ),
+    }
+    return cast(GameStateSnapshot, snap)
+
+
+def _snapshot_with_may(names: list[str]) -> GameStateSnapshot:
+    a = names[0]
+    snap: dict[str, object] = {
+        "turn": 3,
+        "active_player": "p1",
+        "step": "Upkeep",
+        "players": [
+            _player("p1", "Self", battlefield=[_card("c1", a, tapped=False)]),
+            _player("p2", "Opp"),
+        ],
+        "pending": cast(PendingState, {"kind": "may", "player_idx": 0, "options": []}),
+    }
+    return cast(GameStateSnapshot, snap)
+
+
+def _snapshot_with_mode(names: list[str]) -> GameStateSnapshot:
+    a = names[0]
+    snap: dict[str, object] = {
+        "turn": 3,
+        "active_player": "p1",
+        "step": "Precombat Main",
+        "players": [
+            _player("p1", "Self", battlefield=[_card("c1", a, tapped=False)]),
+            _player("p2", "Opp"),
+        ],
+        "pending": cast(
+            PendingState,
+            {
+                "kind": "mode",
+                "player_idx": 0,
+                "options": [
+                    cast(PendingOptionState, {"id": "mode-0", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "mode-1", "kind": "choice"}),
+                ],
+            },
+        ),
+    }
+    return cast(GameStateSnapshot, snap)
+
+
+def _snapshot_with_number(names: list[str]) -> GameStateSnapshot:
+    a = names[0]
+    snap: dict[str, object] = {
+        "turn": 3,
+        "active_player": "p1",
+        "step": "Precombat Main",
+        "players": [
+            _player("p1", "Self", battlefield=[_card("c1", a, tapped=False)]),
+            _player("p2", "Opp"),
+        ],
+        "pending": cast(
+            PendingState,
+            {
+                "kind": "number",
+                "player_idx": 0,
+                "options": [
+                    cast(PendingOptionState, {"id": "x-0", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "x-1", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "x-2", "kind": "choice"}),
+                ],
+            },
+        ),
+    }
+    return cast(GameStateSnapshot, snap)
+
+
+def _snapshot_with_mana_color(names: list[str]) -> GameStateSnapshot:
+    a = names[0]
+    snap: dict[str, object] = {
+        "turn": 3,
+        "active_player": "p1",
+        "step": "Precombat Main",
+        "players": [
+            _player("p1", "Self", battlefield=[_card("c1", a, tapped=False)]),
+            _player("p2", "Opp"),
+        ],
+        "pending": cast(
+            PendingState,
+            {
+                "kind": "mana_color",
+                "player_idx": 0,
+                "options": [
+                    cast(PendingOptionState, {"id": "white", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "blue", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "black", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "red", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "green", "kind": "choice"}),
+                    cast(PendingOptionState, {"id": "colorless", "kind": "choice"}),
+                ],
+            },
+        ),
+    }
+    return cast(GameStateSnapshot, snap)
+
+
 # ---------------------------------------------------------------------------
 # End-to-end smoke
 # ---------------------------------------------------------------------------
@@ -216,33 +347,172 @@ def test_text_policy_end_to_end(
 
     out: TextPolicyOutput = policy(batch)
 
-    b_size, max_opts = batch.option_positions.shape
-    max_targets = batch.target_positions.shape[2]
+    b_size = batch.token_ids.shape[0]
     d = cfg.d_model
     k = batch.card_ref_positions.shape[1]
 
     # Shapes
-    assert out.policy_logits.shape == (b_size, max_opts)
-    assert out.target_logits.shape == (b_size, max_opts, max_targets)
     assert out.values.shape == (b_size,)
     assert out.card_vectors.shape == (b_size, k, d)
     assert out.card_mask.shape == (b_size, k)
-    assert out.option_vectors.shape == (b_size, max_opts, d)
-    assert out.option_mask.shape == (b_size, max_opts)
-    assert out.target_vectors.shape == (b_size, max_opts, max_targets, d)
-    assert out.target_mask.shape == (b_size, max_opts, max_targets)
     assert out.state_vector.shape == (b_size, d)
 
     # Finiteness on valid slots; -inf on masked-out logits.
     assert torch.isfinite(out.values).all()
     assert torch.isfinite(out.state_vector).all()
-    assert torch.isfinite(out.policy_logits[out.option_mask]).all()
-    assert (out.policy_logits[~out.option_mask] == float("-inf")).all()
-    assert torch.isfinite(out.target_logits[out.target_mask]).all()
-    assert (out.target_logits[~out.target_mask] == float("-inf")).all()
 
-    # At least one valid option in this batch.
-    assert out.option_mask.any()
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+
+
+def test_text_policy_inline_blank_forward(
+    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
+) -> None:
+    cfg = _small_cfg(tokenizer)
+    policy = build_text_policy(tokenizer, cfg)
+    batch = TextPolicy.encode_snapshots(
+        [_snapshot_with_action(real_card_names)],
+        actions_per_snapshot=None,
+        oracle=oracle,
+        tokenizer=tokenizer,
+    )
+
+    assert batch.blank_positions.shape[1] > 0
+    assert batch.blank_legal_mask.any()
+
+    out = policy(batch)
+
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+    assert (out.blank_logits[~batch.blank_legal_mask] == float("-inf")).all()
+    assert out.blank_group is batch.blank_group
+    assert out.blank_group_kind is batch.blank_group_kind
+
+
+def test_text_policy_inline_block_blank_forward(
+    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
+) -> None:
+    cfg = _small_cfg(tokenizer)
+    policy = build_text_policy(tokenizer, cfg)
+    batch = TextPolicy.encode_snapshots(
+        [_snapshot_with_blockers(real_card_names)],
+        actions_per_snapshot=None,
+        oracle=oracle,
+        tokenizer=tokenizer,
+    )
+
+    assert batch.blank_positions.shape == (1, 1)
+    assert batch.blank_legal_ids.shape == (1, 1, 2)
+    assert int(batch.blank_option_index[0, 0]) == 0
+    none_id = tokenizer.convert_tokens_to_ids("<none>")
+    assert int(batch.blank_legal_ids[0, 0, 0]) == int(none_id)
+
+    out = policy(batch)
+
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert out.blank_option_index is batch.blank_option_index
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+
+
+def test_text_policy_inline_may_blank_forward(
+    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
+) -> None:
+    cfg = _small_cfg(tokenizer)
+    policy = build_text_policy(tokenizer, cfg)
+    batch = TextPolicy.encode_snapshots(
+        [_snapshot_with_may(real_card_names)],
+        actions_per_snapshot=None,
+        oracle=oracle,
+        tokenizer=tokenizer,
+    )
+
+    assert batch.blank_positions.shape == (1, 1)
+    no_id = tokenizer.convert_tokens_to_ids("<no>")
+    yes_id = tokenizer.convert_tokens_to_ids("<yes>")
+    assert int(batch.blank_legal_ids[0, 0, 0]) == int(no_id)
+    assert int(batch.blank_legal_ids[0, 0, 1]) == int(yes_id)
+
+    out = policy(batch)
+
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+
+
+def test_text_policy_inline_mode_blank_forward(
+    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
+) -> None:
+    cfg = _small_cfg(tokenizer)
+    policy = build_text_policy(tokenizer, cfg)
+    batch = TextPolicy.encode_snapshots(
+        [_snapshot_with_mode(real_card_names)],
+        actions_per_snapshot=None,
+        oracle=oracle,
+        tokenizer=tokenizer,
+    )
+
+    assert batch.blank_positions.shape == (1, 1)
+    num0_id = tokenizer.convert_tokens_to_ids("<num:0>")
+    num1_id = tokenizer.convert_tokens_to_ids("<num:1>")
+    assert int(batch.blank_legal_ids[0, 0, 0]) == int(num0_id)
+    assert int(batch.blank_legal_ids[0, 0, 1]) == int(num1_id)
+
+    out = policy(batch)
+
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+
+
+def test_text_policy_inline_number_blank_forward(
+    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
+) -> None:
+    cfg = _small_cfg(tokenizer)
+    policy = build_text_policy(tokenizer, cfg)
+    batch = TextPolicy.encode_snapshots(
+        [_snapshot_with_number(real_card_names)],
+        actions_per_snapshot=None,
+        oracle=oracle,
+        tokenizer=tokenizer,
+    )
+
+    assert batch.blank_positions.shape == (1, 1)
+    for k in range(3):
+        num_id = tokenizer.convert_tokens_to_ids(f"<num:{k}>")
+        assert int(batch.blank_legal_ids[0, 0, k]) == int(num_id)
+
+    out = policy(batch)
+
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+
+
+def test_text_policy_inline_mana_color_blank_forward(
+    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
+) -> None:
+    cfg = _small_cfg(tokenizer)
+    policy = build_text_policy(tokenizer, cfg)
+    batch = TextPolicy.encode_snapshots(
+        [_snapshot_with_mana_color(real_card_names)],
+        actions_per_snapshot=None,
+        oracle=oracle,
+        tokenizer=tokenizer,
+    )
+
+    assert batch.blank_positions.shape == (1, 1)
+    for k, symbol in enumerate(("W", "U", "B", "R", "G", "C")):
+        mana_id = tokenizer.convert_tokens_to_ids(f"<mana:{symbol}>")
+        assert int(batch.blank_legal_ids[0, 0, k]) == int(mana_id)
+
+    out = policy(batch)
+
+    assert out.blank_logits is not None
+    assert out.blank_logits.shape == batch.blank_legal_ids.shape
+    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
 
 
 def test_text_policy_backward(
@@ -254,11 +524,8 @@ def test_text_policy_backward(
 
     out = policy(batch)
 
-    loss = (
-        out.values.sum()
-        + out.policy_logits[out.option_mask].sum()
-        + out.target_logits[out.target_mask].sum()
-    )
+    assert out.blank_logits is not None
+    loss = out.values.sum() + out.blank_logits[batch.blank_legal_mask].sum()
     loss.backward()
 
     grad_norms = [
@@ -377,12 +644,8 @@ def test_hf_text_policy_copies_checkpoint_into_local_encoder(monkeypatch) -> Non
         token_ids=torch.tensor([[1, 2, 0], [3, 0, 0]], dtype=torch.int64),
         attention_mask=torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.int64),
         card_ref_positions=torch.full((2, 256), -1, dtype=torch.int64),
-        option_positions=torch.tensor([[0], [0]], dtype=torch.int64),
-        option_mask=torch.ones((2, 1), dtype=torch.bool),
-        target_positions=torch.full((2, 1, 0), -1, dtype=torch.int64),
-        target_mask=torch.zeros((2, 1, 0), dtype=torch.bool),
         seq_lengths=torch.tensor([2, 1], dtype=torch.int64),
     )
     out = policy(batch)
     assert out.state_vector.shape == (2, 16)
-    assert out.option_vectors.shape == (2, 1, 16)
+    assert out.values.shape == (2,)

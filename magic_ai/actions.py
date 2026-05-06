@@ -45,6 +45,7 @@ PENDING_KINDS = (
     "may",
     "mode",
     "number",
+    "mulligan",
     "unknown",
 )
 TARGET_TYPES = ("player", "permanent", "card", "unknown", "empty")
@@ -697,6 +698,40 @@ def action_from_blockers(
         if blocker_id and attacker_id:
             assignments.append({"blocker": blocker_id, "attacker": attacker_id})
     return cast(ActionRequest, {"blockers": assignments})
+
+
+def action_from_inline_block_choices(
+    pending: PendingState,
+    option_indices: Tensor | list[int],
+    legal_slot_indices: Tensor | list[int],
+) -> ActionRequest:
+    """Decode inline block blanks back into the existing blocker action shape.
+
+    Inline `<choose-block>` blanks use legal slot 0 for `<none>` and slots
+    1..N for the option's `valid_targets`. `option_indices` maps each blank
+    back to the corresponding pending option index.
+    """
+
+    target_indices = [-1] * len(pending.get("options", []))
+    for raw_option_idx, raw_legal_slot_idx in zip(
+        option_indices,
+        legal_slot_indices,
+        strict=False,
+    ):
+        option_idx = (
+            int(raw_option_idx.item())
+            if isinstance(raw_option_idx, Tensor)
+            else int(raw_option_idx)
+        )
+        legal_slot_idx = (
+            int(raw_legal_slot_idx.item())
+            if isinstance(raw_legal_slot_idx, Tensor)
+            else int(raw_legal_slot_idx)
+        )
+        if not 0 <= option_idx < len(target_indices):
+            continue
+        target_indices[option_idx] = legal_slot_idx - 1
+    return action_from_blockers(pending, target_indices)
 
 
 def action_from_choice_index(index: int) -> ActionRequest:

@@ -13,7 +13,8 @@ Utility scripts for building data pipelines, evaluating card embeddings, pretrai
 - `compare_reports.py` — Display side-by-side comparison of eval_card_embeddings JSON reports with delta highlighting.
 - `eval_card_embeddings.py` — Evaluate embeddings against triplet/synonym/cluster labels and compute composite scores.
 - `jsonl_games_to_bin.py` — Convert recorded `*.jsonl.gz` game logs into per-game uint16 `.bin` token streams (one rendered snapshot per decision point) for MLM pretraining; pass `--with-value-labels` to also emit a `<gameId>.json` sidecar (winner_id, players, per-span perspective-signed labels) for value-head pretraining.
-- `play_text_rollout.py` — Run smoke-test episodes with RecurrentTextPolicy against the mage engine.
-- `pretrain_text_encoder.py` — Smoke-test the text encoder training loop with synthetic data (value or distill mode).
+- `inline_blank_bc_parity.py` — Priority-only inline-blank BC smoke gate on fixed JSONL traces or a synthetic fixture.
+- `play_text_rollout.py` — Run smoke-test episodes with RecurrentTextPolicy against the mage engine; can emit priority JSONL traces for the inline-blank BC gate.
+- `pretrain_text_encoder.py` — Smoke-test the text encoder value training loop with synthetic data.
 - `synth_embedding_eval.py` — Evaluate synthetic card embeddings for invariance and analogies under rules-text encoding.
 - `train.py` — Train a PPO self-play policy against the mage-go Python engine.

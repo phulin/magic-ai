@@ -9,16 +9,12 @@ from __future__ import annotations
 
 import torch
 from magic_ai.text_encoder.render_plan import (
-    OP_CLOSE_ACTIONS,
     OP_CLOSE_STATE,
     OP_CLOSE_ZONE,
     OP_LITERAL_TOKENS,
-    OP_OPEN_ACTIONS,
     OP_OPEN_STATE,
     OP_OPEN_ZONE,
-    OP_OPTION,
     OP_PLACE_CARD,
-    OP_TARGET,
     OPCODE_ARITY,
     OWNER_OPP,
     OWNER_SELF,
@@ -37,10 +33,6 @@ def test_writer_round_trip() -> None:
     w.emit_place_card(0, 7, STATUS_TAPPED | STATUS_TAPPED_KNOWN, 0)
     w.emit_end_card()
     w.emit_close_zone()
-    w.emit_open_actions()
-    w.emit_option(0, 0, 0, -1, -1)
-    w.emit_target(7, 0, 1)
-    w.emit_close_actions()
     w.emit_close_state()
 
     buf = w.finalize()
@@ -72,10 +64,6 @@ def test_writer_round_trip() -> None:
         # OP_END_CARD has arity 0.
         (18, []),  # OP_END_CARD = 18
         (OP_CLOSE_ZONE, []),
-        (OP_OPEN_ACTIONS, []),
-        (OP_OPTION, [0, 0, 0, -1, -1]),
-        (OP_TARGET, [7, 0, 1]),
-        (OP_CLOSE_ACTIONS, []),
         (OP_CLOSE_STATE, []),
     ]
     assert seen == expected
@@ -98,14 +86,10 @@ def test_arity_table_covers_every_emit_method() -> None:
     w.emit_close_player()
     w.emit_open_zone(0, 0)
     w.emit_close_zone()
-    w.emit_open_actions()
-    w.emit_close_actions()
     w.emit_place_card(0, 0, 0, -1)
     w.emit_end_card()
     w.emit_counter(0, 0)
     w.emit_attached_to(-1)
-    w.emit_option(0, 0, -1, -1, -1)
-    w.emit_target(0, -1, 0)
     w.emit_open_raw_card(-1)
     w.emit_close_raw_card()
     w.emit_literal_tokens([1, 2, 3])
@@ -122,5 +106,5 @@ def test_arity_table_covers_every_emit_method() -> None:
         else:
             i += 1 + arity
         n_ops += 1
-    assert n_ops == 17
+    assert n_ops == 13
     assert i == buf.shape[0]

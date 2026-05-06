@@ -40,12 +40,8 @@ def _make_packed_batch(rows: list[int], *, anchor_token_offset: int = 0) -> Pack
     seq_id = torch.repeat_interleave(torch.arange(len(rows), dtype=torch.int32), rows_t)
     pos_in_seq = torch.arange(total, dtype=torch.int32) - state_pos.repeat_interleave(rows_t)
     token_ids = torch.arange(total, dtype=torch.int32) + 1
-    option_pos = state_pos.unsqueeze(1).clone() + anchor_token_offset
-    option_pos = torch.where(option_pos >= 0, option_pos, torch.full_like(option_pos, -1))
-    option_mask = torch.ones((len(rows), 1), dtype=torch.bool)
-    target_pos = torch.full((len(rows), 1, 1), -1, dtype=torch.int32)
-    target_mask = torch.zeros((len(rows), 1, 1), dtype=torch.bool)
-    card_ref_pos = torch.full((len(rows), 1), -1, dtype=torch.int32)
+    card_ref_pos = state_pos.unsqueeze(1).clone() + anchor_token_offset
+    card_ref_pos = torch.where(card_ref_pos >= 0, card_ref_pos, torch.full_like(card_ref_pos, -1))
     return PackedTextBatch(
         token_ids=token_ids,
         seq_id=seq_id,
@@ -54,10 +50,6 @@ def _make_packed_batch(rows: list[int], *, anchor_token_offset: int = 0) -> Pack
         seq_lengths=rows_t,
         state_positions=state_pos,
         card_ref_positions=card_ref_pos,
-        option_positions=option_pos,
-        option_mask=option_mask,
-        target_positions=target_pos,
-        target_mask=target_mask,
     )
 
 
@@ -76,9 +68,9 @@ class ConcatPackedBatchTest(unittest.TestCase):
             merged.state_positions,
             torch.tensor([0, 3, 5], dtype=torch.int32),
         )
-        # b's option position (row-local 1, state 5 → global 6).
+        # b's card-ref position (row-local 1, state 5 -> global 6).
         torch.testing.assert_close(
-            merged.option_positions[2],
+            merged.card_ref_positions[2],
             torch.tensor([6], dtype=torch.int32),
         )
         # seq_id contiguous and shifted (a: rows 0,1; b: row 2)
@@ -190,6 +182,7 @@ class _FakePolicy:
             decision_mask=torch.ones(b, 2, dtype=torch.bool),
             uses_none_head=torch.zeros(b, dtype=torch.bool),
             selected_indices=torch.zeros(b, dtype=torch.int64),
+            behavior_action_log_prob=torch.zeros(b, dtype=torch.float32),
             may_selected=torch.zeros(b, dtype=torch.float32),
             old_log_prob=torch.full((b,), -0.5, dtype=torch.float32),
             value=torch.linspace(0.0, 1.0, b, dtype=torch.float32, device=device),

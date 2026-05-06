@@ -381,6 +381,8 @@ class NativeTextTrajectoryBuffer:
         self.max_tokens = replay_buffer.max_tokens
         self.max_options = replay_buffer.max_options
         self.max_targets_per_option = replay_buffer.max_targets_per_option
+        self.max_blanks_per_row = replay_buffer.max_blanks_per_row
+        self.max_legal_per_blank = replay_buffer.max_legal_per_blank
         self.max_decision_groups = replay_buffer.max_decision_groups
         self.max_cached_choices = replay_buffer.max_cached_choices
         self.max_card_refs = replay_buffer.max_card_refs
@@ -397,22 +399,32 @@ class NativeTextTrajectoryBuffer:
         self.card_ref_positions = torch.full(
             (*shape, self.max_card_refs), -1, dtype=torch.int32, device=self.device
         )
-        self.option_positions = torch.full(
-            (*shape, self.max_options), -1, dtype=torch.int32, device=self.device
+        self.blank_positions = torch.full(
+            (*shape, self.max_blanks_per_row), -1, dtype=torch.int32, device=self.device
         )
-        self.option_mask = torch.zeros(
-            *shape, self.max_options, dtype=torch.bool, device=self.device
+        self.blank_kind = torch.zeros(
+            *shape, self.max_blanks_per_row, dtype=torch.int32, device=self.device
         )
-        self.target_positions = torch.full(
-            (*shape, self.max_options, self.max_targets_per_option),
-            -1,
+        self.blank_group = torch.full(
+            (*shape, self.max_blanks_per_row), -1, dtype=torch.int32, device=self.device
+        )
+        self.blank_group_kind = torch.zeros(
+            *shape, self.max_blanks_per_row, dtype=torch.int32, device=self.device
+        )
+        self.blank_option_index = torch.full(
+            (*shape, self.max_blanks_per_row), -1, dtype=torch.int32, device=self.device
+        )
+        self.blank_legal_ids = torch.zeros(
+            *shape,
+            self.max_blanks_per_row,
+            self.max_legal_per_blank,
             dtype=torch.int32,
             device=self.device,
         )
-        self.target_mask = torch.zeros(
+        self.blank_legal_mask = torch.zeros(
             *shape,
-            self.max_options,
-            self.max_targets_per_option,
+            self.max_blanks_per_row,
+            self.max_legal_per_blank,
             dtype=torch.bool,
             device=self.device,
         )
@@ -514,28 +526,43 @@ class NativeTextTrajectoryBuffer:
             encoded.card_ref_positions,
             (batch_size, 1),
         )
-        option_width = min(int(encoded.option_positions.shape[1]), self.max_options)
-        target_width = min(int(encoded.target_positions.shape[2]), self.max_targets_per_option)
-        self.option_positions[env_t, step_t].fill_(-1)
-        self.option_mask[env_t, step_t].zero_()
-        self.target_positions[env_t, step_t].fill_(-1)
-        self.target_mask[env_t, step_t].zero_()
-        if option_width > 0:
-            self.option_positions[env_t, step_t, :option_width] = rebase_positions(
-                encoded.option_positions[:, :option_width],
+        blank_width = min(int(encoded.blank_positions.shape[1]), self.max_blanks_per_row)
+        blank_legal_width = min(int(encoded.blank_legal_ids.shape[2]), self.max_legal_per_blank)
+        self.blank_positions[env_t, step_t].fill_(-1)
+        self.blank_kind[env_t, step_t].zero_()
+        self.blank_group[env_t, step_t].fill_(-1)
+        self.blank_group_kind[env_t, step_t].zero_()
+        self.blank_option_index[env_t, step_t].fill_(-1)
+        self.blank_legal_ids[env_t, step_t].zero_()
+        self.blank_legal_mask[env_t, step_t].zero_()
+        if blank_width > 0:
+            self.blank_positions[env_t, step_t, :blank_width] = rebase_positions(
+                encoded.blank_positions[:, :blank_width],
                 (batch_size, 1),
             )
-            self.option_mask[env_t, step_t, :option_width] = encoded.option_mask[
-                :, :option_width
-            ].to(device=self.device, dtype=torch.bool)
-        if option_width > 0 and target_width > 0:
-            self.target_positions[env_t, step_t, :option_width, :target_width] = rebase_positions(
-                encoded.target_positions[:, :option_width, :target_width],
-                (batch_size, 1, 1),
+            self.blank_kind[env_t, step_t, :blank_width] = encoded.blank_kind[:, :blank_width].to(
+                device=self.device, dtype=torch.int32
             )
-            self.target_mask[env_t, step_t, :option_width, :target_width] = encoded.target_mask[
-                :, :option_width, :target_width
-            ].to(device=self.device, dtype=torch.bool)
+            self.blank_group[env_t, step_t, :blank_width] = encoded.blank_group[:, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+            self.blank_group_kind[env_t, step_t, :blank_width] = encoded.blank_group_kind[
+                :, :blank_width
+            ].to(device=self.device, dtype=torch.int32)
+            self.blank_option_index[env_t, step_t, :blank_width] = encoded.blank_option_index[
+                :, :blank_width
+            ].to(device=self.device, dtype=torch.int32)
+            if blank_legal_width > 0:
+                self.blank_legal_ids[env_t, step_t, :blank_width, :blank_legal_width] = (
+                    encoded.blank_legal_ids[:, :blank_width, :blank_legal_width].to(
+                        device=self.device, dtype=torch.int32
+                    )
+                )
+                self.blank_legal_mask[env_t, step_t, :blank_width, :blank_legal_width] = (
+                    encoded.blank_legal_mask[:, :blank_width, :blank_legal_width].to(
+                        device=self.device, dtype=torch.bool
+                    )
+                )
 
         decision_count = payload.decision_count.to(device=self.device, dtype=torch.long)
         decision_count_host = payload.decision_count_host
@@ -751,10 +778,13 @@ class NativeTextTrajectoryBuffer:
             seq_lengths=seq_lengths,
             seq_lengths_host=seq_lengths_host,
             card_ref_positions=self.card_ref_positions,
-            option_positions=self.option_positions,
-            option_mask=self.option_mask,
-            target_positions=self.target_positions,
-            target_mask=self.target_mask,
+            blank_positions=self.blank_positions,
+            blank_kind=self.blank_kind,
+            blank_group=self.blank_group,
+            blank_group_kind=self.blank_group_kind,
+            blank_option_index=self.blank_option_index,
+            blank_legal_ids=self.blank_legal_ids,
+            blank_legal_mask=self.blank_legal_mask,
             trace_kind_id=self.trace_kind_id[flat_env, flat_step],
             decision_count=decision_count,
             decision_count_host=decision_count_host,
@@ -1909,6 +1939,9 @@ def main() -> None:
     validate_args(args)
     initialize_game_log(game_log_path(args))
     _maybe_install_sync_debug()
+    trace_path = priority_trace_jsonl_path(args)
+    if trace_path is not None:
+        initialize_game_log(trace_path)
     if args.learning_rate is None:
         args.learning_rate = 5e-5 if args.trainer == "rnad" else 3e-4
     deck_pool = load_deck_pool(args.deck_json, args.deck_dir, args.jumpstart_dir)
@@ -2566,6 +2599,15 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GAME_LOG_PATH,
         help="path for sampled game transcripts; rewritten at the start of training",
     )
+    parser.add_argument(
+        "--priority-trace-jsonl-path",
+        type=Path,
+        default=None,
+        help=(
+            "optional JSONL path for sampled priority transcript rows; suitable for "
+            "scripts/inline_blank_bc_parity.py --trace-jsonl"
+        ),
+    )
     parser.add_argument("--wandb-project", default="magic-ai")
     parser.add_argument("--wandb-run-name", default=None)
     parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
@@ -2877,6 +2919,11 @@ def game_log_path(args: argparse.Namespace) -> Path:
     return Path(getattr(args, "game_log_path", DEFAULT_GAME_LOG_PATH))
 
 
+def priority_trace_jsonl_path(args: argparse.Namespace) -> Path | None:
+    path = getattr(args, "priority_trace_jsonl_path", None)
+    return None if path is None else Path(path)
+
+
 def append_sample_game_log(
     path: Path,
     transcript: list[TranscriptAction],
@@ -2898,6 +2945,40 @@ def append_sample_game_log(
         )
         handle.write("\n".join(lines))
         handle.write("\n\n")
+
+
+def append_priority_trace_jsonl(
+    path: Path | None,
+    transcript: list[TranscriptAction],
+    *,
+    episode_idx: int,
+    winner_idx: int,
+    encoder: str,
+) -> None:
+    """Append gate-ready priority transcript rows for inline-blank BC parity."""
+
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        for action_idx, item in enumerate(transcript):
+            if item.pending.get("kind") != "priority":
+                continue
+            handle.write(
+                json.dumps(
+                    {
+                        "episode_idx": int(episode_idx),
+                        "action_idx": int(action_idx),
+                        "winner_idx": int(winner_idx),
+                        "encoder": encoder,
+                        "state": item.state,
+                        "pending": item.pending,
+                        "action": item.action,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
 
 
 def rollout_value_metrics(
@@ -3198,6 +3279,13 @@ def train_native_batched_envs(
                     episode_idx=env.episode_idx,
                     winner_idx=winner_idx,
                     max_actions=args.sample_actions,
+                    encoder="slots",
+                )
+                append_priority_trace_jsonl(
+                    priority_trace_jsonl_path(args),
+                    env.transcript,
+                    episode_idx=env.episode_idx,
+                    winner_idx=winner_idx,
                     encoder="slots",
                 )
                 print_sample_game(
@@ -3825,6 +3913,13 @@ def train_text_envs(
             max_actions=args.sample_actions,
             encoder="text",
         )
+        append_priority_trace_jsonl(
+            priority_trace_jsonl_path(args),
+            transcript,
+            episode_idx=episode_idx,
+            winner_idx=winner_idx,
+            encoder="text",
+        )
         completed_games += 1
         if is_timeout:
             win_stats.timeouts += 1
@@ -4258,6 +4353,13 @@ def train_text_native_batched_envs(
                     episode_idx=env.episode_idx,
                     winner_idx=winner_idx,
                     max_actions=args.sample_actions,
+                    encoder="text",
+                )
+                append_priority_trace_jsonl(
+                    priority_trace_jsonl_path(args),
+                    env.transcript,
+                    episode_idx=env.episode_idx,
+                    winner_idx=winner_idx,
                     encoder="text",
                 )
             free_slots.append(env.slot_idx)
@@ -4988,7 +5090,7 @@ def train_text_native_batched_envs(
                     max_card_refs=256,
                 )
                 packed_text_batch = nat_outputs.to_packed_text_batch(
-                    trim=False, derive_token_metadata=False
+                    trim=True, derive_token_metadata=False
                 )
             else:
                 native_batch = native_encoder.encode_handles(

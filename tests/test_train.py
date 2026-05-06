@@ -19,6 +19,7 @@ from magic_ai.slot_encoder.game_state import GameStateEncoder
 from magic_ai.slot_encoder.model import PPOPolicy
 from magic_ai.text_encoder.actor_critic import NativeTextReplayPayload
 from magic_ai.text_encoder.batch import TextEncodedBatch, pack_batch
+from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from scripts.train import (
@@ -32,6 +33,7 @@ from scripts.train import (
     _restore_opponent_pool,
     _should_run_mlm_pretrain,
     _should_run_value_pretrain,
+    append_priority_trace_jsonl,
     append_sample_game_log,
     build_slot_backend,
     build_text_backend,
@@ -43,6 +45,7 @@ from scripts.train import (
     log_ppo_stats,
     log_retrospective_table,
     main,
+    priority_trace_jsonl_path,
     retrospective_rating_rows,
     sample_decks,
     sample_text_policy_batch,
@@ -238,6 +241,70 @@ class TrainPPOTests(unittest.TestCase):
         self.assertNotIn("stale", text)
         self.assertIn("encoder=text episode=7 winner=0", text)
         self.assertIn("pass", text)
+
+    def test_priority_trace_jsonl_appends_only_priority_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "priority.jsonl"
+            transcript = [
+                train_mod.TranscriptAction(
+                    state=cast(
+                        GameStateSnapshot,
+                        {
+                            "players": [
+                                {"ID": "A", "Name": "A", "Life": 20},
+                                {"ID": "B", "Name": "B", "Life": 20},
+                            ],
+                            "active_player": "A",
+                            "turn": 1,
+                            "step": "Precombat Main",
+                        },
+                    ),
+                    pending=cast(
+                        PendingState,
+                        {"kind": "priority", "player_idx": 0, "options": []},
+                    ),
+                    action={"kind": "pass"},
+                ),
+                train_mod.TranscriptAction(
+                    state=cast(
+                        GameStateSnapshot,
+                        {
+                            "players": [],
+                            "active_player": "A",
+                            "turn": 1,
+                            "step": "Declare Attackers",
+                        },
+                    ),
+                    pending=cast(
+                        PendingState,
+                        {"kind": "attackers", "player_idx": 0, "options": []},
+                    ),
+                    action={"attackers": []},
+                ),
+            ]
+
+            append_priority_trace_jsonl(
+                path,
+                transcript,
+                episode_idx=3,
+                winner_idx=1,
+                encoder="text",
+            )
+
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["episode_idx"], 3)
+        self.assertEqual(rows[0]["action_idx"], 0)
+        self.assertEqual(rows[0]["winner_idx"], 1)
+        self.assertEqual(rows[0]["encoder"], "text")
+        self.assertEqual(rows[0]["pending"]["kind"], "priority")
+        self.assertEqual(rows[0]["action"], {"kind": "pass"})
+
+    def test_priority_trace_jsonl_path_defaults_to_none(self) -> None:
+        self.assertIsNone(priority_trace_jsonl_path(Namespace()))
+        path = Path("/tmp/priority.jsonl")
+        self.assertEqual(priority_trace_jsonl_path(Namespace(priority_trace_jsonl_path=path)), path)
 
     def test_gae_returns_flips_bootstrap_sign_for_opponent_steps(self) -> None:
         steps = [
@@ -640,20 +707,19 @@ class TrainPPOTests(unittest.TestCase):
             token_ids = torch.tensor([[1, 4, 5, 2]], dtype=torch.long)
             attention_mask = torch.ones_like(token_ids)
             card_ref_positions = torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long)
-            option_positions = torch.tensor([[1, 2]], dtype=torch.long)
-            option_mask = torch.tensor([[True, True]])
-            target_positions = torch.full((1, 2, 1), -1, dtype=torch.long)
-            target_mask = torch.zeros((1, 2, 1), dtype=torch.bool)
             seq_lengths = torch.tensor([4], dtype=torch.long)
             return TextEncodedBatch(
                 token_ids=token_ids,
                 attention_mask=attention_mask,
                 card_ref_positions=card_ref_positions,
-                option_positions=option_positions,
-                option_mask=option_mask,
-                target_positions=target_positions,
-                target_mask=target_mask,
                 seq_lengths=seq_lengths,
+                blank_positions=torch.tensor([[1, 2]], dtype=torch.int32),
+                blank_kind=torch.ones(1, 2, dtype=torch.int32),
+                blank_group=torch.zeros(1, 2, dtype=torch.int32),
+                blank_group_kind=torch.full((1, 2), BLANK_GROUP_CROSS_BLANK, dtype=torch.int32),
+                blank_option_index=torch.tensor([[0, 1]], dtype=torch.int32),
+                blank_legal_ids=torch.ones(1, 2, 1, dtype=torch.int32),
+                blank_legal_mask=torch.ones(1, 2, 1, dtype=torch.bool),
             )
 
         cache = CardTokenCache(
@@ -932,10 +998,6 @@ class TrainPPOTests(unittest.TestCase):
             token_ids=torch.tensor([[101, 102, 103, 0, 0], [201, 202, 0, 0, 0]]),
             attention_mask=torch.tensor([[1, 1, 1, 0, 0], [1, 1, 0, 0, 0]]),
             card_ref_positions=torch.full((2, MAX_CARD_REFS), -1, dtype=torch.long),
-            option_positions=torch.tensor([[1, -1, -1], [0, -1, -1]]),
-            option_mask=torch.tensor([[True, False, False], [True, False, False]]),
-            target_positions=torch.full((2, 3, 2), -1, dtype=torch.long),
-            target_mask=torch.zeros((2, 3, 2), dtype=torch.bool),
             seq_lengths=torch.tensor([3, 2]),
         )
         payload = NativeTextReplayPayload(
@@ -950,6 +1012,7 @@ class TrainPPOTests(unittest.TestCase):
             decision_mask=torch.tensor([[True, False, False, False]]).expand(2, -1),
             uses_none_head=torch.tensor([False, True]),
             selected_indices=torch.tensor([0, 0]),
+            behavior_action_log_prob=torch.zeros(2),
             may_selected=torch.tensor([0.0, 1.0]),
             old_log_prob=torch.tensor([-0.1, -0.2]),
             value=torch.tensor([0.3, 0.4]),

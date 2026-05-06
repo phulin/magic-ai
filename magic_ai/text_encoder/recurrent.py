@@ -38,16 +38,11 @@ class RecurrentTextPolicyConfig:
 
 @dataclass
 class RecurrentTextPolicyOutput:
-    policy_logits: Tensor  # [B, max_opts]
-    target_logits: Tensor  # [B, max_opts, max_targets]
     values: Tensor  # [B]
     state_hidden: Tensor  # [B, lstm_hidden]
-    option_vectors: Tensor  # [B, max_opts, d_model]
-    option_mask: Tensor
-    target_vectors: Tensor
-    target_mask: Tensor
     card_vectors: Tensor
     card_mask: Tensor
+    blank_logits: Tensor | None = None
     lstm_input: Tensor | None = None  # [B, lstm_hidden] in_proj(state_vector); None when bypassed
 
 
@@ -202,21 +197,14 @@ class RecurrentTextPolicy(nn.Module):
             state_hidden = y.squeeze(1)
 
         state_for_heads = self.out_proj(state_hidden)
-        policy_logits, target_logits, values = self.text_policy.run_heads(
-            encoded, state_vec=state_for_heads
-        )
+        values = self.text_policy.run_heads(encoded, state_vec=state_for_heads)
 
         out = RecurrentTextPolicyOutput(
-            policy_logits=policy_logits,
-            target_logits=target_logits,
             values=values,
             state_hidden=state_hidden,
-            option_vectors=encoded.option_vectors,
-            option_mask=encoded.option_mask,
-            target_vectors=encoded.target_vectors,
-            target_mask=encoded.target_mask,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,
+            blank_logits=encoded.blank_logits,
             lstm_input=lstm_input,
         )
         return out, (h_out, c_out)
@@ -242,20 +230,13 @@ class RecurrentTextPolicy(nn.Module):
             device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
         ):
             state_for_heads = self.out_proj(state_hidden)
-            policy_logits, target_logits, values = self.text_policy.run_heads(
-                encoded, state_vec=state_for_heads
-            )
+            values = self.text_policy.run_heads(encoded, state_vec=state_for_heads)
         return RecurrentTextPolicyOutput(
-            policy_logits=policy_logits,
-            target_logits=target_logits,
             values=values,
             state_hidden=state_hidden,
-            option_vectors=encoded.option_vectors,
-            option_mask=encoded.option_mask,
-            target_vectors=encoded.target_vectors,
-            target_mask=encoded.target_mask,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,
+            blank_logits=encoded.blank_logits,
         )
 
 

@@ -5,15 +5,12 @@ from __future__ import annotations
 import torch
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.model import (
-    PolicyHead,
-    TargetHead,
+    InlineBlankPolicy,
     TextEncoderConfig,
     TextStateEncoder,
     ValueHead,
     gather_card_vectors,
-    gather_option_vectors,
     gather_state_vector,
-    gather_target_vectors,
 )
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -21,8 +18,6 @@ from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 def _make_batch(
     b: int = 2,
     t: int = 24,
-    max_opts: int = 4,
-    max_targets: int = 3,
     vocab_size: int = 1000,
 ) -> TextEncodedBatch:
     torch.manual_seed(0)
@@ -39,27 +34,10 @@ def _make_batch(
     card_ref_positions[0, :3] = torch.tensor([2, 5, 8])
     card_ref_positions[1, :2] = torch.tensor([3, 6])
 
-    # Options: 3 valid in row 0, 2 valid in row 1.
-    option_positions = torch.full((b, max_opts), -1, dtype=torch.int64)
-    option_positions[0, :3] = torch.tensor([10, 14, 18])
-    option_positions[1, :2] = torch.tensor([9, 13])
-    option_mask = option_positions >= 0
-
-    # Targets per option.
-    target_positions = torch.full((b, max_opts, max_targets), -1, dtype=torch.int64)
-    target_positions[0, 0, :2] = torch.tensor([11, 12])
-    target_positions[0, 1, :1] = torch.tensor([15])
-    target_positions[1, 0, :3] = torch.tensor([10, 11, 12])
-    target_mask = target_positions >= 0
-
     return TextEncodedBatch(
         token_ids=token_ids,
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
-        option_positions=option_positions,
-        option_mask=option_mask,
-        target_positions=target_positions,
-        target_mask=target_mask,
         seq_lengths=seq_lens,
     )
 
@@ -81,53 +59,66 @@ def test_text_encoder_forward_pooling_heads_backward() -> None:
     assert (card_vecs[~card_mask] == 0).all()
     assert card_mask[0, :3].all() and not card_mask[0, 3:].any()
 
-    # Options.
-    opt_vecs, opt_mask = gather_option_vectors(hidden, batch)
-    assert opt_vecs.shape == (2, 4, cfg.d_model)
-    assert opt_mask.shape == (2, 4)
-    assert (opt_vecs[~opt_mask] == 0).all()
-
-    # Targets.
-    tgt_vecs, tgt_mask = gather_target_vectors(hidden, batch)
-    assert tgt_vecs.shape == (2, 4, 3, cfg.d_model)
-    assert tgt_mask.shape == (2, 4, 3)
-    assert (tgt_vecs[~tgt_mask] == 0).all()
-
     # State.
     state_vec = gather_state_vector(hidden, batch)
     assert state_vec.shape == (2, cfg.d_model)
     assert torch.allclose(state_vec, hidden[:, 0, :])
 
-    # Heads.
-    policy = PolicyHead(cfg.d_model)
-    target = TargetHead(cfg.d_model)
+    # Value head.
     value = ValueHead(cfg.d_model)
-
-    policy_logits = policy(opt_vecs, state_vec, opt_mask)
-    assert policy_logits.shape == (2, 4)
-    assert (policy_logits[~opt_mask] == float("-inf")).all()
-    assert torch.isfinite(policy_logits[opt_mask]).all()
-
-    target_logits = target(tgt_vecs, opt_vecs, state_vec, tgt_mask)
-    assert target_logits.shape == (2, 4, 3)
-    assert (target_logits[~tgt_mask] == float("-inf")).all()
-    assert torch.isfinite(target_logits[tgt_mask]).all()
 
     values = value(state_vec)
     assert values.shape == (2,)
     assert torch.isfinite(values).all()
 
     # Backward smoke.
-    valid_policy = policy_logits[opt_mask]
-    loss = values.sum() + valid_policy.sum() + target_logits[tgt_mask].sum()
+    loss = values.sum() + card_vecs[card_mask].sum()
     loss.backward()
 
     grad_norms = [
         p.grad.detach().abs().sum().item()
-        for p in list(encoder.parameters()) + list(policy.parameters()) + list(value.parameters())
+        for p in list(encoder.parameters()) + list(value.parameters())
         if p.grad is not None
     ]
     assert any(g > 0 for g in grad_norms)
+
+
+def test_inline_blank_policy_scores_legal_candidates_and_masks_padding() -> None:
+    torch.manual_seed(0)
+    vocab_size = 32
+    d_model = 8
+    embed = torch.nn.Embedding(vocab_size, d_model)
+    dense = torch.nn.Linear(d_model, d_model)
+    norm = torch.nn.LayerNorm(d_model)
+    head = InlineBlankPolicy(embed, dense, norm, num_kinds=vocab_size)
+
+    hidden = torch.randn(2, 5, d_model, requires_grad=True)
+    blank_positions = torch.tensor([[1, 3], [2, -1]], dtype=torch.int32)
+    blank_kind = torch.tensor([[4, 5], [6, 0]], dtype=torch.int32)
+    blank_legal_ids = torch.tensor(
+        [
+            [[7, 8, 0], [9, 10, 11]],
+            [[12, 13, 0], [0, 0, 0]],
+        ],
+        dtype=torch.int32,
+    )
+    blank_legal_mask = torch.tensor(
+        [
+            [[True, True, False], [True, True, True]],
+            [[True, True, False], [False, False, False]],
+        ]
+    )
+
+    logits = head(hidden, blank_positions, blank_kind, blank_legal_ids, blank_legal_mask)
+
+    assert logits.shape == (2, 2, 3)
+    assert torch.isfinite(logits[blank_legal_mask]).all()
+    assert (logits[~blank_legal_mask] == float("-inf")).all()
+
+    loss = logits[blank_legal_mask].sum()
+    loss.backward()
+    assert hidden.grad is not None
+    assert float(hidden.grad.detach().abs().sum().item()) > 0
 
 
 def test_local_window_collapses_to_global_when_oversized() -> None:

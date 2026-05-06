@@ -108,6 +108,38 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
             out_parts.append(torch.where(valid, t + int(off), t))
         return torch.cat(out_parts, dim=0)
 
+    max_blanks = max((int(b.blank_positions.shape[1]) for b in batches), default=0)
+    max_legal = max((int(b.blank_legal_ids.shape[2]) for b in batches), default=0)
+
+    def _pad_blank_2d(name: str, *, fill: int = 0, shift: bool = False) -> torch.Tensor:
+        parts: list[torch.Tensor] = []
+        for b, off in zip(batches, token_offsets.tolist(), strict=True):
+            t = cast(torch.Tensor, getattr(b, name)).to(torch.int32)
+            rows = int(t.shape[0])
+            out = torch.full((rows, max_blanks), fill, dtype=torch.int32, device=t.device)
+            cols = int(t.shape[1])
+            if cols > 0:
+                src = t[:, :cols]
+                if shift:
+                    valid = src >= 0
+                    src = torch.where(valid, src + int(off), src)
+                out[:, :cols] = src
+            parts.append(out)
+        return torch.cat(parts, dim=0)
+
+    def _pad_blank_legal(name: str, *, dtype: torch.dtype) -> torch.Tensor:
+        parts: list[torch.Tensor] = []
+        for b in batches:
+            t = cast(torch.Tensor, getattr(b, name)).to(dtype)
+            rows = int(t.shape[0])
+            out = torch.zeros((rows, max_blanks, max_legal), dtype=dtype, device=t.device)
+            k = int(t.shape[1])
+            v = int(t.shape[2])
+            if k > 0 and v > 0:
+                out[:, :k, :v] = t
+            parts.append(out)
+        return torch.cat(parts, dim=0)
+
     return PackedTextBatch(
         token_ids=token_ids,
         seq_id=seq_id,
@@ -116,12 +148,15 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
         seq_lengths=seq_lengths,
         state_positions=state_positions,
         card_ref_positions=_shift_anchor("card_ref_positions"),
-        option_positions=_shift_anchor("option_positions"),
-        option_mask=torch.cat([b.option_mask for b in batches], dim=0),
-        target_positions=_shift_anchor("target_positions"),
-        target_mask=torch.cat([b.target_mask for b in batches], dim=0),
         total_tokens=int(token_ids.shape[0]),
         seq_lengths_host=seq_lengths_host,
+        blank_positions=_pad_blank_2d("blank_positions", fill=-1, shift=True),
+        blank_kind=_pad_blank_2d("blank_kind"),
+        blank_group=_pad_blank_2d("blank_group", fill=-1),
+        blank_group_kind=_pad_blank_2d("blank_group_kind"),
+        blank_option_index=_pad_blank_2d("blank_option_index", fill=-1),
+        blank_legal_ids=_pad_blank_legal("blank_legal_ids", dtype=torch.int32),
+        blank_legal_mask=_pad_blank_legal("blank_legal_mask", dtype=torch.bool),
     )
 
 

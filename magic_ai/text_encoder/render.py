@@ -6,9 +6,9 @@ into a single text string laced with custom tokens (mana symbols, status flags,
 zone delimiters, intra-snapshot card references). The output is consumed by the
 tokenizer in a follow-up PR; this module deliberately stops at ``str``.
 
-Anchor positions (string indices for ``<card-ref:K>``, ``<option>``,
-``<target>``) are returned alongside the text so downstream code can map them
-to token ids and to per-card / per-option / per-target pooling slots.
+Anchor positions for ``<card-ref:K>`` and inline ``<choose-*>`` blanks are
+returned alongside the text so downstream code can map them to token ids,
+per-card pooling slots, and per-blank legal-token metadata.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from magic_ai.game_state import (
     GameCardState,
@@ -25,14 +25,25 @@ from magic_ai.game_state import (
     PendingOptionState,
     PlayerState,
     StackObjectState,
-    TargetState,
 )
 from magic_ai.text_encoder.tokenizer import (
     _CARD_TYPE_WORDS,
     MAX_CARD_REFS,
+    MAX_NUM,
     card_ref_token,
     step_token,
 )
+
+
+class RenderError(RuntimeError):
+    """Raised when a snapshot can't be rendered into a legal blank layout.
+
+    Examples: an inline-blank pass produces a blank with zero legal candidates,
+    or a priority option references a card / permanent that isn't in any
+    visible zone. Render-time validation per
+    ``docs/text_encoder_inline_blanks_plan.md`` "Legality enforcement".
+    """
+
 
 DEFAULT_ORACLE_PATH = Path(__file__).resolve().parents[2] / "data" / "card_oracle_embeddings.json"
 
@@ -87,25 +98,29 @@ class CardRefAnchor:
 
 
 @dataclass(frozen=True)
-class OptionAnchor:
-    """Position of an ``<option>`` block."""
+class BlankAnchor:
+    """Position of an inline-blank ``<choose-*>`` token in the rendered string.
 
-    option_index: int
-    kind: str
-    char_start: int  # offset of '<' in <option>
-    char_end: int  # offset just past '>' of </option>
-    target_anchors: tuple[TargetAnchor, ...] = ()
+    Step 2 of ``docs/text_encoder_inline_blanks_plan.md``. Only priority
+    blanks (``<choose-play>`` / ``<use-ability>`` / ``<pass>``) are emitted
+    today; combat / target / mode / X / mana-source kinds land in later
+    steps. All priority anchors in a snapshot share **one** ``group_id``
+    with ``group_kind == "CROSS_BLANK"`` per the plan's cross-blank
+    softmax design; the per-anchor "logit" is the score for selecting the
+    ``<chosen>`` token at that position, so ``legal_token_ids`` is the
+    singleton ``(<chosen>_id,)``.
+    """
 
-
-@dataclass(frozen=True)
-class TargetAnchor:
-    """Position of a ``<target>`` block inside an option."""
-
-    option_index: int
-    target_index: int
-    referenced_card_ref: int | None  # K from <card-ref:K> if the target binds to one
+    blank_index: int  # ordinal across the snapshot (render order)
+    kind: str  # "<choose-play>" / "<use-ability>" / "<pass>"
     char_start: int
     char_end: int
+    group_id: int
+    group_kind: str  # "CROSS_BLANK" | "PER_BLANK" | "CONSTRAINED"
+    legal_token_ids: tuple[int, ...]
+    # Provenance: index into the engine's options list, so the engine adapter
+    # can map a chosen blank back to a concrete action.
+    option_index: int
 
 
 @dataclass
@@ -113,7 +128,7 @@ class RenderedSnapshot:
     text: str
     card_refs: dict[str, int] = field(default_factory=dict)
     card_ref_anchors: list[CardRefAnchor] = field(default_factory=list)
-    option_anchors: list[OptionAnchor] = field(default_factory=list)
+    blank_anchors: list[BlankAnchor] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -508,11 +523,44 @@ class SnapshotRenderer:
         oracle: dict[str, OracleEntry] | None = None,
         *,
         max_card_refs: int = MAX_CARD_REFS,
+        chosen_token_id: int | None = None,
+        none_token_id: int | None = None,
+        yes_token_id: int | None = None,
+        no_token_id: int | None = None,
+        mulligan_token_id: int | None = None,
+        keep_token_id: int | None = None,
+        self_token_id: int | None = None,
+        opp_token_id: int | None = None,
+        num_token_ids: Sequence[int] | None = None,
+        mana_token_ids: Sequence[int] | None = None,
+        card_ref_token_ids: Sequence[int] | None = None,
     ) -> None:
         self._oracle = oracle if oracle is not None else {}
         self._max_card_refs = max_card_refs
+        self._chosen_token_id = 0 if chosen_token_id is None else chosen_token_id
+        self._none_token_id = none_token_id
+        self._yes_token_id = yes_token_id
+        self._no_token_id = no_token_id
+        self._mulligan_token_id = mulligan_token_id
+        self._keep_token_id = keep_token_id
+        self._self_token_id = self_token_id
+        self._opp_token_id = opp_token_id
+        self._num_token_ids = tuple(int(tid) for tid in num_token_ids or ())
+        self._mana_token_ids = tuple(int(tid) for tid in mana_token_ids or ())
+        self._card_ref_token_ids = tuple(
+            int(tid) for tid in (card_ref_token_ids or range(max_card_refs))
+        )
         self._cur_self_id: str = ""
         self._cur_opp_id: str = ""
+        # Per-render scratch state for inline-blank emission. Reset in
+        # ``render`` before each pass so a renderer instance can be reused.
+        self._blank_options_by_card: dict[
+            str, list[tuple[str, int, tuple[int, ...], str, tuple[object, ...]]]
+        ] = {}
+        self._pass_options: list[int] = []
+        self._blank_group_id: int = 0
+        self._blank_index: int = 0
+        self._pending_kind: str = ""
 
     # -- public ------------------------------------------------------------
 
@@ -523,6 +571,12 @@ class SnapshotRenderer:
     ) -> RenderedSnapshot:
         result = RenderedSnapshot(text="")
         buf: list[str] = []
+        # Reset per-render scratch state.
+        self._blank_options_by_card = {}
+        self._pass_options = []
+        self._blank_group_id = 0
+        self._blank_index = 0
+        self._pending_kind = ""
         # First pass: assign card-ref indices in deterministic traversal order.
         card_refs = self._assign_card_refs(snapshot)
         result.card_refs = card_refs
@@ -533,6 +587,23 @@ class SnapshotRenderer:
         opp_player = players[1 - perspective] if len(players) == 2 else None
         self._cur_self_id = str(self_player.get("ID", "")) if self_player else ""
         self._cur_opp_id = str(opp_player.get("ID", "")) if opp_player else ""
+
+        # Resolve the pending options once so inline pre-classification and
+        # the later action / choices block use the same list.
+        pending = snapshot.get("pending")
+        self._pending_kind = str((pending or {}).get("kind") or "").lower()
+        if actions is None:
+            resolved_actions: Sequence[PendingOptionState] = (
+                pending.get("options", []) if pending is not None else []
+            )
+        else:
+            resolved_actions = actions
+
+        # Inline-blank pre-classification: bucket pending options by source
+        # card / permanent so the zone walk can splice the correct
+        # ``<choose-play>`` / ``<use-ability>`` token next to each card.
+        # Pass options are buffered for the trailing ``<choices>`` block.
+        self._classify_inline_options(resolved_actions, card_refs)
 
         buf.append("<bos><state>")
         # Top-level game info: <turn>N</turn><step:...>
@@ -575,7 +646,7 @@ class SnapshotRenderer:
         # Stack
         buf.append("<stack>")
         for stack_obj in snapshot.get("stack") or []:
-            self._render_stack_object(buf, stack_obj, card_refs)
+            self._render_stack_object(buf, result, stack_obj, card_refs)
         buf.append("</stack>")
 
         # Command zone — only emitted when at least one player has a non-empty
@@ -587,11 +658,8 @@ class SnapshotRenderer:
         if has_command:
             buf.append("<command></command>")
 
-        # Actions
-        if actions is None:
-            pending = snapshot.get("pending")
-            actions = pending.get("options", []) if pending is not None else []
-        self._render_actions(buf, result, actions, card_refs)
+        # Decision blanks / choices.
+        self._render_choices_inline(buf, result, resolved_actions)
 
         buf.append("</state><eos>")
         result.text = "".join(buf)
@@ -694,140 +762,380 @@ class SnapshotRenderer:
         elif tapped is False:
             buf.append("<untapped>")
         buf.append(closing)
+        # Inline-blank emission: any priority anchor whose source is this
+        # card / permanent gets emitted immediately after ``</card>``. The
+        # per-card option list was sorted at classification time so render
+        # order is deterministic across dict-iteration perturbations.
+        if cid:
+            options_here = self._blank_options_by_card.get(cid)
+            if options_here:
+                for kind_token, option_index, legal_ids, group_kind, _sort_key in options_here:
+                    self._emit_blank(
+                        buf,
+                        result,
+                        kind_token,
+                        option_index,
+                        legal_token_ids=legal_ids,
+                        group_kind=group_kind,
+                    )
 
     def _render_stack_object(
         self,
         buf: list[str],
+        result: RenderedSnapshot,
         obj: StackObjectState,
         card_refs: dict[str, int],
     ) -> None:
         cid = obj.get("id", "")
         name = obj.get("name", "") or ""
-        ref_idx = card_refs.get(cid)
-        # Mirror _emit_stack_object exactly: spaces around the inner content.
-        if ref_idx is not None:
-            buf.append(f"<card> {card_ref_token(ref_idx)} {name} </card>")
-        else:
-            buf.append(f"<card> {name} </card>")
+        card = cast(GameCardState, {"ID": cid, "Name": name} if cid else {"Name": name})
+        self._render_card(buf, result, card, card_refs)
 
-    # -- actions -----------------------------------------------------------
+    # -- inline-blank helpers ---------------------------------------------
 
-    def _render_actions(
+    def _classify_inline_options(
+        self,
+        actions: Sequence[PendingOptionState],
+        card_refs: dict[str, int],
+    ) -> None:
+        """Bucket inline options into per-card blanks + a pass-only list.
+
+        Every option is one of:
+
+        - ``play`` / ``cast`` of a hand card → ``<choose-play>`` blank
+          adjacent to the hand-card render position; targeted cast options
+          also get a following ``<choose-target>`` blank.
+        - ``activate`` of an ability → ``<use-ability>`` blank adjacent to
+          the source permanent on the battlefield; targeted abilities also
+          get a following ``<choose-target>`` blank.
+        - ``pass`` → buffered for emission in the trailing ``<choices>``
+          block.
+
+        Per-card options are sorted by an engine-stable key so the blank
+        ordinal layout is deterministic across re-renders, independent of
+        Python dict iteration order. See "Stable blank numbering" in
+        ``docs/text_encoder_inline_blanks_plan.md``.
+        """
+
+        chosen_id = self._chosen_token_id
+        if chosen_id is None:
+            raise RenderError("inline priority blanks require chosen_token_id")
+        priority_legal_ids = (int(chosen_id),)
+        per_card: dict[str, list[tuple[str, int, tuple[int, ...], str, tuple[object, ...]]]] = {}
+        pass_options: list[int] = []
+        for opt_idx, option in enumerate(actions):
+            kind = (option.get("kind") or "").lower()
+            if kind in ("play", "play_land", "cast", "cast_spell"):
+                source = option.get("card_id") or option.get("permanent_id") or ""
+                if not source:
+                    raise RenderError(
+                        f"play/cast option {opt_idx} ({kind!r}) has no card_id; "
+                        "cannot anchor inline blank."
+                    )
+                # Stable key: (ability_index_or_-1, option-id-string, opt_idx).
+                ability_idx = option.get("ability_index")
+                key: tuple[object, ...] = (
+                    0,
+                    "<choose-play>",
+                    -1 if ability_idx is None else int(ability_idx),
+                    str(option.get("id") or ""),
+                    opt_idx,
+                )
+                per_card.setdefault(source, []).append(
+                    ("<choose-play>", opt_idx, priority_legal_ids, "CROSS_BLANK", key)
+                )
+                self._append_target_blank_option(per_card, source, opt_idx, option, card_refs)
+            elif kind in ("activate", "activate_ability", "activated_ability"):
+                source = option.get("permanent_id") or option.get("card_id") or ""
+                if not source:
+                    raise RenderError(
+                        f"activate option {opt_idx} has no permanent_id / card_id; "
+                        "cannot anchor inline blank."
+                    )
+                ability_idx = option.get("ability_index")
+                key = (
+                    0,
+                    "<use-ability>",
+                    -1 if ability_idx is None else int(ability_idx),
+                    str(option.get("id") or ""),
+                    opt_idx,
+                )
+                per_card.setdefault(source, []).append(
+                    ("<use-ability>", opt_idx, priority_legal_ids, "CROSS_BLANK", key)
+                )
+                self._append_target_blank_option(per_card, source, opt_idx, option, card_refs)
+            elif kind == "block":
+                source = option.get("permanent_id") or option.get("card_id") or ""
+                if not source:
+                    raise RenderError(
+                        f"block option {opt_idx} has no permanent_id / card_id; "
+                        "cannot anchor inline blank."
+                    )
+                legal_ids = self._block_legal_token_ids(option, card_refs)
+                key = (0, "<choose-block>", str(option.get("id") or ""), opt_idx)
+                per_card.setdefault(source, []).append(
+                    ("<choose-block>", opt_idx, legal_ids, "CONSTRAINED", key)
+                )
+            elif kind in ("attacker", "attack"):
+                source = option.get("permanent_id") or option.get("card_id") or ""
+                if not source:
+                    raise RenderError(
+                        f"attacker option {opt_idx} has no permanent_id / card_id; "
+                        "cannot anchor inline blank."
+                    )
+                legal_ids = self._attacker_legal_token_ids(source, card_refs)
+                key = (0, "<choose-target>", str(option.get("id") or ""), opt_idx)
+                per_card.setdefault(source, []).append(
+                    ("<choose-target>", opt_idx, legal_ids, "PER_BLANK", key)
+                )
+            elif kind == "pass":
+                pass_options.append(opt_idx)
+            else:
+                # Other kinds (mulligan, attack, block, choice, …) aren't
+                # in scope for Step 2. Silently drop them; later steps add
+                # their dedicated blank kinds. Crucially we don't raise:
+                # the legacy path still runs in non-inline mode for them.
+                continue
+
+        # Sort each card's options by their stable key so the blank ordinal
+        # ordering is independent of input-list permutation.
+        for cid in per_card:
+            per_card[cid].sort(key=lambda item: item[4])
+        self._blank_options_by_card = per_card
+        self._pass_options = pass_options
+
+    def _append_target_blank_option(
+        self,
+        per_card: dict[str, list[tuple[str, int, tuple[int, ...], str, tuple[object, ...]]]],
+        source: str,
+        opt_idx: int,
+        option: PendingOptionState,
+        card_refs: dict[str, int],
+    ) -> None:
+        legal_ids = self._target_legal_token_ids(option, card_refs)
+        if not legal_ids:
+            return
+        key = (1, "<choose-target>", str(option.get("id") or ""), opt_idx)
+        per_card.setdefault(source, []).append(
+            ("<choose-target>", opt_idx, legal_ids, "PER_BLANK", key)
+        )
+
+    def _block_legal_token_ids(
+        self,
+        option: PendingOptionState,
+        card_refs: dict[str, int],
+    ) -> tuple[int, ...]:
+        none_id = self._none_token_id
+        if none_id is None:
+            raise RenderError("inline block blanks require none_token_id")
+        legal_ids = [int(none_id)]
+        for target in option.get("valid_targets") or []:
+            tid = target.get("id", "")
+            ref = card_refs.get(tid)
+            if ref is None:
+                continue
+            if not 0 <= ref < len(self._card_ref_token_ids):
+                raise RenderError(
+                    f"block target card-ref:{ref} has no token id in card_ref_token_ids"
+                )
+            legal_ids.append(int(self._card_ref_token_ids[ref]))
+        return tuple(legal_ids)
+
+    def _attacker_legal_token_ids(
+        self,
+        source: str,
+        card_refs: dict[str, int],
+    ) -> tuple[int, ...]:
+        none_id = self._none_token_id
+        if none_id is None:
+            raise RenderError("inline attacker blanks require none_token_id")
+        ref = card_refs.get(source)
+        if ref is None:
+            return (int(none_id),)
+        if not 0 <= ref < len(self._card_ref_token_ids):
+            raise RenderError(f"attacker card-ref:{ref} has no token id in card_ref_token_ids")
+        return (int(none_id), int(self._card_ref_token_ids[ref]))
+
+    def _target_legal_token_ids(
+        self,
+        option: PendingOptionState,
+        card_refs: dict[str, int],
+    ) -> tuple[int, ...]:
+        legal_ids: list[int] = []
+        for target in option.get("valid_targets") or []:
+            tid = target.get("id", "")
+            if tid and tid == self._cur_self_id and self._self_token_id is not None:
+                legal_ids.append(int(self._self_token_id))
+                continue
+            if tid and tid == self._cur_opp_id and self._opp_token_id is not None:
+                legal_ids.append(int(self._opp_token_id))
+                continue
+            ref = card_refs.get(tid)
+            if ref is None:
+                continue
+            if not 0 <= ref < len(self._card_ref_token_ids):
+                raise RenderError(f"target card-ref:{ref} has no token id in card_ref_token_ids")
+            legal_ids.append(int(self._card_ref_token_ids[ref]))
+        return tuple(legal_ids)
+
+    def _indexed_choice_legal_token_ids(
+        self,
+        actions: Sequence[PendingOptionState],
+        card_refs: dict[str, int],
+    ) -> tuple[int, ...]:
+        card_ref_ids: list[int] = []
+        for option in actions:
+            option_id = str(option.get("id", "") or "")
+            ref = card_refs.get(option_id)
+            if ref is None:
+                card_ref_ids = []
+                break
+            if not 0 <= ref < len(self._card_ref_token_ids):
+                raise RenderError(f"choice card-ref:{ref} has no token id in card_ref_token_ids")
+            card_ref_ids.append(int(self._card_ref_token_ids[ref]))
+        if len(card_ref_ids) == len(actions) and card_ref_ids:
+            return tuple(card_ref_ids)
+
+        choice_count = len(actions)
+        if choice_count < 1:
+            raise RenderError(f"inline {self._pending_kind} blanks require at least one option")
+        if choice_count > MAX_NUM:
+            raise RenderError(
+                f"inline {self._pending_kind} option count {choice_count} exceeds MAX_NUM"
+            )
+        if len(self._num_token_ids) < choice_count:
+            raise RenderError(f"inline {self._pending_kind} blanks require num_token_ids")
+        return tuple(self._num_token_ids[:choice_count])
+
+    def _emit_blank(
+        self,
+        buf: list[str],
+        result: RenderedSnapshot,
+        kind_token: str,
+        option_index: int,
+        *,
+        legal_token_ids: tuple[int, ...],
+        group_kind: str,
+    ) -> None:
+        """Write ``kind_token`` to ``buf`` and record a ``BlankAnchor``.
+
+        An empty legal set raises ``RenderError``; every inline blank must
+        expose at least one legal answer token.
+        """
+
+        if not legal_token_ids:
+            raise RenderError(f"blank {kind_token!r} for option {option_index} has empty legal set")
+        char_start = sum(len(s) for s in buf)
+        buf.append(kind_token)
+        char_end = sum(len(s) for s in buf)
+        result.blank_anchors.append(
+            BlankAnchor(
+                blank_index=self._blank_index,
+                kind=kind_token,
+                char_start=char_start,
+                char_end=char_end,
+                group_id=self._blank_group_id,
+                group_kind=group_kind,
+                legal_token_ids=legal_token_ids,
+                option_index=option_index,
+            )
+        )
+        self._blank_index += 1
+
+    def _render_choices_inline(
         self,
         buf: list[str],
         result: RenderedSnapshot,
         actions: Sequence[PendingOptionState],
-        card_refs: dict[str, int],
     ) -> None:
-        buf.append("<actions>")
-        for opt_idx, option in enumerate(actions):
-            self._render_option(buf, result, opt_idx, option, card_refs)
-        buf.append("</actions>")
+        """Emit the trailing ``<choices>`` block with the ``<pass>`` blank.
 
-    def _render_option(
-        self,
-        buf: list[str],
-        result: RenderedSnapshot,
-        option_index: int,
-        option: PendingOptionState,
-        card_refs: dict[str, int],
-    ) -> None:
-        char_start = sum(len(s) for s in buf)
-        buf.append("<option>")
+        Currently the choices zone carries priority-pass anchors and the
+        Step-7 ``<choose-may>`` blank. Later steps add ``<choose-mode>`` /
+        ``<choose-x>`` groups whose blanks live here too.
+        """
 
-        kind = (option.get("kind") or "").lower()
-        card_id = option.get("card_id") or option.get("permanent_id") or ""
-        card_name = option.get("card_name") or ""
-        targets = option.get("valid_targets") or []
-        target_anchors: list[TargetAnchor] = []
-
-        def emit_card(cid: str, fallback_name: str) -> None:
-            ref = card_refs.get(cid)
-            if ref is not None:
-                buf.append(card_ref_token(ref))
-            elif fallback_name:
-                buf.append(fallback_name)
-
-        if kind in ("cast", "cast_spell", "play", "play_land"):
-            buf.append("<play>" if kind in ("play", "play_land") else "<cast>")
-            emit_card(card_id, card_name)
-        elif kind in ("activate", "activate_ability", "activated_ability"):
-            buf.append("<activate>")
-            emit_card(card_id, card_name)
-            ability_idx = option.get("ability_index")
-            if ability_idx is not None:
-                buf.append(f" ability {int(ability_idx)}")
-        elif kind == "pass":
-            buf.append("<pass>")
-        elif kind == "attack":
-            buf.append("<attack>")
-            emit_card(card_id, card_name)
-        elif kind == "block":
-            buf.append("<block>")
-            emit_card(card_id, card_name)
-        elif kind == "mulligan":
-            buf.append("<mulligan>")
-        elif kind == "keep":
-            buf.append("<keep>")
-        else:
-            # Generic fallback: kind + label (label retained verbatim).
-            label = option.get("label") or ""
-            if kind:
-                buf.append(kind)
-            if label:
-                if kind:
-                    buf.append(" ")
-                buf.append(label)
-
-        for target_idx, target in enumerate(targets):
-            self._render_target(buf, target_anchors, option_index, target_idx, target, card_refs)
-
-        buf.append("</option>")
-        char_end = sum(len(s) for s in buf)
-        result.option_anchors.append(
-            OptionAnchor(
-                option_index=option_index,
-                kind=kind,
-                char_start=char_start,
-                char_end=char_end,
-                target_anchors=tuple(target_anchors),
+        buf.append("<choices>")
+        chosen_id = self._chosen_token_id
+        if chosen_id is None:
+            raise RenderError("inline pass blanks require chosen_token_id")
+        priority_legal_ids = (int(chosen_id),)
+        for opt_idx in self._pass_options:
+            self._emit_blank(
+                buf,
+                result,
+                "<pass>",
+                opt_idx,
+                legal_token_ids=priority_legal_ids,
+                group_kind="CROSS_BLANK",
             )
-        )
-
-    def _render_target(
-        self,
-        buf: list[str],
-        target_anchors: list[TargetAnchor],
-        option_index: int,
-        target_index: int,
-        target: TargetState,
-        card_refs: dict[str, int],
-    ) -> None:
-        tid = target.get("id", "")
-        ref = card_refs.get(tid)
-        char_start = sum(len(s) for s in buf)
-        buf.append("<target>")
-        if ref is not None:
-            buf.append(card_ref_token(ref))
-        elif tid and tid == self._cur_self_id:
-            buf.append("<self>")
-        elif tid and tid == self._cur_opp_id:
-            buf.append("<opp>")
-        else:
-            label = target.get("label") or tid
-            if label:
-                buf.append(label)
-        buf.append("</target>")
-        char_end = sum(len(s) for s in buf)
-        target_anchors.append(
-            TargetAnchor(
-                option_index=option_index,
-                target_index=target_index,
-                referenced_card_ref=ref,
-                char_start=char_start,
-                char_end=char_end,
+        if self._pending_kind == "mulligan":
+            mulligan_id = self._mulligan_token_id
+            keep_id = self._keep_token_id
+            if mulligan_id is None or keep_id is None:
+                raise RenderError(
+                    "inline mulligan blanks require mulligan_token_id and keep_token_id"
+                )
+            self._emit_blank(
+                buf,
+                result,
+                "<choose-may>",
+                -1,
+                legal_token_ids=(int(mulligan_id), int(keep_id)),
+                group_kind="PER_BLANK",
             )
-        )
+        if self._pending_kind == "may":
+            yes_id = self._yes_token_id
+            no_id = self._no_token_id
+            if yes_id is None or no_id is None:
+                raise RenderError("inline may blanks require yes_token_id and no_token_id")
+            self._emit_blank(
+                buf,
+                result,
+                "<choose-may>",
+                -1,
+                legal_token_ids=(int(no_id), int(yes_id)),
+                group_kind="PER_BLANK",
+            )
+        if self._pending_kind in ("mode", "number"):
+            choice_count = len(actions)
+            if choice_count < 1:
+                raise RenderError(f"inline {self._pending_kind} blanks require at least one option")
+            if choice_count > MAX_NUM:
+                raise RenderError(
+                    f"inline {self._pending_kind} option count {choice_count} exceeds MAX_NUM"
+                )
+            if len(self._num_token_ids) < choice_count:
+                raise RenderError(f"inline {self._pending_kind} blanks require num_token_ids")
+            self._emit_blank(
+                buf,
+                result,
+                "<choose-mode>" if self._pending_kind == "mode" else "<choose-x-digit>",
+                -1,
+                legal_token_ids=tuple(self._num_token_ids[:choice_count]),
+                group_kind="PER_BLANK",
+            )
+        if self._pending_kind in ("permanent", "cards_from_hand", "card_from_library"):
+            self._emit_blank(
+                buf,
+                result,
+                "<choose-target>",
+                -1,
+                legal_token_ids=self._indexed_choice_legal_token_ids(actions, result.card_refs),
+                group_kind="PER_BLANK",
+            )
+        if self._pending_kind == "mana_color":
+            if len(self._mana_token_ids) < 6:
+                raise RenderError("inline mana_color blanks require mana_token_ids")
+            self._emit_blank(
+                buf,
+                result,
+                "<choose-mana-source>",
+                -1,
+                legal_token_ids=tuple(self._mana_token_ids[:6]),
+                group_kind="PER_BLANK",
+            )
+        buf.append("</choices>")
 
 
 # ---------------------------------------------------------------------------
@@ -841,12 +1149,43 @@ def render_snapshot(
     *,
     oracle: dict[str, OracleEntry] | None = None,
     max_card_refs: int = MAX_CARD_REFS,
+    chosen_token_id: int | None = None,
+    none_token_id: int | None = None,
+    yes_token_id: int | None = None,
+    no_token_id: int | None = None,
+    mulligan_token_id: int | None = None,
+    keep_token_id: int | None = None,
+    self_token_id: int | None = None,
+    opp_token_id: int | None = None,
+    num_token_ids: Sequence[int] | None = None,
+    mana_token_ids: Sequence[int] | None = None,
+    card_ref_token_ids: Sequence[int] | None = None,
 ) -> RenderedSnapshot:
     """Render ``snapshot`` (and optional ``actions``) to text + anchor metadata.
 
     The ``oracle`` dict (loaded once via :func:`load_oracle_text`) supplies card
     type lines, mana costs, and oracle text. If a card name is missing from the
     dict the renderer falls back to emitting only the card name + status flags.
+
+    Pending decisions are rendered as inline ``<choose-*>`` blanks adjacent to
+    their natural source text plus a trailing ``<choices>`` block for
+    standalone choices. Scoring callers should supply ``chosen_token_id`` (the
+    tokenizer id of the ``<chosen>`` scoring token); render-only callers may
+    omit it.
     """
 
-    return SnapshotRenderer(oracle, max_card_refs=max_card_refs).render(snapshot, actions)
+    return SnapshotRenderer(
+        oracle,
+        max_card_refs=max_card_refs,
+        chosen_token_id=chosen_token_id,
+        none_token_id=none_token_id,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
+        mulligan_token_id=mulligan_token_id,
+        keep_token_id=keep_token_id,
+        self_token_id=self_token_id,
+        opp_token_id=opp_token_id,
+        num_token_ids=num_token_ids,
+        mana_token_ids=mana_token_ids,
+        card_ref_token_ids=card_ref_token_ids,
+    ).render(snapshot, actions)

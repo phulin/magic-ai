@@ -1,9 +1,8 @@
-"""Text-encoder model: ModernBERT-shaped scratch trunk + pooling + heads.
+"""Text-encoder model: ModernBERT-shaped scratch trunk + inline blank heads.
 
-Implements PR #3 from ``docs/text_encoder_plan.md``: a bidirectional
-transformer encoder that consumes pre-tokenized state/action text and
-produces (a) per-card / per-option / per-target / global state vectors via
-position-anchored gather pools, and (b) policy / target / value head logits.
+Implements a bidirectional transformer encoder that consumes pre-tokenized
+state text and produces card/global pooled vectors, value logits, and
+legal-token scores for inline decision blanks.
 """
 
 from __future__ import annotations
@@ -733,16 +732,6 @@ def gather_card_vectors(hidden: Tensor, batch: TextEncodedBatch) -> tuple[Tensor
     return _gather_at(hidden, batch.card_ref_positions)
 
 
-def gather_option_vectors(hidden: Tensor, batch: TextEncodedBatch) -> tuple[Tensor, Tensor]:
-    vecs, _ = _gather_at(hidden, batch.option_positions)
-    return vecs, batch.option_mask
-
-
-def gather_target_vectors(hidden: Tensor, batch: TextEncodedBatch) -> tuple[Tensor, Tensor]:
-    vecs, _ = _gather_at(hidden, batch.target_positions)
-    return vecs, batch.target_mask
-
-
 def gather_state_vector(hidden: Tensor, batch: TextEncodedBatch) -> Tensor:
     del batch  # position 0 is always the <bos>/<state> opener.
     return hidden[:, 0, :]
@@ -767,18 +756,61 @@ def gather_card_vectors_packed(hidden: Tensor, batch: PackedTextBatch) -> tuple[
     return _gather_packed(hidden, batch.card_ref_positions)
 
 
-def gather_option_vectors_packed(hidden: Tensor, batch: PackedTextBatch) -> tuple[Tensor, Tensor]:
-    vecs, _ = _gather_packed(hidden, batch.option_positions)
-    return vecs, batch.option_mask
-
-
-def gather_target_vectors_packed(hidden: Tensor, batch: PackedTextBatch) -> tuple[Tensor, Tensor]:
-    vecs, _ = _gather_packed(hidden, batch.target_positions)
-    return vecs, batch.target_mask
-
-
 def gather_state_vector_packed(hidden: Tensor, batch: PackedTextBatch) -> Tensor:
     return hidden.index_select(0, batch.state_positions)
+
+
+class InlineBlankPolicy(nn.Module):
+    """Score each inline blank against its legal token-id candidates.
+
+    This reuses the tied input embedding matrix as the output vocabulary
+    projection, but only gathers the legal rows for each blank instead of
+    materializing a full-vocabulary logits tensor.
+    """
+
+    def __init__(
+        self,
+        embed: nn.Embedding,
+        decoder_dense: nn.Linear,
+        decoder_norm: nn.Module,
+        *,
+        num_kinds: int,
+    ) -> None:
+        super().__init__()
+        self.embed = embed
+        self.decoder_dense = decoder_dense
+        self.decoder_norm = decoder_norm
+        self.kind_temperature = nn.Embedding(num_kinds, 1)
+        nn.init.ones_(self.kind_temperature.weight)
+
+    def forward(
+        self,
+        hidden: Tensor,
+        blank_positions: Tensor,
+        blank_kind: Tensor,
+        blank_legal_ids: Tensor,
+        blank_legal_mask: Tensor,
+    ) -> Tensor:
+        positions = blank_positions.to(device=hidden.device, dtype=torch.long)
+        if hidden.dim() == 3:
+            blank_h, _ = _gather_at(hidden, positions)
+        elif hidden.dim() == 2:
+            blank_h, _ = _gather_packed(hidden, positions)
+        else:
+            raise ValueError(f"hidden must be rank 2 or 3, got shape {tuple(hidden.shape)}")
+
+        blank_h = self.decoder_norm(F.gelu(self.decoder_dense(blank_h)))
+        legal_ids = blank_legal_ids.to(device=hidden.device, dtype=torch.long)
+        legal_emb = self.embed(legal_ids)
+        logits = (legal_emb * blank_h.unsqueeze(-2)).sum(dim=-1)
+
+        safe_kind = blank_kind.to(device=hidden.device, dtype=torch.long).clamp(
+            min=0, max=self.kind_temperature.num_embeddings - 1
+        )
+        temp = self.kind_temperature(safe_kind).squeeze(-1).unsqueeze(-1).to(logits.dtype)
+        logits = logits * temp
+        legal_mask = blank_legal_mask.to(device=hidden.device, dtype=torch.bool)
+        return logits.masked_fill(~legal_mask, float("-inf"))
 
 
 class _MLP(nn.Module):
@@ -795,57 +827,6 @@ class _MLP(nn.Module):
         return self.fc2(F.gelu(self.fc1(x)))
 
 
-class PolicyHead(nn.Module):
-    def __init__(self, d_model: int) -> None:
-        super().__init__()
-        self.d_model = d_model
-        self.mlp = _MLP(2 * d_model, d_model, 1)
-
-    def forward(
-        self,
-        option_vecs: Tensor,  # [B, O, D]
-        state_vec: Tensor,  # [B, D]
-        option_mask: Tensor,  # [B, O] bool
-    ) -> Tensor:
-        # Math-equivalent to ``fc1(cat([option_vecs, state_b], -1))`` where
-        # state_b is state_vec broadcast over O. Splitting fc1 across the two
-        # input chunks avoids the [B, O, 2D] cat allocation and the per-call
-        # broadcast of state through the GEMM.
-        d = self.d_model
-        w = self.mlp.fc1.weight  # [D, 2D]
-        b1 = self.mlp.fc1.bias  # [D]
-        h = F.linear(option_vecs, w[:, :d]) + F.linear(state_vec, w[:, d:], b1).unsqueeze(1)
-        logits = self.mlp.fc2(F.gelu(h)).squeeze(-1)  # [B, O]
-        neg_inf = torch.full_like(logits, float("-inf"))
-        return torch.where(option_mask, logits, neg_inf)
-
-
-class TargetHead(nn.Module):
-    def __init__(self, d_model: int) -> None:
-        super().__init__()
-        self.d_model = d_model
-        self.mlp = _MLP(3 * d_model, d_model, 1)
-
-    def forward(
-        self,
-        target_vecs: Tensor,  # [B, O, M, D]
-        option_vecs: Tensor,  # [B, O, D]
-        state_vec: Tensor,  # [B, D]
-        target_mask: Tensor,  # [B, O, M] bool
-    ) -> Tensor:
-        # Same trick as PolicyHead, three-way split. Avoids the [B, O, M, 3D]
-        # cat allocation and the broadcasts of option/state through the GEMM.
-        d = self.d_model
-        w = self.mlp.fc1.weight  # [D, 3D]
-        b1 = self.mlp.fc1.bias  # [D]
-        h_tgt = F.linear(target_vecs, w[:, :d])  # [B, O, M, D]
-        h_opt = F.linear(option_vecs, w[:, d : 2 * d]).unsqueeze(2)  # [B, O, 1, D]
-        h_state = F.linear(state_vec, w[:, 2 * d :], b1)[:, None, None, :]  # [B, 1, 1, D]
-        logits = self.mlp.fc2(F.gelu(h_tgt + h_opt + h_state)).squeeze(-1)
-        neg_inf = torch.full_like(logits, float("-inf"))
-        return torch.where(target_mask, logits, neg_inf)
-
-
 class ValueHead(nn.Module):
     def __init__(self, d_model: int) -> None:
         super().__init__()
@@ -858,17 +839,12 @@ class ValueHead(nn.Module):
 __all__ = [
     "TextEncoderConfig",
     "TextStateEncoder",
-    "PolicyHead",
-    "TargetHead",
+    "InlineBlankPolicy",
     "ValueHead",
     "DEFAULT_HF_ENCODER_MODEL",
     "gather_card_vectors",
-    "gather_option_vectors",
-    "gather_target_vectors",
     "gather_state_vector",
     "gather_card_vectors_packed",
-    "gather_option_vectors_packed",
-    "gather_target_vectors_packed",
     "gather_state_vector_packed",
     "initialize_text_state_encoder_from_hf",
     "text_encoder_config_from_hf",
