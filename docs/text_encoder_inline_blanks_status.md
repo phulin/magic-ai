@@ -181,7 +181,7 @@ Implemented blank kinds and current wire shapes:
 | Priority play/cast | `<choose-play>` next to the source card | `CROSS_BLANK` | singleton `<chosen>` | Softmax is across all priority anchors, not within the singleton legal list. |
 | Priority ability | `<use-ability>` next to the source permanent | `CROSS_BLANK` | singleton `<chosen>` | Shares the priority cross-blank group with play/cast/pass anchors. |
 | Pass priority | `<pass>` in trailing `<choices>` | `CROSS_BLANK` | singleton `<chosen>` | Uses the existing action-kind `<pass>` token as the blank anchor. |
-| Target choice | `<choose-target>` immediately after the source action blank | `PER_BLANK` | visible target `<card-ref:K>` ids plus player `<self>` / `<opp>` ids | Zones, stack objects without refs, and other non-card/non-player targets are not represented by this blank. |
+| Target / indexed object choice | `<choose-target>` immediately after the source action blank, or in trailing `<choices>` for standalone object choices | `PER_BLANK` | visible target `<card-ref:K>` ids plus player `<self>` / `<opp>` ids; hidden object choices fall back to `<num:K>` option ids | Zones, stack objects without refs, and other non-card/non-player targets are not self-describing yet. |
 | Block choice | `<choose-block>` next to the potential blocker | `CONSTRAINED` | `<none>` plus legal attacker `<card-ref:K>` ids | Maps sampled legal slot back to the existing blocker action payload. |
 | May choice | `<choose-may>` in trailing `<choices>` | `PER_BLANK` | `<no>, <yes>` | Legal-slot order matches `may_selected` labels. |
 | Mode choice | `<choose-mode>` in trailing `<choices>` | `PER_BLANK` | `<num:0>...<num:N-1>` | One bounded choice over the engine's mode options. |
@@ -216,9 +216,12 @@ every choice the engine can ask the player to make. Remaining gaps:
 2. **Targets cover visible cards and players, but not every target class.**
    `<choose-target>` legal vocabularies are built from visible target object
    ids that have `<card-ref:K>` entries plus player targets represented as
-   `<self>` / `<opp>`. Zones, spells/abilities on stack without card refs, and
-   other non-card/non-player target classes still need explicit answer tokens
-   or structured target handles.
+   `<self>` / `<opp>`. Standalone `permanent`, `cards_from_hand`, and
+   `card_from_library` choices now emit a trailing `<choose-target>` blank; if
+   every option has a visible card ref, the legal ids are card refs, otherwise
+   they fall back to `<num:K>` selected-column ids. Zones, spells/abilities on
+   stack without card refs, and other non-card/non-player target classes still
+   need explicit answer tokens or structured target handles.
 3. **Multi-target cardinality and constraints are incomplete.** Current
    targeted priority handling emits a target blank tied to a source option,
    but it does not fully model "choose any number", "up to N", repeated target
@@ -233,7 +236,8 @@ every choice the engine can ask the player to make. Remaining gaps:
    pip, does not represent alternative costs, and cannot distinguish multiple
    sources producing the same color.
 6. **Non-priority choice kinds are only partially covered.** `may`, `mode`,
-   `number`, and `mana_color` are wired. Other engine pending kinds such as
+   `number`, `mana_color`, `permanent`, `cards_from_hand`, and
+   `card_from_library` are wired. Other engine pending kinds such as
    mulligan/keep, attack declaration, ordering choices, replacement/prevention
    choices, and any bespoke prompt kinds need either dedicated blank kinds or a
    generic structured choice blank before the representation is complete.

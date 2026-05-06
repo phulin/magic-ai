@@ -728,6 +728,40 @@ def test_inline_blanks_targeted_priority_option_keeps_player_targets(
     assert target_anchor.legal_token_ids == (SELF_FAKE_ID, OPP_FAKE_ID)
 
 
+def test_inline_blanks_permanent_choice_uses_visible_card_refs(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = _basic_snapshot()
+    self_perm_id = snap["players"][0]["Battlefield"][0]["ID"]
+    opp_perm_id = snap["players"][1]["Battlefield"][0]["ID"]
+    pending = cast(
+        PendingState,
+        {
+            "kind": "permanent",
+            "player_idx": 0,
+            "options": [
+                cast(PendingOptionState, {"id": self_perm_id, "label": "Llanowar Elves"}),
+                cast(PendingOptionState, {"id": opp_perm_id, "label": "Serra Angel"}),
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        card_ref_token_ids=CARD_REF_FAKE_IDS,
+        num_token_ids=NUM_FAKE_IDS,
+    )
+
+    assert [a.kind for a in rendered.blank_anchors] == ["<choose-target>"]
+    anchor = rendered.blank_anchors[0]
+    assert anchor.group_kind == "PER_BLANK"
+    assert anchor.legal_token_ids == (
+        CARD_REF_FAKE_IDS[rendered.card_refs[self_perm_id]],
+        CARD_REF_FAKE_IDS[rendered.card_refs[opp_perm_id]],
+    )
+
+
 def test_inline_blanks_pass_only_snapshot(oracle: dict[str, OracleEntry]) -> None:
     snap = _basic_snapshot()
     pending = cast(

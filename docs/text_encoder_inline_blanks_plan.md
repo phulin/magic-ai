@@ -35,7 +35,8 @@ Implemented blank surfaces:
 
 Known fidelity gaps before this is a complete representation of all game
 choices: damage assignment order is not wired; targets currently cover visible
-card refs and player ids but not every target class; arbitrary multi-target
+card refs, player ids, and selected-column fallback for standalone object
+choices, but not every target class; arbitrary multi-target
 cardinality/constraints are not fully modeled; X is a bounded single blank
 rather than a digit sequence; mana-color blanks choose colors rather than
 source objects; several engine pending kinds still need dedicated or generic

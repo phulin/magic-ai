@@ -950,6 +950,35 @@ class SnapshotRenderer:
             legal_ids.append(int(self._card_ref_token_ids[ref]))
         return tuple(legal_ids)
 
+    def _indexed_choice_legal_token_ids(
+        self,
+        actions: Sequence[PendingOptionState],
+        card_refs: dict[str, int],
+    ) -> tuple[int, ...]:
+        card_ref_ids: list[int] = []
+        for option in actions:
+            option_id = str(option.get("id", "") or "")
+            ref = card_refs.get(option_id)
+            if ref is None:
+                card_ref_ids = []
+                break
+            if not 0 <= ref < len(self._card_ref_token_ids):
+                raise RenderError(f"choice card-ref:{ref} has no token id in card_ref_token_ids")
+            card_ref_ids.append(int(self._card_ref_token_ids[ref]))
+        if len(card_ref_ids) == len(actions) and card_ref_ids:
+            return tuple(card_ref_ids)
+
+        choice_count = len(actions)
+        if choice_count < 1:
+            raise RenderError(f"inline {self._pending_kind} blanks require at least one option")
+        if choice_count > MAX_NUM:
+            raise RenderError(
+                f"inline {self._pending_kind} option count {choice_count} exceeds MAX_NUM"
+            )
+        if len(self._num_token_ids) < choice_count:
+            raise RenderError(f"inline {self._pending_kind} blanks require num_token_ids")
+        return tuple(self._num_token_ids[:choice_count])
+
     def _emit_blank(
         self,
         buf: list[str],
@@ -1041,6 +1070,15 @@ class SnapshotRenderer:
                 "<choose-mode>" if self._pending_kind == "mode" else "<choose-x-digit>",
                 -1,
                 legal_token_ids=tuple(self._num_token_ids[:choice_count]),
+                group_kind="PER_BLANK",
+            )
+        if self._pending_kind in ("permanent", "cards_from_hand", "card_from_library"):
+            self._emit_blank(
+                buf,
+                result,
+                "<choose-target>",
+                -1,
+                legal_token_ids=self._indexed_choice_legal_token_ids(actions, result.card_refs),
                 group_kind="PER_BLANK",
             )
         if self._pending_kind == "mana_color":
