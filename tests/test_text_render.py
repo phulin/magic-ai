@@ -547,6 +547,8 @@ CHOSEN_FAKE_ID = 99999
 NONE_FAKE_ID = 99998
 YES_FAKE_ID = 99997
 NO_FAKE_ID = 99996
+SELF_FAKE_ID = 99995
+OPP_FAKE_ID = 99994
 CARD_REF_FAKE_IDS = tuple(88000 + k for k in range(MAX_CARD_REFS))
 NUM_FAKE_IDS = tuple(77000 + k for k in range(16))
 MANA_FAKE_IDS = tuple(66000 + k for k in range(6))
@@ -681,6 +683,49 @@ def test_inline_blanks_targeted_priority_option_emits_target_blank(
     assert target_anchor.group_kind == "PER_BLANK"
     assert target_anchor.legal_token_ids == (CARD_REF_FAKE_IDS[target_ref],)
     assert target_anchor.option_index == 0
+
+
+def test_inline_blanks_targeted_priority_option_keeps_player_targets(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    snap = _basic_snapshot()
+    bolt_id = snap["players"][0]["Hand"][0]["ID"]
+    self_id = snap["players"][0]["ID"]
+    opp_id = snap["players"][1]["ID"]
+    pending = cast(
+        PendingState,
+        {
+            "kind": "priority",
+            "player_idx": 0,
+            "options": [
+                cast(
+                    PendingOptionState,
+                    {
+                        "id": "bolt-any-target",
+                        "kind": "cast",
+                        "card_id": bolt_id,
+                        "card_name": "Lightning Bolt",
+                        "valid_targets": [
+                            cast(TargetState, {"id": self_id, "label": "Self"}),
+                            cast(TargetState, {"id": opp_id, "label": "Opp"}),
+                        ],
+                    },
+                )
+            ],
+        },
+    )
+    rendered = render_snapshot(
+        cast(GameStateSnapshot, {**snap, "pending": pending}),
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        self_token_id=SELF_FAKE_ID,
+        opp_token_id=OPP_FAKE_ID,
+    )
+
+    assert [a.kind for a in rendered.blank_anchors] == ["<choose-play>", "<choose-target>"]
+    target_anchor = rendered.blank_anchors[1]
+    assert target_anchor.group_kind == "PER_BLANK"
+    assert target_anchor.legal_token_ids == (SELF_FAKE_ID, OPP_FAKE_ID)
 
 
 def test_inline_blanks_pass_only_snapshot(oracle: dict[str, OracleEntry]) -> None:

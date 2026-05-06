@@ -221,6 +221,14 @@ class TextPolicy(nn.Module):
         if isinstance(no_tid, list):
             raise TypeError("convert_tokens_to_ids('<no>') returned a list")
         no_token_id = int(no_tid)
+        self_tid = tokenizer.convert_tokens_to_ids("<self>")
+        if isinstance(self_tid, list):
+            raise TypeError("convert_tokens_to_ids('<self>') returned a list")
+        self_token_id = int(self_tid)
+        opp_tid = tokenizer.convert_tokens_to_ids("<opp>")
+        if isinstance(opp_tid, list):
+            raise TypeError("convert_tokens_to_ids('<opp>') returned a list")
+        opp_token_id = int(opp_tid)
         num_token_ids = []
         for k in range(MAX_NUM):
             tid = tokenizer.convert_tokens_to_ids(f"<num:{k}>")
@@ -248,6 +256,8 @@ class TextPolicy(nn.Module):
                 none_token_id=none_token_id,
                 yes_token_id=yes_token_id,
                 no_token_id=no_token_id,
+                self_token_id=self_token_id,
+                opp_token_id=opp_token_id,
                 num_token_ids=num_token_ids,
                 mana_token_ids=mana_token_ids,
                 card_ref_token_ids=card_ref_token_ids,

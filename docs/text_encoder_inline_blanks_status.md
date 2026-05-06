@@ -181,7 +181,7 @@ Implemented blank kinds and current wire shapes:
 | Priority play/cast | `<choose-play>` next to the source card | `CROSS_BLANK` | singleton `<chosen>` | Softmax is across all priority anchors, not within the singleton legal list. |
 | Priority ability | `<use-ability>` next to the source permanent | `CROSS_BLANK` | singleton `<chosen>` | Shares the priority cross-blank group with play/cast/pass anchors. |
 | Pass priority | `<pass>` in trailing `<choices>` | `CROSS_BLANK` | singleton `<chosen>` | Uses the existing action-kind `<pass>` token as the blank anchor. |
-| Target choice | `<choose-target>` immediately after the source action blank | `PER_BLANK` | visible target `<card-ref:K>` ids | Currently card-target only; targets without visible card refs are not represented by this blank. |
+| Target choice | `<choose-target>` immediately after the source action blank | `PER_BLANK` | visible target `<card-ref:K>` ids plus player `<self>` / `<opp>` ids | Zones, stack objects without refs, and other non-card/non-player targets are not represented by this blank. |
 | Block choice | `<choose-block>` next to the potential blocker | `CONSTRAINED` | `<none>` plus legal attacker `<card-ref:K>` ids | Maps sampled legal slot back to the existing blocker action payload. |
 | May choice | `<choose-may>` in trailing `<choices>` | `PER_BLANK` | `<no>, <yes>` | Legal-slot order matches `may_selected` labels. |
 | Mode choice | `<choose-mode>` in trailing `<choices>` | `PER_BLANK` | `<num:0>...<num:N-1>` | One bounded choice over the engine's mode options. |
@@ -213,11 +213,12 @@ every choice the engine can ask the player to make. Remaining gaps:
 1. **Damage assignment order is declared but not wired.** `<choose-damage-order>`
    exists in the tokenizer, but current renderer/native sampling paths do not
    emit or decode ordered blocker permutations for multi-block combat damage.
-2. **Targets are card-ref only.** `<choose-target>` legal vocabularies are
-   built from visible target object ids that have `<card-ref:K>` entries.
-   Player targets, zones, spells/abilities on stack without card refs, "any
-   target" player choices, and other non-card target classes need explicit
-   answer tokens or structured target handles.
+2. **Targets cover visible cards and players, but not every target class.**
+   `<choose-target>` legal vocabularies are built from visible target object
+   ids that have `<card-ref:K>` entries plus player targets represented as
+   `<self>` / `<opp>`. Zones, spells/abilities on stack without card refs, and
+   other non-card/non-player target classes still need explicit answer tokens
+   or structured target handles.
 3. **Multi-target cardinality and constraints are incomplete.** Current
    targeted priority handling emits a target blank tied to a source option,
    but it does not fully model "choose any number", "up to N", repeated target

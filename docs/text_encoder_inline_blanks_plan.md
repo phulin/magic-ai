@@ -34,12 +34,13 @@ Implemented blank surfaces:
   `<card-ref:K>` ids.
 
 Known fidelity gaps before this is a complete representation of all game
-choices: damage assignment order is not wired; targets are currently limited
-to visible card refs; arbitrary multi-target cardinality/constraints are not
-fully modeled; X is a bounded single blank rather than a digit sequence;
-mana-color blanks choose colors rather than source objects; several engine
-pending kinds still need dedicated or generic blank encodings. The detailed
-live status and gap list lives in `docs/text_encoder_inline_blanks_status.md`.
+choices: damage assignment order is not wired; targets currently cover visible
+card refs and player ids but not every target class; arbitrary multi-target
+cardinality/constraints are not fully modeled; X is a bounded single blank
+rather than a digit sequence; mana-color blanks choose colors rather than
+source objects; several engine pending kinds still need dedicated or generic
+blank encodings. The detailed live status and gap list lives in
+`docs/text_encoder_inline_blanks_status.md`.
 
 ## Motivation
 

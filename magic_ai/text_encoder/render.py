@@ -527,6 +527,8 @@ class SnapshotRenderer:
         none_token_id: int | None = None,
         yes_token_id: int | None = None,
         no_token_id: int | None = None,
+        self_token_id: int | None = None,
+        opp_token_id: int | None = None,
         num_token_ids: Sequence[int] | None = None,
         mana_token_ids: Sequence[int] | None = None,
         card_ref_token_ids: Sequence[int] | None = None,
@@ -537,6 +539,8 @@ class SnapshotRenderer:
         self._none_token_id = none_token_id
         self._yes_token_id = yes_token_id
         self._no_token_id = no_token_id
+        self._self_token_id = self_token_id
+        self._opp_token_id = opp_token_id
         self._num_token_ids = tuple(int(tid) for tid in num_token_ids or ())
         self._mana_token_ids = tuple(int(tid) for tid in mana_token_ids or ())
         self._card_ref_token_ids = tuple(
@@ -932,6 +936,12 @@ class SnapshotRenderer:
         legal_ids: list[int] = []
         for target in option.get("valid_targets") or []:
             tid = target.get("id", "")
+            if tid and tid == self._cur_self_id and self._self_token_id is not None:
+                legal_ids.append(int(self._self_token_id))
+                continue
+            if tid and tid == self._cur_opp_id and self._opp_token_id is not None:
+                legal_ids.append(int(self._opp_token_id))
+                continue
             ref = card_refs.get(tid)
             if ref is None:
                 continue
@@ -1062,6 +1072,8 @@ def render_snapshot(
     none_token_id: int | None = None,
     yes_token_id: int | None = None,
     no_token_id: int | None = None,
+    self_token_id: int | None = None,
+    opp_token_id: int | None = None,
     num_token_ids: Sequence[int] | None = None,
     mana_token_ids: Sequence[int] | None = None,
     card_ref_token_ids: Sequence[int] | None = None,
@@ -1086,6 +1098,8 @@ def render_snapshot(
         none_token_id=none_token_id,
         yes_token_id=yes_token_id,
         no_token_id=no_token_id,
+        self_token_id=self_token_id,
+        opp_token_id=opp_token_id,
         num_token_ids=num_token_ids,
         mana_token_ids=mana_token_ids,
         card_ref_token_ids=card_ref_token_ids,
