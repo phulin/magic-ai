@@ -156,10 +156,6 @@ class _PackedOutputs:
     cu_seqlens: torch.Tensor
     seq_lengths: torch.Tensor
     state_positions: torch.Tensor
-    option_positions: torch.Tensor
-    option_mask: torch.Tensor
-    target_positions: torch.Tensor
-    target_mask: torch.Tensor
     card_ref_positions: torch.Tensor
     token_overflow: torch.Tensor
     blank_positions: torch.Tensor
@@ -180,10 +176,6 @@ def _packed_outputs(batch_size: int, max_tokens: int = 8) -> _PackedOutputs:
         cu_seqlens=torch.zeros(batch_size + 1, dtype=torch.int32),
         seq_lengths=torch.zeros(batch_size, dtype=torch.int32),
         state_positions=torch.zeros(batch_size, dtype=torch.int32),
-        option_positions=torch.full((batch_size, 3), -1, dtype=torch.int32),
-        option_mask=torch.zeros((batch_size, 3), dtype=torch.uint8),
-        target_positions=torch.full((batch_size, 3, 2), -1, dtype=torch.int32),
-        target_mask=torch.zeros((batch_size, 3, 2), dtype=torch.uint8),
         card_ref_positions=torch.full((batch_size, 4), -1, dtype=torch.int32),
         token_overflow=torch.zeros(batch_size, dtype=torch.int32),
         blank_positions=torch.full((batch_size, 3), -1, dtype=torch.int32),
@@ -206,14 +198,6 @@ class MergePackedOutputsTests(unittest.TestCase):
         a.cu_seqlens[:] = torch.tensor([0, 2, 5], dtype=torch.int32)
         a.seq_lengths[:] = torch.tensor([2, 3], dtype=torch.int32)
         a.state_positions[:] = torch.tensor([0, 2], dtype=torch.int32)
-        a.option_positions[:, :2] = torch.tensor([[1, -1], [3, 4]], dtype=torch.int32)
-        a.option_mask[:, :2] = torch.tensor([[1, 0], [1, 1]], dtype=torch.uint8)
-        a.target_positions[:, :2, :] = torch.tensor(
-            [[[1, -1], [-1, -1]], [[3, -1], [4, -1]]], dtype=torch.int32
-        )
-        a.target_mask[:, :2, :] = torch.tensor(
-            [[[1, 0], [0, 0]], [[1, 0], [1, 0]]], dtype=torch.uint8
-        )
         a.card_ref_positions[:, :2] = torch.tensor([[0, -1], [2, 4]], dtype=torch.int32)
         a.blank_positions[:, :2] = torch.tensor([[1, -1], [2, 4]], dtype=torch.int32)
         a.blank_kind[:, :2] = torch.tensor([[101, 0], [102, 103]], dtype=torch.int32)
@@ -233,10 +217,6 @@ class MergePackedOutputsTests(unittest.TestCase):
         b.cu_seqlens[:] = torch.tensor([0, 4], dtype=torch.int32)
         b.seq_lengths[:] = torch.tensor([4], dtype=torch.int32)
         b.state_positions[:] = torch.tensor([0], dtype=torch.int32)
-        b.option_positions[:, :2] = torch.tensor([[0, 2]], dtype=torch.int32)
-        b.option_mask[:, :2] = torch.tensor([[1, 1]], dtype=torch.uint8)
-        b.target_positions[:, :2, :] = torch.tensor([[[1, -1], [2, 3]]], dtype=torch.int32)
-        b.target_mask[:, :2, :] = torch.tensor([[[1, 0], [1, 1]]], dtype=torch.uint8)
         b.card_ref_positions[:, :2] = torch.tensor([[1, -1]], dtype=torch.int32)
         b.token_overflow[:] = torch.tensor([1], dtype=torch.int32)
         b.blank_positions[:, :2] = torch.tensor([[0, 3]], dtype=torch.int32)
@@ -270,17 +250,6 @@ class MergePackedOutputsTests(unittest.TestCase):
         torch.testing.assert_close(out.seq_lengths[:3], torch.tensor([2, 3, 4], dtype=torch.int32))
         torch.testing.assert_close(
             out.state_positions[:3], torch.tensor([0, 2, 5], dtype=torch.int32)
-        )
-        torch.testing.assert_close(
-            out.option_positions[:3, :2],
-            torch.tensor([[1, -1], [3, 4], [5, 7]], dtype=torch.int32),
-        )
-        torch.testing.assert_close(
-            out.target_positions[:3, :2, :],
-            torch.tensor(
-                [[[1, -1], [-1, -1]], [[3, -1], [4, -1]], [[6, -1], [7, 8]]],
-                dtype=torch.int32,
-            ),
         )
         torch.testing.assert_close(
             out.card_ref_positions[:3, :2],

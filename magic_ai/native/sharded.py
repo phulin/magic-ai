@@ -137,14 +137,6 @@ def _merge_packed_outputs(
         output.state_positions[batch_cursor:next_batch].copy_(
             _add_token_offset(shard.state_positions[:shard_n], token_cursor)
         )
-        output.option_positions[batch_cursor:next_batch].copy_(
-            _add_token_offset(shard.option_positions[:shard_n], token_cursor)
-        )
-        output.option_mask[batch_cursor:next_batch].copy_(shard.option_mask[:shard_n])
-        output.target_positions[batch_cursor:next_batch].copy_(
-            _add_token_offset(shard.target_positions[:shard_n], token_cursor)
-        )
-        output.target_mask[batch_cursor:next_batch].copy_(shard.target_mask[:shard_n])
         output.card_ref_positions[batch_cursor:next_batch].copy_(
             _add_token_offset(shard.card_ref_positions[:shard_n], token_cursor)
         )

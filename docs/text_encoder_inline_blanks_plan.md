@@ -18,9 +18,9 @@ options/targets.
 
 The migration is currently inline-only on the Python policy side: legacy
 text-policy option/target heads and batch fields have been removed, and live
-native text rollout uses `MageEncodeTokensPacked` blank outputs. Native
-option/target ABI buffers remain as scratch compatibility fields until the
-mage-go ABI is cleaned up.
+native text rollout uses `MageEncodeTokensPacked` blank outputs. The packed
+text-token ABI no longer exposes option/target scratch buffers; remaining
+option/target arrays belong to the separate slot-encoder/native action path.
 
 Implemented blank surfaces:
 

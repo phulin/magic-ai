@@ -24,7 +24,7 @@ the eight-step migration. Update at every step boundary.
 | 5 | BC smoke gate (priority-only)              | 🚧 harnessed  | Loss/accuracy utilities and fixed-trace inline BC CLI landed; real trace gate still pending. |
 | 6 | Combat blocks                               | ✅ done       | `<choose-block>` render/batch/model path, live sampler/action adapter, replay storage, and replay scoring landed. |
 | 7 | Targets / modes / mays / X / mana sources  | ✅ done       | Targets, may, modes, number/X, and mana-color choices are inline-blank wired. |
-| 8 | Delete legacy option/target heads          | 🚧 in progress | Python model/policy/batch/replay/render/render-plan surfaces are inline-only; native token-table/assembler ABI compatibility fields remain until mage-go is updated. |
+| 8 | Delete legacy option/target heads          | ✅ done       | Python model/policy/batch/replay/render/render-plan surfaces are inline-only; native packed-token ABI no longer exposes option/target scratch buffers. |
 
 ## What landed in each completed step
 
@@ -169,8 +169,10 @@ without treating the accuracy gate as a blocker.
 
 The Python policy, recurrent wrapper, actor-critic live sampler, text replay
 buffer, and native packed-token rollout path are inline-only. The old
-option/target text-policy heads have been deleted; native legacy option/target
-ABI fields still exist only as mage-go compatibility scratch.
+option/target text-policy heads have been deleted, and the mage-go packed
+text-token ABI now returns only token/card-ref/overflow metadata plus inline
+blank metadata. Legacy option/target arrays remain only in the separate
+slot-encoder/native action encoder path.
 
 Implemented blank kinds and current wire shapes:
 
@@ -195,10 +197,11 @@ blank tensors with token-offset rebasing.
 
 Mage-go commit `f0edc8e` extends native render-plan inline blank emission to
 match the implemented Python surfaces for priority targets, blockers, may,
-mode, bounded number, and mana-color choices. `go test ./cmd/pylib` and the
-Python native packed inline blank smoke pass against the rebuilt worktree
-install. The full mage-go suite passes with three known Jumpstart failures
-marked skipped/xfail.
+mode, bounded number, and mana-color choices. A follow-up ABI cleanup removes
+packed option/target scratch buffers from `MagePackedTokenAssemblerOutputs`;
+`go test ./...`, `tests/test_sharded_native.py`, and the Python native packed
+inline blank smoke pass against the rebuilt worktree install. The full
+mage-go suite passes with three known Jumpstart failures marked skipped/xfail.
 
 ## Fidelity gaps for perfect game-choice representation
 
