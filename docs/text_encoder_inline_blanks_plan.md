@@ -28,8 +28,9 @@ Implemented blank surfaces:
   anchors scored with singleton `<chosen>` legal vocabularies and one softmax
   across the anchor positions.
 - `PER_BLANK`: `<choose-target>`, `<choose-may>`, `<choose-mode>`,
-  `<choose-x-digit>` for bounded `number` choices, and
-  `<choose-mana-source>` for `mana_color`.
+  `<choose-x-digit>` for bounded `number` choices,
+  `<choose-mana-source>` for `mana_color`, and binary attacker-declaration
+  blanks.
 - `CONSTRAINED`: `<choose-block>` with `<none>` plus legal attacker
   `<card-ref:K>` ids.
 

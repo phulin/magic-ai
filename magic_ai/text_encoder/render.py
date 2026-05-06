@@ -875,6 +875,18 @@ class SnapshotRenderer:
                 per_card.setdefault(source, []).append(
                     ("<choose-block>", opt_idx, legal_ids, "CONSTRAINED", key)
                 )
+            elif kind in ("attacker", "attack"):
+                source = option.get("permanent_id") or option.get("card_id") or ""
+                if not source:
+                    raise RenderError(
+                        f"attacker option {opt_idx} has no permanent_id / card_id; "
+                        "cannot anchor inline blank."
+                    )
+                legal_ids = self._attacker_legal_token_ids(source, card_refs)
+                key = (0, "<choose-target>", str(option.get("id") or ""), opt_idx)
+                per_card.setdefault(source, []).append(
+                    ("<choose-target>", opt_idx, legal_ids, "PER_BLANK", key)
+                )
             elif kind == "pass":
                 pass_options.append(opt_idx)
             else:
@@ -927,6 +939,21 @@ class SnapshotRenderer:
                 )
             legal_ids.append(int(self._card_ref_token_ids[ref]))
         return tuple(legal_ids)
+
+    def _attacker_legal_token_ids(
+        self,
+        source: str,
+        card_refs: dict[str, int],
+    ) -> tuple[int, ...]:
+        none_id = self._none_token_id
+        if none_id is None:
+            raise RenderError("inline attacker blanks require none_token_id")
+        ref = card_refs.get(source)
+        if ref is None:
+            return (int(none_id),)
+        if not 0 <= ref < len(self._card_ref_token_ids):
+            raise RenderError(f"attacker card-ref:{ref} has no token id in card_ref_token_ids")
+        return (int(none_id), int(self._card_ref_token_ids[ref]))
 
     def _target_legal_token_ids(
         self,

@@ -399,6 +399,27 @@ class TextActorCritic(nn.Module):
                     if trace_kind == "blockers"
                     else None
                 )
+                inline_attacker_sample = (
+                    _sample_inline_attackers_for_step(
+                        output,
+                        inline_batch,
+                        layout,
+                        step_idx=step_idx,
+                        deterministic=deterministic,
+                    )
+                    if trace_kind == "attackers"
+                    else None
+                )
+                if inline_attacker_sample is not None:
+                    selected_tensors, log_prob, entropy = inline_attacker_sample
+                    per_step_log_prob.append(log_prob)
+                    per_step_entropy.append(entropy)
+                    per_step_value.append(value)
+                    per_step_may_sample.append(may_sample_t)
+                    per_step_trace_kind.append(trace_kind)
+                    per_step_layout.append(layout)
+                    per_step_selected_tensors.append(selected_tensors)
+                    continue
                 if inline_block_sample is not None:
                     selected_tensors, log_prob, entropy = inline_block_sample
                     per_step_log_prob.append(log_prob)
@@ -644,8 +665,22 @@ class TextActorCritic(nn.Module):
                         if trace_kind == "blockers"
                         else None
                     )
+                    inline_attacker_sample = (
+                        _sample_inline_attackers_for_step(
+                            output,
+                            inline_batch,
+                            layout,
+                            step_idx=step_idx,
+                            deterministic=deterministic,
+                        )
+                        if trace_kind == "attackers"
+                        else None
+                    )
                     inline_sample = (
-                        inline_choice_sample or inline_priority_sample or inline_block_sample
+                        inline_choice_sample
+                        or inline_priority_sample
+                        or inline_block_sample
+                        or inline_attacker_sample
                     )
                     if inline_sample is None:
                         raise ValueError(
@@ -1238,27 +1273,57 @@ class TextActorCritic(nn.Module):
                 group_skip_mask=choice_group_mask | color_group_mask | priority_group_mask,
             )
         )
+        attacker_log_probs, attacker_entropies, attacker_group_mask, attacker_per_choice = (
+            _evaluate_inline_blocker_replay_groups(
+                output,
+                batch,
+                return_per_choice=return_per_choice,
+                trace_kind_id=TRACE_KIND_TO_ID["attackers"],
+                blank_group_kind_id=BLANK_GROUP_PER_BLANK,
+                group_skip_mask=(
+                    choice_group_mask | color_group_mask | priority_group_mask | blocker_group_mask
+                ),
+            )
+        )
         log_probs = (
-            log_probs + choice_log_probs + color_log_probs + priority_log_probs + blocker_log_probs
+            log_probs
+            + choice_log_probs
+            + color_log_probs
+            + priority_log_probs
+            + blocker_log_probs
+            + attacker_log_probs
         )
         entropies = (
-            entropies + choice_entropies + color_entropies + priority_entropies + blocker_entropies
+            entropies
+            + choice_entropies
+            + color_entropies
+            + priority_entropies
+            + blocker_entropies
+            + attacker_entropies
         )
 
         inline_group_mask = (
-            choice_group_mask | color_group_mask | priority_group_mask | blocker_group_mask
+            choice_group_mask
+            | color_group_mask
+            | priority_group_mask
+            | blocker_group_mask
+            | attacker_group_mask
         )
         if return_per_choice:
             assert choice_per_choice is not None
             assert color_per_choice is not None
             assert priority_per_choice is not None
             assert blocker_per_choice is not None
+            assert attacker_per_choice is not None
             inline_per_choice = _concat_replay_per_choice(
                 _concat_replay_per_choice(
-                    _concat_replay_per_choice(choice_per_choice, color_per_choice),
-                    priority_per_choice,
+                    _concat_replay_per_choice(
+                        _concat_replay_per_choice(choice_per_choice, color_per_choice),
+                        priority_per_choice,
+                    ),
+                    blocker_per_choice,
                 ),
-                blocker_per_choice,
+                attacker_per_choice,
             )
         else:
             inline_per_choice = None
@@ -1712,6 +1777,54 @@ def _sample_inline_blockers_for_step(
     return selected, log_prob, entropy
 
 
+def _sample_inline_attackers_for_step(
+    output: RecurrentTextPolicyOutput,
+    batch: TextEncodedBatch | PackedTextBatch,
+    layout: TextDecisionLayout,
+    *,
+    step_idx: int,
+    deterministic: bool,
+) -> tuple[list[Tensor], Tensor, Tensor] | None:
+    blank_logits = output.blank_logits
+    if blank_logits is None or blank_logits.numel() == 0:
+        return None
+    if batch.blank_option_index.numel() == 0:
+        return None
+
+    row_group_kind = batch.blank_group_kind[step_idx].to(device=blank_logits.device)
+    row_option_index = batch.blank_option_index[step_idx].to(device=blank_logits.device)
+    row_legal_mask = batch.blank_legal_mask[step_idx].to(
+        device=blank_logits.device, dtype=torch.bool
+    )
+    row_logits = blank_logits[step_idx]
+    blank_support = (row_group_kind == BLANK_GROUP_PER_BLANK) & (row_option_index >= 0)
+
+    selected: list[Tensor] = []
+    log_prob = output.values.new_zeros(())
+    entropy = output.values.new_zeros(())
+    for group_idx in range(int(layout.decision_option_idx.shape[0])):
+        row = layout.decision_option_idx[group_idx]
+        valid = row[row >= 0]
+        if int(valid.numel()) == 0:
+            return None
+        option_idx = int(valid[0].item())
+        matches = (row_option_index == option_idx) & blank_support
+        match_idx = matches.nonzero(as_tuple=False).squeeze(-1)
+        if int(match_idx.numel()) != 1:
+            return None
+        blank_idx = match_idx[0]
+        legal_slots = row_legal_mask[blank_idx].nonzero(as_tuple=False).squeeze(-1)
+        if legal_slots.numel() < 2:
+            return None
+        logits = row_logits[blank_idx, legal_slots]
+        dist = Categorical(logits=logits)
+        chosen_in_legal = torch.argmax(logits) if deterministic else dist.sample()
+        log_prob = log_prob + dist.log_prob(chosen_in_legal)
+        entropy = entropy + dist.entropy()
+        selected.append(legal_slots[chosen_in_legal].to(dtype=torch.long))
+    return selected, log_prob, entropy
+
+
 def _evaluate_inline_priority_replay_groups(
     output: RecurrentTextPolicyOutput,
     batch: TextReplayBatch,
@@ -2067,9 +2180,11 @@ def _evaluate_inline_blocker_replay_groups(
     batch: TextReplayBatch,
     *,
     return_per_choice: bool,
+    trace_kind_id: int = TRACE_KIND_TO_ID["blockers"],
+    blank_group_kind_id: int = BLANK_GROUP_CONSTRAINED,
     group_skip_mask: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice | None]:
-    """Score replayed block choices from inline blank logits when available."""
+    """Score replayed per-option choices from inline blank logits when available."""
 
     decision_count = batch.decision_count
     n = int(decision_count.shape[0])
@@ -2105,7 +2220,7 @@ def _evaluate_inline_blocker_replay_groups(
 
     row_blank_option = blank_option_index[steps_t]
     row_blank_kind = blank_group_kind[steps_t]
-    blank_support = (row_blank_kind == BLANK_GROUP_CONSTRAINED) & (row_blank_option >= 0)
+    blank_support = (row_blank_kind == blank_group_kind_id) & (row_blank_option >= 0)
     matches = (row_blank_option == group_option_idx.unsqueeze(1)) & blank_support
     match_count = matches.sum(dim=-1)
     blank_idx = matches.to(dtype=torch.long).argmax(dim=-1)
@@ -2118,9 +2233,9 @@ def _evaluate_inline_blocker_replay_groups(
     selected_in_range = (selected >= 0) & (selected < legal_width)
     safe_selected = selected.clamp(min=0, max=legal_width - 1)
     selected_legal = row_legal_mask.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
-    is_blocker_step = trace_kind[steps_t] == TRACE_KIND_TO_ID["blockers"]
+    is_matching_step = trace_kind[steps_t] == trace_kind_id
     group_mask = (
-        is_blocker_step & has_option & (match_count == 1) & selected_in_range & selected_legal
+        is_matching_step & has_option & (match_count == 1) & selected_in_range & selected_legal
     )
     if group_skip_mask is not None:
         group_mask = group_mask & ~group_skip_mask.to(device=device, dtype=torch.bool)

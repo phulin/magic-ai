@@ -182,6 +182,7 @@ Implemented blank kinds and current wire shapes:
 | Priority ability | `<use-ability>` next to the source permanent | `CROSS_BLANK` | singleton `<chosen>` | Shares the priority cross-blank group with play/cast/pass anchors. |
 | Pass priority | `<pass>` in trailing `<choices>` | `CROSS_BLANK` | singleton `<chosen>` | Uses the existing action-kind `<pass>` token as the blank anchor. |
 | Target / indexed object choice | `<choose-target>` immediately after the source action blank, or in trailing `<choices>` for standalone object choices | `PER_BLANK` | visible target `<card-ref:K>` ids plus player `<self>` / `<opp>` ids; hidden object choices fall back to `<num:K>` option ids | Zones, stack objects without refs, and other non-card/non-player targets are not self-describing yet. |
+| Attack declaration | `<choose-target>` next to each eligible attacker | `PER_BLANK` | `<none>` plus that attacker's `<card-ref:K>` id | Maps legal slot 0/1 back to the existing attacker selected-column payload. |
 | Block choice | `<choose-block>` next to the potential blocker | `CONSTRAINED` | `<none>` plus legal attacker `<card-ref:K>` ids | Maps sampled legal slot back to the existing blocker action payload. |
 | May choice | `<choose-may>` in trailing `<choices>` | `PER_BLANK` | `<no>, <yes>` | Legal-slot order matches `may_selected` labels. |
 | Mode choice | `<choose-mode>` in trailing `<choices>` | `PER_BLANK` | `<num:0>...<num:N-1>` | One bounded choice over the engine's mode options. |
@@ -235,12 +236,12 @@ every choice the engine can ask the player to make. Remaining gaps:
    color token. It does not choose which land/treasure/permanent/ability paid a
    pip, does not represent alternative costs, and cannot distinguish multiple
    sources producing the same color.
-6. **Non-priority choice kinds are only partially covered.** `may`, `mode`,
-   `number`, `mana_color`, `permanent`, `cards_from_hand`, and
+6. **Non-priority choice kinds are only partially covered.** `attackers`,
+   `may`, `mode`, `number`, `mana_color`, `permanent`, `cards_from_hand`, and
    `card_from_library` are wired. Other engine pending kinds such as
-   mulligan/keep, attack declaration, ordering choices, replacement/prevention
-   choices, and any bespoke prompt kinds need either dedicated blank kinds or a
-   generic structured choice blank before the representation is complete.
+   mulligan/keep, ordering choices, replacement/prevention choices, and any
+   bespoke prompt kinds need either dedicated blank kinds or a generic
+   structured choice blank before the representation is complete.
 7. **Hidden/ambiguous option identity still depends on engine columns.**
    `blank_option_index` is stored so sampled blanks can map back to the native
    engine's selected-column API. That is pragmatic for training now, but a

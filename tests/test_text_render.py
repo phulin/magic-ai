@@ -963,6 +963,61 @@ def test_inline_blanks_blockers_emit_constrained_block_blanks(
     assert anchor.option_index == 0
 
 
+def test_inline_blanks_attackers_emit_binary_attack_blanks(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    attacker = _card("attacker-1", "Grizzly Bears", tapped=False)
+    snap = cast(
+        GameStateSnapshot,
+        {
+            "turn": 4,
+            "active_player": "p1",
+            "step": "Declare Attackers",
+            "players": [
+                _player("p1", "Self", battlefield=[attacker]),
+                _player("p2", "Opp"),
+            ],
+            "pending": cast(
+                PendingState,
+                {
+                    "kind": "attackers",
+                    "player_idx": 0,
+                    "options": [
+                        cast(
+                            PendingOptionState,
+                            {
+                                "id": "attack-opt",
+                                "kind": "attacker",
+                                "permanent_id": attacker["ID"],
+                            },
+                        )
+                    ],
+                },
+            ),
+        },
+    )
+
+    rendered = render_snapshot(
+        snap,
+        oracle=oracle,
+        chosen_token_id=CHOSEN_FAKE_ID,
+        none_token_id=NONE_FAKE_ID,
+        card_ref_token_ids=CARD_REF_FAKE_IDS,
+    )
+
+    assert "<actions>" not in rendered.text
+    self_bf_segment = rendered.text.split("<self><battlefield>", 1)[1].split(
+        "</battlefield></self>", 1
+    )[0]
+    assert "<choose-target>" in self_bf_segment
+    [anchor] = rendered.blank_anchors
+    attacker_ref = rendered.card_refs[attacker["ID"]]
+    assert anchor.kind == "<choose-target>"
+    assert anchor.group_kind == "PER_BLANK"
+    assert anchor.legal_token_ids == (NONE_FAKE_ID, CARD_REF_FAKE_IDS[attacker_ref])
+    assert anchor.option_index == 0
+
+
 def test_inline_blanks_ordinal_parity_under_option_permutation(
     oracle: dict[str, OracleEntry],
 ) -> None:
