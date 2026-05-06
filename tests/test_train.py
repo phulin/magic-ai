@@ -77,6 +77,16 @@ class TrainPPOTests(unittest.TestCase):
         ):
             validate_checkpoint_encoder(args, checkpoint)
 
+    def test_validate_checkpoint_encoder_rejects_policy_snapshot(self) -> None:
+        args = Namespace(encoder="text")
+        checkpoint = {"state_dict": {}}
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "policy snapshot, not a training checkpoint",
+        ):
+            validate_checkpoint_encoder(args, checkpoint)
+
     def test_validate_checkpoint_encoder_rejects_text_config_mismatch(self) -> None:
         args = Namespace(
             encoder="text",

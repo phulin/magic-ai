@@ -1193,6 +1193,13 @@ def validate_checkpoint_encoder(
 ) -> None:
     if checkpoint is None:
         return
+    if "state_dict" in checkpoint and "policy" not in checkpoint:
+        raise ValueError(
+            "--checkpoint points to a policy snapshot, not a training checkpoint. "
+            "R-NaD reg_mNNN.pt files are restored automatically from the main "
+            "checkpoint's saved reg_snapshot_dir; resume with the main --output "
+            "checkpoint instead."
+        )
     checkpoint_encoder = checkpoint_encoder_kind(checkpoint)
     if checkpoint_encoder != args.encoder:
         raise ValueError(
@@ -4642,7 +4649,7 @@ def train_text_native_batched_envs(
                             slot_idx = actor_free_slots[aid].pop()
                             new_games.append(start_game(slot_idx, next_episode_idx))
                             next_episode_idx += 1
-                    if next_episode_idx >= args.episodes and not actor_free_slots[aid]:
+                    if next_episode_idx >= args.episodes:
                         no_more = True
                     refill_resp_qs[aid].put(
                         RefillResponse(games=new_games, no_more_episodes=no_more)
