@@ -14,6 +14,7 @@ from magic_ai.text_encoder.actor_critic import (
     _sample_inline_blockers_for_step,
     _sample_inline_choice_index_for_step,
     _sample_inline_may_for_step,
+    _sample_inline_priority_batch,
     _sample_inline_priority_for_step,
     _score_inline_may_decisions,
     build_text_decision_layout,
@@ -338,6 +339,46 @@ class TextActorCriticTests(unittest.TestCase):
         self.assertEqual([int(t.item()) for t in selected], [1])
         self.assertTrue(torch.isfinite(log_prob))
         self.assertTrue(torch.isfinite(entropy))
+
+    def test_inline_priority_batch_sampler_maps_target_blank_to_candidate_column(self) -> None:
+        output = RecurrentTextPolicyOutput(
+            values=torch.zeros(1),
+            state_hidden=torch.zeros(1, 8),
+            card_vectors=torch.empty(1, MAX_CARD_REFS, 8),
+            card_mask=torch.zeros(1, MAX_CARD_REFS, dtype=torch.bool),
+            blank_logits=torch.tensor([[[5.0, 0.0], [0.0, 4.0], [0.0, 1.0]]]),
+        )
+        batch = TextEncodedBatch(
+            token_ids=torch.tensor([[1, 2, 3]]),
+            attention_mask=torch.ones(1, 3, dtype=torch.long),
+            card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
+            seq_lengths=torch.tensor([3]),
+            blank_group_kind=torch.tensor(
+                [[BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK, BLANK_GROUP_CROSS_BLANK]],
+                dtype=torch.int32,
+            ),
+            blank_option_index=torch.tensor([[0, 0, 1]], dtype=torch.int32),
+            blank_legal_mask=torch.tensor([[[True, False], [True, True], [True, False]]]),
+        )
+
+        sampled = _sample_inline_priority_batch(
+            output,
+            batch,
+            option_idx=torch.tensor([[0, 0, 1]]),
+            target_idx=torch.tensor([[0, 1, -1]]),
+            decision_mask=torch.ones(1, 3, dtype=torch.bool),
+            trace_kind_id=torch.tensor([TRACE_KIND_TO_ID["priority"]]),
+            decision_count=torch.tensor([1]),
+            decision_rows=1,
+            deterministic=True,
+        )
+
+        assert sampled is not None
+        selected, log_prob, entropy, active = sampled
+        self.assertEqual(selected.tolist(), [1])
+        self.assertEqual(active.tolist(), [True])
+        self.assertTrue(torch.isfinite(log_prob).all())
+        self.assertTrue(torch.isfinite(entropy).all())
 
     def test_inline_may_sampler_uses_yes_no_blank(self) -> None:
         output = RecurrentTextPolicyOutput(
