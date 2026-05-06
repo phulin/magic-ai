@@ -2160,8 +2160,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--trainer",
         choices=("ppo", "rnad"),
-        default="ppo",
-        help="training algorithm: 'ppo' (default) or 'rnad' (Regularized Nash "
+        default="rnad",
+        help="training algorithm: 'ppo' or 'rnad' (default, Regularized Nash "
         "Dynamics / DeepNash). The 'rnad' path is scaffolded via CLI and "
         "primitives in magic_ai/rnad.py; the full training loop integration "
         "lands in phases 4-7 of docs/rnad_implementation_plan.md.",
@@ -2300,7 +2300,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inference-max-batch",
         type=int,
-        default=0,
+        default=1024,
         help=(
             "inference server: cap merged forward-batch row count; 0 = use --num-envs as the cap"
         ),
@@ -2423,7 +2423,7 @@ def parse_args() -> argparse.Namespace:
         "starting RL. Pass this path back as --checkpoint to skip MLM and "
         "start RL from the pretrained encoder; opponent pool will start empty.",
     )
-    parser.add_argument("--pretrain-mlm-batch-size", type=int, default=128)
+    parser.add_argument("--pretrain-mlm-batch-size", type=int, default=64)
     parser.add_argument("--pretrain-mlm-seq-len", type=int, default=512)
     parser.add_argument("--pretrain-mlm-mask-prob", type=float, default=0.15)
     parser.add_argument("--pretrain-mlm-lr", type=float, default=2e-4)
@@ -2571,7 +2571,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--ppo-epochs", type=int, default=4)
-    parser.add_argument("--minibatch-size", type=int, default=2048)
+    parser.add_argument("--minibatch-size", type=int, default=256)
     parser.add_argument(
         "--minibatch-token-limit",
         type=int,
