@@ -918,7 +918,16 @@ def save_reg_snapshot(policy: nn.Module, path: str | Path) -> None:
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": policy.state_dict()}, path)
+    torch.save(
+        {
+            "state_dict": {
+                name: tensor
+                for name, tensor in policy.state_dict().items()
+                if not is_actor_runtime_state_key(name)
+            }
+        },
+        path,
+    )
 
 
 def load_reg_snapshot_into(policy: nn.Module, path: str | Path) -> None:
@@ -929,7 +938,14 @@ def load_reg_snapshot_into(policy: nn.Module, path: str | Path) -> None:
         map_location="cpu",
         weights_only=False,
     )
-    policy.load_state_dict(payload["state_dict"])
+    policy.load_state_dict(
+        {
+            name: tensor
+            for name, tensor in payload["state_dict"].items()
+            if not is_actor_runtime_state_key(name)
+        },
+        strict=False,
+    )
     for p in policy.parameters():
         p.requires_grad_(False)
     policy.eval()

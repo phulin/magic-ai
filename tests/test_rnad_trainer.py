@@ -21,7 +21,7 @@ from magic_ai.slot_encoder.model import PPOPolicy
 from torch import nn
 
 
-def _make_policy() -> PPOPolicy:
+def _make_policy(*, use_lstm: bool = False) -> PPOPolicy:
     encoder = GameStateEncoder({"Mountain": [0.1, 0.2, 0.3]}, d_model=8)
     return PPOPolicy(
         encoder,
@@ -30,6 +30,7 @@ def _make_policy() -> PPOPolicy:
         max_options=4,
         max_targets_per_option=2,
         rollout_capacity=16,
+        use_lstm=use_lstm,
     )
 
 
@@ -203,6 +204,67 @@ class CheckpointRoundTripTests(unittest.TestCase):
         self.assertTrue(
             torch.allclose(cast(PPOPolicy, fresh.target).value_head.weight, torch.tensor(0.321)),
         )
+
+    def test_save_and_restore_rnad_state_ignores_runtime_lstm_buffers(self) -> None:
+        from argparse import Namespace
+
+        from magic_ai.opponent_pool import OpponentPool
+        from scripts.train import (
+            _restore_rnad_state,
+            load_training_checkpoint,
+            save_checkpoint,
+        )
+
+        policy = _make_policy(use_lstm=True)
+        policy.init_lstm_env_states(3)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            reg_dir = tmp / "rnad"
+            state = build_trainer_state(
+                policy,
+                config=RNaDConfig(delta_m=5),
+                reg_snapshot_dir=reg_dir,
+                device=policy.device,
+            )
+            cast(PPOPolicy, state.target).init_lstm_env_states(3)
+            from magic_ai.rnad import save_reg_snapshot
+
+            save_reg_snapshot(cast(nn.Module, state.target), reg_dir / "reg_m001.pt")
+            state.outer_iteration = 1
+
+            ckpt_path = tmp / "ckpt.pt"
+            optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+            args = Namespace(output=ckpt_path, opponent_pool_dir=tmp / "opponent_pool")
+            save_checkpoint(
+                ckpt_path,
+                policy,
+                optimizer,
+                args,
+                opponent_pool=OpponentPool(),
+                rnad_state=state,
+            )
+
+            checkpoint = load_training_checkpoint(ckpt_path)
+            assert checkpoint is not None
+            self.assertNotIn("live_lstm_h", checkpoint["policy"])
+            self.assertNotIn("live_lstm_c", checkpoint["training_state"]["rnad_state"]["target"])
+            checkpoint["training_state"]["rnad_state"]["target"]["live_lstm_h"] = torch.zeros(
+                1, 3, 16
+            )
+            checkpoint["training_state"]["rnad_state"]["target"]["live_lstm_c"] = torch.zeros(
+                1, 3, 16
+            )
+
+            fresh_policy = _make_policy(use_lstm=True)
+            fresh = build_trainer_state(
+                fresh_policy,
+                config=RNaDConfig(delta_m=5),
+                reg_snapshot_dir=reg_dir,
+                device=fresh_policy.device,
+            )
+            _restore_rnad_state(fresh, checkpoint)
+
+        self.assertEqual(fresh.outer_iteration, 1)
 
 
 class FinetuneGateTests(unittest.TestCase):

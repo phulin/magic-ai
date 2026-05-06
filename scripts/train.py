@@ -45,6 +45,7 @@ from magic_ai.game_state import (  # noqa: E402
     PendingOptionState,
     PendingState,
 )
+from magic_ai.model_state import is_actor_runtime_state_key  # noqa: E402
 from magic_ai.native.sharded import (  # noqa: E402
     ShardedNativeBatchEncoder,
     ShardedNativeRolloutDriver,
@@ -1168,6 +1169,31 @@ def _training_state_dict(checkpoint: dict[str, Any] | None) -> dict[str, Any]:
     return training_state if isinstance(training_state, dict) else {}
 
 
+def _model_checkpoint_state_dict(model: torch.nn.Module) -> dict[str, Any]:
+    return {
+        name: tensor
+        for name, tensor in model.state_dict().items()
+        if not is_actor_runtime_state_key(name)
+    }
+
+
+def _load_model_checkpoint_state(model: torch.nn.Module, state_dict: dict[str, Any]) -> None:
+    result = model.load_state_dict(
+        {
+            name: tensor
+            for name, tensor in state_dict.items()
+            if not is_actor_runtime_state_key(name)
+        },
+        strict=False,
+    )
+    missing = [name for name in result.missing_keys if not is_actor_runtime_state_key(name)]
+    unexpected = [name for name in result.unexpected_keys if not is_actor_runtime_state_key(name)]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"checkpoint state did not match model (missing={missing}, unexpected={unexpected})"
+        )
+
+
 def _is_post_mlm_checkpoint(checkpoint: dict[str, Any] | None) -> bool:
     return bool(_checkpoint_metadata(checkpoint).get("post_mlm", False))
 
@@ -1390,7 +1416,7 @@ def _restore_rnad_state(
     target_sd = payload.get("target")
     if isinstance(target_sd, dict):
         target_module = cast(PPOPolicy, state.target)
-        target_module.load_state_dict(target_sd)
+        _load_model_checkpoint_state(target_module, target_sd)
         for p in target_module.parameters():
             p.requires_grad_(False)
         target_module.eval()
@@ -1950,7 +1976,7 @@ def main() -> None:
         optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate, fused=fused_optim)
     checkpoint = load_training_checkpoint(args.checkpoint, map_location=device)
     if checkpoint is not None:
-        policy.load_state_dict(checkpoint["policy"])
+        _load_model_checkpoint_state(policy, checkpoint["policy"])
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
 
@@ -5372,7 +5398,7 @@ def save_checkpoint(
             "outer_iteration": rnad_state.outer_iteration,
             "gradient_step": rnad_state.gradient_step,
             "is_finetuning": rnad_state.is_finetuning,
-            "target": cast(PPOPolicy, rnad_state.target).state_dict(),
+            "target": _model_checkpoint_state_dict(cast(PPOPolicy, rnad_state.target)),
             "reg_snapshot_dir": str(rnad_state.reg_snapshot_dir),
         }
     metadata = {
@@ -5417,7 +5443,7 @@ def save_checkpoint(
         }
     torch.save(
         {
-            "policy": policy.state_dict(),
+            "policy": _model_checkpoint_state_dict(policy),
             "optimizer": optimizer.state_dict(),
             "args": serialized_args,
             "training_state": training_state,
