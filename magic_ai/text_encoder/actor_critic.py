@@ -1807,10 +1807,16 @@ def _sample_inline_may_batch(
     row_idx = torch.arange(blank_logits.shape[0], device=device)
     logits = blank_logits[row_idx, blank_idx, :2]
     logits = torch.where(active.unsqueeze(1), logits, torch.zeros_like(logits))
-    dist = Categorical(logits=logits)
-    selected = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
+    selected = (
+        torch.argmax(logits, dim=-1)
+        if deterministic
+        else (logits - torch.empty_like(logits).exponential_().log()).argmax(dim=-1)
+    )
+    log_probs = torch.log_softmax(logits, dim=-1)
     selected_may = selected.to(dtype=output.values.dtype)
-    return selected_may, dist.log_prob(selected), dist.entropy(), active
+    log_prob = log_probs.gather(1, selected.unsqueeze(1)).squeeze(1)
+    entropy = torch.zeros_like(log_prob)
+    return selected_may, log_prob, entropy, active
 
 
 def _sample_inline_choice_index_for_step(
