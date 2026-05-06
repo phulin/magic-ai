@@ -2862,9 +2862,6 @@ def train_native_batched_envs(
     total_rollout_steps = restored_state.total_rollout_steps
     total_generated_rollout_steps = restored_state.total_generated_rollout_steps
     total_wandb_logs = restored_state.total_wandb_logs
-    run_step = getattr(wandb.run, "step", None) if wandb.run is not None else None
-    if isinstance(run_step, int):
-        total_wandb_logs = max(total_wandb_logs, run_step)
     next_episode_idx = completed_games
     live_games: list[LiveGame] = []
     free_slots = list(range(args.num_envs - 1, -1, -1))
@@ -3529,9 +3526,6 @@ def train_text_envs(
     total_rollout_steps = restored_state.total_rollout_steps
     total_generated_rollout_steps = restored_state.total_generated_rollout_steps
     total_wandb_logs = restored_state.total_wandb_logs
-    run_step = getattr(wandb.run, "step", None) if wandb.run is not None else None
-    if isinstance(run_step, int):
-        total_wandb_logs = max(total_wandb_logs, run_step)
 
     pending_steps: list[RolloutStep] = []
     pending_returns: list[torch.Tensor] = []
@@ -3929,9 +3923,6 @@ def train_text_native_batched_envs(
     total_rollout_steps = restored_state.total_rollout_steps
     total_generated_rollout_steps = restored_state.total_generated_rollout_steps
     total_wandb_logs = restored_state.total_wandb_logs
-    run_step = getattr(wandb.run, "step", None) if wandb.run is not None else None
-    if isinstance(run_step, int):
-        total_wandb_logs = max(total_wandb_logs, run_step)
 
     pending_replay_rows: list[torch.Tensor] = []
     pending_returns: list[torch.Tensor] = []
