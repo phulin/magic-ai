@@ -116,7 +116,7 @@ class BlankAnchor:
     char_start: int
     char_end: int
     group_id: int
-    group_kind: str  # "CROSS_BLANK" | "PER_BLANK" | "CONSTRAINED"
+    group_kind: str  # "CROSS_BLANK" | "PER_BLANK"
     legal_token_ids: tuple[int, ...]
     # Provenance: index into the engine's options list, so the engine adapter
     # can map a chosen blank back to a concrete action.
@@ -874,7 +874,7 @@ class SnapshotRenderer:
                 legal_ids = self._block_legal_token_ids(option, card_refs)
                 key = (0, "<choose-block>", str(option.get("id") or ""), opt_idx)
                 per_card.setdefault(source, []).append(
-                    ("<choose-block>", opt_idx, legal_ids, "CONSTRAINED", key)
+                    ("<choose-block>", opt_idx, legal_ids, "PER_BLANK", key)
                 )
             elif kind in ("attacker", "attack"):
                 source = option.get("permanent_id") or option.get("card_id") or ""

@@ -505,6 +505,7 @@ class NativeBatchEncoder:
             or batch_size > scratch.batch_size
             or decision_capacity > scratch.decision_capacity
             or (self.emit_render_plan and scratch.buffers.render_plan is None)
+            or (not self.emit_render_plan and scratch.buffers.render_plan is not None)
         ):
             scratch.batch_size = max(batch_size, scratch.batch_size * 2 or 64)
             scratch.decision_capacity = max(decision_capacity, scratch.decision_capacity * 2 or 64)

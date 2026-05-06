@@ -337,6 +337,8 @@ class NativeTextTrajectoryBuffer:
         self.max_decision_groups = replay_buffer.max_decision_groups
         self.max_cached_choices = replay_buffer.max_cached_choices
         self.max_card_refs = replay_buffer.max_card_refs
+        self.max_blanks_per_row = replay_buffer.max_blanks_per_row
+        self.max_legal_per_blank = replay_buffer.max_legal_per_blank
         self.recurrent_layers = replay_buffer.recurrent_layers
         self.recurrent_hidden_dim = replay_buffer.recurrent_hidden_dim
         self.lstm_proj_hidden = replay_buffer.lstm_proj_hidden
@@ -347,6 +349,29 @@ class NativeTextTrajectoryBuffer:
         self.seq_lengths = torch.zeros(*shape, dtype=torch.int32, device=self.device)
         self.card_ref_positions = torch.full(
             (*shape, self.max_card_refs), -1, dtype=torch.int32, device=self.device
+        )
+        self.blank_positions = torch.full(
+            (*shape, self.max_blanks_per_row), -1, dtype=torch.int32, device=self.device
+        )
+        self.blank_kind = torch.zeros(
+            *shape, self.max_blanks_per_row, dtype=torch.int32, device=self.device
+        )
+        self.blank_group = torch.full_like(self.blank_kind, -1)
+        self.blank_group_kind = torch.zeros_like(self.blank_kind)
+        self.blank_option_index = torch.full_like(self.blank_kind, -1)
+        self.blank_legal_ids = torch.zeros(
+            *shape,
+            self.max_blanks_per_row,
+            self.max_legal_per_blank,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.blank_legal_mask = torch.zeros(
+            *shape,
+            self.max_blanks_per_row,
+            self.max_legal_per_blank,
+            dtype=torch.bool,
+            device=self.device,
         )
         self.trace_kind_id = torch.zeros(*shape, dtype=torch.int8, device=self.device)
         self.decision_count = torch.zeros(*shape, dtype=torch.int16, device=self.device)
@@ -428,6 +453,43 @@ class NativeTextTrajectoryBuffer:
             encoded.card_ref_positions,
             (batch_size, 1),
         )
+        blank_width = min(int(encoded.blank_positions.shape[1]), self.max_blanks_per_row)
+        legal_width = min(int(encoded.blank_legal_ids.shape[2]), self.max_legal_per_blank)
+        self.blank_positions[env_t, step_t].fill_(-1)
+        self.blank_kind[env_t, step_t].zero_()
+        self.blank_group[env_t, step_t].fill_(-1)
+        self.blank_group_kind[env_t, step_t].zero_()
+        self.blank_option_index[env_t, step_t].fill_(-1)
+        self.blank_legal_ids[env_t, step_t].zero_()
+        self.blank_legal_mask[env_t, step_t].zero_()
+        if blank_width > 0:
+            self.blank_positions[env_t, step_t, :blank_width] = rebase_positions(
+                encoded.blank_positions[:, :blank_width],
+                (batch_size, 1),
+            )
+            self.blank_kind[env_t, step_t, :blank_width] = encoded.blank_kind[:, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+            self.blank_group[env_t, step_t, :blank_width] = encoded.blank_group[:, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+            self.blank_group_kind[env_t, step_t, :blank_width] = encoded.blank_group_kind[
+                :, :blank_width
+            ].to(device=self.device, dtype=torch.int32)
+            self.blank_option_index[env_t, step_t, :blank_width] = encoded.blank_option_index[
+                :, :blank_width
+            ].to(device=self.device, dtype=torch.int32)
+            if legal_width > 0:
+                self.blank_legal_ids[env_t, step_t, :blank_width, :legal_width] = (
+                    encoded.blank_legal_ids[:, :blank_width, :legal_width].to(
+                        device=self.device, dtype=torch.int32
+                    )
+                )
+                self.blank_legal_mask[env_t, step_t, :blank_width, :legal_width] = (
+                    encoded.blank_legal_mask[:, :blank_width, :legal_width].to(
+                        device=self.device, dtype=torch.bool
+                    )
+                )
 
         decision_count = payload.decision_count.to(device=self.device, dtype=torch.long)
         stored_count = decision_count.clamp(max=self.max_decision_groups)
@@ -563,6 +625,15 @@ class NativeTextTrajectoryBuffer:
             card_ref_positions=pack_positions(
                 self.card_ref_positions[flat_env, flat_step], (row_count, 1)
             ),
+            blank_positions=pack_positions(
+                self.blank_positions[flat_env, flat_step], (row_count, 1)
+            ),
+            blank_kind=self.blank_kind[flat_env, flat_step],
+            blank_group=self.blank_group[flat_env, flat_step],
+            blank_group_kind=self.blank_group_kind[flat_env, flat_step],
+            blank_option_index=self.blank_option_index[flat_env, flat_step],
+            blank_legal_ids=self.blank_legal_ids[flat_env, flat_step],
+            blank_legal_mask=self.blank_legal_mask[flat_env, flat_step],
         )
         decision_count = self.decision_count[flat_env, flat_step].to(dtype=torch.long)
         group_mask = (
@@ -2487,8 +2558,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--rnad-m must be at least 1")
         if args.rnad_neurd_beta <= 0.0:
             raise ValueError("--rnad-neurd-beta must be positive")
-        if not 0.0 < args.rnad_target_ema < 1.0:
-            raise ValueError("--rnad-target-ema must be in (0, 1)")
+        if not 0.0 <= args.rnad_target_ema < 1.0:
+            raise ValueError("--rnad-target-ema must be in [0, 1)")
         if not 0.0 <= args.rnad_finetune_eps < 1.0:
             raise ValueError("--rnad-finetune-eps must be in [0, 1)")
         if args.rnad_finetune_ndisc < 1:

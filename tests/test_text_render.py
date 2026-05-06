@@ -1028,7 +1028,7 @@ def test_inline_blanks_blockers_emit_constrained_block_blanks(
     attacker_ref = rendered.card_refs[attacker["ID"]]
     assert anchor.kind == "<choose-block>"
     assert anchor.group_id == 0
-    assert anchor.group_kind == "CONSTRAINED"
+    assert anchor.group_kind == "PER_BLANK"
     assert anchor.legal_token_ids == (NONE_FAKE_ID, CARD_REF_FAKE_IDS[attacker_ref])
     assert anchor.option_index == 0
 

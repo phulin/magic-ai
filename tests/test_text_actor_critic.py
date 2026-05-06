@@ -22,11 +22,7 @@ from magic_ai.text_encoder.actor_critic import (
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig, RecurrentTextPolicyOutput
-from magic_ai.text_encoder.render_plan import (
-    BLANK_GROUP_CONSTRAINED,
-    BLANK_GROUP_CROSS_BLANK,
-    BLANK_GROUP_PER_BLANK,
-)
+from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -233,7 +229,7 @@ class TextActorCriticTests(unittest.TestCase):
             attention_mask=torch.ones(1, 3, dtype=torch.long),
             card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
             seq_lengths=torch.tensor([3]),
-            blank_group_kind=torch.full((1, 2), BLANK_GROUP_CONSTRAINED, dtype=torch.int32),
+            blank_group_kind=torch.full((1, 2), BLANK_GROUP_PER_BLANK, dtype=torch.int32),
             blank_option_index=torch.tensor([[1, 0]], dtype=torch.int32),
             blank_legal_mask=torch.ones(1, 2, 2, dtype=torch.bool),
         )
@@ -384,7 +380,7 @@ class TextActorCriticTests(unittest.TestCase):
             blank_positions=torch.tensor([[1, 2]], dtype=torch.int32),
             blank_kind=torch.ones(1, 2, dtype=torch.int32),
             blank_group=torch.zeros(1, 2, dtype=torch.int32),
-            blank_group_kind=torch.full((1, 2), BLANK_GROUP_CONSTRAINED, dtype=torch.int32),
+            blank_group_kind=torch.full((1, 2), BLANK_GROUP_PER_BLANK, dtype=torch.int32),
             blank_option_index=torch.tensor([[1, 0]], dtype=torch.int32),
             blank_legal_ids=torch.ones(1, 2, 3, dtype=torch.int32),
             blank_legal_mask=torch.tensor([[[True, True, True], [True, True, False]]]),

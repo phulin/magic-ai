@@ -29,9 +29,8 @@ Implemented blank surfaces:
   across the anchor positions.
 - `PER_BLANK`: `<choose-target>`, `<choose-may>`, `<choose-mode>`,
   `<choose-x-digit>` for bounded `number` choices,
-  `<choose-mana-source>` for `mana_color`, and binary attacker-declaration
-  blanks.
-- `CONSTRAINED`: `<choose-block>` with `<none>` plus legal attacker
+  `<choose-mana-source>` for `mana_color`, binary attacker-declaration
+  blanks, and `<choose-block>` with `<none>` plus legal attacker
   `<card-ref:K>` ids.
 
 Known fidelity gaps before this is a complete representation of all game
@@ -110,7 +109,7 @@ gather, which would be wasteful at K × V and unnecessary since we know
 the legal candidates per blank up front.
 
 **Group-level policy shapes.** A `blank_group` is the unit of policy
-factorization, not the individual blank. Three group shapes cover all
+factorization, not the individual blank. Two group shapes cover all current
 decision kinds:
 
 - **Per-blank softmax** (most decisions): each blank in the group is its
@@ -122,17 +121,14 @@ decision kinds:
   in the group; the logit at position k comes from a fixed scoring
   token (e.g. `<chosen>`) at that blank's position via the LM head.
   Exactly one anchor in the group is the chosen action.
-- **Constrained per-blank** (multi-block, multi-target with
-  inter-target constraints): per-blank softmax with a post-hoc legality
-  projection at sample time (see "Action sampling").
-
-`blank_group_kind ∈ {PER_BLANK, CROSS_BLANK, CONSTRAINED}` rides
+`blank_group_kind ∈ {PER_BLANK, CROSS_BLANK}` rides
 alongside `blank_group` in the batch.
 
-The current implementation carries `blank_group_kind` but only a subset of
-constraint semantics are enforced. Complete Magic-fidelity requires richer
-constraint metadata or an engine-backed legality filter for compound choices
-whose legal sets shrink as earlier blanks are filled.
+Group kind describes scoring topology only. Game semantics live in the typed
+blank token (`<choose-block>`, `<choose-target>`, `<choose-may>`, etc.) plus
+the per-blank legal-id set. Complete Magic-fidelity for compound choices whose
+legal sets shrink as earlier blanks are filled will need richer decision
+metadata or an engine-backed legality filter, but not a third group kind.
 
 ## Data flow
 
@@ -220,19 +216,16 @@ For each decision-kind the renderer:
 
 `group_id` semantics:
 
-- All `<choose-block>` blanks for one combat step share a `CONSTRAINED`
-  group (a defender can block at most one attacker, so at sample time
-  the "this defender already chose attacker A" constraint is enforced
-  across blanks — but here it's a per-defender uniqueness constraint
-  on the *blank itself*, not across blanks; the cross-blank constraint
-  is "no attacker is blocked by 0 defenders if some defender must
-  block" — only present for must-block defenders).
+- `<choose-block>` blanks are `PER_BLANK` groups over `<none>` plus legal
+  attacker card refs. Cross-blank combat constraints are not represented by a
+  third group kind; they require richer decision metadata or an engine-backed
+  legality filter.
 - Each multi-blocked attacker's `<choose-damage-order>` sequence is its
   own `PER_BLANK` group; positions are decoded left-to-right (legal set
   shrinks as blockers are committed).
-- All target slots for one spell share a group: `PER_BLANK` if slots are
-  independent, `CONSTRAINED` if the spell says "no two of which share a
-  controller" or similar.
+- All target slots for one spell share a `PER_BLANK` group; target constraints
+  such as "no two of which share a controller" need richer decision metadata
+  or an engine-backed legality filter.
 - All priority anchors in a snapshot (every `<choose-play>`,
   `<use-ability>`, and the single `<pass>`) share **one `CROSS_BLANK`
   group**. Exactly one is selected.
@@ -351,16 +344,12 @@ unreachable. Empty legal sets (no legal action for a blank) are an
 engine bug — render must not emit a blank with zero legal candidates;
 a `RenderError` is raised at render time if it tries.
 
-**Layer 2 — group-level constraint projection (`CONSTRAINED` groups).**
+**Layer 2 — optional engine legality projection.**
 Per-blank masking only enforces *per-blank* legality. Group-level
 constraints (e.g. "a defender blocks at most one attacker", "no two
-targets share a controller") are enforced at sample time by the
-greedy projection step described in "Action sampling": after each
-blank is sampled, the remaining blanks' legal sets are tightened to
-exclude choices that would violate the group constraint, then the
-next blank samples from that tightened set. The committed log-prob is
-taken under the tightened distribution so importance sampling remains
-correct.
+targets share a controller") should be enforced by richer decision metadata
+or an engine-backed legality filter. The current basic representation keeps
+block choices as independent `PER_BLANK` categoricals over legal attacker ids.
 
 If group constraints can never be satisfied (e.g. impossible
 combinatorial state), the engine must not have rendered the decision
@@ -394,8 +383,8 @@ mask is needed.
 Group blanks by `blank_group`. For each group, dispatch on
 `blank_group_kind`:
 
-- **`PER_BLANK`** (mode, may, X-digits, single-target, mana-source,
-  damage-order positions): sample each blank's softmax independently.
+- **`PER_BLANK`** (mode, may, X-digits, single-target, blocker choice,
+  mana-source, damage-order positions): sample each blank's softmax independently.
   `group_logp = sum(per_blank_logp)`. Damage-order positions are
   decoded left-to-right with the legal set shrinking after each pick;
   the position-i softmax is over remaining unassigned blockers.
@@ -405,15 +394,6 @@ Group blanks by `blank_group`. For each group, dispatch on
   softmax across positions. `group_logp = log_softmax(scores)[selected]`.
   This is the primary fix to the per-anchor yes/no formulation: a single
   priority decision can't be factored as independent per-card yeses.
-- **`CONSTRAINED`** (multi-block, multi-target with cross-slot
-  constraints): parallel-fill plus a legality projection at sample time:
-    1. Sort blanks by max-logit confidence descending.
-    2. Greedily commit each blank's argmax/sample; if it violates a
-       group-level constraint, resample from the remaining legal subset.
-    3. `group_logp = sum_k log p_k(chosen_k | remaining_legal_k)` —
-       i.e., per-blank log-probs are taken under the *post-projection*
-       legal set, which keeps log-probs consistent with the actual
-       sampling distribution.
 
 The factor model is still an approximation to the true joint. If BC
 accuracy on block steps regresses materially vs. the legacy head,

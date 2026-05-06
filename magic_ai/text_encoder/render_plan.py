@@ -120,16 +120,13 @@ OP_COMMAND_CLOSE: Final = 29
 OP_EMIT_BLANK: Final = 30
 OP_EMIT_BLANK_LEGAL: Final = 31
 
-# Group-kind enum (matches mage-go ``blankGroupPerBlank``/``...CrossBlank``/
-# ``...Constrained``).
+# Group-kind enum (matches mage-go ``blankGroupPerBlank``/``...CrossBlank``).
 BLANK_GROUP_PER_BLANK: Final = 0
 BLANK_GROUP_CROSS_BLANK: Final = 1
-BLANK_GROUP_CONSTRAINED: Final = 2
 
 _BLANK_GROUP_KIND_BY_NAME: Final[dict[str, int]] = {
     "PER_BLANK": BLANK_GROUP_PER_BLANK,
     "CROSS_BLANK": BLANK_GROUP_CROSS_BLANK,
-    "CONSTRAINED": BLANK_GROUP_CONSTRAINED,
 }
 
 
@@ -327,7 +324,7 @@ class RenderPlanWriter:
         """Emit one ``OP_EMIT_BLANK`` followed by per-legal ``OP_EMIT_BLANK_LEGAL``.
 
         ``group_kind`` accepts either the textual enum name
-        (``"PER_BLANK"``/``"CROSS_BLANK"``/``"CONSTRAINED"``) or the
+        (``"PER_BLANK"``/``"CROSS_BLANK"``) or the
         already-resolved int32 enum value. The cursor position written to
         the blank table is the assembler's emit position when it processes
         this opcode — the writer itself does not track it.

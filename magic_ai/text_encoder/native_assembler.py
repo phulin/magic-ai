@@ -56,6 +56,7 @@ class _MagePackedBlankOutputsC(ctypes.Structure):
         ("blank_kind", ctypes.POINTER(ctypes.c_int32)),
         ("blank_group", ctypes.POINTER(ctypes.c_int32)),
         ("blank_group_kind", ctypes.POINTER(ctypes.c_int32)),
+        ("blank_option_index", ctypes.POINTER(ctypes.c_int32)),
         ("blank_legal_ids", ctypes.POINTER(ctypes.c_int32)),
         ("blank_legal_mask", ctypes.POINTER(ctypes.c_uint8)),
         ("blank_overflow", ctypes.POINTER(ctypes.c_int32)),
@@ -128,6 +129,7 @@ class NativePackedAssemblerOutputs:
     blank_kind: torch.Tensor  # (B, max_blanks) int32
     blank_group: torch.Tensor  # (B, max_blanks) int32
     blank_group_kind: torch.Tensor  # (B, max_blanks) int32
+    blank_option_index: torch.Tensor  # (B, max_blanks) int32
     blank_legal_ids: torch.Tensor  # (B, max_blanks, max_legal_per_blank) int32
     blank_legal_mask: torch.Tensor  # (B, max_blanks, max_legal_per_blank) uint8
     blank_overflow: torch.Tensor  # (B,) int32
@@ -160,6 +162,7 @@ class NativePackedAssemblerOutputs:
         blank_kind_full = self.blank_kind[:active_n]
         blank_group_full = self.blank_group[:active_n]
         blank_group_kind_full = self.blank_group_kind[:active_n]
+        blank_option_index_full = self.blank_option_index[:active_n]
         blank_legal_ids_full = self.blank_legal_ids[:active_n]
         blank_legal_mask_full = self.blank_legal_mask[:active_n]
 
@@ -202,6 +205,11 @@ class NativePackedAssemblerOutputs:
                 if max_blanks > 0
                 else blank_group_kind_full[:, :0]
             )
+            blank_option_index = (
+                blank_option_index_full[:, :max_blanks]
+                if max_blanks > 0
+                else blank_option_index_full[:, :0]
+            )
             blank_legal_ids = blank_legal_ids_full[:, :max_blanks, :max_legal]
             blank_legal_mask = blank_legal_mask_full[:, :max_blanks, :max_legal].bool()
         else:
@@ -209,6 +217,7 @@ class NativePackedAssemblerOutputs:
             blank_kind = blank_kind_full
             blank_group = blank_group_full
             blank_group_kind = blank_group_kind_full
+            blank_option_index = blank_option_index_full
             blank_legal_ids = blank_legal_ids_full
             blank_legal_mask = blank_legal_mask_full.bool()
 
@@ -227,6 +236,7 @@ class NativePackedAssemblerOutputs:
             blank_kind=blank_kind,
             blank_group=blank_group,
             blank_group_kind=blank_group_kind,
+            blank_option_index=blank_option_index,
             blank_legal_ids=blank_legal_ids,
             blank_legal_mask=blank_legal_mask,
             max_seqlen=max_seqlen,
@@ -260,6 +270,9 @@ def allocate_packed_outputs(
         blank_kind=torch.zeros((batch_size, max_blanks), dtype=torch.int32, pin_memory=pin),
         blank_group=torch.full((batch_size, max_blanks), -1, dtype=torch.int32, pin_memory=pin),
         blank_group_kind=torch.zeros((batch_size, max_blanks), dtype=torch.int32, pin_memory=pin),
+        blank_option_index=torch.full(
+            (batch_size, max_blanks), -1, dtype=torch.int32, pin_memory=pin
+        ),
         blank_legal_ids=torch.zeros(
             (batch_size, max_blanks, max_legal_per_blank), dtype=torch.int32, pin_memory=pin
         ),
@@ -384,6 +397,7 @@ def encode_tokens_packed(
                 "blank_kind": ffi.cast("int32_t *", outputs.blank_kind.data_ptr()),
                 "blank_group": ffi.cast("int32_t *", outputs.blank_group.data_ptr()),
                 "blank_group_kind": ffi.cast("int32_t *", outputs.blank_group_kind.data_ptr()),
+                "blank_option_index": ffi.cast("int32_t *", outputs.blank_option_index.data_ptr()),
                 "blank_legal_ids": ffi.cast("int32_t *", outputs.blank_legal_ids.data_ptr()),
                 "blank_legal_mask": ffi.cast("uint8_t *", outputs.blank_legal_mask.data_ptr()),
                 "blank_overflow": ffi.cast("int32_t *", outputs.blank_overflow.data_ptr()),
@@ -439,6 +453,7 @@ def encode_tokens_packed(
                         blank_kind=_tensor_ptr(outputs.blank_kind, ctypes.c_int32),
                         blank_group=_tensor_ptr(outputs.blank_group, ctypes.c_int32),
                         blank_group_kind=_tensor_ptr(outputs.blank_group_kind, ctypes.c_int32),
+                        blank_option_index=_tensor_ptr(outputs.blank_option_index, ctypes.c_int32),
                         blank_legal_ids=_tensor_ptr(outputs.blank_legal_ids, ctypes.c_int32),
                         blank_legal_mask=_tensor_ptr(outputs.blank_legal_mask, ctypes.c_uint8),
                         blank_overflow=_tensor_ptr(outputs.blank_overflow, ctypes.c_int32),

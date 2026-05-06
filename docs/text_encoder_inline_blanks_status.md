@@ -58,7 +58,7 @@ the eight-step migration. Update at every step boundary.
 ### Step 3 — Python side (`/home/user/magic-ai-inline-blanks`)
 
 - `magic_ai/text_encoder/render_plan.py` — `OP_EMIT_BLANK = 30`,
-  `OP_EMIT_BLANK_LEGAL = 31`, `BLANK_GROUP_PER_BLANK/CROSS_BLANK/CONSTRAINED`,
+  `OP_EMIT_BLANK_LEGAL = 31`, `BLANK_GROUP_PER_BLANK/CROSS_BLANK`,
   `RenderPlanWriter.emit_blank(...)`, `emit_blank_anchors(...)`.
 - `magic_ai/text_encoder/batch.py` — `TextEncodedBatch` and
   `PackedTextBatch` gain `blank_positions`, `blank_kind`, `blank_group`,
@@ -183,7 +183,7 @@ Implemented blank kinds and current wire shapes:
 | Pass priority | `<pass>` in trailing `<choices>` | `CROSS_BLANK` | singleton `<chosen>` | Uses the existing action-kind `<pass>` token as the blank anchor. |
 | Target / indexed object choice | `<choose-target>` immediately after the source action blank, or in trailing `<choices>` for standalone object choices | `PER_BLANK` | visible target `<card-ref:K>` ids plus player `<self>` / `<opp>` ids; hidden object choices fall back to `<num:K>` option ids | Zones, stack objects without refs, and other non-card/non-player targets are not self-describing yet. |
 | Attack declaration | `<choose-target>` next to each eligible attacker | `PER_BLANK` | `<none>` plus that attacker's `<card-ref:K>` id | Maps legal slot 0/1 back to the existing attacker selected-column payload. |
-| Block choice | `<choose-block>` next to the potential blocker | `CONSTRAINED` | `<none>` plus legal attacker `<card-ref:K>` ids | Maps sampled legal slot back to the existing blocker action payload. |
+| Block choice | `<choose-block>` next to the potential blocker | `PER_BLANK` | `<none>` plus legal attacker `<card-ref:K>` ids | Maps sampled legal slot back to the existing blocker action payload. |
 | May choice | `<choose-may>` in trailing `<choices>` | `PER_BLANK` | `<no>, <yes>` | Legal-slot order matches `may_selected` labels. |
 | Mode choice | `<choose-mode>` in trailing `<choices>` | `PER_BLANK` | `<num:0>...<num:N-1>` | One bounded choice over the engine's mode options. |
 | Number / X choice | `<choose-x-digit>` in trailing `<choices>` | `PER_BLANK` | `<num:0>...<num:N-1>` | Currently implemented as one bounded numeric-option choice, not a multi-digit sequence. |
@@ -196,13 +196,15 @@ trimmed actor requests back to batch-local maxima while preserving all blank
 metadata. Sharded native packed assembly allocates blank capacity and merges
 blank tensors with token-offset rebasing.
 
-Mage-go commit `f0edc8e` extends native render-plan inline blank emission to
-match the implemented Python surfaces for priority targets, blockers, may,
-mode, bounded number, and mana-color choices. A follow-up ABI cleanup removes
-packed option/target scratch buffers from `MagePackedTokenAssemblerOutputs`;
-`go test ./...`, `tests/test_sharded_native.py`, and the Python native packed
-inline blank smoke pass against the rebuilt worktree install. The full
-mage-go suite passes with three known Jumpstart failures marked skipped/xfail.
+The current mage-go direct packed assembler emits inline blank metadata without
+using render-plan assembly for priority actions/targets, indexed object
+choices, attackers, blockers, may, mode, bounded number, and mana-color
+choices. A follow-up ABI cleanup removes packed option/target scratch buffers
+from `MagePackedTokenAssemblerOutputs`; `go test ./cmd/pylib` and the Python
+native packed inline blank smoke pass against the rebuilt worktree install.
+Native text rollout staging now preserves packed inline-blank tensors into
+replay rows, so R-NaD/PPO update-time replay scoring sees the same blank
+metadata that live sampling used.
 
 ## Fidelity gaps for perfect game-choice representation
 
@@ -253,10 +255,10 @@ every choice the engine can ask the player to make. Remaining gaps:
    live native path). Faithful representation requires deterministic overflow
    handling, telemetry, and probably larger or ragged storage for pathological
    board states.
-9. **Legality projection is still shallow.** `CONSTRAINED` marks block choices,
-   but the sampler does not yet implement every cross-blank legality rule that
-   Magic can impose. Perfect fidelity needs per-group constraint metadata or an
-   engine-backed legality filter for sampled compound assignments.
+9. **Compound-choice legality projection is still shallow.** Block choices are
+   ordinary `PER_BLANK` categoricals over per-blocker legal attackers. Perfect
+   fidelity for cross-blank constraints still needs richer decision metadata or
+   an engine-backed legality filter for sampled compound assignments.
 10. **Python render-plan parity is obsolete.** The native packed assembler is
     the active path. Tests that compare through the old Python render-plan
     assembler can fail on stale opcode support and should not be treated as
@@ -281,7 +283,7 @@ every choice the engine can ask the player to make. Remaining gaps:
 - `magic_ai/text_encoder/render.py` — inline mode now classifies `block`
   options into `<choose-block>` blanks next to each defender. Legal ids are
   `<none>` followed by the legal attacker `<card-ref:K>` ids in target order;
-  anchors use `group_kind="CONSTRAINED"`.
+  anchors use `group_kind="PER_BLANK"`.
 - `magic_ai/text_encoder/batch.py` / `policy.py` / `recurrent.py` — blank
   tensors now preserve `blank_option_index` and recurrent forwards expose
   `blank_logits`, so live sampling can map blank choices back to engine
@@ -293,16 +295,15 @@ every choice the engine can ask the player to make. Remaining gaps:
   inline `<choose-block>` logits for blocker decisions, returning the same
   selected-column semantics as the legacy blocker layout. PPO/R-NaD replay
   evaluation also scores blocker decision groups from replayed inline blank
-  logits when a matching constrained blank is present, falling back to legacy
-  option/target scoring for all other decision groups.
+  logits when a matching per-blank blocker anchor is present.
 - `magic_ai/text_encoder/replay_buffer.py` — replay rows now store and gather
   inline blank positions, legal ids/masks, group metadata, and
   `blank_option_index`; packed append keeps Triton token/legacy-field writes
   while copying blank columns through the Torch path.
 - `magic_ai/text_encoder/training.py` — added
   `inline_blank_per_blank_loss(...)` and
-  `inline_blank_per_blank_accuracy(...)` for `PER_BLANK` and `CONSTRAINED`
-  groups; block blanks use this target shape (`0=<none>`, `1..N=attackers`).
+  `inline_blank_per_blank_accuracy(...)` for `PER_BLANK` groups; block blanks
+  use this target shape (`0=<none>`, `1..N=attackers`).
 - `tests/test_text_render.py`, `tests/test_text_policy.py`,
   `tests/test_text_actor_critic.py`, `tests/test_text_replay_buffer.py` —
   coverage for block anchor placement, legal ids, blank option provenance,

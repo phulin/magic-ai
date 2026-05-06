@@ -49,11 +49,7 @@ from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicyConfig,
     RecurrentTextPolicyOutput,
 )
-from magic_ai.text_encoder.render_plan import (
-    BLANK_GROUP_CONSTRAINED,
-    BLANK_GROUP_CROSS_BLANK,
-    BLANK_GROUP_PER_BLANK,
-)
+from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 
 
@@ -640,7 +636,7 @@ class TextActorCritic(nn.Module):
                             step_idx=step_idx,
                             deterministic=deterministic,
                         )
-                        if trace_kind in ("choice_index", "choice_color")
+                        if trace_kind in ("choice_index", "choice_ids", "choice_color")
                         else None
                     )
                     inline_priority_sample = (
@@ -683,9 +679,16 @@ class TextActorCritic(nn.Module):
                         or inline_attacker_sample
                     )
                     if inline_sample is None:
+                        live_blank_count = 0
+                        if inline_batch.blank_positions.numel() > 0:
+                            live_blank_count = int(
+                                (inline_batch.blank_positions[step_idx] >= 0).sum().item()
+                            )
                         raise ValueError(
                             "native text sampling requires inline blank metadata for "
-                            f"trace_kind={trace_kind!r} at batch row {step_idx}"
+                            f"trace_kind={trace_kind!r} at batch row {step_idx}; "
+                            f"decision_groups={int(layout.decision_option_idx.shape[0])} "
+                            f"live_blanks={live_blank_count}"
                         )
                     selected_tensors, log_prob, entropy = inline_sample
                     selected_chunks.extend(selected_tensors)
@@ -1257,12 +1260,21 @@ class TextActorCritic(nn.Module):
                 group_skip_mask=choice_group_mask,
             )
         )
+        choice_ids_log_probs, choice_ids_entropies, choice_ids_group_mask, choice_ids_per_choice = (
+            _evaluate_inline_choice_index_replay_groups(
+                output,
+                batch,
+                return_per_choice=return_per_choice,
+                trace_kind_id=TRACE_KIND_TO_ID["choice_ids"],
+                group_skip_mask=choice_group_mask | color_group_mask,
+            )
+        )
         priority_log_probs, priority_entropies, priority_group_mask, priority_per_choice = (
             _evaluate_inline_priority_replay_groups(
                 output,
                 batch,
                 return_per_choice=return_per_choice,
-                group_skip_mask=choice_group_mask | color_group_mask,
+                group_skip_mask=choice_group_mask | color_group_mask | choice_ids_group_mask,
             )
         )
         blocker_log_probs, blocker_entropies, blocker_group_mask, blocker_per_choice = (
@@ -1289,6 +1301,7 @@ class TextActorCritic(nn.Module):
             log_probs
             + choice_log_probs
             + color_log_probs
+            + choice_ids_log_probs
             + priority_log_probs
             + blocker_log_probs
             + attacker_log_probs
@@ -1297,6 +1310,7 @@ class TextActorCritic(nn.Module):
             entropies
             + choice_entropies
             + color_entropies
+            + choice_ids_entropies
             + priority_entropies
             + blocker_entropies
             + attacker_entropies
@@ -1305,6 +1319,7 @@ class TextActorCritic(nn.Module):
         inline_group_mask = (
             choice_group_mask
             | color_group_mask
+            | choice_ids_group_mask
             | priority_group_mask
             | blocker_group_mask
             | attacker_group_mask
@@ -1312,13 +1327,17 @@ class TextActorCritic(nn.Module):
         if return_per_choice:
             assert choice_per_choice is not None
             assert color_per_choice is not None
+            assert choice_ids_per_choice is not None
             assert priority_per_choice is not None
             assert blocker_per_choice is not None
             assert attacker_per_choice is not None
             inline_per_choice = _concat_replay_per_choice(
                 _concat_replay_per_choice(
                     _concat_replay_per_choice(
-                        _concat_replay_per_choice(choice_per_choice, color_per_choice),
+                        _concat_replay_per_choice(
+                            _concat_replay_per_choice(choice_per_choice, color_per_choice),
+                            choice_ids_per_choice,
+                        ),
                         priority_per_choice,
                     ),
                     blocker_per_choice,
@@ -1336,10 +1355,45 @@ class TextActorCritic(nn.Module):
 
         legacy_group_ids = legacy_group_mask.nonzero(as_tuple=False).squeeze(-1)
         kinds = batch.trace_kind_id[batch.step_for_decision_group[legacy_group_ids]]
+        first_group = int(legacy_group_ids[0].detach().cpu().item())
+        first_step = int(batch.step_for_decision_group[first_group].detach().cpu().item())
+        first_blanks = batch.encoded.blank_positions[first_step] >= 0
+        first_blank_indices = first_blanks.nonzero(as_tuple=False).squeeze(-1)
+        first_selected = int(batch.selected_indices[first_group].detach().cpu().item())
+        first_option_row = batch.decision_option_idx[first_group].detach().cpu().tolist()
+        first_target_row = batch.decision_target_idx[first_group].detach().cpu().tolist()
+        first_blank_options = (
+            batch.encoded.blank_option_index[first_step, first_blank_indices]
+            .detach()
+            .cpu()
+            .tolist()
+            if first_blank_indices.numel() > 0
+            else []
+        )
+        first_blank_group_kind = (
+            batch.encoded.blank_group_kind[first_step, first_blank_indices].detach().cpu().tolist()
+            if first_blank_indices.numel() > 0
+            else []
+        )
+        first_blank_legal_counts = (
+            batch.encoded.blank_legal_mask[first_step, first_blank_indices]
+            .sum(dim=-1)
+            .detach()
+            .cpu()
+            .tolist()
+            if first_blank_indices.numel() > 0
+            else []
+        )
         raise ValueError(
             "text replay batch contains decision groups without inline blank scoring "
             f"(group_ids={legacy_group_ids.detach().cpu().tolist()}, "
-            f"trace_kind_ids={kinds.detach().cpu().tolist()})"
+            f"trace_kind_ids={kinds.detach().cpu().tolist()}, "
+            f"first_group={first_group}, first_step={first_step}, "
+            f"first_selected={first_selected}, first_option_row={first_option_row}, "
+            f"first_target_row={first_target_row}, "
+            f"first_blank_options={first_blank_options}, "
+            f"first_blank_group_kind={first_blank_group_kind}, "
+            f"first_blank_legal_counts={first_blank_legal_counts})"
         )
 
     def _replay_scoring_forward(self, output: RecurrentTextPolicyOutput) -> ReplayScoringForward:
@@ -1743,7 +1797,7 @@ def _sample_inline_blockers_for_step(
         device=blank_logits.device, dtype=torch.bool
     )
     row_logits = blank_logits[step_idx]
-    blank_support = (row_group_kind == BLANK_GROUP_CONSTRAINED) & (row_option_index >= 0)
+    blank_support = (row_group_kind == BLANK_GROUP_PER_BLANK) & (row_option_index >= 0)
 
     group_option_indices: list[int] = []
     for group_idx in range(int(layout.decision_option_idx.shape[0])):
@@ -2181,7 +2235,7 @@ def _evaluate_inline_blocker_replay_groups(
     *,
     return_per_choice: bool,
     trace_kind_id: int = TRACE_KIND_TO_ID["blockers"],
-    blank_group_kind_id: int = BLANK_GROUP_CONSTRAINED,
+    blank_group_kind_id: int = BLANK_GROUP_PER_BLANK,
     group_skip_mask: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice | None]:
     """Score replayed per-option choices from inline blank logits when available."""
