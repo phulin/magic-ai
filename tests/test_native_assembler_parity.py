@@ -522,6 +522,11 @@ class NativeAssemblerParityTests(unittest.TestCase):
                         torch.full_like(packed.blank_legal_ids, self.token_tables_py.chosen_id),
                     )
                 )
+                live_option_indices = packed.blank_option_index[packed.blank_positions >= 0]
+                self.assertEqual(
+                    sorted(int(x) for x in live_option_indices.tolist()),
+                    list(range(len(options))),
+                )
                 for pos, kind_id in zip(
                     packed.blank_positions[0].tolist(),
                     packed.blank_kind[0].tolist(),
