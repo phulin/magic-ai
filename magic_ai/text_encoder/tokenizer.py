@@ -372,7 +372,7 @@ BLANK_ANSWER_TOKENS: tuple[str, ...] = (
     "<x-end>",
 )
 
-MAX_NUM = 16
+MAX_NUM = 64
 
 
 def num_token(k: int) -> str:

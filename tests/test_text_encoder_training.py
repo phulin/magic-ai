@@ -14,11 +14,7 @@ from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
     RecurrentTextPolicyConfig,
 )
-from magic_ai.text_encoder.render_plan import (
-    BLANK_GROUP_CONSTRAINED,
-    BLANK_GROUP_CROSS_BLANK,
-    BLANK_GROUP_PER_BLANK,
-)
+from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from magic_ai.text_encoder.training import (
     TextEncoderTrainer,
@@ -148,9 +144,9 @@ def test_inline_blank_priority_accuracy_counts_valid_rows_only() -> None:
     assert stats == {"accuracy": 0.5, "correct": 1, "total": 2}
 
 
-def test_inline_blank_per_blank_loss_for_constrained_block_choices() -> None:
+def test_inline_blank_per_blank_loss_for_block_choices() -> None:
     logits = torch.tensor([[[0.0, 5.0, -1.0], [4.0, 0.0, -2.0]]], requires_grad=True)
-    group_kind = torch.full((1, 2), BLANK_GROUP_CONSTRAINED, dtype=torch.int64)
+    group_kind = torch.full((1, 2), BLANK_GROUP_PER_BLANK, dtype=torch.int64)
     legal_mask = torch.tensor([[[True, True, True], [True, True, False]]])
     target = torch.tensor([[1, 0]])
 
@@ -174,8 +170,8 @@ def test_inline_blank_per_blank_ignores_cross_and_invalid_targets() -> None:
     )
     group_kind = torch.tensor(
         [
-            [BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK, BLANK_GROUP_CONSTRAINED],
-            [BLANK_GROUP_CONSTRAINED, BLANK_GROUP_CONSTRAINED, BLANK_GROUP_CONSTRAINED],
+            [BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK, BLANK_GROUP_CROSS_BLANK],
+            [BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_CROSS_BLANK],
         ]
     )
     legal_mask = torch.tensor(
@@ -200,7 +196,7 @@ def test_inline_blank_per_blank_ignores_cross_and_invalid_targets() -> None:
 def test_inline_blank_per_blank_accuracy_counts_valid_slots_only() -> None:
     logits = torch.tensor([[[0.0, 3.0], [4.0, 0.0], [7.0, 8.0]]])
     group_kind = torch.tensor(
-        [[BLANK_GROUP_CONSTRAINED, BLANK_GROUP_PER_BLANK, BLANK_GROUP_CROSS_BLANK]]
+        [[BLANK_GROUP_PER_BLANK, BLANK_GROUP_PER_BLANK, BLANK_GROUP_CROSS_BLANK]]
     )
     legal_mask = torch.ones((1, 3, 2), dtype=torch.bool)
     target = torch.tensor([[1, 1, 1]])

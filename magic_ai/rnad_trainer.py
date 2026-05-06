@@ -28,6 +28,7 @@ First-cut simplifications (see ``docs/rnad_deviations.md`` for rationale):
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -353,6 +354,43 @@ def run_rnad_update(
 
     trainable = [p for p in policy.parameters() if p.requires_grad]
     grad_norm = float(nn.utils.clip_grad_norm_(trainable, max_norm=state.config.grad_clip))
+    loss_total = cl_loss_total + pl_loss_total
+    if not math.isfinite(grad_norm) or not math.isfinite(loss_total):
+        optimizer.zero_grad(set_to_none=True)
+        print(
+            f"[rnad] non-finite update skipped: loss={loss_total:.4g} "
+            f"grad_norm={grad_norm:.4g} cl={cl_loss_total:.4g} pl={pl_loss_total:.4g}",
+            flush=True,
+        )
+        aggregate = RNaDStats(
+            loss=loss_total,
+            critic_loss=cl_loss_total,
+            policy_loss=pl_loss_total,
+            v_hat_mean=v_hat_mean_acc / n_pieces,
+            grad_norm=grad_norm,
+            transformed_reward_mean=transformed_mean_acc / n_pieces,
+            q_clip_fraction=(
+                float(n_q_clipped_total) / float(flat_active_total)
+                if flat_active_total > 0
+                else 0.0
+            ),
+            sampled_log_ratio_mean=(diag_lr_sum / diag_lr_count) if diag_lr_count > 0 else 0.0,
+            sampled_log_ratio_absmax=diag_lr_absmax,
+            is_bias_up_mean=(diag_isup_sum / diag_isup_count) if diag_isup_count > 0 else 0.0,
+            is_bias_down_mean=(diag_isdn_sum / diag_isdn_count) if diag_isdn_count > 0 else 0.0,
+            v_target_reg_share=(
+                (diag_vshare_sum / diag_vshare_count) if diag_vshare_count > 0 else 0.0
+            ),
+        )
+        state.last_stats = [aggregate]
+        return PPOStats(
+            loss=aggregate.loss,
+            policy_loss=aggregate.policy_loss,
+            value_loss=aggregate.critic_loss,
+            entropy=0.0,
+            approx_kl=0.0,
+            clip_fraction=0.0,
+        )
     optimizer.step()
     polyak_update_(
         cast(nn.Module, state.target),

@@ -116,7 +116,7 @@ class BlankAnchor:
     char_start: int
     char_end: int
     group_id: int
-    group_kind: str  # "CROSS_BLANK" | "PER_BLANK" | "CONSTRAINED"
+    group_kind: str  # "CROSS_BLANK" | "PER_BLANK"
     legal_token_ids: tuple[int, ...]
     # Provenance: index into the engine's options list, so the engine adapter
     # can map a chosen blank back to a concrete action.
@@ -874,7 +874,7 @@ class SnapshotRenderer:
                 legal_ids = self._block_legal_token_ids(option, card_refs)
                 key = (0, "<choose-block>", str(option.get("id") or ""), opt_idx)
                 per_card.setdefault(source, []).append(
-                    ("<choose-block>", opt_idx, legal_ids, "CONSTRAINED", key)
+                    ("<choose-block>", opt_idx, legal_ids, "PER_BLANK", key)
                 )
             elif kind in ("attacker", "attack"):
                 source = option.get("permanent_id") or option.get("card_id") or ""
@@ -1127,15 +1127,46 @@ class SnapshotRenderer:
         if self._pending_kind == "mana_color":
             if len(self._mana_token_ids) < 6:
                 raise RenderError("inline mana_color blanks require mana_token_ids")
+            legal_ids = self._mana_color_legal_token_ids(actions)
             self._emit_blank(
                 buf,
                 result,
                 "<choose-mana-source>",
                 -1,
-                legal_token_ids=tuple(self._mana_token_ids[:6]),
+                legal_token_ids=legal_ids,
                 group_kind="PER_BLANK",
             )
         buf.append("</choices>")
+
+    def _mana_color_legal_token_ids(self, actions: Sequence[PendingOptionState]) -> tuple[int, ...]:
+        color_to_idx = {
+            "white": 0,
+            "White": 0,
+            "W": 0,
+            "blue": 1,
+            "Blue": 1,
+            "U": 1,
+            "black": 2,
+            "Black": 2,
+            "B": 2,
+            "red": 3,
+            "Red": 3,
+            "R": 3,
+            "green": 4,
+            "Green": 4,
+            "G": 4,
+            "colorless": 5,
+            "Colorless": 5,
+            "C": 5,
+        }
+        legal_ids: list[int] = []
+        for action in actions:
+            raw = action.get("color") or action.get("id")
+            idx = color_to_idx.get(str(raw))
+            if idx is None:
+                raise RenderError(f"unknown mana_color option {raw!r}")
+            legal_ids.append(self._mana_token_ids[idx])
+        return tuple(legal_ids)
 
 
 # ---------------------------------------------------------------------------

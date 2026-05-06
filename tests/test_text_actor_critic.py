@@ -22,11 +22,7 @@ from magic_ai.text_encoder.actor_critic import (
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig, RecurrentTextPolicyOutput
-from magic_ai.text_encoder.render_plan import (
-    BLANK_GROUP_CONSTRAINED,
-    BLANK_GROUP_CROSS_BLANK,
-    BLANK_GROUP_PER_BLANK,
-)
+from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -233,7 +229,7 @@ class TextActorCriticTests(unittest.TestCase):
             attention_mask=torch.ones(1, 3, dtype=torch.long),
             card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
             seq_lengths=torch.tensor([3]),
-            blank_group_kind=torch.full((1, 2), BLANK_GROUP_CONSTRAINED, dtype=torch.int32),
+            blank_group_kind=torch.full((1, 2), BLANK_GROUP_PER_BLANK, dtype=torch.int32),
             blank_option_index=torch.tensor([[1, 0]], dtype=torch.int32),
             blank_legal_mask=torch.ones(1, 2, 2, dtype=torch.bool),
         )
@@ -257,6 +253,46 @@ class TextActorCriticTests(unittest.TestCase):
         assert sampled is not None
         selected, log_prob, entropy = sampled
         self.assertEqual([int(t.item()) for t in selected], [0, 1])
+        self.assertTrue(torch.isfinite(log_prob))
+        self.assertTrue(torch.isfinite(entropy))
+
+    def test_inline_blocker_sampler_handles_none_only_row(self) -> None:
+        output = RecurrentTextPolicyOutput(
+            values=torch.zeros(1),
+            state_hidden=torch.zeros(1, 8),
+            card_vectors=torch.empty(1, MAX_CARD_REFS, 8),
+            card_mask=torch.zeros(1, MAX_CARD_REFS, dtype=torch.bool),
+            blank_logits=torch.tensor([[[3.0, 0.0]]]),
+        )
+        batch = TextEncodedBatch(
+            token_ids=torch.tensor([[1, 2, 3]]),
+            attention_mask=torch.ones(1, 3, dtype=torch.long),
+            card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
+            seq_lengths=torch.tensor([3]),
+            blank_group_kind=torch.full((1, 1), BLANK_GROUP_PER_BLANK, dtype=torch.int32),
+            blank_option_index=torch.tensor([[0]], dtype=torch.int32),
+            blank_legal_mask=torch.tensor([[[True, False]]]),
+        )
+        layout = TextDecisionLayout(
+            trace_kind="blockers",
+            decision_option_idx=torch.tensor([[-1, -1]]),
+            decision_target_idx=torch.tensor([[-1, -1]]),
+            decision_mask=torch.tensor([[True, False]]),
+            uses_none_head=torch.ones(1, dtype=torch.bool),
+            pending=cast(PendingState, {"kind": "blockers", "player_idx": 0, "options": []}),
+        )
+
+        sampled = _sample_inline_blockers_for_step(
+            output,
+            batch,
+            layout,
+            step_idx=0,
+            deterministic=True,
+        )
+
+        assert sampled is not None
+        selected, log_prob, entropy = sampled
+        self.assertEqual([int(t.item()) for t in selected], [0])
         self.assertTrue(torch.isfinite(log_prob))
         self.assertTrue(torch.isfinite(entropy))
 
@@ -384,7 +420,7 @@ class TextActorCriticTests(unittest.TestCase):
             blank_positions=torch.tensor([[1, 2]], dtype=torch.int32),
             blank_kind=torch.ones(1, 2, dtype=torch.int32),
             blank_group=torch.zeros(1, 2, dtype=torch.int32),
-            blank_group_kind=torch.full((1, 2), BLANK_GROUP_CONSTRAINED, dtype=torch.int32),
+            blank_group_kind=torch.full((1, 2), BLANK_GROUP_PER_BLANK, dtype=torch.int32),
             blank_option_index=torch.tensor([[1, 0]], dtype=torch.int32),
             blank_legal_ids=torch.ones(1, 2, 3, dtype=torch.int32),
             blank_legal_mask=torch.tensor([[[True, True, True], [True, True, False]]]),
@@ -425,6 +461,66 @@ class TextActorCriticTests(unittest.TestCase):
         assert per_choice is not None
         self.assertEqual(tuple(per_choice.flat_logits.shape), (5,))
         self.assertEqual(int(per_choice.is_sampled_flat.sum()), 2)
+
+    def test_inline_blocker_replay_scoring_handles_none_only_row(self) -> None:
+        output = RecurrentTextPolicyOutput(
+            values=torch.zeros(1),
+            state_hidden=torch.zeros(1, 8),
+            card_vectors=torch.empty(1, MAX_CARD_REFS, 8),
+            card_mask=torch.zeros(1, MAX_CARD_REFS, dtype=torch.bool),
+            blank_logits=torch.tensor([[[2.0, -1.0]]]),
+        )
+        encoded = PackedTextBatch(
+            token_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
+            seq_id=torch.tensor([0, 0, 0], dtype=torch.int32),
+            pos_in_seq=torch.tensor([0, 1, 2], dtype=torch.int32),
+            cu_seqlens=torch.tensor([0, 3], dtype=torch.int32),
+            seq_lengths=torch.tensor([3], dtype=torch.int32),
+            state_positions=torch.tensor([0], dtype=torch.int32),
+            card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.int32),
+            blank_positions=torch.tensor([[1]], dtype=torch.int32),
+            blank_kind=torch.ones(1, 1, dtype=torch.int32),
+            blank_group=torch.zeros(1, 1, dtype=torch.int32),
+            blank_group_kind=torch.full((1, 1), BLANK_GROUP_PER_BLANK, dtype=torch.int32),
+            blank_option_index=torch.tensor([[0]], dtype=torch.int32),
+            blank_legal_ids=torch.ones(1, 1, 2, dtype=torch.int32),
+            blank_legal_mask=torch.tensor([[[True, False]]]),
+        )
+        batch = TextReplayBatch(
+            encoded=encoded,
+            trace_kind_id=torch.tensor([TRACE_KIND_TO_ID["blockers"]]),
+            decision_start=torch.tensor([0]),
+            decision_count=torch.tensor([1]),
+            decision_option_idx=torch.tensor([[-1, -1]]),
+            decision_target_idx=torch.tensor([[-1, -1]]),
+            decision_mask=torch.tensor([[True, False]]),
+            uses_none_head=torch.ones(1, dtype=torch.bool),
+            selected_indices=torch.tensor([0]),
+            step_for_decision_group=torch.tensor([0]),
+            behavior_action_log_prob=torch.zeros(1),
+            may_selected=torch.zeros(1),
+            old_log_prob=torch.zeros(1),
+            value=torch.zeros(1),
+            perspective_player_idx=torch.zeros(1, dtype=torch.long),
+            lstm_h_in=None,
+            lstm_c_in=None,
+        )
+
+        log_probs, entropies, group_mask, per_choice = _evaluate_inline_blocker_replay_groups(
+            output,
+            batch,
+            return_per_choice=True,
+        )
+
+        blank_logits = output.blank_logits
+        assert blank_logits is not None
+        expected = torch.log_softmax(blank_logits[0, 0, :1], dim=0)[0]
+        torch.testing.assert_close(log_probs[0], expected)
+        self.assertTrue(torch.isfinite(entropies).all())
+        torch.testing.assert_close(group_mask, torch.tensor([True]))
+        assert per_choice is not None
+        self.assertEqual(tuple(per_choice.flat_logits.shape), (1,))
+        self.assertEqual(int(per_choice.is_sampled_flat.sum()), 1)
 
     def test_inline_priority_replay_scoring_uses_target_blank_logits(self) -> None:
         output = RecurrentTextPolicyOutput(

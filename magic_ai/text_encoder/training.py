@@ -26,11 +26,7 @@ from torch import Tensor
 
 from magic_ai.text_encoder.batch import TextEncodedBatch
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy
-from magic_ai.text_encoder.render_plan import (
-    BLANK_GROUP_CONSTRAINED,
-    BLANK_GROUP_CROSS_BLANK,
-    BLANK_GROUP_PER_BLANK,
-)
+from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 
 # ---------------------------------------------------------------------------
 # Loss functions
@@ -237,9 +233,7 @@ def _inline_per_blank_valid_slots(
 ) -> Tensor:
     target = target_legal_index.to(device=blank_legal_mask.device, dtype=torch.long)
     group_kind = blank_group_kind.to(device=blank_legal_mask.device)
-    support = (
-        (group_kind == BLANK_GROUP_PER_BLANK) | (group_kind == BLANK_GROUP_CONSTRAINED)
-    ) & blank_legal_mask.any(dim=-1)
+    support = (group_kind == BLANK_GROUP_PER_BLANK) & blank_legal_mask.any(dim=-1)
     in_range = (target >= 0) & (target < blank_legal_mask.shape[-1]) & (target != ignore_index)
     safe_target = target.clamp(min=0, max=max(0, blank_legal_mask.shape[-1] - 1))
     target_is_legal = blank_legal_mask.gather(-1, safe_target.unsqueeze(-1)).squeeze(-1)
@@ -254,7 +248,7 @@ def inline_blank_per_blank_loss(
     *,
     ignore_index: int = -1,
 ) -> Tensor:
-    """Per-blank CE for ``PER_BLANK`` and ``CONSTRAINED`` inline groups.
+    """Per-blank CE for ``PER_BLANK`` inline groups.
 
     ``target_legal_index`` stores the chosen legal-slot ordinal per blank
     (for blockers: 0 is ``<none>``, 1..N are legal attackers). Cross-blank
@@ -290,7 +284,7 @@ def inline_blank_per_blank_accuracy(
     *,
     ignore_index: int = -1,
 ) -> dict[str, float | int]:
-    """Accuracy for ``PER_BLANK`` and ``CONSTRAINED`` inline groups."""
+    """Accuracy for ``PER_BLANK`` inline groups."""
 
     _validate_inline_per_blank_shapes(
         blank_logits,

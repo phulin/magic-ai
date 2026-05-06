@@ -801,15 +801,22 @@ class InlineBlankPolicy(nn.Module):
 
         blank_h = self.decoder_norm(F.gelu(self.decoder_dense(blank_h)))
         legal_ids = blank_legal_ids.to(device=hidden.device, dtype=torch.long)
-        legal_emb = self.embed(legal_ids)
-        logits = (legal_emb * blank_h.unsqueeze(-2)).sum(dim=-1)
+        legal_mask = blank_legal_mask.to(device=hidden.device, dtype=torch.bool)
+        logits = blank_h.new_zeros(tuple(legal_ids.shape))
+        legal_coords = legal_mask.nonzero(as_tuple=False)
+        if legal_coords.numel() > 0:
+            b_idx = legal_coords[:, 0]
+            k_idx = legal_coords[:, 1]
+            v_idx = legal_coords[:, 2]
+            legal_emb = self.embed(legal_ids[b_idx, k_idx, v_idx])
+            blank_vec = blank_h[b_idx, k_idx]
+            logits[legal_mask] = (legal_emb * blank_vec).sum(dim=-1)
 
         safe_kind = blank_kind.to(device=hidden.device, dtype=torch.long).clamp(
             min=0, max=self.kind_temperature.num_embeddings - 1
         )
         temp = self.kind_temperature(safe_kind).squeeze(-1).unsqueeze(-1).to(logits.dtype)
         logits = logits * temp
-        legal_mask = blank_legal_mask.to(device=hidden.device, dtype=torch.bool)
         return logits.masked_fill(~legal_mask, float("-inf"))
 
 

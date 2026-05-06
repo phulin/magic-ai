@@ -386,6 +386,8 @@ class NativeTextTrajectoryBuffer:
         self.max_decision_groups = replay_buffer.max_decision_groups
         self.max_cached_choices = replay_buffer.max_cached_choices
         self.max_card_refs = replay_buffer.max_card_refs
+        self.max_blanks_per_row = replay_buffer.max_blanks_per_row
+        self.max_legal_per_blank = replay_buffer.max_legal_per_blank
         self.recurrent_layers = replay_buffer.recurrent_layers
         self.recurrent_hidden_dim = replay_buffer.recurrent_hidden_dim
         self.lstm_proj_hidden = replay_buffer.lstm_proj_hidden
@@ -985,6 +987,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         max_targets_per_option=args.max_targets_per_option,
         max_decision_groups=args.max_decision_groups,
         max_cached_choices=args.max_cached_choices,
+        max_legal_per_blank=args.max_cached_choices,
         recurrent_layers=recurrent_cfg.lstm_layers,
         recurrent_hidden_dim=cfg.d_model,
         lstm_proj_hidden=recurrent_cfg.lstm_hidden,
@@ -2752,8 +2755,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--rnad-m must be at least 1")
         if args.rnad_neurd_beta <= 0.0:
             raise ValueError("--rnad-neurd-beta must be positive")
-        if not 0.0 < args.rnad_target_ema < 1.0:
-            raise ValueError("--rnad-target-ema must be in (0, 1)")
+        if not 0.0 <= args.rnad_target_ema < 1.0:
+            raise ValueError("--rnad-target-ema must be in [0, 1)")
         if not 0.0 <= args.rnad_finetune_eps < 1.0:
             raise ValueError("--rnad-finetune-eps must be in [0, 1)")
         if args.rnad_finetune_ndisc < 1:
@@ -3038,6 +3041,7 @@ def train_native_batched_envs(
                 finetune_eps=args.rnad_finetune_eps,
                 finetune_n_disc=args.rnad_finetune_ndisc,
                 learning_rate=args.learning_rate,
+                grad_clip=args.max_grad_norm,
                 q_corr_rho_bar=args.rnad_q_corr_rho_bar,
                 bptt_chunk_size=args.rnad_bptt_chunk_size,
                 step_minibatch_size=args.minibatch_size,
@@ -3056,9 +3060,6 @@ def train_native_batched_envs(
     total_rollout_steps = restored_state.total_rollout_steps
     total_generated_rollout_steps = restored_state.total_generated_rollout_steps
     total_wandb_logs = restored_state.total_wandb_logs
-    run_step = getattr(wandb.run, "step", None) if wandb.run is not None else None
-    if isinstance(run_step, int):
-        total_wandb_logs = max(total_wandb_logs, run_step)
     next_episode_idx = completed_games
     live_games: list[LiveGame] = []
     free_slots = list(range(args.num_envs - 1, -1, -1))
@@ -3730,9 +3731,6 @@ def train_text_envs(
     total_rollout_steps = restored_state.total_rollout_steps
     total_generated_rollout_steps = restored_state.total_generated_rollout_steps
     total_wandb_logs = restored_state.total_wandb_logs
-    run_step = getattr(wandb.run, "step", None) if wandb.run is not None else None
-    if isinstance(run_step, int):
-        total_wandb_logs = max(total_wandb_logs, run_step)
 
     pending_steps: list[RolloutStep] = []
     pending_returns: list[torch.Tensor] = []
@@ -4131,9 +4129,6 @@ def train_text_native_batched_envs(
     total_rollout_steps = restored_state.total_rollout_steps
     total_generated_rollout_steps = restored_state.total_generated_rollout_steps
     total_wandb_logs = restored_state.total_wandb_logs
-    run_step = getattr(wandb.run, "step", None) if wandb.run is not None else None
-    if isinstance(run_step, int):
-        total_wandb_logs = max(total_wandb_logs, run_step)
 
     pending_replay_rows: list[torch.Tensor] = []
     pending_returns: list[torch.Tensor] = []
@@ -4157,6 +4152,7 @@ def train_text_native_batched_envs(
                 finetune_eps=args.rnad_finetune_eps,
                 finetune_n_disc=args.rnad_finetune_ndisc,
                 learning_rate=args.learning_rate,
+                grad_clip=args.max_grad_norm,
                 q_corr_rho_bar=args.rnad_q_corr_rho_bar,
                 bptt_chunk_size=args.rnad_bptt_chunk_size,
                 step_minibatch_size=args.minibatch_size,
