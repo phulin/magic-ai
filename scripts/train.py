@@ -2970,6 +2970,7 @@ def train_native_batched_envs(
         cast(PPOPolicy, rnad_state.target).init_lstm_env_states(args.num_envs)
     restored_state = resume_state or TrainingResumeState()
     completed_games = restored_state.completed_games
+    trained_completed_games = completed_games
     last_saved_games = restored_state.last_saved_games
     total_rollout_steps = restored_state.total_rollout_steps
     total_generated_rollout_steps = restored_state.total_generated_rollout_steps
@@ -3477,13 +3478,13 @@ def train_native_batched_envs(
             pending_episodes.clear()
             pending_step_count = 0
             win_stats.reset()
+            trained_completed_games = completed_games
             _record_phase("post_update", _t)
 
         if (
             args.save_every
-            and completed_games > 0
-            and completed_games % args.save_every == 0
-            and completed_games != last_saved_games
+            and trained_completed_games > 0
+            and trained_completed_games >= last_saved_games + args.save_every
         ):
             save_checkpoint(
                 args.output,
@@ -3494,15 +3495,15 @@ def train_native_batched_envs(
                 snapshot_schedule=snapshot_schedule,
                 retrospective_schedule=retrospective_schedule,
                 resume_state=TrainingResumeState(
-                    completed_games=completed_games,
-                    last_saved_games=completed_games,
+                    completed_games=trained_completed_games,
+                    last_saved_games=trained_completed_games,
                     total_rollout_steps=total_rollout_steps,
                     total_generated_rollout_steps=total_generated_rollout_steps,
                     total_wandb_logs=total_wandb_logs,
                 ),
                 rnad_state=rnad_state,
             )
-            last_saved_games = completed_games
+            last_saved_games = trained_completed_games
 
         if (
             opponent_pool is not None
@@ -3597,10 +3598,11 @@ def train_native_batched_envs(
         )
         policy.reset_rollout_buffer()
         pending_episodes.clear()
+        trained_completed_games = completed_games
 
     return (
         TrainingResumeState(
-            completed_games=completed_games,
+            completed_games=trained_completed_games,
             last_saved_games=last_saved_games,
             total_rollout_steps=total_rollout_steps,
             total_generated_rollout_steps=total_generated_rollout_steps,
@@ -3635,6 +3637,7 @@ def train_text_envs(
     eval_rng = random.Random(args.seed ^ 0x5EED5)
     restored_state = resume_state or TrainingResumeState()
     completed_games = restored_state.completed_games
+    trained_completed_games = completed_games
     last_saved_games = restored_state.last_saved_games
     total_rollout_steps = restored_state.total_rollout_steps
     total_generated_rollout_steps = restored_state.total_generated_rollout_steps
@@ -3662,7 +3665,7 @@ def train_text_envs(
         wandb.log(payload)
 
     def run_update(*, final: bool = False) -> None:
-        nonlocal total_rollout_steps, last_step_time
+        nonlocal total_rollout_steps, last_step_time, trained_completed_games
         if not pending_steps:
             return
         rollout_returns = torch.cat(pending_returns)
@@ -3734,6 +3737,7 @@ def train_text_envs(
         pending_returns.clear()
         pending_episode_rows.clear()
         win_stats.reset()
+        trained_completed_games = completed_games
 
     for episode_idx in range(completed_games, args.episodes):
         backend.policy.reset_lstm_env_states([0])
@@ -3857,9 +3861,8 @@ def train_text_envs(
 
         if (
             args.save_every
-            and completed_games > 0
-            and completed_games % args.save_every == 0
-            and completed_games != last_saved_games
+            and trained_completed_games > 0
+            and trained_completed_games >= last_saved_games + args.save_every
         ):
             save_checkpoint(
                 args.output,
@@ -3870,14 +3873,14 @@ def train_text_envs(
                 snapshot_schedule=snapshot_schedule,
                 retrospective_schedule=retrospective_schedule,
                 resume_state=TrainingResumeState(
-                    completed_games=completed_games,
-                    last_saved_games=completed_games,
+                    completed_games=trained_completed_games,
+                    last_saved_games=trained_completed_games,
                     total_rollout_steps=total_rollout_steps,
                     total_generated_rollout_steps=total_generated_rollout_steps,
                     total_wandb_logs=total_wandb_logs,
                 ),
             )
-            last_saved_games = completed_games
+            last_saved_games = trained_completed_games
 
         if (
             opponent_pool is not None
@@ -3916,7 +3919,7 @@ def train_text_envs(
     run_update(final=True)
     return (
         TrainingResumeState(
-            completed_games=completed_games,
+            completed_games=trained_completed_games,
             last_saved_games=last_saved_games,
             total_rollout_steps=total_rollout_steps,
             total_generated_rollout_steps=total_generated_rollout_steps,
@@ -4028,6 +4031,7 @@ def train_text_native_batched_envs(
 
     restored_state = resume_state or TrainingResumeState()
     completed_games = restored_state.completed_games
+    trained_completed_games = completed_games
     last_saved_games = restored_state.last_saved_games
     total_rollout_steps = restored_state.total_rollout_steps
     total_generated_rollout_steps = restored_state.total_generated_rollout_steps
@@ -4269,6 +4273,7 @@ def train_text_native_batched_envs(
 
     def run_update(*, final: bool = False) -> None:
         nonlocal total_rollout_steps, last_step_time, pending_step_count
+        nonlocal trained_completed_games
         if pending_step_count == 0:
             return
         rollout_returns = torch.cat(pending_returns)
@@ -4442,6 +4447,7 @@ def train_text_native_batched_envs(
         pending_step_count = 0
         backend.replay_buffer.reset()
         win_stats.reset()
+        trained_completed_games = completed_games
 
     def run_text_rollouts_actor_loop() -> None:
         """IMPALA-style coordinator. Spins up N actor threads + 1 GPU server.
@@ -4781,9 +4787,8 @@ def train_text_native_batched_envs(
                 # Save / snapshot / retrospective (mirrors the legacy loop).
                 if (
                     args.save_every
-                    and completed_games > 0
-                    and completed_games % args.save_every == 0
-                    and completed_games != last_saved_games
+                    and trained_completed_games > 0
+                    and trained_completed_games >= last_saved_games + args.save_every
                 ):
                     save_checkpoint(
                         args.output,
@@ -4794,15 +4799,15 @@ def train_text_native_batched_envs(
                         snapshot_schedule=snapshot_schedule,
                         retrospective_schedule=retrospective_schedule,
                         resume_state=TrainingResumeState(
-                            completed_games=completed_games,
-                            last_saved_games=completed_games,
+                            completed_games=trained_completed_games,
+                            last_saved_games=trained_completed_games,
                             total_rollout_steps=total_rollout_steps,
                             total_generated_rollout_steps=total_generated_rollout_steps,
                             total_wandb_logs=total_wandb_logs,
                         ),
                         rnad_state=rnad_state,
                     )
-                    last_saved_games = completed_games
+                    last_saved_games = trained_completed_games
 
                 if (
                     opponent_pool is not None
@@ -4868,7 +4873,7 @@ def train_text_native_batched_envs(
         run_update(final=True)
         return (
             TrainingResumeState(
-                completed_games=completed_games,
+                completed_games=trained_completed_games,
                 last_saved_games=last_saved_games,
                 total_rollout_steps=total_rollout_steps,
                 total_generated_rollout_steps=total_generated_rollout_steps,
@@ -4911,9 +4916,8 @@ def train_text_native_batched_envs(
 
         if (
             args.save_every
-            and completed_games > 0
-            and completed_games % args.save_every == 0
-            and completed_games != last_saved_games
+            and trained_completed_games > 0
+            and trained_completed_games >= last_saved_games + args.save_every
         ):
             save_checkpoint(
                 args.output,
@@ -4924,15 +4928,15 @@ def train_text_native_batched_envs(
                 snapshot_schedule=snapshot_schedule,
                 retrospective_schedule=retrospective_schedule,
                 resume_state=TrainingResumeState(
-                    completed_games=completed_games,
-                    last_saved_games=completed_games,
+                    completed_games=trained_completed_games,
+                    last_saved_games=trained_completed_games,
                     total_rollout_steps=total_rollout_steps,
                     total_generated_rollout_steps=total_generated_rollout_steps,
                     total_wandb_logs=total_wandb_logs,
                 ),
                 rnad_state=rnad_state,
             )
-            last_saved_games = completed_games
+            last_saved_games = trained_completed_games
 
         if (
             opponent_pool is not None
@@ -5072,7 +5076,7 @@ def train_text_native_batched_envs(
     run_update(final=True)
     return (
         TrainingResumeState(
-            completed_games=completed_games,
+            completed_games=trained_completed_games,
             last_saved_games=last_saved_games,
             total_rollout_steps=total_rollout_steps,
             total_generated_rollout_steps=total_generated_rollout_steps,
