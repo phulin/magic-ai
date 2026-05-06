@@ -19,7 +19,7 @@ from magic_ai.text_encoder.actor_critic import (
     build_text_decision_layout,
     infer_text_trace_kind,
 )
-from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
+from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch, pack_batch
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig, RecurrentTextPolicyOutput
 from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
@@ -835,6 +835,66 @@ class TextActorCriticTests(unittest.TestCase):
         self.assertEqual(out.replay_rows, [-1, -1])
         self.assertFalse(torch.equal(model.live_lstm_h[:, 0], torch.zeros(1, 8)))
         self.assertFalse(torch.equal(model.live_lstm_h[:, 2], torch.zeros(1, 8)))
+
+    def test_sample_native_tensor_batch_uses_inline_may_blank(self) -> None:
+        model = _model()
+        model.rollout_buffer = None
+        model.init_lstm_env_states(1)
+        native_batch = SimpleNamespace(
+            trace_kind_id=torch.tensor([TRACE_KIND_TO_ID["may"]], dtype=torch.long),
+            decision_count=torch.tensor([0], dtype=torch.long),
+            decision_rows_written=0,
+            decision_option_idx=torch.empty(0, 2, dtype=torch.long),
+            decision_target_idx=torch.empty(0, 2, dtype=torch.long),
+            decision_mask=torch.empty(0, 2, dtype=torch.bool),
+            uses_none_head=torch.empty(0, dtype=torch.bool),
+        )
+        text_batch = TextEncodedBatch(
+            token_ids=torch.tensor([[1, 2]]),
+            attention_mask=torch.ones(1, 2, dtype=torch.long),
+            card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
+            seq_lengths=torch.tensor([2]),
+            blank_positions=torch.tensor([[1]]),
+            blank_kind=torch.ones(1, 1, dtype=torch.long),
+            blank_group=torch.zeros(1, 1, dtype=torch.long),
+            blank_group_kind=torch.tensor([[BLANK_GROUP_PER_BLANK]], dtype=torch.long),
+            blank_option_index=torch.tensor([[-1]], dtype=torch.long),
+            blank_legal_ids=torch.ones(1, 1, 2, dtype=torch.long),
+            blank_legal_mask=torch.tensor([[[True, True]]]),
+        )
+
+        def fake_forward_packed(
+            _batch: PackedTextBatch,
+            h_in: torch.Tensor | None = None,
+            c_in: torch.Tensor | None = None,
+            *,
+            state_hidden_override: torch.Tensor | None = None,
+        ) -> tuple[RecurrentTextPolicyOutput, tuple[torch.Tensor, torch.Tensor]]:
+            del _batch, state_hidden_override
+            assert h_in is not None and c_in is not None
+            output = RecurrentTextPolicyOutput(
+                values=torch.zeros(1),
+                state_hidden=torch.zeros(1, 8),
+                card_vectors=torch.empty(1, MAX_CARD_REFS, 8),
+                card_mask=torch.zeros(1, MAX_CARD_REFS, dtype=torch.bool),
+                blank_logits=torch.tensor([[[0.0, 4.0]]]),
+                lstm_input=torch.zeros(1, 8),
+            )
+            return output, (h_in, c_in)
+
+        object.__setattr__(model.policy, "forward_packed", fake_forward_packed)
+
+        out = model.sample_native_tensor_batch(
+            native_batch=native_batch,
+            env_indices=[0],
+            perspective_player_indices=[0],
+            packed_batch=pack_batch(text_batch),
+            deterministic=True,
+        )
+
+        self.assertEqual(out.may_selected, [1])
+        expected_log_prob = torch.log_softmax(torch.tensor([0.0, 4.0]), dim=0)[1]
+        self.assertAlmostEqual(out.old_log_prob[0], float(expected_log_prob), places=6)
 
     def test_sample_text_batch_handles_may_head(self) -> None:
         torch.manual_seed(0)

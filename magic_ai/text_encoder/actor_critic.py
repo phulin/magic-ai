@@ -600,6 +600,11 @@ class TextActorCritic(nn.Module):
             may_logits = self.may_head(output.state_hidden).squeeze(-1)
             step_log_probs = output.values.new_zeros(batch_size)
             step_entropies = output.values.new_zeros(batch_size)
+            may_selected_t = output.values.new_zeros(batch_size)
+            inline_may_active = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            inline_batch = (
+                moved_packed if moved_packed is not None else cast(TextEncodedBatch, moved_text)
+            )
 
             if decision_rows > 0:
                 option_idx = native_batch.decision_option_idx[:decision_rows].to(
@@ -616,9 +621,6 @@ class TextActorCritic(nn.Module):
                 )
                 id_to_trace = {int(v): k for k, v in TRACE_KIND_TO_ID.items()}
                 selected_chunks: list[Tensor] = []
-                inline_batch = (
-                    moved_packed if moved_packed is not None else cast(TextEncodedBatch, moved_text)
-                )
                 cursor = 0
                 for step_idx in range(batch_size):
                     group_count = int(decision_count[step_idx].item())
@@ -777,13 +779,28 @@ class TextActorCritic(nn.Module):
             group_log_probs = output.values.new_zeros(decision_rows)
 
             may_mask = trace_kind_id == TRACE_KIND_TO_ID["may"]
+            inline_may_sample = _sample_inline_may_batch(
+                output,
+                inline_batch,
+                may_mask=may_mask,
+                deterministic=deterministic,
+            )
+            if inline_may_sample is not None:
+                selected_may, log_prob, entropy, inline_may_active = inline_may_sample
+                may_selected_t = torch.where(inline_may_active, selected_may, may_selected_t)
+                active_f = inline_may_active.to(dtype=output.values.dtype)
+                step_log_probs = step_log_probs + log_prob * active_f
+                step_entropies = step_entropies + entropy * active_f
+
+            fallback_may_mask = may_mask & ~inline_may_active
             if deterministic:
-                may_selected_t = (may_logits >= 0).to(dtype=output.values.dtype)
+                fallback_may_selected = (may_logits >= 0).to(dtype=output.values.dtype)
             else:
-                may_selected_t = torch.bernoulli(torch.sigmoid(may_logits))
+                fallback_may_selected = torch.bernoulli(torch.sigmoid(may_logits))
+            may_selected_t = torch.where(fallback_may_mask, fallback_may_selected, may_selected_t)
             may_log_prob = -torch.nn.functional.binary_cross_entropy_with_logits(
                 may_logits,
-                may_selected_t,
+                fallback_may_selected,
                 reduction="none",
             )
             with torch.autocast(device_type=device_type, enabled=False):
@@ -793,7 +810,7 @@ class TextActorCritic(nn.Module):
                     may_prob,
                     reduction="none",
                 )
-            may_mask_f = may_mask.to(dtype=output.values.dtype)
+            may_mask_f = fallback_may_mask.to(dtype=output.values.dtype)
             step_log_probs = step_log_probs + may_log_prob * may_mask_f
             step_entropies = step_entropies + may_entropy * may_mask_f
             del step_entropies
@@ -1695,6 +1712,41 @@ def _sample_inline_may_for_step(
     selected = torch.argmax(logits) if deterministic else dist.sample()
     may_selected = selected.to(dtype=output.values.dtype)
     return may_selected, dist.log_prob(selected), dist.entropy()
+
+
+def _sample_inline_may_batch(
+    output: RecurrentTextPolicyOutput,
+    batch: TextEncodedBatch | PackedTextBatch,
+    *,
+    may_mask: Tensor,
+    deterministic: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+    blank_logits = output.blank_logits
+    if blank_logits is None or blank_logits.numel() == 0:
+        return None
+    if batch.blank_option_index.numel() == 0:
+        return None
+    device = blank_logits.device
+    row_group_kind = batch.blank_group_kind.to(device=device)
+    row_option_index = batch.blank_option_index.to(device=device)
+    row_legal_mask = batch.blank_legal_mask.to(device=device, dtype=torch.bool)
+    if int(row_group_kind.shape[1]) == 0 or int(row_legal_mask.shape[2]) < 2:
+        return None
+    support = (
+        (row_group_kind == BLANK_GROUP_PER_BLANK)
+        & (row_option_index < 0)
+        & row_legal_mask[..., :2].all(dim=-1)
+        & may_mask.to(device=device, dtype=torch.bool).unsqueeze(1)
+    )
+    active = support.sum(dim=1) == 1
+    blank_idx = support.to(dtype=torch.long).argmax(dim=1)
+    row_idx = torch.arange(blank_logits.shape[0], device=device)
+    logits = blank_logits[row_idx, blank_idx, :2]
+    logits = torch.where(active.unsqueeze(1), logits, torch.zeros_like(logits))
+    dist = Categorical(logits=logits)
+    selected = torch.argmax(logits, dim=-1) if deterministic else dist.sample()
+    selected_may = selected.to(dtype=output.values.dtype)
+    return selected_may, dist.log_prob(selected), dist.entropy(), active
 
 
 def _sample_inline_choice_index_for_step(

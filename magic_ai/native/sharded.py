@@ -147,9 +147,12 @@ def _merge_packed_outputs(
         output.blank_kind[batch_cursor:next_batch].copy_(shard.blank_kind[:shard_n])
         output.blank_group[batch_cursor:next_batch].copy_(shard.blank_group[:shard_n])
         output.blank_group_kind[batch_cursor:next_batch].copy_(shard.blank_group_kind[:shard_n])
+        output.blank_option_index[batch_cursor:next_batch].copy_(shard.blank_option_index[:shard_n])
         output.blank_legal_ids[batch_cursor:next_batch].copy_(shard.blank_legal_ids[:shard_n])
         output.blank_legal_mask[batch_cursor:next_batch].copy_(shard.blank_legal_mask[:shard_n])
         output.blank_overflow[batch_cursor:next_batch].copy_(shard.blank_overflow[:shard_n])
+        output.blank_count[batch_cursor:next_batch].copy_(shard.blank_count[:shard_n])
+        output.blank_legal_count[batch_cursor:next_batch].copy_(shard.blank_legal_count[:shard_n])
 
         batch_cursor = next_batch
         token_cursor = next_token

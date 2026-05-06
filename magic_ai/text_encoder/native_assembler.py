@@ -60,6 +60,8 @@ class _MagePackedBlankOutputsC(ctypes.Structure):
         ("blank_legal_ids", ctypes.POINTER(ctypes.c_int32)),
         ("blank_legal_mask", ctypes.POINTER(ctypes.c_uint8)),
         ("blank_overflow", ctypes.POINTER(ctypes.c_int32)),
+        ("blank_count", ctypes.POINTER(ctypes.c_int32)),
+        ("blank_legal_count", ctypes.POINTER(ctypes.c_int32)),
     ]
 
 
@@ -133,6 +135,8 @@ class NativePackedAssemblerOutputs:
     blank_legal_ids: torch.Tensor  # (B, max_blanks, max_legal_per_blank) int32
     blank_legal_mask: torch.Tensor  # (B, max_blanks, max_legal_per_blank) uint8
     blank_overflow: torch.Tensor  # (B,) int32
+    blank_count: torch.Tensor  # (B,) int32
+    blank_legal_count: torch.Tensor  # (B, max_blanks) int32
     active_batch_size: int = 0
     _packed_out_cffi: Any = None
     _tok_cfg_cffi: Any = None
@@ -165,6 +169,8 @@ class NativePackedAssemblerOutputs:
         blank_option_index_full = self.blank_option_index[:active_n]
         blank_legal_ids_full = self.blank_legal_ids[:active_n]
         blank_legal_mask_full = self.blank_legal_mask[:active_n]
+        blank_count_full = self.blank_count[:active_n]
+        blank_legal_count_full = self.blank_legal_count[:active_n]
 
         total = int(cu_seqlens[-1].item()) if cu_seqlens.numel() else 0
         seq_lengths_host = tuple(int(x) for x in seq_lengths.tolist())
@@ -183,12 +189,9 @@ class NativePackedAssemblerOutputs:
             pos_in_seq = self.token_ids[:0]
 
         if trim:
-            blank_any = blank_positions_full >= 0
-            blank_cols = blank_any.any(dim=0)
-            max_blanks = int(blank_cols.sum().item()) if blank_cols.numel() else 0
+            max_blanks = int(blank_count_full.max().item()) if blank_count_full.numel() else 0
             if max_blanks > 0:
-                legal_cols = blank_legal_mask_full[:, :max_blanks].bool().any(dim=0).any(dim=0)
-                max_legal = int(legal_cols.sum().item()) if legal_cols.numel() else 0
+                max_legal = int(blank_legal_count_full[:, :max_blanks].max().item())
             else:
                 max_legal = 0
             blank_positions = (
@@ -213,7 +216,41 @@ class NativePackedAssemblerOutputs:
                 else blank_option_index_full[:, :0]
             )
             blank_legal_ids = blank_legal_ids_full[:, :max_blanks, :max_legal]
-            blank_legal_mask = blank_legal_mask_full[:, :max_blanks, :max_legal].bool()
+            if max_blanks > 0:
+                blank_counts = blank_count_full.to(dtype=torch.int32)
+                blank_idx = torch.arange(max_blanks, dtype=torch.int32, device=blank_counts.device)
+                live_blank_mask = blank_idx.unsqueeze(0) < blank_counts.unsqueeze(1)
+                blank_positions = torch.where(
+                    live_blank_mask,
+                    blank_positions,
+                    torch.full_like(blank_positions, -1),
+                )
+                blank_kind = torch.where(live_blank_mask, blank_kind, torch.zeros_like(blank_kind))
+                blank_group = torch.where(
+                    live_blank_mask,
+                    blank_group,
+                    torch.full_like(blank_group, -1),
+                )
+                blank_group_kind = torch.where(
+                    live_blank_mask,
+                    blank_group_kind,
+                    torch.zeros_like(blank_group_kind),
+                )
+                blank_option_index = torch.where(
+                    live_blank_mask,
+                    blank_option_index,
+                    torch.full_like(blank_option_index, -1),
+                )
+                legal_counts = blank_legal_count_full[:, :max_blanks].to(dtype=torch.int32)
+                if max_legal > 0:
+                    legal_idx = torch.arange(
+                        max_legal, dtype=torch.int32, device=legal_counts.device
+                    )
+                    blank_legal_mask = legal_idx.view(1, 1, max_legal) < legal_counts.unsqueeze(-1)
+                else:
+                    blank_legal_mask = blank_legal_mask_full[:, :max_blanks, :0].bool()
+            else:
+                blank_legal_mask = blank_legal_mask_full[:, :0, :0].bool()
         else:
             blank_positions = blank_positions_full
             blank_kind = blank_kind_full
@@ -284,6 +321,8 @@ def allocate_packed_outputs(
             (batch_size, max_blanks, max_legal_per_blank), dtype=torch.uint8, pin_memory=pin
         ),
         blank_overflow=torch.zeros((batch_size,), dtype=torch.int32),
+        blank_count=torch.zeros((batch_size,), dtype=torch.int32, pin_memory=pin),
+        blank_legal_count=torch.zeros((batch_size, max_blanks), dtype=torch.int32, pin_memory=pin),
     )
 
 
@@ -405,6 +444,8 @@ def encode_tokens_packed(
                 "blank_legal_ids": ffi.cast("int32_t *", outputs.blank_legal_ids.data_ptr()),
                 "blank_legal_mask": ffi.cast("uint8_t *", outputs.blank_legal_mask.data_ptr()),
                 "blank_overflow": ffi.cast("int32_t *", outputs.blank_overflow.data_ptr()),
+                "blank_count": ffi.cast("int32_t *", outputs.blank_count.data_ptr()),
+                "blank_legal_count": ffi.cast("int32_t *", outputs.blank_legal_count.data_ptr()),
             },
         )
     blank_cfg: Any = outputs._blank_cfg_cffi
@@ -461,6 +502,8 @@ def encode_tokens_packed(
                         blank_legal_ids=_tensor_ptr(outputs.blank_legal_ids, ctypes.c_int32),
                         blank_legal_mask=_tensor_ptr(outputs.blank_legal_mask, ctypes.c_uint8),
                         blank_overflow=_tensor_ptr(outputs.blank_overflow, ctypes.c_int32),
+                        blank_count=_tensor_ptr(outputs.blank_count, ctypes.c_int32),
+                        blank_legal_count=_tensor_ptr(outputs.blank_legal_count, ctypes.c_int32),
                     )
                 blank_cfg_c = outputs._blank_cfg_ctypes
                 blank_out_c = outputs._blank_out_ctypes

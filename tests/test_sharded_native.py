@@ -162,9 +162,12 @@ class _PackedOutputs:
     blank_kind: torch.Tensor
     blank_group: torch.Tensor
     blank_group_kind: torch.Tensor
+    blank_option_index: torch.Tensor
     blank_legal_ids: torch.Tensor
     blank_legal_mask: torch.Tensor
     blank_overflow: torch.Tensor
+    blank_count: torch.Tensor
+    blank_legal_count: torch.Tensor
     active_batch_size: int
 
 
@@ -182,9 +185,12 @@ def _packed_outputs(batch_size: int, max_tokens: int = 8) -> _PackedOutputs:
         blank_kind=torch.zeros((batch_size, 3), dtype=torch.int32),
         blank_group=torch.full((batch_size, 3), -1, dtype=torch.int32),
         blank_group_kind=torch.zeros((batch_size, 3), dtype=torch.int32),
+        blank_option_index=torch.full((batch_size, 3), -1, dtype=torch.int32),
         blank_legal_ids=torch.zeros((batch_size, 3, 4), dtype=torch.int32),
         blank_legal_mask=torch.zeros((batch_size, 3, 4), dtype=torch.uint8),
         blank_overflow=torch.zeros(batch_size, dtype=torch.int32),
+        blank_count=torch.zeros(batch_size, dtype=torch.int32),
+        blank_legal_count=torch.zeros((batch_size, 3), dtype=torch.int32),
         active_batch_size=batch_size,
     )
 
@@ -209,6 +215,8 @@ class MergePackedOutputsTests(unittest.TestCase):
         a.blank_legal_mask[:, :2, :2] = torch.tensor(
             [[[1, 1], [0, 0]], [[1, 1], [1, 1]]], dtype=torch.uint8
         )
+        a.blank_count[:] = torch.tensor([1, 2], dtype=torch.int32)
+        a.blank_legal_count[:, :2] = torch.tensor([[2, 0], [2, 2]], dtype=torch.int32)
 
         b = _packed_outputs(1)
         b.token_ids[:4] = torch.tensor([20, 21, 22, 23], dtype=torch.int32)
@@ -226,6 +234,8 @@ class MergePackedOutputsTests(unittest.TestCase):
         b.blank_legal_ids[:, :2, :2] = torch.tensor([[[41, 42], [51, 52]]], dtype=torch.int32)
         b.blank_legal_mask[:, :2, :2] = torch.tensor([[[1, 1], [1, 1]]], dtype=torch.uint8)
         b.blank_overflow[:] = torch.tensor([1], dtype=torch.int32)
+        b.blank_count[:] = torch.tensor([2], dtype=torch.int32)
+        b.blank_legal_count[:, :2] = torch.tensor([[2, 2]], dtype=torch.int32)
 
         out = _packed_outputs(3)
         merged = _merge_packed_outputs([a, b], out)
@@ -290,6 +300,11 @@ class MergePackedOutputsTests(unittest.TestCase):
         )
         torch.testing.assert_close(
             out.blank_overflow[:3], torch.tensor([0, 0, 1], dtype=torch.int32)
+        )
+        torch.testing.assert_close(out.blank_count[:3], torch.tensor([1, 2, 2], dtype=torch.int32))
+        torch.testing.assert_close(
+            out.blank_legal_count[:3, :2],
+            torch.tensor([[2, 0], [2, 2], [2, 2]], dtype=torch.int32),
         )
 
 
