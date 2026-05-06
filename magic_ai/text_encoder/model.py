@@ -802,7 +802,7 @@ class InlineBlankPolicy(nn.Module):
         blank_h = self.decoder_norm(F.gelu(self.decoder_dense(blank_h)))
         legal_ids = blank_legal_ids.to(device=hidden.device, dtype=torch.long)
         legal_mask = blank_legal_mask.to(device=hidden.device, dtype=torch.bool)
-        logits = blank_h.new_full(tuple(legal_ids.shape), float("-inf"))
+        logits = blank_h.new_zeros(tuple(legal_ids.shape))
         legal_coords = legal_mask.nonzero(as_tuple=False)
         if legal_coords.numel() > 0:
             b_idx = legal_coords[:, 0]
