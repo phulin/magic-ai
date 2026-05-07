@@ -25,7 +25,14 @@ from typing import Any, TextIO, cast
 
 import numpy as np
 import torch
+import torch._dynamo
 from dotenv import load_dotenv
+
+# Let Dynamo trace through nn.LSTM (cuDNN op stays opaque) instead of breaking
+# the graph at every LSTM call. Without this the recurrent text policy is
+# compiled as fragments around the LSTM, halving the speedup and doubling
+# cold-compile time. Typed as Literal[False] in the stubs; setattr around it.
+setattr(torch._dynamo.config, "allow_rnn", True)  # noqa: B010
 
 load_dotenv()
 
