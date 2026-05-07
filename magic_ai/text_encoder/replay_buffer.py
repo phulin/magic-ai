@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -64,6 +65,7 @@ class TextReplayTrainWindow:
     row_start: int
     row_end: int
     rows: Tensor
+    ready_events: tuple[Any, ...] = ()
 
 
 class TextReplayBuffer:
@@ -263,6 +265,7 @@ class TextReplayBuffer:
         self._committed_windows: list[tuple[int, int]] = []
         self._reservations: dict[int, _ReplayReservation] = {}
         self._row_complete_host = [False] * self.capacity
+        self._row_ready_events: list[Any | None] = [None] * self.capacity
 
     @property
     def size(self) -> int:
@@ -306,6 +309,7 @@ class TextReplayBuffer:
             self._committed_windows.clear()
             self._reservations.clear()
             self._row_complete_host[:] = [False] * self.capacity
+            self._row_ready_events[:] = [None] * self.capacity
             self._reserve_cond.notify_all()
 
     def write_ppo_targets(
@@ -346,7 +350,14 @@ class TextReplayBuffer:
         self.behavior_policy_version[rows] = int(behavior_policy_version)
         self.inference_policy_version[rows] = int(inference_policy_version)
         self.target_policy_version[rows] = int(target_policy_version)
-        tuple(map(lambda row: self._row_complete_host.__setitem__(int(row), True), rows_host))
+        ready_event: Any | None = None
+        if self.device.type == "cuda":
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream(self.device))
+        for row in rows_host:
+            row_i = int(row)
+            self._row_ready_events[row_i % self.capacity] = ready_event
+            self._row_complete_host[row_i % self.capacity] = True
         with self._reserve_cond:
             self._reserve_cond.notify_all()
 
@@ -398,11 +409,13 @@ class TextReplayBuffer:
             if not allow_partial and available < target:
                 return None
             row_end = row_start + min(available, int(max_rows))
+            ready_events = self._ready_events_for_rows_locked(row_start, row_end)
             self._consume_committed_prefix_locked(row_end)
         return TextReplayTrainWindow(
             row_start=row_start,
             row_end=row_end,
             rows=torch.arange(row_start, row_end, dtype=torch.long, device=self.device),
+            ready_events=ready_events,
         )
 
     def wait_for_train_window(
@@ -810,8 +823,26 @@ class TextReplayBuffer:
             idx += 1
         return int(row_start), int(completed_limit)
 
+    def _ready_events_for_rows_locked(self, row_start: int, row_end: int) -> tuple[Any, ...]:
+        events: list[Any] = []
+        seen: set[int] = set()
+        for row in range(int(row_start), int(row_end)):
+            event = self._row_ready_events[row % self.capacity]
+            if event is None:
+                continue
+            event_id = id(event)
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            events.append(event)
+        return tuple(events)
+
     def _consume_committed_prefix_locked(self, row_end: int) -> None:
         row_end = int(row_end)
+        if self._committed_windows:
+            start = int(self._committed_windows[0][0])
+            for row in range(start, row_end):
+                self._row_ready_events[row % self.capacity] = None
         while self._committed_windows and self._committed_windows[0][1] <= row_end:
             self._committed_windows.pop(0)
         if self._committed_windows and self._committed_windows[0][0] < row_end:

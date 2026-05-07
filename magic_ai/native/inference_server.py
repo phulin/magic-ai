@@ -3,10 +3,9 @@
 A single background thread owns the GPU policy: it drains encoded-batch
 requests submitted by N actor threads, dynamically batches them into one
 forward pass, calls ``TextActorCritic.sample_native_tensor_batch`` on the
-merged batch, stages the resulting replay payload into the shared
-``NativeTextTrajectoryBuffer``, and scatters per-request host-side scalars
-(decision counts, selected choices, may-bit, log-prob, value, trace-kind)
-back to the actors via per-request ``Future`` objects.
+merged batch, and scatters per-request replay payload slices plus host-side
+scalars (decision counts, selected choices, may-bit, log-prob, value,
+trace-kind) back to the actors via per-request ``Future`` objects.
 
 All concat / scatter operations are vectorized — no Python ``for`` loops over
 tensor rows. The server is the only thread that touches the policy's
@@ -58,6 +57,8 @@ class TextInferenceReply:
     replay_payload: NativeTextReplayPayload
     replay_rows: list[int] | None = None
     inference_policy_version: int = 0
+    ready_event: Any | None = None
+    release_item: Any | None = None
 
 
 class RolloutTimingStats:
@@ -294,6 +295,7 @@ class _PendingItem:
     seq_lengths_host: tuple[int, ...]
     blank_cols: int
     legal_cols: int
+    released: bool = False
 
 
 class _InferenceWorkRing:
@@ -319,6 +321,7 @@ class _InferenceWorkRing:
         self._reserved_rows = 0
         self._reserved_tokens = 0
         self._reserved_decisions = 0
+        self._waiting_producers = 0
         self._row_cursor = 0
         self._token_cursor = 0
         self._decision_cursor = 0
@@ -330,7 +333,13 @@ class _InferenceWorkRing:
         self._native_arena: dict[str, torch.Tensor] | None = None
         self._packed_arena: dict[str, torch.Tensor] | None = None
 
-    def put(self, request: TextInferenceRequest, future: Future[TextInferenceReply]) -> None:
+    def put(
+        self,
+        request: TextInferenceRequest,
+        future: Future[TextInferenceReply],
+        *,
+        block: bool = True,
+    ) -> bool:
         rows = len(request.env_indices)
         if rows > self.capacity_rows:
             raise RuntimeError(
@@ -351,7 +360,16 @@ class _InferenceWorkRing:
                     decisions=decision_count,
                 ):
                     break
-                self._cond.wait()
+                if not block:
+                    self._force_flush = True
+                    self._cond.notify_all()
+                    return False
+                self._waiting_producers += 1
+                self._cond.notify_all()
+                try:
+                    self._cond.wait()
+                finally:
+                    self._waiting_producers -= 1
             if self._closed:
                 raise RuntimeError("inference work ring is closed")
             row_start = self._row_cursor
@@ -425,6 +443,7 @@ class _InferenceWorkRing:
                 self._items.append(published)
                 self._next_publish_seq += 1
             self._cond.notify_all()
+        return True
 
     def close(self) -> None:
         with self._cond:
@@ -498,9 +517,14 @@ class _InferenceWorkRing:
 
     def wait_for_item_or_flush(self) -> bool:
         with self._cond:
-            while not self._items and not self._force_flush and not self._closed:
+            while (
+                not self._items
+                and not self._force_flush
+                and not self._closed
+                and self._waiting_producers <= 0
+            ):
                 self._cond.wait()
-            return self._force_flush or self._closed
+            return self._force_flush or self._closed or self._waiting_producers > 0
 
     def clear_flush(self) -> None:
         with self._cond:
@@ -523,9 +547,24 @@ class _InferenceWorkRing:
         with self._cond:
             return sum(item.rows for item in self._items if item is not None)
 
+    def has_tail_capacity_for_another_item(self) -> bool:
+        with self._cond:
+            return (
+                self._row_cursor < self.capacity_rows
+                and self._token_cursor < self.token_capacity
+                and self._decision_cursor < self.decision_capacity
+            )
+
+    def has_capacity_blocked_producers(self) -> bool:
+        with self._cond:
+            return self._waiting_producers > 0
+
     def finish_items(self, items: list[_PendingItem]) -> None:
         with self._cond:
             for item in items:
+                if item.released:
+                    continue
+                item.released = True
                 self._active_rows -= item.rows
                 self._active_tokens -= item.token_end - item.token_start
                 self._active_decisions -= item.decision_end - item.decision_start
@@ -943,22 +982,21 @@ class TextInferenceServer:
     Submitting actors block on their per-request ``Future``; the server thread
     drains the queue once the configured row threshold is reached (or an
     explicit flush/stop arrives), merges descriptors into a single GPU batch,
-    runs the policy forward, stages the replay payload, and resolves each
-    future with a sliced ``TextInferenceReply``.
+    runs the policy forward, and resolves each future with a sliced
+    ``TextInferenceReply``. Actors own trajectory staging and commit finished
+    games into replay after returns can be computed.
     """
 
     def __init__(
         self,
         *,
         sampling_policy: Any,  # TextActorCritic-compatible
-        staging_buffer: Any,
         max_batch: int,
         deterministic: bool = False,
         name: str = "text-inference",
         timing_stats: RolloutTimingStats | None = None,
         ring_capacity_rows: int | None = None,
         min_batch_rows: int = 1,
-        replay_buffer: Any | None = None,
     ) -> None:
         if max_batch < 1:
             raise ValueError("max_batch must be >= 1")
@@ -968,12 +1006,10 @@ class TextInferenceServer:
         self._policy_version_manager = (
             sampling_policy if hasattr(sampling_policy, "acquire_inference_policy") else None
         )
-        self._staging = staging_buffer
         self._max_batch = int(max_batch)
         self._min_batch_rows = min(int(min_batch_rows), int(max_batch))
         self._deterministic = bool(deterministic)
         self._timing = timing_stats
-        self._replay_buffer = replay_buffer
         self._queue = _InferenceWorkRing(
             capacity_rows=(
                 int(ring_capacity_rows)
@@ -1021,6 +1057,34 @@ class TextInferenceServer:
             self._queue.put(request, fut2)
         except BaseException as exc:  # noqa: BLE001
             fut2.set_exception(exc)
+        return fut2
+
+    def try_submit(self, request: TextInferenceRequest) -> Future[TextInferenceReply] | None:
+        """Submit without waiting for ring capacity.
+
+        ``None`` means the request was not published because the arena tail is
+        currently full. The caller still owns the encoded tensors and should
+        drain completed replies before retrying.
+        """
+
+        if not request.env_indices:
+            raise ValueError("try_submit() requires a non-empty request")
+        if self._stop_event.is_set() or not self._thread.is_alive():
+            fut: Future[TextInferenceReply] = Future()
+            fut.set_exception(
+                self._exc
+                if self._exc is not None
+                else RuntimeError("inference server is not running")
+            )
+            return fut
+        fut2: Future[TextInferenceReply] = Future()
+        try:
+            published = self._queue.put(request, fut2, block=False)
+        except BaseException as exc:  # noqa: BLE001
+            fut2.set_exception(exc)
+            return fut2
+        if not published:
+            return None
         return fut2
 
     def pause(self) -> None:
@@ -1087,15 +1151,18 @@ class TextInferenceServer:
                     return
                 self._idle = False
             try:
+                processed = False
                 try:
                     self._process(batch)
+                    processed = True
                 except BaseException as exc:  # noqa: BLE001
                     self._exc = exc
                     # Resolve only the in-flight batch's futures; do NOT
                     # tear down the server. Pending submits are independent.
                     self._fail_items(batch, exc)
             finally:
-                self._queue.finish_items(batch)
+                if not processed:
+                    self._queue.finish_items(batch)
                 with self._cond:
                     self._idle = True
                     self._cond.notify_all()
@@ -1138,6 +1205,11 @@ class TextInferenceServer:
                     break
                 except Empty:
                     if rows >= self._min_batch_rows:
+                        break
+                    if (
+                        not self._queue.has_tail_capacity_for_another_item()
+                        or self._queue.has_capacity_blocked_producers()
+                    ):
                         break
                     if self._queue.wait_for_item_or_flush():
                         break
@@ -1204,44 +1276,10 @@ class TextInferenceServer:
             self._timing.add("server_sample", time.perf_counter() - start)
         if sample.replay_payload is None:
             raise RuntimeError("inference server expected a replay payload")
-
-        replay_rows: torch.Tensor | None = None
-        replay_start = time.perf_counter()
-        if self._replay_buffer is not None:
-            replay_rows = self._replay_buffer.append_batch(
-                encoded=merged_packed,
-                trace_kind_id=sample.replay_payload.trace_kind_id,
-                decision_count=sample.replay_payload.decision_count,
-                decision_count_host=tuple(map(int, sample.decision_counts)),
-                total_decision_groups=int(sample.replay_payload.decision_option_idx.shape[0]),
-                total_stored_decision_groups=int(
-                    sample.replay_payload.decision_option_idx.shape[0]
-                ),
-                decision_option_idx=sample.replay_payload.decision_option_idx,
-                decision_target_idx=sample.replay_payload.decision_target_idx,
-                decision_mask=sample.replay_payload.decision_mask,
-                uses_none_head=sample.replay_payload.uses_none_head,
-                selected_indices=sample.replay_payload.selected_indices,
-                behavior_action_log_prob=sample.replay_payload.behavior_action_log_prob,
-                may_selected=sample.replay_payload.may_selected,
-                old_log_prob=sample.replay_payload.old_log_prob,
-                value=sample.replay_payload.value,
-                perspective_player_idx=sample.replay_payload.perspective_player_idx,
-                lstm_h_in=sample.replay_payload.lstm_h_in,
-                lstm_c_in=sample.replay_payload.lstm_c_in,
-            )
-            if (
-                self._replay_buffer.projected_state is not None
-                and sample.replay_payload.projected_state is not None
-            ):
-                self._replay_buffer.write_projected_state(
-                    replay_rows,
-                    sample.replay_payload.projected_state,
-                )
-        elif self._staging is not None:
-            pass
-        if self._timing is not None:
-            self._timing.add("server_stage", time.perf_counter() - replay_start)
+        ready_event: Any | None = None
+        if sample.replay_payload.value.device.type == "cuda":
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream(sample.replay_payload.value.device))
 
         # Scatter per-request host-side slices.
         start = time.perf_counter()
@@ -1257,7 +1295,6 @@ class TextInferenceServer:
         seq_lengths_host = merged_packed.seq_lengths_host
         if seq_lengths_host is None:
             seq_lengths_host = tuple(int(x) for x in merged_packed.seq_lengths.cpu().tolist())
-        replay_rows_host = replay_rows.detach().cpu().tolist() if replay_rows is not None else None
         for it in items:
             n = len(it.env_indices)
             row_end = row_cursor + n
@@ -1317,10 +1354,10 @@ class TextInferenceServer:
                 value=list(value[row_cursor:row_end]),
                 trace_kind_id=list(trace_kind_ids[row_cursor:row_end]),
                 replay_payload=replay_payload,
-                replay_rows=list(replay_rows_host[row_cursor:row_end])
-                if replay_rows_host is not None
-                else None,
+                replay_rows=None,
                 inference_policy_version=int(policy_version),
+                ready_event=ready_event,
+                release_item=lambda item=it: self._queue.finish_items([item]),
             )
             row_cursor = row_end
             col_cursor += req_cols_total

@@ -24,6 +24,7 @@ from __future__ import annotations
 import threading
 import time
 import traceback
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -93,6 +94,16 @@ class _InFlightBatch:
 
 
 @dataclass
+class _SubmitBatch:
+    ready_envs: list[Any]
+    ready_games: list[Any]
+    ready_players: list[int]
+    ready_env_indices: list[int]
+    native_batch: Any
+    packed: Any
+
+
+@dataclass
 class _PollBatch:
     envs: list[Any]
 
@@ -126,6 +137,7 @@ class TextRolloutActor:
     _no_more_episodes: bool = False
     _thread: threading.Thread | None = None
     _pending_inference: int = 0
+    _blocked_submits: deque[_SubmitBatch] = field(default_factory=deque)
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -165,6 +177,17 @@ class TextRolloutActor:
     def _run(self) -> None:
         try:
             while not self._stop_event.is_set():
+                if self._blocked_submits:
+                    blocked = self._blocked_submits.popleft()
+                    if not self._try_submit_batch(blocked, retry=True):
+                        timeout = 0.001 if self._pending_inference > 0 else 0.005
+                        try:
+                            item = self.refill_response_queue.get(timeout=timeout)
+                        except Empty:
+                            pass
+                        else:
+                            self._process_work_item(item)
+                    continue
                 try:
                     item = self.refill_response_queue.get(timeout=0.05)
                 except Empty:
@@ -262,28 +285,50 @@ class TextRolloutActor:
         packed = nat_outputs.to_packed_text_batch(trim=True, derive_token_metadata=True)
         self._record_timing("actor_pack", start)
 
-        start = time.perf_counter()
-        future = self.inference_server.submit(
-            TextInferenceRequest(
-                native_batch=native_batch,
-                packed_batch=packed,
-                env_indices=ready_env_indices,
-                perspective_player_indices=ready_players,
-            )
-        )
-        self._record_timing("actor_submit", start)
-        batch = _InFlightBatch(
+        batch = _SubmitBatch(
             ready_envs=ready_envs,
             ready_games=ready_games,
             ready_players=ready_players,
             ready_env_indices=ready_env_indices,
+            native_batch=native_batch,
+            packed=packed,
+        )
+        self._try_submit_batch(batch)
+        self._record_timing("actor_tick", tick_start)
+
+    def _try_submit_batch(self, batch: _SubmitBatch, *, retry: bool = False) -> bool:
+        self._drain_completed_inference()
+        start = time.perf_counter()
+        request = TextInferenceRequest(
+            native_batch=batch.native_batch,
+            packed_batch=batch.packed,
+            env_indices=batch.ready_env_indices,
+            perspective_player_indices=batch.ready_players,
+        )
+        try_submit = getattr(self.inference_server, "try_submit", None)
+        future = (
+            try_submit(request) if try_submit is not None else self.inference_server.submit(request)
+        )
+        self._record_timing("actor_submit", start)
+        if future is None:
+            self.inference_server.flush()
+            if retry:
+                self._blocked_submits.appendleft(batch)
+            else:
+                self._blocked_submits.append(batch)
+            return False
+        in_flight = _InFlightBatch(
+            ready_envs=batch.ready_envs,
+            ready_games=batch.ready_games,
+            ready_players=batch.ready_players,
+            ready_env_indices=batch.ready_env_indices,
             submitted_at=time.perf_counter(),
             future=future,
         )
-        setattr(future, "_magic_ai_actor_batch", batch)
+        setattr(future, "_magic_ai_actor_batch", in_flight)
         self._pending_inference += 1
         future.add_done_callback(self._enqueue_inference_done)
-        self._record_timing("actor_tick", tick_start)
+        return True
 
     def _enqueue_inference_done(self, future: Future[Any]) -> None:
         try:
@@ -295,10 +340,19 @@ class TextRolloutActor:
     def _finish_inference(self, batch: _InFlightBatch) -> list[Any]:
         reply = batch.future.result()
         self._record_timing("actor_wait_inference", batch.submitted_at)
-        if reply.replay_rows is None:
-            start = time.perf_counter()
-            self.staging_buffer.stage_batch(batch.ready_env_indices, reply.replay_payload)
-            self._record_timing("actor_stage", start)
+        try:
+            if reply.replay_rows is None:
+                start = time.perf_counter()
+                self.staging_buffer.stage_batch(
+                    batch.ready_env_indices,
+                    reply.replay_payload,
+                    ready_event=getattr(reply, "ready_event", None),
+                )
+                self._record_timing("actor_stage", start)
+        finally:
+            release_item = getattr(reply, "release_item", None)
+            if release_item is not None:
+                release_item()
         # Build transcripts + RolloutSteps (CPU-only, actor-local) and then
         # advance the engine. Transcript work uses host-side scalars from the
         # reply, so no additional GPU sync is needed.
@@ -356,6 +410,24 @@ class TextRolloutActor:
         )
         self._record_timing("actor_step", start)
         return list(batch.ready_envs)
+
+    def _drain_completed_inference(self) -> None:
+        deferred: list[Any] = []
+        completed_envs: list[Any] = []
+        while True:
+            try:
+                item = self.refill_response_queue.get_nowait()
+            except Empty:
+                break
+            if isinstance(item, _InferenceDone):
+                self._pending_inference = max(0, self._pending_inference - 1)
+                completed_envs.extend(self._finish_inference(item.batch))
+            else:
+                deferred.append(item)
+        for item in deferred:
+            self.refill_response_queue.put_nowait(item)
+        if completed_envs:
+            self.refill_response_queue.put_nowait(_PollBatch(completed_envs))
 
     def _encode_packed(self, games: list[Any], perspectives: list[int]) -> tuple[Any, Any]:
         from magic_ai.text_encoder.native_assembler import encode_tokens_packed

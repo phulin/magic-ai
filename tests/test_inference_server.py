@@ -1,13 +1,12 @@
 """Tests for magic_ai.native.inference_server.
 
 These tests exercise the dynamic-batching inference server against a fake
-``sample_native_tensor_batch`` callable plus a fake staging buffer; we verify
-that:
+``sample_native_tensor_batch`` callable; we verify that:
 
 * requests from concurrent submitters are coalesced into one forward call
   when enough rows are queued,
 * per-request host-side scalars are scattered back to the right futures,
-* the merged ``replay_payload`` is staged exactly once,
+* each reply receives its sliced ``replay_payload`` without committed replay rows,
 * ``pause()`` blocks new forwards and ``resume()`` re-enables them,
 * PackedTextBatch concatenation rebases token / row / anchor offsets
   correctly (vectorized — no per-row loops).
@@ -17,6 +16,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -176,6 +176,12 @@ def _make_native(batch_size: int, *, trace_offset: int = 0) -> _FakeNativeBatch:
     )
 
 
+def _release_reply(reply: Any) -> None:
+    release = getattr(reply, "release_item", None)
+    if release is not None:
+        release()
+
+
 class _FakePolicy:
     def __init__(self) -> None:
         self.calls = 0
@@ -225,21 +231,11 @@ class _FakePolicy:
         )
 
 
-class _FakeStaging:
-    def __init__(self) -> None:
-        self.calls: list[tuple[list[int], int]] = []
-
-    def stage_batch(self, env_indices: list[int], payload: Any) -> None:
-        # Record env_indices and payload encoded-row count (sanity).
-        self.calls.append((list(env_indices), int(payload.encoded.seq_lengths.shape[0])))
-
-
 class InferenceWorkRingTest(unittest.TestCase):
     def test_submit_rejects_item_larger_than_ring_capacity(self) -> None:
         policy = _FakePolicy()
         server = TextInferenceServer(
             sampling_policy=policy,
-            staging_buffer=_FakeStaging(),
             max_batch=8,
             ring_capacity_rows=2,
         )
@@ -258,13 +254,56 @@ class InferenceWorkRingTest(unittest.TestCase):
         finally:
             server.stop()
 
+    def test_try_submit_returns_none_when_arena_capacity_is_held(self) -> None:
+        policy = _FakePolicy()
+        server = TextInferenceServer(
+            sampling_policy=policy,
+            max_batch=8,
+            min_batch_rows=1,
+            ring_capacity_rows=1,
+        )
+        server.start()
+        try:
+            first = server.submit(
+                TextInferenceRequest(
+                    native_batch=_make_native(1),
+                    packed_batch=_make_packed_batch([1]),
+                    env_indices=[0],
+                    perspective_player_indices=[0],
+                )
+            )
+            first_reply = first.result(timeout=5.0)
+            second = server.try_submit(
+                TextInferenceRequest(
+                    native_batch=_make_native(1),
+                    packed_batch=_make_packed_batch([1]),
+                    env_indices=[1],
+                    perspective_player_indices=[0],
+                )
+            )
+            self.assertIsNone(second)
+            _release_reply(first_reply)
+            third = server.try_submit(
+                TextInferenceRequest(
+                    native_batch=_make_native(1),
+                    packed_batch=_make_packed_batch([1]),
+                    env_indices=[1],
+                    perspective_player_indices=[0],
+                )
+            )
+            self.assertIsNotNone(third)
+            assert third is not None
+            reply = third.result(timeout=5.0)
+            _release_reply(reply)
+        finally:
+            server.stop()
+
 
 class InferenceServerBatchingTest(unittest.TestCase):
     def test_partial_batch_waits_for_explicit_flush(self) -> None:
         policy = _FakePolicy()
         server = TextInferenceServer(
             sampling_policy=policy,
-            staging_buffer=_FakeStaging(),
             max_batch=8,
             min_batch_rows=2,
         )
@@ -282,18 +321,84 @@ class InferenceServerBatchingTest(unittest.TestCase):
             self.assertFalse(fut.done())
             server.flush()
             reply = fut.result(timeout=5.0)
+            _release_reply(reply)
         finally:
             server.stop()
 
         self.assertEqual(policy.calls, 1)
         self.assertEqual(reply.decision_counts, [1])
 
-    def test_dynamic_batches_concurrent_submits(self) -> None:
+    def test_partial_batch_launches_when_ring_tail_is_full(self) -> None:
         policy = _FakePolicy()
-        staging = _FakeStaging()
         server = TextInferenceServer(
             sampling_policy=policy,
-            staging_buffer=staging,
+            max_batch=8,
+            min_batch_rows=4,
+            ring_capacity_rows=3,
+        )
+        server.start()
+        try:
+            fut = server.submit(
+                TextInferenceRequest(
+                    native_batch=_make_native(3),
+                    packed_batch=_make_packed_batch([2, 2, 2]),
+                    env_indices=[0, 1, 2],
+                    perspective_player_indices=[0, 0, 0],
+                )
+            )
+            reply = fut.result(timeout=5.0)
+            _release_reply(reply)
+        finally:
+            server.stop()
+
+        self.assertEqual(policy.calls, 1)
+        self.assertEqual(reply.decision_counts, [1, 1, 1])
+        self.assertIsNone(reply.replay_rows)
+
+    def test_partial_batch_launches_when_next_producer_is_capacity_blocked(self) -> None:
+        policy = _FakePolicy()
+        server = TextInferenceServer(
+            sampling_policy=policy,
+            max_batch=8,
+            min_batch_rows=4,
+            ring_capacity_rows=4,
+        )
+        server.start()
+        try:
+            first = server.submit(
+                TextInferenceRequest(
+                    native_batch=_make_native(2),
+                    packed_batch=_make_packed_batch([2, 2]),
+                    env_indices=[0, 1],
+                    perspective_player_indices=[0, 0],
+                )
+            )
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                second_submit = pool.submit(
+                    server.submit,
+                    TextInferenceRequest(
+                        native_batch=_make_native(3),
+                        packed_batch=_make_packed_batch([2, 2, 2]),
+                        env_indices=[2, 3, 4],
+                        perspective_player_indices=[0, 0, 0],
+                    ),
+                )
+                reply = first.result(timeout=5.0)
+                _release_reply(reply)
+                second = second_submit.result(timeout=5.0)
+                server.flush()
+                second_reply = second.result(timeout=5.0)
+                _release_reply(second_reply)
+        finally:
+            server.stop()
+
+        self.assertEqual(reply.decision_counts, [1, 1])
+        self.assertEqual(second_reply.decision_counts, [1, 1, 1])
+
+    def test_dynamic_batches_concurrent_submits(self) -> None:
+        policy = _FakePolicy()
+        server = TextInferenceServer(
+            sampling_policy=policy,
             max_batch=64,
             min_batch_rows=8,
         )
@@ -310,6 +415,8 @@ class InferenceServerBatchingTest(unittest.TestCase):
         try:
             futs = [server.submit(req) for req in reqs]
             replies = [f.result(timeout=5.0) for f in futs]
+            for reply in replies:
+                _release_reply(reply)
         finally:
             server.stop()
 
@@ -321,14 +428,12 @@ class InferenceServerBatchingTest(unittest.TestCase):
             self.assertEqual(len(reply.decision_counts), 2)
             self.assertEqual(reply.selected_choice_cols, [7, 7])
             self.assertIsNotNone(reply.replay_payload)
-        # Actors own staging now; the server only returns per-request payloads.
-        self.assertEqual(staging.calls, [])
+            self.assertIsNone(reply.replay_rows)
 
     def test_arena_keeps_later_blank_metadata_after_no_blank_first_request(self) -> None:
         policy = _FakePolicy()
         server = TextInferenceServer(
             sampling_policy=policy,
-            staging_buffer=_FakeStaging(),
             max_batch=8,
             min_batch_rows=2,
         )
@@ -350,6 +455,8 @@ class InferenceServerBatchingTest(unittest.TestCase):
         try:
             futs = [server.submit(req) for req in reqs]
             replies = [fut.result(timeout=5.0) for fut in futs]
+            for reply in replies:
+                _release_reply(reply)
         finally:
             server.stop()
 
@@ -358,10 +465,8 @@ class InferenceServerBatchingTest(unittest.TestCase):
 
     def test_pause_blocks_until_resume(self) -> None:
         policy = _FakePolicy()
-        staging = _FakeStaging()
         server = TextInferenceServer(
             sampling_policy=policy,
-            staging_buffer=staging,
             max_batch=8,
             min_batch_rows=1,
         )
@@ -382,6 +487,7 @@ class InferenceServerBatchingTest(unittest.TestCase):
             server.resume()
             reply = fut.result(timeout=5.0)
             self.assertEqual(len(reply.decision_counts), 1)
+            _release_reply(reply)
         finally:
             server.stop()
 

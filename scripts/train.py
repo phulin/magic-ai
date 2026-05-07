@@ -403,6 +403,9 @@ class NativeTextTrajectoryBuffer:
         shape = (self.num_envs, self.max_steps)
         self.step_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.step_count_host = [0 for _ in range(self.num_envs)]
+        self._stage_ready_events: list[list[Any | None]] = [
+            [None for _ in range(self.max_steps)] for _ in range(self.num_envs)
+        ]
         self.token_ids = torch.zeros(*shape, self.max_tokens, dtype=torch.int32, device=self.device)
         self.seq_lengths = torch.zeros(*shape, dtype=torch.int32, device=self.device)
         self.seq_lengths_host = [[0 for _ in range(self.max_steps)] for _ in range(self.num_envs)]
@@ -493,13 +496,18 @@ class NativeTextTrajectoryBuffer:
             env_idx = int(env_idx)
             self.step_count[env_idx] = 0
             self.step_count_host[env_idx] = 0
+            for step in range(self.max_steps):
+                self._stage_ready_events[env_idx][step] = None
 
     def stage_batch(
         self,
         env_indices: list[int],
         payload: NativeTextReplayPayload,
+        ready_event: Any | None = None,
     ) -> None:
         with self._lock:
+            if ready_event is not None and self.device.type == "cuda":
+                torch.cuda.current_stream(self.device).wait_event(ready_event)
             self._stage_batch_locked(env_indices, payload)
 
     def _stage_batch_locked(
@@ -692,8 +700,13 @@ class NativeTextTrajectoryBuffer:
             self.projected_state[env_t, step_t] = payload.projected_state.to(
                 device=self.device, dtype=torch.bfloat16
             )
+        ready_event: Any | None = None
+        if self.device.type == "cuda":
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream(self.device))
         self.step_count[env_t] = step_t + 1
         for env_idx, step in zip(env_indices, step_host, strict=True):
+            self._stage_ready_events[int(env_idx)][step] = ready_event
             self.step_count_host[int(env_idx)] = step + 1
 
     def _append_envs_to_replay_core(
@@ -725,13 +738,22 @@ class NativeTextTrajectoryBuffer:
             env_t_all = torch.tensor(env_indices, dtype=torch.long, device=device)
             self.step_count[env_t_all] = 0
             for env_idx in env_indices:
-                self.step_count_host[int(env_idx)] = 0
+                env_idx_i = int(env_idx)
+                self.step_count_host[env_idx_i] = 0
+                for step in range(self.max_steps):
+                    self._stage_ready_events[env_idx_i][step] = None
             return torch.zeros(0, dtype=torch.long, device=device), counts_all
 
         flat_env_host = [env_idx for env_idx, _step in flat_pairs]
         flat_step_host = [step for _env_idx, step in flat_pairs]
         flat_env = torch.tensor(flat_env_host, dtype=torch.long, device=device)
         flat_step = torch.tensor(flat_step_host, dtype=torch.long, device=device)
+        if self.device.type == "cuda":
+            stream = torch.cuda.current_stream(self.device)
+            for env_idx, step in flat_pairs:
+                event = self._stage_ready_events[env_idx][step]
+                if event is not None:
+                    stream.wait_event(event)
 
         seq_lengths = self.seq_lengths[flat_env, flat_step].to(dtype=torch.long)
         seq_lengths_host = tuple(
@@ -843,8 +865,11 @@ class NativeTextTrajectoryBuffer:
         start = time.perf_counter()
         env_t_all = torch.tensor(env_indices, dtype=torch.long, device=device)
         self.step_count[env_t_all] = 0
-        for env_idx in env_indices:
-            self.step_count_host[int(env_idx)] = 0
+        for env_idx, count in zip(env_indices, counts_host, strict=True):
+            env_idx_i = int(env_idx)
+            self.step_count_host[env_idx_i] = 0
+            for step in range(count):
+                self._stage_ready_events[env_idx_i][step] = None
         self._record_timing("finish_append_reset_slots", start)
         return rows, counts_all
 
@@ -2799,7 +2824,6 @@ def validate_args(args: argparse.Namespace) -> None:
         args.replay_ring_capacity = max(
             6 * args.rollout_steps,
             2 * args.num_envs,
-            args.num_envs * args.max_steps_per_game,
         )
     if args.learner_min_rows < 1:
         raise ValueError("--learner-min-rows must be at least 1")
@@ -2811,10 +2835,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--learner-target-rows must be <= --learner-max-rows")
     if args.replay_ring_capacity < 1:
         raise ValueError("--replay-ring-capacity must be at least 1")
-    if args.replay_ring_capacity < args.num_envs * args.max_steps_per_game:
+    if args.replay_ring_capacity < args.learner_max_rows:
         raise ValueError(
-            "--replay-ring-capacity must be at least --num-envs * --max-steps-per-game "
-            "for the direct global IMPALA ring"
+            "--replay-ring-capacity must be at least --learner-max-rows so a claimed "
+            "training window can fit in the replay ring"
         )
     args.benchmark_warmup_updates = getattr(args, "benchmark_warmup_updates", 1)
     args.benchmark_steady_updates = getattr(args, "benchmark_steady_updates", 5)
@@ -4983,14 +5007,10 @@ def train_text_native_batched_envs(
             )
         server = TextInferenceServer(
             sampling_policy=policy_versions,
-            staging_buffer=staging_buffer,
             max_batch=max_batch,
             deterministic=bool(args.deterministic_rollout),
             timing_stats=timing_stats,
             min_batch_rows=min_batch_rows,
-            replay_buffer=backend.replay_buffer
-            if hasattr(backend.replay_buffer, "append_batch")
-            else None,
         )
         server.start()
 
@@ -5081,6 +5101,7 @@ def train_text_native_batched_envs(
         _profile_state: dict[str, Any] = {"prof": None, "started_at": None, "done": False}
         _updates_seen = 0
         benchmark_samples: list[tuple[int, int, float]] = []
+        benchmark_done = threading.Event()
         learner_stop = threading.Event()
         learner_wakeup = threading.Event()
         learner_errors: list[tuple[BaseException, str]] = []
@@ -5107,7 +5128,6 @@ def train_text_native_batched_envs(
                 "server_collect",
                 "server_concat",
                 "server_sample",
-                "server_stage",
                 "server_scatter",
                 "learner_finish_games",
                 "finish_terminal_reward",
@@ -5156,6 +5176,10 @@ def train_text_native_batched_envs(
                         continue
                     update_start = time.perf_counter()
                     try:
+                        if window.ready_events and backend.replay_buffer.device.type == "cuda":
+                            stream = torch.cuda.current_stream(backend.replay_buffer.device)
+                            for event in window.ready_events:
+                                stream.wait_event(event)
                         returns = backend.replay_buffer.build_ppo_returns_for_rows(
                             window.rows,
                             gamma=args.gamma,
@@ -5193,6 +5217,8 @@ def train_text_native_batched_envs(
                                         f"steady_rows_per_s={total_steps / max(total_s, 1e-9):.1f}",
                                         flush=True,
                                     )
+                                if len(benchmark_samples) >= steady_updates:
+                                    benchmark_done.set()
                         _print_rollout_timing(timing_stats.snapshot_and_reset())
                         _updates_seen += 1
                     finally:
@@ -5225,6 +5251,8 @@ def train_text_native_batched_envs(
                 if learner_errors:
                     exc, tb = learner_errors[0]
                     raise RuntimeError(f"learner thread crashed: {tb}") from exc
+                if benchmark_done.is_set():
+                    break
 
                 # Watchdog: if nothing has changed for a while, dump diagnostic
                 # state. This makes startup-time hangs (e.g. server thread
@@ -5523,7 +5551,7 @@ def train_text_native_batched_envs(
                                     )
                         finally:
                             server.resume()
-            if pending_step_count > 0:
+            if pending_step_count > 0 and not benchmark_done.is_set():
                 while not _schedule_update(final=True):
                     time.sleep(0.01)
             learner_stop.set()
