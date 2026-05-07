@@ -473,6 +473,105 @@ class TextReplayBufferTests(unittest.TestCase):
             gathered.lstm_c_in[1], torch.arange(100, 106, dtype=torch.float32).reshape(1, 6)
         )
 
+    def test_commit_order_train_window_and_episode_metadata(self) -> None:
+        buffer = TextReplayBuffer(
+            capacity=4,
+            max_tokens=6,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=2,
+            max_cached_choices=4,
+        )
+        first = buffer.reserve_append(row_count=2, token_count=2, decision_count=0)
+        second = buffer.reserve_append(row_count=1, token_count=1, decision_count=0)
+
+        buffer.commit(second)
+        self.assertEqual(buffer.committed_size, 0)
+        self.assertIsNone(buffer.claim_train_window(min_rows=1, max_rows=4))
+
+        buffer.commit(first)
+        self.assertEqual(buffer.committed_size, 3)
+        buffer.write_episode_metadata(
+            torch.tensor([0, 1]),
+            episode_id=42,
+            terminal_reward_p0=-1.0,
+            zero_sum=True,
+            actor_id=7,
+            behavior_policy_version=3,
+            inference_policy_version=4,
+            target_policy_version=5,
+        )
+        window = buffer.claim_train_window(min_rows=2, max_rows=2)
+        self.assertIsNotNone(window)
+        assert window is not None
+        self.assertEqual((window.row_start, window.row_end), (0, 2))
+        torch.testing.assert_close(window.rows.cpu(), torch.tensor([0, 1]))
+        torch.testing.assert_close(buffer.episode_id[:2].cpu(), torch.tensor([42, 42]))
+        torch.testing.assert_close(buffer.step_idx[:2].cpu(), torch.tensor([0, 1]))
+        torch.testing.assert_close(buffer.is_terminal[:2].cpu(), torch.tensor([False, True]))
+        torch.testing.assert_close(buffer.actor_id[:2].cpu(), torch.tensor([7, 7]))
+        torch.testing.assert_close(
+            buffer.behavior_policy_version[:2].cpu(),
+            torch.tensor([3, 3]),
+        )
+        torch.testing.assert_close(
+            buffer.inference_policy_version[:2].cpu(),
+            torch.tensor([4, 4]),
+        )
+        torch.testing.assert_close(
+            buffer.target_policy_version[:2].cpu(),
+            torch.tensor([5, 5]),
+        )
+        buffer.release_train_window(window)
+
+    def test_ring_release_reuses_row_slots_without_reset(self) -> None:
+        buffer = TextReplayBuffer(
+            capacity=3,
+            max_tokens=2,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            use_triton_gather=False,
+        )
+
+        def append_one(token: int) -> torch.Tensor:
+            encoded = TextEncodedBatch(
+                token_ids=torch.tensor([[token, 0]]),
+                attention_mask=torch.tensor([[1, 0]]),
+                card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
+                seq_lengths=torch.tensor([1]),
+            )
+            return buffer.append_batch(
+                encoded=pack_batch(encoded),
+                trace_kind_id=torch.tensor([1]),
+                decision_count=torch.tensor([1]),
+                decision_option_idx=torch.tensor([[0, -1]]),
+                decision_target_idx=torch.tensor([[-1, -1]]),
+                decision_mask=torch.tensor([[True, False]]),
+                uses_none_head=torch.tensor([False]),
+                selected_indices=torch.tensor([0]),
+                may_selected=torch.tensor([0.0]),
+                old_log_prob=torch.tensor([-0.1]),
+                value=torch.tensor([0.0]),
+                perspective_player_idx=torch.tensor([0]),
+            )
+
+        row0 = append_one(101)
+        row1 = append_one(102)
+        buffer.release_rows(row0)
+        row2 = append_one(103)
+        buffer.release_rows(row1)
+        row0_reused = append_one(104)
+
+        torch.testing.assert_close(row2.cpu(), torch.tensor([2]))
+        torch.testing.assert_close(row0_reused.cpu(), torch.tensor([0]))
+        gathered = buffer.gather(torch.cat((row2, row0_reused)))
+        torch.testing.assert_close(
+            gathered.encoded.token_ids.cpu(),
+            torch.tensor([103, 104], dtype=torch.int32),
+        )
+
     def test_append_only_rows_and_reset_clears_occupancy(self) -> None:
         buffer = _buffer()
         encoded = _encoded_batch()

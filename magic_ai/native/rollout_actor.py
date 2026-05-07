@@ -16,7 +16,7 @@ transcript) and a per-actor ``refill_queue`` from which the actor pulls
 freshly-spawned ``LiveGame`` records.
 
 The learner is the only thread that mutates global rollout state
-(``pending_steps``, ``staging_buffer.append_envs_to_replay``,
+(``pending_steps``, replay metadata,
 ``free_slots``/``next_episode_idx``); the actor never touches those. This
 keeps synchronization down to two queues and one inference future per
 ready-batch.
@@ -188,7 +188,7 @@ class TextRolloutActor:
 
     def _step_once(self) -> None:
         self._drain_inflight(blocking=False)
-        if self._inflight_rows() >= self._inflight_row_target():
+        if self._inflight_rows() >= self._max_inflight_rows():
             self._drain_inflight(blocking=True, flush=False)
             return
         tick_start = time.perf_counter()
@@ -202,7 +202,7 @@ class TextRolloutActor:
         winner_l = winner_t.tolist()
 
         start = time.perf_counter()
-        remaining_inflight_capacity = max(0, self._inflight_row_target() - self._inflight_rows())
+        remaining_inflight_capacity = max(0, self._max_inflight_rows() - self._inflight_rows())
         ready_envs: list[Any] = []
         ready_players: list[int] = []
         still_live: list[Any] = []
@@ -279,9 +279,10 @@ class TextRolloutActor:
     def _finish_inflight(self, batch: _InFlightBatch) -> None:
         reply = batch.future.result()
         self._record_timing("actor_wait_inference", batch.submitted_at)
-        start = time.perf_counter()
-        self.staging_buffer.stage_batch(batch.ready_env_indices, reply.replay_payload)
-        self._record_timing("actor_stage", start)
+        if reply.replay_rows is None:
+            start = time.perf_counter()
+            self.staging_buffer.stage_batch(batch.ready_env_indices, reply.replay_payload)
+            self._record_timing("actor_stage", start)
         # Build transcripts + RolloutSteps (CPU-only, actor-local) and then
         # advance the engine. Transcript work uses host-side scalars from the
         # reply, so no additional GPU sync is needed.
@@ -291,7 +292,10 @@ class TextRolloutActor:
             zip(batch.ready_envs, batch.ready_players, strict=True)
         ):
             env.action_count += 1
+            env.inference_policy_version = int(getattr(reply, "inference_policy_version", 0))
+            env.behavior_policy_version = int(env.inference_policy_version)
             count = int(reply.decision_counts[step_idx])
+            replay_idx = int(reply.replay_rows[step_idx]) if reply.replay_rows is not None else None
             selected_for_step = reply.selected_choice_cols[cursor : cursor + count]
             cursor += count
             if env.transcript_enabled:
@@ -314,6 +318,7 @@ class TextRolloutActor:
                 int(player_idx),
                 float(reply.old_log_prob[step_idx]),
                 float(reply.value[step_idx]),
+                replay_idx,
             )
         self._record_timing("actor_record", start)
 
@@ -358,6 +363,9 @@ class TextRolloutActor:
     def _inflight_row_target(self) -> int:
         fraction = max(0.0, float(self.runtime_cfg.actor_inflight_row_fraction))
         return max(1, int(math.ceil(fraction * float(self._env_capacity_seen))))
+
+    def _max_inflight_rows(self) -> int:
+        return max(self._inflight_row_target(), int(self._env_capacity_seen))
 
     def _encode_packed(self, games: list[Any], perspectives: list[int]) -> tuple[Any, Any]:
         from magic_ai.text_encoder.native_assembler import encode_tokens_packed

@@ -56,6 +56,8 @@ class TextInferenceReply:
     value: list[float]
     trace_kind_id: list[int]
     replay_payload: NativeTextReplayPayload
+    replay_rows: list[int] | None = None
+    inference_policy_version: int = 0
 
 
 class RolloutTimingStats:
@@ -963,18 +965,25 @@ class TextInferenceServer:
         timing_stats: RolloutTimingStats | None = None,
         ring_capacity_rows: int | None = None,
         min_batch_rows: int = 1,
+        replay_buffer: Any | None = None,
     ) -> None:
         if max_batch < 1:
             raise ValueError("max_batch must be >= 1")
         if min_batch_rows < 1:
             raise ValueError("min_batch_rows must be >= 1")
         self._policy = sampling_policy
+        self._policy_version_manager = (
+            sampling_policy if hasattr(sampling_policy, "acquire_inference_policy") else None
+        )
         self._staging = staging_buffer
         self._max_batch = int(max_batch)
         self._min_batch_rows = min(int(min_batch_rows), int(max_batch))
+        self._adaptive_min_batch_rows = self._min_batch_rows
         self._max_wait_s = float(max_wait_ms) / 1000.0
+        self._target_collect_wait_s = max(0.0005, self._max_wait_s * 0.5)
         self._deterministic = bool(deterministic)
         self._timing = timing_stats
+        self._replay_buffer = replay_buffer
         self._queue = _InferenceWorkRing(
             capacity_rows=(
                 int(ring_capacity_rows)
@@ -1140,11 +1149,19 @@ class TextInferenceServer:
                 except _HeadItemDoesNotFit:
                     break
                 except Empty:
-                    if rows >= self._min_batch_rows:
+                    if rows >= self._adaptive_min_batch_rows:
                         break
-                    if self._queue.wait_for_item_or_flush():
+                    if self._max_wait_s <= 0.0:
+                        if self._queue.wait_for_item_or_flush():
+                            break
+                        continue
+                    try:
+                        nxt = self._queue.get_fit(
+                            remaining_rows=remaining_rows,
+                            timeout=max(self._max_wait_s, self._target_collect_wait_s),
+                        )
+                    except Empty:
                         break
-                    continue
                 if nxt is None:
                     break
                 if not isinstance(nxt, _PendingItem):
@@ -1152,10 +1169,24 @@ class TextInferenceServer:
                 items.append(nxt)
                 rows += nxt.rows
             self._queue.clear_flush()
+            self._adapt_launch_policy(rows=rows, collect_s=time.perf_counter() - start)
             return items
         finally:
             if self._timing is not None:
                 self._timing.add("server_collect", time.perf_counter() - start)
+
+    def _adapt_launch_policy(self, *, rows: int, collect_s: float) -> None:
+        if self._max_batch <= 1:
+            return
+        rows = int(rows)
+        collect_s = float(collect_s)
+        high_latency = collect_s > self._target_collect_wait_s
+        underfilled = rows < int(0.75 * float(self._max_batch))
+        saturated = rows >= int(0.9 * float(self._max_batch))
+        if high_latency and underfilled:
+            self._adaptive_min_batch_rows = max(1, self._adaptive_min_batch_rows - 1)
+        elif not high_latency and saturated:
+            self._adaptive_min_batch_rows = min(self._max_batch, self._adaptive_min_batch_rows + 1)
 
     def _process(self, items: list[_PendingItem]) -> None:
         start = time.perf_counter()
@@ -1177,20 +1208,74 @@ class TextInferenceServer:
             )
 
         start = time.perf_counter()
+        policy_version = 0
         with torch.no_grad():
-            sample = self._policy.sample_native_tensor_batch(
-                native_batch=merged_native,
-                env_indices=env_indices,
-                perspective_player_indices=perspective,
-                packed_batch=merged_packed,
-                deterministic=self._deterministic,
-                append_replay=False,
-                return_replay_payload=True,
-            )
+            if self._policy_version_manager is not None:
+                with self._policy_version_manager.acquire_inference_policy() as (
+                    policy,
+                    policy_version,
+                ):
+                    sample = policy.sample_native_tensor_batch(
+                        native_batch=merged_native,
+                        env_indices=env_indices,
+                        perspective_player_indices=perspective,
+                        packed_batch=merged_packed,
+                        deterministic=self._deterministic,
+                        append_replay=False,
+                        return_replay_payload=True,
+                    )
+            else:
+                sample = self._policy.sample_native_tensor_batch(
+                    native_batch=merged_native,
+                    env_indices=env_indices,
+                    perspective_player_indices=perspective,
+                    packed_batch=merged_packed,
+                    deterministic=self._deterministic,
+                    append_replay=False,
+                    return_replay_payload=True,
+                )
         if self._timing is not None:
             self._timing.add("server_sample", time.perf_counter() - start)
         if sample.replay_payload is None:
             raise RuntimeError("inference server expected a replay payload")
+
+        replay_rows: torch.Tensor | None = None
+        replay_start = time.perf_counter()
+        if self._replay_buffer is not None:
+            replay_rows = self._replay_buffer.append_batch(
+                encoded=merged_packed,
+                trace_kind_id=sample.replay_payload.trace_kind_id,
+                decision_count=sample.replay_payload.decision_count,
+                decision_count_host=tuple(map(int, sample.decision_counts)),
+                total_decision_groups=int(sample.replay_payload.decision_option_idx.shape[0]),
+                total_stored_decision_groups=int(
+                    sample.replay_payload.decision_option_idx.shape[0]
+                ),
+                decision_option_idx=sample.replay_payload.decision_option_idx,
+                decision_target_idx=sample.replay_payload.decision_target_idx,
+                decision_mask=sample.replay_payload.decision_mask,
+                uses_none_head=sample.replay_payload.uses_none_head,
+                selected_indices=sample.replay_payload.selected_indices,
+                behavior_action_log_prob=sample.replay_payload.behavior_action_log_prob,
+                may_selected=sample.replay_payload.may_selected,
+                old_log_prob=sample.replay_payload.old_log_prob,
+                value=sample.replay_payload.value,
+                perspective_player_idx=sample.replay_payload.perspective_player_idx,
+                lstm_h_in=sample.replay_payload.lstm_h_in,
+                lstm_c_in=sample.replay_payload.lstm_c_in,
+            )
+            if (
+                self._replay_buffer.projected_state is not None
+                and sample.replay_payload.projected_state is not None
+            ):
+                self._replay_buffer.write_projected_state(
+                    replay_rows,
+                    sample.replay_payload.projected_state,
+                )
+        elif self._staging is not None:
+            pass
+        if self._timing is not None:
+            self._timing.add("server_stage", time.perf_counter() - replay_start)
 
         # Scatter per-request host-side slices.
         start = time.perf_counter()
@@ -1206,6 +1291,7 @@ class TextInferenceServer:
         seq_lengths_host = merged_packed.seq_lengths_host
         if seq_lengths_host is None:
             seq_lengths_host = tuple(int(x) for x in merged_packed.seq_lengths.cpu().tolist())
+        replay_rows_host = replay_rows.detach().cpu().tolist() if replay_rows is not None else None
         for it in items:
             n = len(it.env_indices)
             row_end = row_cursor + n
@@ -1265,6 +1351,10 @@ class TextInferenceServer:
                 value=list(value[row_cursor:row_end]),
                 trace_kind_id=list(trace_kind_ids[row_cursor:row_end]),
                 replay_payload=replay_payload,
+                replay_rows=list(replay_rows_host[row_cursor:row_end])
+                if replay_rows_host is not None
+                else None,
+                inference_policy_version=int(policy_version),
             )
             row_cursor = row_end
             col_cursor += req_cols_total

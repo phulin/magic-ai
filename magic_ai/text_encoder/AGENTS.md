@@ -16,7 +16,7 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 - `recurrent.py` — LSTM history adapter wrapping TextPolicy; carries recurrence through encoder state vector.
 - `render.py` — Deterministic GameStateSnapshot → text renderer; produces custom-token-laced strings plus inline-blank anchor metadata.
 - `render_plan.py` — Opcode definitions, writer, and Python emitter for render-plan ABI.
-- `replay_buffer.py` — Fixed-width storage for encoded text snapshots, inline blank metadata, and policy/value/trace metadata for training.
+- `replay_buffer.py` — Single global concurrent ring for encoded text snapshots, inline blank metadata, episode/policy-version metadata, completed-window claims, and GPU-side PPO return building.
 - `replay_triton.py` — Optional CUDA/Triton kernels for packed replay-buffer batch append writes, gather packing, and position rebasing.
 - `rollout.py` — End-to-end Python Magic game player using text encoder and RecurrentTextPolicy.
 - `token_tables.py` — Closed-vocabulary token-id lookup tables for every assembler emission; source of truth for native side.

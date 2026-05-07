@@ -694,7 +694,7 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(tuple(backend.policy.live_lstm_h.shape), (1, 4, 8))
         build_cache.assert_called_once()
 
-    def test_build_text_backend_default_replay_capacity_is_three_rollouts(self) -> None:
+    def test_build_text_backend_default_replay_capacity_is_six_rollouts(self) -> None:
         from magic_ai.text_encoder.card_cache import CardTokenCache
 
         class StubTokenizer:
@@ -741,7 +741,7 @@ class TrainPPOTests(unittest.TestCase):
         ):
             backend = build_text_backend(args, torch.device("cpu"))
 
-        self.assertEqual(backend.replay_buffer.capacity, 6000)
+        self.assertEqual(backend.replay_buffer.capacity, 12000)
 
     def test_sample_text_policy_batch_emits_assembles_and_appends_replay(self) -> None:
         from magic_ai.text_encoder.card_cache import CardTokenCache
