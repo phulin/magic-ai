@@ -2381,30 +2381,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--inference-batch-wait-ms",
-        type=float,
-        default=0.0,
-        help=(
-            "deprecated actor-path setting; batching now launches by "
-            "--inference-ready-fraction plus explicit tail flushes"
-        ),
-    )
-    parser.add_argument(
         "--inference-ready-fraction",
         type=float,
         default=0.45,
         help=(
             "actor-path inference server: launch a forward pass once this "
             "fraction of --num-envs rows is queued; tails flush explicitly"
-        ),
-    )
-    parser.add_argument(
-        "--actor-inflight-row-fraction",
-        type=float,
-        default=0.5,
-        help=(
-            "actor-path rollout scheduler: each actor keeps about this fraction "
-            "of its env shard in flight for GPU inference before draining results"
         ),
     )
     parser.add_argument(
@@ -2798,12 +2780,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-steps-per-game must be at least 1")
     if getattr(args, "num_rollout_actors", 1) < 1:
         raise ValueError("--num-rollout-actors must be at least 1")
-    if getattr(args, "inference_batch_wait_ms", 0.0) < 0.0:
-        raise ValueError("--inference-batch-wait-ms must be non-negative")
     if not (0.0 < getattr(args, "inference_ready_fraction", 0.45) <= 1.0):
         raise ValueError("--inference-ready-fraction must be in (0, 1]")
-    if not (0.0 < getattr(args, "actor_inflight_row_fraction", 0.5) <= 1.0):
-        raise ValueError("--actor-inflight-row-fraction must be in (0, 1]")
     if getattr(args, "inference_max_batch", 0) < 0:
         raise ValueError("--inference-max-batch must be non-negative")
     if getattr(args, "max_policy_lag", 2) < 0:
@@ -4970,7 +4948,6 @@ def train_text_native_batched_envs(
         )
         runtime_cfg = ActorRuntimeConfig(
             max_steps_per_game=int(args.max_steps_per_game),
-            actor_inflight_row_fraction=float(args.actor_inflight_row_fraction),
         )
 
         max_batch = int(args.inference_max_batch) or int(args.num_envs)
@@ -5008,7 +4985,6 @@ def train_text_native_batched_envs(
             sampling_policy=policy_versions,
             staging_buffer=staging_buffer,
             max_batch=max_batch,
-            max_wait_ms=float(args.inference_batch_wait_ms),
             deterministic=bool(args.deterministic_rollout),
             timing_stats=timing_stats,
             min_batch_rows=min_batch_rows,
@@ -5092,6 +5068,7 @@ def train_text_native_batched_envs(
 
         active_actors = num_actors
         actor_done: list[bool] = [False] * num_actors
+        pending_refill_slots: list[list[int]] = [[] for _ in range(num_actors)]
         deferred_finishes: list[FinishedEnv] = []
         last_progress_t = time.monotonic()
         last_progress_state = (completed_games, pending_step_count, next_episode_idx)
@@ -5286,6 +5263,22 @@ def train_text_native_batched_envs(
                                 "".join(_traceback.format_stack(frame, limit=8)),
                                 flush=True,
                             )
+                    for actor in actors:
+                        thread = actor._thread
+                        actor_ident = None if thread is None else thread.ident
+                        if actor_ident is None:
+                            continue
+                        frame = sys._current_frames().get(actor_ident)
+                        if frame is None:
+                            continue
+                        import traceback as _traceback
+
+                        print(
+                            cli_step_prefix(),
+                            f"[watchdog_actor_stack actor={actor.actor_id}]",
+                            "".join(_traceback.format_stack(frame, limit=8)),
+                            flush=True,
+                        )
                     last_progress_t = now
 
                 # Drain a batch of finished envs (up to ~num_envs at once).
@@ -5362,29 +5355,35 @@ def train_text_native_batched_envs(
                     _schedule_update()
 
                 # Service refill requests.
-                refill_now: dict[int, list[int]] = {}
                 while True:
                     try:
                         req = refill_req_q.get_nowait()
                     except Empty:
                         break
-                    refill_now.setdefault(req.actor_id, []).extend(req.slot_indices)
-                for aid, requested in refill_now.items():
+                    pending_refill_slots[req.actor_id].extend(req.slot_indices)
+                for aid, requested in enumerate(pending_refill_slots):
+                    if not requested:
+                        continue
                     # Slots requested *back* are slots the actor already
                     # released via FinishedEnv; they are already back in
                     # actor_free_slots[aid] above. Pull from there.
                     new_games: list[Any] = []
                     no_more = False
                     if pending_step_count < int(args.learner_max_rows):
-                        while actor_free_slots[aid] and next_episode_idx < args.episodes:
+                        while (
+                            requested and actor_free_slots[aid] and next_episode_idx < args.episodes
+                        ):
+                            requested.pop()
                             slot_idx = actor_free_slots[aid].pop()
                             new_games.append(start_game(slot_idx, next_episode_idx))
                             next_episode_idx += 1
                     if next_episode_idx >= args.episodes:
                         no_more = True
-                    refill_resp_qs[aid].put(
-                        RefillResponse(games=new_games, no_more_episodes=no_more)
-                    )
+                        requested.clear()
+                    if new_games or no_more:
+                        refill_resp_qs[aid].put(
+                            RefillResponse(games=new_games, no_more_episodes=no_more)
+                        )
                     if no_more and not new_games and not actor_done[aid]:
                         # Actor's slice has truly drained; mark it.
                         actor_done[aid] = True

@@ -5,7 +5,7 @@ These tests exercise the dynamic-batching inference server against a fake
 that:
 
 * requests from concurrent submitters are coalesced into one forward call
-  when they arrive within ``max_wait_ms``,
+  when enough rows are queued,
 * per-request host-side scalars are scattered back to the right futures,
 * the merged ``replay_payload`` is staged exactly once,
 * ``pause()`` blocks new forwards and ``resume()`` re-enables them,
@@ -241,7 +241,6 @@ class InferenceWorkRingTest(unittest.TestCase):
             sampling_policy=policy,
             staging_buffer=_FakeStaging(),
             max_batch=8,
-            max_wait_ms=0.0,
             ring_capacity_rows=2,
         )
         server.start()
@@ -267,7 +266,6 @@ class InferenceServerBatchingTest(unittest.TestCase):
             sampling_policy=policy,
             staging_buffer=_FakeStaging(),
             max_batch=8,
-            max_wait_ms=0.0,
             min_batch_rows=2,
         )
         server.start()
@@ -297,12 +295,8 @@ class InferenceServerBatchingTest(unittest.TestCase):
             sampling_policy=policy,
             staging_buffer=staging,
             max_batch=64,
-            max_wait_ms=0.0,
             min_batch_rows=8,
         )
-        # Pre-build requests so the submit loop is purely queue puts; otherwise
-        # tensor construction between submits can outrun ``max_wait_ms`` on a
-        # contended host and split the batch across two forwards.
         reqs = [
             TextInferenceRequest(
                 native_batch=_make_native(2),
@@ -336,7 +330,6 @@ class InferenceServerBatchingTest(unittest.TestCase):
             sampling_policy=policy,
             staging_buffer=_FakeStaging(),
             max_batch=8,
-            max_wait_ms=0.0,
             min_batch_rows=2,
         )
         reqs = [
@@ -370,7 +363,7 @@ class InferenceServerBatchingTest(unittest.TestCase):
             sampling_policy=policy,
             staging_buffer=staging,
             max_batch=8,
-            max_wait_ms=0.0,
+            min_batch_rows=1,
         )
         server.start()
         try:

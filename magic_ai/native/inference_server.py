@@ -313,7 +313,6 @@ class _InferenceWorkRing:
         self.decision_capacity = self.capacity_rows * 128
         self._cond = threading.Condition()
         self._items: list[_PendingItem | None] = []
-        self._queued_rows = 0
         self._active_rows = 0
         self._active_tokens = 0
         self._active_decisions = 0
@@ -421,13 +420,10 @@ class _InferenceWorkRing:
                 legal_cols=int(packed.blank_legal_ids.shape[2]),
             )
             self._pending_publish[publish_seq] = item
-            published_rows = 0
             while self._next_publish_seq in self._pending_publish:
                 published = self._pending_publish.pop(self._next_publish_seq)
                 self._items.append(published)
-                published_rows += published.rows
                 self._next_publish_seq += 1
-            self._queued_rows += published_rows
             self._cond.notify_all()
 
     def close(self) -> None:
@@ -452,7 +448,6 @@ class _InferenceWorkRing:
                 self._cond.wait(timeout=remaining)
             item = self._items.pop(0)
             if item is not None:
-                self._queued_rows -= item.rows
                 self._active_rows += item.rows
                 self._active_tokens += item.token_end - item.token_start
                 self._active_decisions += item.decision_end - item.decision_start
@@ -471,7 +466,6 @@ class _InferenceWorkRing:
             if item.rows > remaining_rows:
                 raise _HeadItemDoesNotFit
             self._items.pop(0)
-            self._queued_rows -= item.rows
             self._active_rows += item.rows
             self._active_tokens += item.token_end - item.token_start
             self._active_decisions += item.decision_end - item.decision_start
@@ -482,6 +476,8 @@ class _InferenceWorkRing:
         deadline = time.monotonic() + timeout
         with self._cond:
             while True:
+                if self._force_flush or self._closed:
+                    raise Empty
                 if self._items:
                     item = self._items[0]
                     if item is None:
@@ -490,7 +486,6 @@ class _InferenceWorkRing:
                         return item
                     if item.rows <= remaining_rows:
                         self._items.pop(0)
-                        self._queued_rows -= item.rows
                         self._active_rows += item.rows
                         self._active_tokens += item.token_end - item.token_start
                         self._active_decisions += item.decision_end - item.decision_start
@@ -515,7 +510,6 @@ class _InferenceWorkRing:
         with self._cond:
             items = [item for item in self._items if item is not None]
             self._items.clear()
-            self._queued_rows = 0
             self._pending_publish.clear()
             self._reset_if_empty_locked()
             self._cond.notify_all()
@@ -527,7 +521,7 @@ class _InferenceWorkRing:
 
     def queued_rows(self) -> int:
         with self._cond:
-            return self._queued_rows
+            return sum(item.rows for item in self._items if item is not None)
 
     def finish_items(self, items: list[_PendingItem]) -> None:
         with self._cond:
@@ -652,7 +646,7 @@ class _InferenceWorkRing:
 
     def _reset_if_empty_locked(self) -> None:
         if (
-            self._queued_rows == 0
+            not any(item is not None for item in self._items)
             and self._active_rows == 0
             and self._active_tokens == 0
             and self._active_decisions == 0
@@ -947,10 +941,10 @@ class TextInferenceServer:
     """Dynamic-batching inference server for the native text rollout path.
 
     Submitting actors block on their per-request ``Future``; the server thread
-    drains the queue (waiting up to ``max_wait_ms`` for additional requests
-    once at least one is in hand), merges them into a single GPU batch, runs
-    the policy forward, stages the replay payload, and resolves each future
-    with a sliced ``TextInferenceReply``.
+    drains the queue once the configured row threshold is reached (or an
+    explicit flush/stop arrives), merges descriptors into a single GPU batch,
+    runs the policy forward, stages the replay payload, and resolves each
+    future with a sliced ``TextInferenceReply``.
     """
 
     def __init__(
@@ -959,7 +953,6 @@ class TextInferenceServer:
         sampling_policy: Any,  # TextActorCritic-compatible
         staging_buffer: Any,
         max_batch: int,
-        max_wait_ms: float,
         deterministic: bool = False,
         name: str = "text-inference",
         timing_stats: RolloutTimingStats | None = None,
@@ -978,9 +971,6 @@ class TextInferenceServer:
         self._staging = staging_buffer
         self._max_batch = int(max_batch)
         self._min_batch_rows = min(int(min_batch_rows), int(max_batch))
-        self._adaptive_min_batch_rows = self._min_batch_rows
-        self._max_wait_s = float(max_wait_ms) / 1000.0
-        self._target_collect_wait_s = max(0.0005, self._max_wait_s * 0.5)
         self._deterministic = bool(deterministic)
         self._timing = timing_stats
         self._replay_buffer = replay_buffer
@@ -1127,9 +1117,7 @@ class TextInferenceServer:
             self._cond.notify_all()
 
     def _collect_batch(self) -> list[_PendingItem] | None:
-        """Block until at least one item is available, then opportunistically
-        coalesce up to max_batch within max_wait_ms.
-        """
+        """Block until a launch condition is met, then coalesce up to max_batch."""
         start = time.perf_counter()
         try:
             try:
@@ -1149,19 +1137,11 @@ class TextInferenceServer:
                 except _HeadItemDoesNotFit:
                     break
                 except Empty:
-                    if rows >= self._adaptive_min_batch_rows:
+                    if rows >= self._min_batch_rows:
                         break
-                    if self._max_wait_s <= 0.0:
-                        if self._queue.wait_for_item_or_flush():
-                            break
-                        continue
-                    try:
-                        nxt = self._queue.get_fit(
-                            remaining_rows=remaining_rows,
-                            timeout=max(self._max_wait_s, self._target_collect_wait_s),
-                        )
-                    except Empty:
+                    if self._queue.wait_for_item_or_flush():
                         break
+                    continue
                 if nxt is None:
                     break
                 if not isinstance(nxt, _PendingItem):
@@ -1169,24 +1149,10 @@ class TextInferenceServer:
                 items.append(nxt)
                 rows += nxt.rows
             self._queue.clear_flush()
-            self._adapt_launch_policy(rows=rows, collect_s=time.perf_counter() - start)
             return items
         finally:
             if self._timing is not None:
                 self._timing.add("server_collect", time.perf_counter() - start)
-
-    def _adapt_launch_policy(self, *, rows: int, collect_s: float) -> None:
-        if self._max_batch <= 1:
-            return
-        rows = int(rows)
-        collect_s = float(collect_s)
-        high_latency = collect_s > self._target_collect_wait_s
-        underfilled = rows < int(0.75 * float(self._max_batch))
-        saturated = rows >= int(0.9 * float(self._max_batch))
-        if high_latency and underfilled:
-            self._adaptive_min_batch_rows = max(1, self._adaptive_min_batch_rows - 1)
-        elif not high_latency and saturated:
-            self._adaptive_min_batch_rows = min(self._max_batch, self._adaptive_min_batch_rows + 1)
 
     def _process(self, items: list[_PendingItem]) -> None:
         start = time.perf_counter()
