@@ -24,7 +24,6 @@ from __future__ import annotations
 import threading
 import time
 import traceback
-from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -137,7 +136,6 @@ class TextRolloutActor:
     _no_more_episodes: bool = False
     _thread: threading.Thread | None = None
     _pending_inference: int = 0
-    _blocked_submits: deque[_SubmitBatch] = field(default_factory=deque)
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -177,17 +175,6 @@ class TextRolloutActor:
     def _run(self) -> None:
         try:
             while not self._stop_event.is_set():
-                if self._blocked_submits:
-                    blocked = self._blocked_submits.popleft()
-                    if not self._try_submit_batch(blocked, retry=True):
-                        timeout = 0.001 if self._pending_inference > 0 else 0.005
-                        try:
-                            item = self.refill_response_queue.get(timeout=timeout)
-                        except Empty:
-                            pass
-                        else:
-                            self._process_work_item(item)
-                    continue
                 try:
                     item = self.refill_response_queue.get(timeout=0.05)
                 except Empty:
@@ -293,10 +280,10 @@ class TextRolloutActor:
             native_batch=native_batch,
             packed=packed,
         )
-        self._try_submit_batch(batch)
+        self._submit_batch(batch)
         self._record_timing("actor_tick", tick_start)
 
-    def _try_submit_batch(self, batch: _SubmitBatch, *, retry: bool = False) -> bool:
+    def _submit_batch(self, batch: _SubmitBatch) -> None:
         self._drain_completed_inference()
         start = time.perf_counter()
         request = TextInferenceRequest(
@@ -306,17 +293,22 @@ class TextRolloutActor:
             perspective_player_indices=batch.ready_players,
         )
         try_submit = getattr(self.inference_server, "try_submit", None)
-        future = (
-            try_submit(request) if try_submit is not None else self.inference_server.submit(request)
-        )
+        if try_submit is None:
+            future = self.inference_server.submit(request)
+        else:
+            # ``native_batch`` and ``packed`` are views into this actor's
+            # reusable encoder scratch. Retry synchronously until the server
+            # copies them into its arena; do not store the views in the actor
+            # queue and then encode over them. While waiting, drain completed
+            # inference so previous arena slots can be released.
+            while True:
+                future = try_submit(request)
+                if future is not None:
+                    break
+                self.inference_server.flush()
+                self._drain_completed_inference()
+                time.sleep(0.001)
         self._record_timing("actor_submit", start)
-        if future is None:
-            self.inference_server.flush()
-            if retry:
-                self._blocked_submits.appendleft(batch)
-            else:
-                self._blocked_submits.append(batch)
-            return False
         in_flight = _InFlightBatch(
             ready_envs=batch.ready_envs,
             ready_games=batch.ready_games,
@@ -328,7 +320,6 @@ class TextRolloutActor:
         setattr(future, "_magic_ai_actor_batch", in_flight)
         self._pending_inference += 1
         future.add_done_callback(self._enqueue_inference_done)
-        return True
 
     def _enqueue_inference_done(self, future: Future[Any]) -> None:
         try:
