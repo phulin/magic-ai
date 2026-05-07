@@ -1994,36 +1994,11 @@ def rnad_batched_trajectory_loss(
     #    below via ``cached=...``; otherwise we fall back to the legacy
     #    ``recompute_lstm_outputs_for_episodes`` + ``hidden_override`` path.
     online_cache = _maybe_precompute_replay_forward(online, episodes_replay_rows)
-    with torch.no_grad():
-        target_cache = _maybe_precompute_replay_forward(target, episodes_replay_rows)
-        reg_cur_cache = _maybe_precompute_replay_forward(reg_cur, episodes_replay_rows)
-        reg_prev_cache = _maybe_precompute_replay_forward(reg_prev, episodes_replay_rows)
-
     if online_cache is not None:
         online_h_concat: Tensor | None = online_cache.h_concat
     else:
         online_h_list = _maybe_recompute_lstm_h_out_episodes(online, episodes_replay_rows)
         online_h_concat = torch.cat(online_h_list, dim=0) if online_h_list is not None else None
-    if target_cache is None:
-        with torch.no_grad():
-            target_h_list = _maybe_recompute_lstm_h_out_episodes(target, episodes_replay_rows)
-        target_h_concat = torch.cat(target_h_list, dim=0) if target_h_list is not None else None
-    else:
-        target_h_concat = target_cache.h_concat
-    if reg_cur_cache is None:
-        with torch.no_grad():
-            reg_cur_h_list = _maybe_recompute_lstm_h_out_episodes(reg_cur, episodes_replay_rows)
-        reg_cur_h_concat = torch.cat(reg_cur_h_list, dim=0) if reg_cur_h_list is not None else None
-    else:
-        reg_cur_h_concat = reg_cur_cache.h_concat
-    if reg_prev_cache is None:
-        with torch.no_grad():
-            reg_prev_h_list = _maybe_recompute_lstm_h_out_episodes(reg_prev, episodes_replay_rows)
-        reg_prev_h_concat = (
-            torch.cat(reg_prev_h_list, dim=0) if reg_prev_h_list is not None else None
-        )
-    else:
-        reg_prev_h_concat = reg_prev_cache.h_concat
 
     online_per_choice = getattr(online, "evaluate_replay_batch_per_choice")  # noqa: B009
     target_per_choice = getattr(target, "evaluate_replay_batch_per_choice")  # noqa: B009
@@ -2041,10 +2016,22 @@ def rnad_batched_trajectory_loss(
     lp_online_b, _, v_online_b, pc_online_b = _forward(
         online_per_choice, online_h_concat, online_cache
     )
+
+    def _aux_forward(policy: Any, per_choice: Any) -> Any:
+        cache = _maybe_precompute_replay_forward(policy, episodes_replay_rows)
+        if cache is None:
+            h_list = _maybe_recompute_lstm_h_out_episodes(policy, episodes_replay_rows)
+            h_concat = torch.cat(h_list, dim=0) if h_list is not None else None
+        else:
+            h_concat = cache.h_concat
+        out = _forward(per_choice, h_concat, cache)
+        del cache, h_concat
+        return out
+
     with torch.no_grad():
-        lp_tgt_b, _, v_tgt_b, pc_tgt_b = _forward(target_per_choice, target_h_concat, target_cache)
-        _, _, _, pc_reg_cur_b = _forward(reg_cur_per_choice, reg_cur_h_concat, reg_cur_cache)
-        _, _, _, pc_reg_prev_b = _forward(reg_prev_per_choice, reg_prev_h_concat, reg_prev_cache)
+        lp_tgt_b, _, v_tgt_b, pc_tgt_b = _aux_forward(target, target_per_choice)
+        _, _, _, pc_reg_cur_b = _aux_forward(reg_cur, reg_cur_per_choice)
+        _, _, _, pc_reg_prev_b = _aux_forward(reg_prev, reg_prev_per_choice)
 
     # 3) Single batched loss assembly across the whole flat batch.
     perspective_flat = torch.tensor(
