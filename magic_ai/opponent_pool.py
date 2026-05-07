@@ -333,18 +333,8 @@ def load_opponent_weights(
 def _disable_text_replay_capture(*policies: Any) -> Iterator[None]:
     """Temporarily run text policies in inference mode without replay writes."""
 
-    from magic_ai.text_encoder.actor_critic import TextActorCritic
-
-    saved: list[tuple[TextActorCritic, Any]] = []
-    try:
-        for policy in policies:
-            if isinstance(policy, TextActorCritic):
-                saved.append((policy, policy.rollout_buffer))
-                policy.rollout_buffer = None
-        yield
-    finally:
-        for policy, rollout_buffer in saved:
-            policy.rollout_buffer = rollout_buffer
+    del policies
+    yield
 
 
 def distribute_games_by_recency(
@@ -524,6 +514,7 @@ def run_eval_matches(
                     perspective_player_indices=players,
                     packed_batch=packed_text_batch,
                     deterministic=False,
+                    append_replay=False,
                 )
             counts = list(sample.decision_counts)
             selected_cols = list(sample.selected_choice_cols)
