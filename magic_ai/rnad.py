@@ -2016,6 +2016,7 @@ def rnad_batched_trajectory_loss(
     lp_online_b, _, v_online_b, pc_online_b = _forward(
         online_per_choice, online_h_concat, online_cache
     )
+    del online_cache, online_h_concat
 
     def _aux_forward(policy: Any, per_choice: Any) -> Any:
         cache = _maybe_precompute_replay_forward(policy, episodes_replay_rows)
