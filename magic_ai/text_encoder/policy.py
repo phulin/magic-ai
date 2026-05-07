@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import torch
 import torch.nn as nn
 from torch import Tensor
 from transformers import PreTrainedTokenizerFast
@@ -136,6 +137,29 @@ class TextPolicy(nn.Module):
         return EncodedSnapshots(
             card_vectors=card_vecs,
             card_mask=card_mask,
+            state_vector=state_vec,
+            blank_logits=blank_logits,
+        )
+
+    def encode_packed_replay_only(self, batch: PackedTextBatch) -> EncodedSnapshots:
+        """Run replay scoring encoder outputs without retaining card vectors."""
+
+        hidden = self.encoder.forward_packed(batch)
+        state_vec = gather_state_vector_packed(hidden, batch)
+        blank_logits = self.inline_blank_policy(
+            hidden,
+            batch.blank_positions,
+            batch.blank_kind,
+            batch.blank_legal_ids,
+            batch.blank_legal_mask,
+        )
+        return EncodedSnapshots(
+            card_vectors=hidden.new_empty((int(batch.seq_lengths.shape[0]), 0, hidden.shape[-1])),
+            card_mask=torch.empty(
+                (int(batch.seq_lengths.shape[0]), 0),
+                dtype=torch.bool,
+                device=hidden.device,
+            ),
             state_vector=state_vec,
             blank_logits=blank_logits,
         )
