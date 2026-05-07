@@ -27,13 +27,16 @@ from __future__ import annotations
 import threading
 import time
 import traceback
+from collections import deque
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
 
 from magic_ai.actions import TRACE_KIND_VALUES, action_from_choice_accepted
 from magic_ai.native.inference_server import (
+    RolloutTimingStats,
     TextInferenceRequest,
     TextInferenceServer,
 )
@@ -54,8 +57,7 @@ class ActorEncodeConfig:
 @dataclass
 class ActorRuntimeConfig:
     max_steps_per_game: int
-    rollout_ready_wait_ms: float
-    rollout_min_ready_batch: int
+    actor_pipeline_depth: int = 8
 
 
 @dataclass
@@ -86,11 +88,22 @@ class RefillResponse:
 
 
 @dataclass
+class _InFlightBatch:
+    ready_envs: list[Any]
+    ready_games: list[Any]
+    ready_players: list[int]
+    ready_env_indices: list[int]
+    submitted_at: float
+    future: Future[Any]
+
+
+@dataclass
 class TextRolloutActor:
     actor_id: int
     encoder: NativeBatchEncoder
     rollout_driver: NativeRolloutDriver
     inference_server: TextInferenceServer
+    staging_buffer: Any
     encode_cfg: ActorEncodeConfig
     runtime_cfg: ActorRuntimeConfig
     finished_queue: Queue[FinishedEnv]
@@ -102,8 +115,10 @@ class TextRolloutActor:
     append_transcript_action: Callable[..., None]
     record_step: Callable[..., None]
     error_hook: Callable[[BaseException, str], None] | None = None
+    timing_stats: RolloutTimingStats | None = None
     name: str = "text-actor"
     _live_games: list[Any] = field(default_factory=list)
+    _inflight: deque[_InFlightBatch] = field(default_factory=deque)
     _stop_event: threading.Event = field(default_factory=threading.Event)
     _no_more_episodes: bool = False
     _thread: threading.Thread | None = None
@@ -146,6 +161,10 @@ class TextRolloutActor:
     def _run(self) -> None:
         try:
             while not self._stop_event.is_set():
+                if self._inflight:
+                    self._drain_inflight(blocking=not self._live_games)
+                    if self._stop_event.is_set():
+                        return
                 if not self._live_games:
                     if self._no_more_episodes:
                         return
@@ -165,13 +184,19 @@ class TextRolloutActor:
                     pass
 
     def _step_once(self) -> None:
+        self._drain_inflight(blocking=False)
+        pipeline_full = len(self._inflight) >= max(1, self.runtime_cfg.actor_pipeline_depth)
+        tick_start = time.perf_counter()
+        start = tick_start
         games = [env.game for env in self._live_games]
         ready_t, over_t, player_t, winner_t = self.rollout_driver.poll(games)
+        self._record_timing("actor_poll", start)
         ready_l = ready_t.tolist()
         over_l = over_t.tolist()
         player_l = player_t.tolist()
         winner_l = winner_t.tolist()
 
+        start = time.perf_counter()
         ready_envs: list[Any] = []
         ready_players: list[int] = []
         still_live: list[Any] = []
@@ -190,10 +215,11 @@ class TextRolloutActor:
                 )
                 freed_slots.append(int(env.slot_idx))
                 continue
-            still_live.append(env)
-            if ready_l[idx]:
+            if ready_l[idx] and not pipeline_full:
                 ready_envs.append(env)
                 ready_players.append(int(player_l[idx]))
+            else:
+                still_live.append(env)
         self._live_games = still_live
 
         if freed_slots:
@@ -203,6 +229,7 @@ class TextRolloutActor:
 
         # Drain any refills the learner has produced for us in earlier ticks.
         self._drain_refills(blocking=False)
+        self._record_timing("actor_partition_refill", start)
 
         if not ready_envs:
             # If our slice has gone empty pending refills, block briefly so we
@@ -211,18 +238,17 @@ class TextRolloutActor:
                 self._drain_refills(blocking=True)
             return
 
-        # Per-actor batch deferral (server still coalesces across actors, but
-        # this matches the original inline loop's behavior).
-        if self._defer_ready(ready_count=len(ready_envs), live_count=len(self._live_games)):
-            time.sleep(self.runtime_cfg.rollout_ready_wait_ms / 1000.0)
-            return
-
         ready_games = [env.game for env in ready_envs]
         ready_env_indices = [int(env.slot_idx) for env in ready_envs]
 
+        start = time.perf_counter()
         native_batch, nat_outputs = self._encode_packed(ready_games, ready_players)
-        packed = nat_outputs.to_packed_text_batch(trim=True, derive_token_metadata=False)
+        self._record_timing("actor_encode", start)
+        start = time.perf_counter()
+        packed = nat_outputs.to_packed_text_batch(trim=True, derive_token_metadata=True)
+        self._record_timing("actor_pack", start)
 
+        start = time.perf_counter()
         future = self.inference_server.submit(
             TextInferenceRequest(
                 native_batch=native_batch,
@@ -231,13 +257,33 @@ class TextRolloutActor:
                 perspective_player_indices=ready_players,
             )
         )
-        reply = future.result()
+        self._record_timing("actor_submit", start)
+        self._inflight.append(
+            _InFlightBatch(
+                ready_envs=ready_envs,
+                ready_games=ready_games,
+                ready_players=ready_players,
+                ready_env_indices=ready_env_indices,
+                submitted_at=time.perf_counter(),
+                future=future,
+            )
+        )
+        self._record_timing("actor_tick", tick_start)
 
+    def _finish_inflight(self, batch: _InFlightBatch) -> None:
+        reply = batch.future.result()
+        self._record_timing("actor_wait_inference", batch.submitted_at)
+        start = time.perf_counter()
+        self.staging_buffer.stage_batch(batch.ready_env_indices, reply.replay_payload)
+        self._record_timing("actor_stage", start)
         # Build transcripts + RolloutSteps (CPU-only, actor-local) and then
         # advance the engine. Transcript work uses host-side scalars from the
         # reply, so no additional GPU sync is needed.
+        start = time.perf_counter()
         cursor = 0
-        for step_idx, (env, player_idx) in enumerate(zip(ready_envs, ready_players, strict=True)):
+        for step_idx, (env, player_idx) in enumerate(
+            zip(batch.ready_envs, batch.ready_players, strict=True)
+        ):
             env.action_count += 1
             count = int(reply.decision_counts[step_idx])
             selected_for_step = reply.selected_choice_cols[cursor : cursor + count]
@@ -263,15 +309,17 @@ class TextRolloutActor:
                 float(reply.old_log_prob[step_idx]),
                 float(reply.value[step_idx]),
             )
+        self._record_timing("actor_record", start)
 
         # CPU step_by_choice (parallel across actors thanks to GIL release in cgo).
+        start = time.perf_counter()
         starts: list[int] = []
         running = 0
         for c in reply.decision_counts:
             starts.append(running)
             running += int(c)
         self.rollout_driver.step_by_choice(
-            ready_games,
+            batch.ready_games,
             decision_starts=starts,
             decision_counts=list(reply.decision_counts),
             selected_choice_cols=list(reply.selected_choice_cols),
@@ -279,13 +327,24 @@ class TextRolloutActor:
             max_options=self.encode_cfg.max_options,
             max_targets_per_option=self.encode_cfg.max_targets_per_option,
         )
+        self._record_timing("actor_step", start)
+        self._live_games.extend(batch.ready_envs)
 
-    def _defer_ready(self, *, ready_count: int, live_count: int) -> bool:
-        if self.runtime_cfg.rollout_ready_wait_ms <= 0.0:
-            return False
-        if ready_count >= self.runtime_cfg.rollout_min_ready_batch:
-            return False
-        return live_count > ready_count
+    def _drain_inflight(self, *, blocking: bool) -> None:
+        if not self._inflight:
+            return
+        if blocking:
+            self.inference_server.flush()
+        while self._inflight:
+            batch = self._inflight[0]
+            if not batch.future.done():
+                if not blocking:
+                    return
+                self._finish_inflight(batch)
+                self._inflight.popleft()
+                return
+            self._finish_inflight(batch)
+            self._inflight.popleft()
 
     def _encode_packed(self, games: list[Any], perspectives: list[int]) -> tuple[Any, Any]:
         from magic_ai.text_encoder.native_assembler import encode_tokens_packed
@@ -319,6 +378,10 @@ class TextRolloutActor:
                 continue
             if self._live_games or self._no_more_episodes:
                 return
+
+    def _record_timing(self, name: str, start: float) -> None:
+        if self.timing_stats is not None:
+            self.timing_stats.add(name, time.perf_counter() - start)
 
 
 __all__ = [

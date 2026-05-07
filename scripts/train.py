@@ -10,9 +10,11 @@ import hashlib
 import importlib
 import itertools
 import json
+import math
 import random
 import re
 import sys
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -391,7 +393,8 @@ class NativeTextTrajectoryBuffer:
         self.recurrent_layers = replay_buffer.recurrent_layers
         self.recurrent_hidden_dim = replay_buffer.recurrent_hidden_dim
         self.lstm_proj_hidden = replay_buffer.lstm_proj_hidden
-
+        self._lock = threading.Lock()
+        self.timing_stats: Any | None = None
         shape = (self.num_envs, self.max_steps)
         self.step_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.step_count_host = [0 for _ in range(self.num_envs)]
@@ -475,19 +478,32 @@ class NativeTextTrajectoryBuffer:
                 device=self.device,
             )
 
+    def _record_timing(self, name: str, start: float) -> None:
+        timing = self.timing_stats
+        if timing is not None:
+            timing.add(name, time.perf_counter() - start)
+
     def reset_env(self, env_idx: int) -> None:
-        env_idx = int(env_idx)
-        self.step_count[env_idx] = 0
-        self.step_count_host[env_idx] = 0
+        with self._lock:
+            env_idx = int(env_idx)
+            self.step_count[env_idx] = 0
+            self.step_count_host[env_idx] = 0
 
     def stage_batch(
         self,
         env_indices: list[int],
         payload: NativeTextReplayPayload,
     ) -> None:
+        with self._lock:
+            self._stage_batch_locked(env_indices, payload)
+
+    def _stage_batch_locked(
+        self,
+        env_indices: list[int],
+        payload: NativeTextReplayPayload,
+    ) -> None:
         if not env_indices:
             return
-        batch_size = len(env_indices)
         env_t = torch.tensor(env_indices, dtype=torch.long, device=self.device)
         step_host = [self.step_count_host[int(env_idx)] for env_idx in env_indices]
         if self.validate and any(step >= self.max_steps for step in step_host):
@@ -499,6 +515,7 @@ class NativeTextTrajectoryBuffer:
             raise RuntimeError(f"native text staging buffer is full for env {env_idx}")
         step_t = torch.tensor(step_host, dtype=torch.long, device=self.device)
 
+        batch_size = len(env_indices)
         encoded = payload.encoded
         seq_lengths = encoded.seq_lengths.to(device=self.device, dtype=torch.long)
         seq_lengths_host = encoded.seq_lengths_host
@@ -620,12 +637,7 @@ class NativeTextTrajectoryBuffer:
             device=self.device,
         )
         none_tmp = torch.zeros(flat_slots + 1, dtype=torch.bool, device=self.device)
-        selected_tmp = torch.full(
-            (flat_slots + 1,),
-            -1,
-            dtype=torch.int16,
-            device=self.device,
-        )
+        selected_tmp = torch.full((flat_slots + 1,), -1, dtype=torch.int16, device=self.device)
         behavior_lp_tmp = torch.zeros(flat_slots + 1, dtype=torch.float32, device=self.device)
         option_tmp[dest] = payload.decision_option_idx.to(device=self.device, dtype=torch.int16)
         target_tmp[dest] = payload.decision_target_idx.to(device=self.device, dtype=torch.int16)
@@ -696,6 +708,7 @@ class NativeTextTrajectoryBuffer:
             empty = torch.zeros(0, dtype=torch.long, device=device)
             return empty, empty
 
+        start = time.perf_counter()
         counts_host = [self.step_count_host[int(env_idx)] for env_idx in env_indices]
         counts_all = torch.tensor(counts_host, dtype=torch.long, device=device)
         flat_pairs = [
@@ -727,6 +740,9 @@ class NativeTextTrajectoryBuffer:
             for env_idx, step in zip(flat_env_host, flat_step_host, strict=True)
         )
         total_decision_groups = sum(decision_count_host)
+        self._record_timing("finish_append_build_indices", start)
+
+        start = time.perf_counter()
         if total_decision_groups:
             step_for_group = torch.repeat_interleave(
                 torch.arange(row_count, device=self.device),
@@ -763,6 +779,9 @@ class NativeTextTrajectoryBuffer:
             uses_none = torch.empty(0, dtype=torch.bool, device=self.device)
             selected_indices = torch.empty(0, dtype=torch.long, device=self.device)
             behavior_action_log_prob = torch.empty(0, dtype=torch.float32, device=self.device)
+        self._record_timing("finish_append_decision_gather", start)
+
+        start = time.perf_counter()
         lstm_h = (
             self.lstm_h_in[flat_env, flat_step].permute(1, 0, 2)
             if self.lstm_h_in is not None
@@ -773,6 +792,9 @@ class NativeTextTrajectoryBuffer:
             if self.lstm_c_in is not None
             else None
         )
+        self._record_timing("finish_append_lstm_gather", start)
+
+        start = time.perf_counter()
         rows = replay_buffer.append_staged_batch(
             flat_env=flat_env,
             flat_step=flat_step,
@@ -809,16 +831,65 @@ class NativeTextTrajectoryBuffer:
         )
         if replay_buffer.projected_state is not None and self.projected_state is not None:
             replay_buffer.write_projected_state(rows, self.projected_state[flat_env, flat_step])
+        self._record_timing("finish_append_replay_copy", start)
 
         # Reset all targeted env slots in one scatter (resetting an already-
         # empty slot to 0 is a no-op).
+        start = time.perf_counter()
         env_t_all = torch.tensor(env_indices, dtype=torch.long, device=device)
         self.step_count[env_t_all] = 0
         for env_idx in env_indices:
             self.step_count_host[int(env_idx)] = 0
+        self._record_timing("finish_append_reset_slots", start)
         return rows, counts_all
 
+    def replay_capacity_required(self, env_indices: list[int]) -> tuple[int, int]:
+        """Return ``(row_count, token_count)`` needed to commit envs.
+
+        Uses host mirrors only, so this is a pure CPU capacity check before
+        launching any copy kernels.
+        """
+
+        with self._lock:
+            row_count = 0
+            token_count = 0
+            for env_idx in env_indices:
+                env_idx_i = int(env_idx)
+                count = self.step_count_host[env_idx_i]
+                row_count += count
+                token_count += sum(self.seq_lengths_host[env_idx_i][:count])
+            return row_count, token_count
+
+    def can_append_envs_to_replay(
+        self,
+        env_indices: list[int],
+        replay_buffer: TextReplayBuffer,
+    ) -> bool:
+        row_count, token_count = self.replay_capacity_required(env_indices)
+        row_remaining = replay_buffer.capacity - replay_buffer.size
+        token_remaining = int(replay_buffer.packed_token_ids.numel()) - int(
+            replay_buffer._token_cursor
+        )
+        return row_count <= row_remaining and token_count <= token_remaining
+
+    def try_append_envs_to_replay_returning_tensor(
+        self,
+        env_indices: list[int],
+        replay_buffer: TextReplayBuffer,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not self.can_append_envs_to_replay(env_indices, replay_buffer):
+            return None
+        return self._append_envs_to_replay_core(env_indices, replay_buffer)
+
     def append_envs_to_replay(
+        self,
+        env_indices: list[int],
+        replay_buffer: TextReplayBuffer,
+    ) -> list[list[int]]:
+        with self._lock:
+            return self._append_envs_to_replay_locked(env_indices, replay_buffer)
+
+    def _append_envs_to_replay_locked(
         self,
         env_indices: list[int],
         replay_buffer: TextReplayBuffer,
@@ -853,7 +924,13 @@ class NativeTextTrajectoryBuffer:
         (``rows.cpu().tolist()``, ``active_counts.cpu().tolist()``,
         ``counts_all.cpu().tolist()``) that the list-of-lists API does.
         """
-        return self._append_envs_to_replay_core(env_indices, replay_buffer)
+        start = time.perf_counter()
+        self._lock.acquire()
+        self._record_timing("finish_append_wait_lock", start)
+        try:
+            return self._append_envs_to_replay_core(env_indices, replay_buffer)
+        finally:
+            self._lock.release()
 
     def append_env_to_replay(self, env_idx: int, replay_buffer: TextReplayBuffer) -> list[int]:
         return self.append_envs_to_replay([env_idx], replay_buffer)[0]
@@ -979,7 +1056,11 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
     )
     policy = TextActorCritic(recurrent_cfg).to(device)
     policy.init_lstm_env_states(args.num_envs)
-    rollout_capacity = args.rollout_buffer_capacity or max(4096, 2 * args.rollout_steps)
+    rollout_capacity = args.rollout_buffer_capacity or max(
+        4096,
+        3 * int(args.rollout_steps),
+        int(args.max_steps_per_game),
+    )
     replay_buffer = TextReplayBuffer(
         capacity=rollout_capacity,
         max_tokens=args.text_max_tokens,
@@ -2273,7 +2354,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "rows in the rollout GPU buffer; default 2 * rollout-steps. "
+            "rows in the rollout GPU buffer; text default max(4096, "
+            "3 * rollout-steps, max-steps-per-game). "
             "If a finished env's trajectory would overflow this cap, the "
             "actor coordinator defers it (keeps its staging slot occupied) "
             "until the next PPO update resets the buffer, instead of OOMing "
@@ -2294,10 +2376,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inference-batch-wait-ms",
         type=float,
-        default=2.0,
+        default=0.0,
         help=(
-            "inference server: max wall-time to wait for additional actor "
-            "requests before launching a forward pass"
+            "deprecated actor-path setting; batching now launches by "
+            "--inference-ready-fraction plus explicit tail flushes"
+        ),
+    )
+    parser.add_argument(
+        "--inference-ready-fraction",
+        type=float,
+        default=0.45,
+        help=(
+            "actor-path inference server: launch a forward pass once this "
+            "fraction of --num-envs rows is queued; tails flush explicitly"
         ),
     )
     parser.add_argument(
@@ -2678,6 +2769,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--num-rollout-actors must be at least 1")
     if getattr(args, "inference_batch_wait_ms", 0.0) < 0.0:
         raise ValueError("--inference-batch-wait-ms must be non-negative")
+    if not (0.0 < getattr(args, "inference_ready_fraction", 0.45) <= 1.0):
+        raise ValueError("--inference-ready-fraction must be in (0, 1]")
     if getattr(args, "inference_max_batch", 0) < 0:
         raise ValueError("--inference-max-batch must be non-negative")
     if args.minibatch_size < 1:
@@ -4250,6 +4343,7 @@ def train_text_native_batched_envs(
             # Per-row terminal reward (in p0's perspective) and zero-sum flag.
             # See the slot path's finish_games for the full breakdown of
             # cases (engine win/loss, engine draw, step-cap timeout).
+            finish_part_start = time.perf_counter()
             terminal_p0_h: list[float] = []
             zero_sum_h: list[bool] = []
             for env, winner_idx, is_timeout in finished_with_steps:
@@ -4263,6 +4357,12 @@ def train_text_native_batched_envs(
                 )
                 terminal_p0_h.append(tp0)
                 zero_sum_h.append(zs)
+            if staging_buffer.timing_stats is not None:
+                staging_buffer.timing_stats.add(
+                    "finish_terminal_reward", time.perf_counter() - finish_part_start
+                )
+
+            finish_part_start = time.perf_counter()
             slot_t = torch.tensor(slot_idxs, dtype=torch.long, pin_memory=True).to(
                 device, non_blocking=True
             )
@@ -4289,6 +4389,11 @@ def train_text_native_batched_envs(
                 gae_lambda=args.gae_lambda,
             )
             flat_returns_dev = returns_padded[valid_mask]
+            if staging_buffer.timing_stats is not None:
+                staging_buffer.timing_stats.add(
+                    "finish_gae", time.perf_counter() - finish_part_start
+                )
+
             flat_rows, _counts = staging_buffer.append_envs_to_replay_returning_tensor(
                 slot_idxs,
                 backend.replay_buffer,
@@ -4337,6 +4442,7 @@ def train_text_native_batched_envs(
                     pending_flat_rows_chunks.append(flat_rows)
                     pending_episode_step_counts.append(step_counts)
 
+        finish_part_start = time.perf_counter()
         for env, winner_idx, is_timeout in finished:
             try:
                 env.game.close()
@@ -4368,6 +4474,10 @@ def train_text_native_batched_envs(
             else:
                 win_stats.draws += 1
             completed_games += 1
+        if staging_buffer.timing_stats is not None:
+            staging_buffer.timing_stats.add(
+                "finish_close_bookkeeping", time.perf_counter() - finish_part_start
+            )
 
     def run_update(*, final: bool = False) -> None:
         nonlocal total_rollout_steps, last_step_time, pending_step_count
@@ -4560,7 +4670,7 @@ def train_text_native_batched_envs(
         threads in parallel; cgo releases the GIL on each native call.
         """
 
-        from magic_ai.native.inference_server import TextInferenceServer
+        from magic_ai.native.inference_server import RolloutTimingStats, TextInferenceServer
         from magic_ai.native.rollout_actor import (
             ActorEncodeConfig,
             ActorRuntimeConfig,
@@ -4613,17 +4723,47 @@ def train_text_native_batched_envs(
         )
         runtime_cfg = ActorRuntimeConfig(
             max_steps_per_game=int(args.max_steps_per_game),
-            rollout_ready_wait_ms=float(args.rollout_ready_wait_ms),
-            rollout_min_ready_batch=int(args.rollout_min_ready_batch),
         )
 
         max_batch = int(args.inference_max_batch) or int(args.num_envs)
+        min_batch_rows = max(
+            1,
+            min(
+                max_batch,
+                int(math.ceil(float(args.inference_ready_fraction) * float(args.num_envs))),
+            ),
+        )
+        timing_stats = RolloutTimingStats()
+        staging_buffer.timing_stats = timing_stats
+        # Compile the batched GAE graph before rollout timing starts; otherwise
+        # the first large finish batch reports Inductor compile time as
+        # learner_finish_games/finish_gae.
+        with torch.no_grad():
+            warm_b = max(1, min(int(args.num_envs), int(args.rollout_steps)))
+            warm_t = int(args.max_steps_per_game)
+            warm_device = staging_buffer.device
+            warm_values = torch.zeros(warm_b, warm_t, dtype=torch.float32, device=warm_device)
+            warm_players = torch.zeros(warm_b, warm_t, dtype=torch.long, device=warm_device)
+            warm_counts = torch.ones(warm_b, dtype=torch.long, device=warm_device)
+            warm_terminal = torch.zeros(warm_b, dtype=torch.float32, device=warm_device)
+            warm_zero_sum = torch.ones(warm_b, dtype=torch.bool, device=warm_device)
+            gae_returns_batched(
+                warm_values,
+                warm_players,
+                warm_counts,
+                terminal_reward_p0=warm_terminal,
+                zero_sum=warm_zero_sum,
+                gamma=args.gamma,
+                gae_lambda=args.gae_lambda,
+            )
         server = TextInferenceServer(
             sampling_policy=sampling_policy,
             staging_buffer=staging_buffer,
             max_batch=max_batch,
             max_wait_ms=float(args.inference_batch_wait_ms),
             deterministic=bool(args.deterministic_rollout),
+            timing_stats=timing_stats,
+            min_batch_rows=min_batch_rows,
         )
         server.start()
 
@@ -4657,6 +4797,7 @@ def train_text_native_batched_envs(
                 encoder=encoders_pool[actor_id],
                 rollout_driver=drivers_pool[actor_id],
                 inference_server=server,
+                staging_buffer=staging_buffer,
                 encode_cfg=encode_cfg,
                 runtime_cfg=runtime_cfg,
                 finished_queue=finished_q,
@@ -4677,6 +4818,7 @@ def train_text_native_batched_envs(
                     )
                 ),
                 error_hook=_actor_error,
+                timing_stats=timing_stats,
             )
             actors.append(actor)
 
@@ -4710,6 +4852,49 @@ def train_text_native_batched_envs(
         _profile_out = _os.environ.get("MAGIC_AI_PROFILE_RL_OUTPUT", "/tmp/rl_profile.json.gz")
         _profile_state: dict[str, Any] = {"prof": None, "started_at": None, "done": False}
         _updates_seen = 0
+
+        def _print_rollout_timing(stats: dict[str, float | int]) -> None:
+            rows = int(stats.get("rows", 0))
+            if rows <= 0:
+                return
+            fields = [
+                cli_step_prefix(),
+                "[rollout_timing]",
+                f"rows={rows}",
+                f"tokens/row={float(stats.get('avg_tokens_per_row', 0.0)):.1f}",
+                f"max_seq={int(stats.get('max_seq', 0))}",
+            ]
+            for name in (
+                "actor_poll",
+                "actor_encode",
+                "actor_pack",
+                "actor_wait_inference",
+                "actor_stage",
+                "actor_record",
+                "actor_step",
+                "server_collect",
+                "server_concat",
+                "server_sample",
+                "server_stage",
+                "server_scatter",
+                "learner_finish_games",
+                "finish_terminal_reward",
+                "finish_gae",
+                "finish_append_wait_lock",
+                "finish_append_build_indices",
+                "finish_append_decision_gather",
+                "finish_append_lstm_gather",
+                "finish_append_replay_copy",
+                "finish_append_reset_slots",
+                "finish_close_bookkeeping",
+                "learner_update",
+            ):
+                total = float(stats.get(f"{name}_total_s", 0.0))
+                if total > 0.0:
+                    mean = float(stats.get(f"{name}_mean_ms", 0.0))
+                    count = int(stats.get(f"{name}_count", 0))
+                    fields.append(f"{name}={total:.2f}s/{mean:.1f}msx{count}")
+            print(*fields, flush=True)
 
         try:
             while active_actors > 0:
@@ -4759,25 +4944,36 @@ def train_text_native_batched_envs(
 
                 # Try to commit any previously-deferred finishes first, then
                 # the freshly-arrived batch. Anything that won't fit in the
-                # remaining replay capacity stays deferred — its slot is NOT
-                # returned to the actor's free pool, so the staging buffer
-                # holds the trajectory until the next PPO update resets the
-                # replay buffer.
+                # current packed replay buffer stays deferred until the next
+                # PPO update frees rows.
                 deferred_finishes.extend(finished_batch)
                 if deferred_finishes:
-                    replay_remaining = backend.replay_buffer.capacity - backend.replay_buffer.size
-                    fits: list[FinishedEnv] = []
+                    replay_rows_remaining = (
+                        backend.replay_buffer.capacity - backend.replay_buffer.size
+                    )
+                    replay_tokens_remaining = int(
+                        backend.replay_buffer.packed_token_ids.numel()
+                    ) - int(backend.replay_buffer._token_cursor)
+                    fits = []
                     still_deferred: list[FinishedEnv] = []
                     for fe in deferred_finishes:
-                        n_steps = len(fe.live_game.episode_steps)
-                        if n_steps == 0 or n_steps <= replay_remaining:
+                        needed_rows, needed_tokens = staging_buffer.replay_capacity_required(
+                            [fe.slot_idx]
+                        )
+                        if (
+                            needed_rows <= replay_rows_remaining
+                            and needed_tokens <= replay_tokens_remaining
+                        ):
                             fits.append(fe)
-                            replay_remaining -= n_steps
+                            replay_rows_remaining -= needed_rows
+                            replay_tokens_remaining -= needed_tokens
                         else:
                             still_deferred.append(fe)
                     deferred_finishes = still_deferred
                     if fits:
+                        finish_start = time.perf_counter()
                         finish_games([(fe.live_game, fe.winner_idx, fe.is_timeout) for fe in fits])
+                        timing_stats.add("learner_finish_games", time.perf_counter() - finish_start)
                         # Return slots to the *originating* actor's pool only
                         # for envs we actually committed.
                         per_actor_freed: list[list[int]] = [[] for _ in range(num_actors)]
@@ -4819,7 +5015,10 @@ def train_text_native_batched_envs(
                 # Periodic update: pause the inference server, run, resume.
                 if pending_step_count >= args.rollout_steps:
                     server.pause()
+                    update_start = time.perf_counter()
                     run_update()
+                    timing_stats.add("learner_update", time.perf_counter() - update_start)
+                    _print_rollout_timing(timing_stats.snapshot_and_reset())
                     server.resume()
                     _updates_seen += 1
                     # Start torch.profiler after the first post-compile update
@@ -5086,7 +5285,7 @@ def train_text_native_batched_envs(
                     max_card_refs=256,
                 )
                 packed_text_batch = nat_outputs.to_packed_text_batch(
-                    trim=True, derive_token_metadata=False
+                    trim=True, derive_token_metadata=True
                 )
             else:
                 native_batch = native_encoder.encode_handles(

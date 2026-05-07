@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -42,6 +43,18 @@ class TextReplayBatch:
     perspective_player_idx: Tensor
     lstm_h_in: Tensor | None
     lstm_c_in: Tensor | None
+
+
+@dataclass
+class _ReplayReservation:
+    reservation_id: int
+    row_start: int
+    row_end: int
+    token_start: int
+    token_end: int
+    decision_start: int
+    decision_end: int
+    complete: bool = False
 
 
 class TextReplayBuffer:
@@ -208,6 +221,11 @@ class TextReplayBuffer:
         self.uses_none_head = self.core.uses_none_head
         self.selected_indices = self.core.selected_indices
         self.behavior_action_log_prob = self.core.behavior_action_log_prob
+        self._reserve_lock = threading.Lock()
+        self._next_reservation_id = 0
+        self._commit_reservation_id = 0
+        self._committed_row_cursor = 0
+        self._reservations: dict[int, _ReplayReservation] = {}
 
     @property
     def size(self) -> int:
@@ -226,6 +244,11 @@ class TextReplayBuffer:
         self.blank_legal_ids.zero_()
         self.blank_legal_mask.zero_()
         self._token_cursor = 0
+        with self._reserve_lock:
+            self._next_reservation_id = 0
+            self._commit_reservation_id = 0
+            self._committed_row_cursor = 0
+            self._reservations.clear()
 
     def write_ppo_targets(
         self,
@@ -331,6 +354,175 @@ class TextReplayBuffer:
         if encoded.seq_lengths.device.type == "cpu":
             return [int(x) for x in encoded.seq_lengths.to(dtype=torch.long).tolist()]
         return [int(x) for x in encoded.seq_lengths.detach().cpu().to(dtype=torch.long).tolist()]
+
+    def _reserve_append(
+        self,
+        *,
+        row_count: int,
+        token_count: int,
+        decision_count: int,
+    ) -> _ReplayReservation:
+        with self._reserve_lock:
+            row_start = self.core._row_cursor
+            row_end = row_start + int(row_count)
+            token_start = self._token_cursor
+            token_end = token_start + int(token_count)
+            decision_start = self.core._decision_cursor
+            decision_end = decision_start + int(decision_count)
+            if row_end > self.capacity:
+                raise RuntimeError("TextReplayBuffer is full")
+            if token_end > int(self.packed_token_ids.numel()):
+                raise RuntimeError("TextReplayBuffer packed token arena is full")
+            if decision_end > self.core.decision_capacity:
+                raise RuntimeError(
+                    f"decision buffer capacity {self.core.decision_capacity} exceeded "
+                    f"(active={self.core._decision_cursor}, add={decision_count})"
+                )
+            self.core._row_cursor = row_end
+            self._token_cursor = token_end
+            self.core._decision_cursor = decision_end
+            reservation = _ReplayReservation(
+                reservation_id=self._next_reservation_id,
+                row_start=row_start,
+                row_end=row_end,
+                token_start=token_start,
+                token_end=token_end,
+                decision_start=decision_start,
+                decision_end=decision_end,
+            )
+            self._reservations[reservation.reservation_id] = reservation
+            self._next_reservation_id += 1
+            return reservation
+
+    def _seal_reservation(self, reservation: _ReplayReservation) -> None:
+        with self._reserve_lock:
+            stored = self._reservations[reservation.reservation_id]
+            stored.complete = True
+            while True:
+                head = self._reservations.get(self._commit_reservation_id)
+                if head is None or not head.complete:
+                    break
+                self._committed_row_cursor = head.row_end
+                del self._reservations[self._commit_reservation_id]
+                self._commit_reservation_id += 1
+
+    def _write_decision_batch_at(
+        self,
+        *,
+        row_start: int,
+        row_end: int,
+        decision_start: int,
+        decision_count: Tensor,
+        decision_count_host: tuple[int, ...] | None = None,
+        total_decision_groups: int | None = None,
+        total_stored_decision_groups: int | None = None,
+        decision_option_idx: Tensor,
+        decision_target_idx: Tensor,
+        decision_mask: Tensor,
+        uses_none_head: Tensor,
+        selected_indices: Tensor,
+        behavior_action_log_prob: Tensor | None,
+    ) -> Tensor:
+        counts = decision_count.to(device=self.device)
+        batch_size = row_end - row_start
+        if int(counts.shape[0]) != batch_size:
+            raise ValueError("decision_count length must match appended row count")
+        if decision_count_host is not None and len(decision_count_host) != batch_size:
+            raise ValueError("decision_count_host length must match appended row count")
+        stored_counts = counts.clamp(max=self.max_decision_groups)
+        total_stored = (
+            int(total_stored_decision_groups)
+            if total_stored_decision_groups is not None
+            else (
+                sum(min(int(c), self.max_decision_groups) for c in decision_count_host)
+                if decision_count_host is not None
+                else int(stored_counts.sum().item())
+            )
+        )
+        starts = torch.cumsum(stored_counts, dim=0) - stored_counts + int(decision_start)
+        self.decision_start[row_start:row_end] = starts
+        self.decision_count[row_start:row_end] = stored_counts
+        if total_stored == 0:
+            return stored_counts
+
+        total_source = (
+            int(total_decision_groups)
+            if total_decision_groups is not None
+            else int(decision_option_idx.shape[0])
+        )
+        required_source = (
+            sum(int(c) for c in decision_count_host)
+            if decision_count_host is not None
+            else int(counts.sum().item())
+        )
+        if total_source < required_source:
+            raise ValueError("decision tensors do not contain decision_count groups")
+        if int(decision_option_idx.shape[0]) < total_source:
+            raise ValueError("decision_option_idx has fewer rows than total_decision_groups")
+        step_for_source = torch.repeat_interleave(
+            torch.arange(batch_size, device=self.device),
+            counts,
+            output_size=total_source,
+        )
+        source_group_starts = torch.cumsum(counts, dim=0) - counts
+        group_in_step = (
+            torch.arange(total_source, device=self.device) - source_group_starts[step_for_source]
+        )
+        valid = group_in_step < self.max_decision_groups
+        relative_dest = starts[step_for_source] - int(decision_start) + group_in_step
+        dummy_dest = relative_dest.new_full((), total_stored)
+        relative_dest = torch.where(valid, relative_dest, dummy_dest)
+
+        option_tmp = torch.full(
+            (total_stored + 1, self.max_cached_choices),
+            -1,
+            dtype=self.core.index_dtype,
+            device=self.device,
+        )
+        target_tmp = torch.full_like(option_tmp, -1)
+        mask_tmp = torch.zeros(
+            total_stored + 1,
+            self.max_cached_choices,
+            dtype=torch.bool,
+            device=self.device,
+        )
+        none_tmp = torch.zeros(total_stored + 1, dtype=torch.bool, device=self.device)
+        selected_tmp = torch.full(
+            (total_stored + 1,),
+            -1,
+            dtype=self.core.index_dtype,
+            device=self.device,
+        )
+        behavior_lp_tmp = torch.zeros(total_stored + 1, dtype=torch.float32, device=self.device)
+
+        option_tmp[relative_dest] = decision_option_idx[:total_source].to(
+            device=self.device, dtype=self.core.index_dtype
+        )
+        target_tmp[relative_dest] = decision_target_idx[:total_source].to(
+            device=self.device, dtype=self.core.index_dtype
+        )
+        mask_tmp[relative_dest] = decision_mask[:total_source].to(
+            device=self.device, dtype=torch.bool
+        )
+        none_tmp[relative_dest] = uses_none_head[:total_source].to(
+            device=self.device, dtype=torch.bool
+        )
+        selected_tmp[relative_dest] = selected_indices[:total_source].to(
+            device=self.device, dtype=self.core.index_dtype
+        )
+        if behavior_action_log_prob is not None:
+            behavior_lp_tmp[relative_dest] = behavior_action_log_prob[:total_source].to(
+                device=self.device, dtype=torch.float32
+            )
+
+        decision_end = int(decision_start) + total_stored
+        self.decision_option_idx[decision_start:decision_end] = option_tmp[:-1]
+        self.decision_target_idx[decision_start:decision_end] = target_tmp[:-1]
+        self.decision_mask[decision_start:decision_end] = mask_tmp[:-1]
+        self.uses_none_head[decision_start:decision_end] = none_tmp[:-1]
+        self.selected_indices[decision_start:decision_end] = selected_tmp[:-1]
+        self.behavior_action_log_prob[decision_start:decision_end] = behavior_lp_tmp[:-1]
+        return stored_counts
 
     def append_batch(
         self,
@@ -469,6 +661,200 @@ class TextReplayBuffer:
 
         return rows
 
+    def write_batch_at(
+        self,
+        *,
+        rows: Tensor,
+        rows_host: tuple[int, ...],
+        encoded: PackedTextBatch,
+        trace_kind_id: Tensor,
+        decision_count: Tensor,
+        decision_count_host: tuple[int, ...] | None = None,
+        total_decision_groups: int | None = None,
+        decision_option_idx: Tensor,
+        decision_target_idx: Tensor,
+        decision_mask: Tensor,
+        uses_none_head: Tensor,
+        selected_indices: Tensor,
+        may_selected: Tensor,
+        old_log_prob: Tensor,
+        value: Tensor,
+        perspective_player_idx: Tensor,
+        behavior_action_log_prob: Tensor | None = None,
+        lstm_h_in: Tensor | None = None,
+        lstm_c_in: Tensor | None = None,
+    ) -> Tensor:
+        """Write replay rows at pre-reserved fixed row ids.
+
+        This is the native actor hot path: row ids are claimed by the caller
+        with host-side slot/step bookkeeping, then this method performs the
+        tensor writes directly into final replay storage.
+        """
+
+        batch_size = int(encoded.seq_lengths.shape[0])
+        if batch_size == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        if len(rows_host) != batch_size:
+            raise ValueError("rows_host length must match batch size")
+        if max(rows_host) >= self.capacity or min(rows_host) < 0:
+            raise RuntimeError("TextReplayBuffer fixed replay row is out of range")
+        rows = rows.to(device=self.device, dtype=torch.long)
+        seq_lengths = encoded.seq_lengths.to(device=self.device)
+        seq_lengths_host = self._packed_seq_lengths_host(encoded)
+        if self.validate:
+            max_seq_length = max(seq_lengths_host, default=0)
+            if max_seq_length > self.max_tokens:
+                raise ValueError("encoded packed row token width exceeds buffer max_tokens")
+            self._validate_packed_blank_widths(encoded)
+        if decision_count_host is not None and len(decision_count_host) != batch_size:
+            raise ValueError("decision_count_host length must match batch size")
+
+        # Mark sparse fixed rows as occupied for gather-time validation. The
+        # caller only samples explicit row ids, so holes below this cursor are
+        # harmless.
+        self.core._row_cursor = max(self.core._row_cursor, max(rows_host) + 1)
+        for row, seq_len in zip(rows_host, seq_lengths_host, strict=True):
+            self.row_token_length_host[int(row)] = int(seq_len)
+
+        total_tokens = int(encoded.token_ids.numel())
+        token_start = self._token_cursor
+        token_end = token_start + total_tokens
+        if token_end > int(self.packed_token_ids.numel()):
+            raise RuntimeError("TextReplayBuffer packed token arena is full")
+        self._token_cursor = token_end
+        seq_lengths_i32 = seq_lengths.to(dtype=torch.int32)
+        self.row_token_length[rows] = seq_lengths_i32
+        self.seq_lengths[rows] = seq_lengths_i32
+        if total_tokens > 0:
+            self.packed_token_ids[token_start:token_end] = encoded.token_ids.to(
+                device=self.device, dtype=torch.int32
+            )
+        self.row_token_start[rows] = token_start + encoded.cu_seqlens[:-1].to(
+            device=self.device, dtype=torch.int32
+        )
+
+        state_positions = encoded.state_positions.to(device=self.device, dtype=torch.int32)
+        self.card_ref_positions.index_fill_(0, rows, -1)
+        self.card_ref_positions[rows] = subtract_packed_offsets(
+            encoded.card_ref_positions.to(device=self.device),
+            state_positions,
+        )
+        self.blank_positions.index_fill_(0, rows, -1)
+        self.blank_kind.index_fill_(0, rows, 0)
+        self.blank_group.index_fill_(0, rows, -1)
+        self.blank_group_kind.index_fill_(0, rows, 0)
+        self.blank_option_index.index_fill_(0, rows, -1)
+        self.blank_legal_ids.index_fill_(0, rows, 0)
+        self.blank_legal_mask.index_fill_(0, rows, 0)
+        blank_width = min(int(encoded.blank_positions.shape[1]), self.max_blanks_per_row)
+        blank_legal_width = min(int(encoded.blank_legal_ids.shape[2]), self.max_legal_per_blank)
+        if blank_width > 0:
+            self.blank_positions[rows, :blank_width] = subtract_packed_offsets(
+                encoded.blank_positions[:, :blank_width].to(device=self.device),
+                state_positions,
+            )
+            self.blank_kind[rows, :blank_width] = encoded.blank_kind[:, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+            self.blank_group[rows, :blank_width] = encoded.blank_group[:, :blank_width].to(
+                device=self.device, dtype=torch.int32
+            )
+            self.blank_group_kind[rows, :blank_width] = encoded.blank_group_kind[
+                :, :blank_width
+            ].to(device=self.device, dtype=torch.int32)
+            self.blank_option_index[rows, :blank_width] = encoded.blank_option_index[
+                :, :blank_width
+            ].to(device=self.device, dtype=torch.int32)
+            if blank_legal_width > 0:
+                self.blank_legal_ids[rows, :blank_width, :blank_legal_width] = (
+                    encoded.blank_legal_ids[:, :blank_width, :blank_legal_width].to(
+                        device=self.device, dtype=torch.int32
+                    )
+                )
+                self.blank_legal_mask[rows, :blank_width, :blank_legal_width] = (
+                    encoded.blank_legal_mask[:, :blank_width, :blank_legal_width].to(
+                        device=self.device, dtype=torch.bool
+                    )
+                )
+
+        counts = decision_count.to(device=self.device)
+        stored_counts = counts.clamp(max=self.max_decision_groups)
+        decision_starts = rows * int(self.max_decision_groups)
+        self.decision_start[rows] = decision_starts.to(dtype=self.decision_start.dtype)
+        self.decision_count[rows] = stored_counts.to(dtype=self.decision_count.dtype)
+        decision_slots = rows.unsqueeze(1) * int(self.max_decision_groups) + torch.arange(
+            self.max_decision_groups, dtype=torch.long, device=self.device
+        )
+        flat_slots = decision_slots.reshape(-1)
+        self.decision_option_idx.index_fill_(0, flat_slots, -1)
+        self.decision_target_idx.index_fill_(0, flat_slots, -1)
+        self.decision_mask.index_fill_(0, flat_slots, 0)
+        self.uses_none_head.index_fill_(0, flat_slots, 0)
+        self.selected_indices.index_fill_(0, flat_slots, -1)
+        self.behavior_action_log_prob.index_fill_(0, flat_slots, 0)
+
+        total_source = (
+            int(total_decision_groups)
+            if total_decision_groups is not None
+            else int(decision_option_idx.shape[0])
+        )
+        if total_source > 0:
+            step_for_source = torch.repeat_interleave(
+                torch.arange(batch_size, device=self.device),
+                counts,
+                output_size=total_source,
+            )
+            source_group_starts = torch.cumsum(counts, dim=0) - counts
+            group_in_step = (
+                torch.arange(total_source, device=self.device)
+                - source_group_starts[step_for_source]
+            )
+            valid = group_in_step < self.max_decision_groups
+            dest = decision_starts[step_for_source] + group_in_step
+            dest = dest[valid]
+            src = valid
+            self.decision_option_idx[dest] = decision_option_idx[:total_source][src].to(
+                device=self.device, dtype=self.core.index_dtype
+            )
+            self.decision_target_idx[dest] = decision_target_idx[:total_source][src].to(
+                device=self.device, dtype=self.core.index_dtype
+            )
+            self.decision_mask[dest] = decision_mask[:total_source][src].to(
+                device=self.device, dtype=torch.bool
+            )
+            self.uses_none_head[dest] = uses_none_head[:total_source][src].to(
+                device=self.device, dtype=torch.bool
+            )
+            self.selected_indices[dest] = selected_indices[:total_source][src].to(
+                device=self.device, dtype=self.core.index_dtype
+            )
+            if behavior_action_log_prob is not None:
+                self.behavior_action_log_prob[dest] = behavior_action_log_prob[:total_source][
+                    src
+                ].to(device=self.device, dtype=torch.float32)
+
+        self.trace_kind_id[rows] = trace_kind_id.to(
+            device=self.device, dtype=self.trace_kind_id.dtype
+        )
+        self.may_selected[rows] = may_selected.to(device=self.device, dtype=torch.float32)
+        self.old_log_prob[rows] = old_log_prob.to(device=self.device, dtype=torch.float32)
+        self.value[rows] = value.to(device=self.device, dtype=torch.float32)
+        self.perspective_player_idx[rows] = perspective_player_idx.to(
+            device=self.device, dtype=self.perspective_player_idx.dtype
+        )
+        if self.lstm_h_in is not None and self.lstm_c_in is not None:
+            if lstm_h_in is None or lstm_c_in is None:
+                raise ValueError("h_in and c_in are required for recurrent text replay")
+            self.lstm_h_in[rows] = lstm_h_in.permute(1, 0, 2).to(
+                device=self.device, dtype=torch.float32
+            )
+            self.lstm_c_in[rows] = lstm_c_in.permute(1, 0, 2).to(
+                device=self.device, dtype=torch.float32
+            )
+        elif lstm_h_in is not None or lstm_c_in is not None:
+            raise ValueError("buffer was constructed without recurrent state storage")
+        return rows
+
     def append_staged_batch(
         self,
         *,
@@ -510,19 +896,28 @@ class TextReplayBuffer:
             return torch.empty(0, dtype=torch.long, device=self.device)
         if len(seq_lengths_host) != batch_size:
             raise ValueError("seq_lengths_host length must match batch size")
-        if self.capacity - self.size < batch_size:
-            raise RuntimeError("TextReplayBuffer is full")
         seq_lengths = seq_lengths.to(device=self.device)
         if self.validate:
             max_seq_length = max(seq_lengths_host, default=0)
             if max_seq_length > self.max_tokens:
                 raise ValueError("encoded staged row token width exceeds buffer max_tokens")
         total_tokens = sum(int(x) for x in seq_lengths_host)
-        token_start = self._token_cursor
-        token_end = token_start + total_tokens
-        if token_end > int(self.packed_token_ids.numel()):
-            raise RuntimeError("TextReplayBuffer packed token arena is full")
-        self._token_cursor = token_end
+        if decision_count_host is not None and len(decision_count_host) != batch_size:
+            raise ValueError("decision_count_host length must match batch size")
+        total_stored = (
+            int(total_stored_decision_groups)
+            if total_stored_decision_groups is not None
+            else (
+                sum(min(int(c), self.max_decision_groups) for c in decision_count_host)
+                if decision_count_host is not None
+                else int(
+                    decision_count.to(device=self.device)
+                    .clamp(max=self.max_decision_groups)
+                    .sum()
+                    .item()
+                )
+            )
+        )
         if self.lstm_h_in is not None and self.lstm_c_in is not None:
             if lstm_h_in is None or lstm_c_in is None:
                 raise ValueError("h_in and c_in are required for recurrent text replay")
@@ -535,47 +930,67 @@ class TextReplayBuffer:
             c_store = None
 
         try:
-            rows = self.core.append_batch(
-                trace_kind_id=trace_kind_id,
-                decision_count=decision_count,
-                decision_count_host=decision_count_host,
-                total_decision_groups=total_decision_groups,
-                total_stored_decision_groups=total_stored_decision_groups,
-                decision_option_idx=decision_option_idx,
-                decision_target_idx=decision_target_idx,
-                decision_mask=decision_mask,
-                uses_none_head=uses_none_head,
-                selected_indices=selected_indices,
-                behavior_action_log_prob=behavior_action_log_prob,
-                may_selected=may_selected,
-                old_log_prob=old_log_prob,
-                value=value,
-                perspective_player_idx=perspective_player_idx,
-                lstm_h_in=h_store,
-                lstm_c_in=c_store,
+            reservation = self._reserve_append(
+                row_count=batch_size,
+                token_count=total_tokens,
+                decision_count=total_stored,
             )
         except RuntimeError as exc:
             raise RuntimeError("TextReplayBuffer is full") from exc
 
-        row_start = self.size - batch_size
+        row_start = reservation.row_start
+        row_end = reservation.row_end
+        token_start = reservation.token_start
+        token_end = reservation.token_end
+        rows = torch.arange(row_start, row_end, dtype=torch.long, device=self.device)
         self.row_token_length_host[row_start : row_start + batch_size] = [
             int(x) for x in seq_lengths_host
         ]
+
+        self._write_decision_batch_at(
+            row_start=row_start,
+            row_end=row_end,
+            decision_start=reservation.decision_start,
+            decision_count=decision_count,
+            decision_count_host=decision_count_host,
+            total_decision_groups=total_decision_groups,
+            total_stored_decision_groups=total_stored,
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            selected_indices=selected_indices,
+            behavior_action_log_prob=behavior_action_log_prob,
+        )
+        self.trace_kind_id[row_start:row_end] = trace_kind_id.to(
+            device=self.device, dtype=self.trace_kind_id.dtype
+        )
+        self.may_selected[row_start:row_end] = may_selected.to(
+            device=self.device, dtype=torch.float32
+        )
+        self.old_log_prob[row_start:row_end] = old_log_prob.to(
+            device=self.device, dtype=torch.float32
+        )
+        self.value[row_start:row_end] = value.to(device=self.device, dtype=torch.float32)
+        self.perspective_player_idx[row_start:row_end] = perspective_player_idx.to(
+            device=self.device, dtype=self.perspective_player_idx.dtype
+        )
+        self.core._write_recurrent_batch(row_start, row_end, h_store, c_store)
 
         cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
         cu_seqlens[1:] = seq_lengths.cumsum(0).to(dtype=torch.int32)
         flat_env = flat_env.to(device=self.device, dtype=torch.long)
         flat_step = flat_step.to(device=self.device, dtype=torch.long)
-        self.row_token_start[rows] = -1
-        self.row_token_length[rows] = 0
-        self.card_ref_positions.index_fill_(0, rows, -1)
-        self.blank_positions.index_fill_(0, rows, -1)
-        self.blank_kind.index_fill_(0, rows, 0)
-        self.blank_group.index_fill_(0, rows, -1)
-        self.blank_group_kind.index_fill_(0, rows, 0)
-        self.blank_option_index.index_fill_(0, rows, -1)
-        self.blank_legal_ids.index_fill_(0, rows, 0)
-        self.blank_legal_mask.index_fill_(0, rows, 0)
+        self.row_token_start[row_start:row_end] = -1
+        self.row_token_length[row_start:row_end] = 0
+        self.card_ref_positions[row_start:row_end].fill_(-1)
+        self.blank_positions[row_start:row_end].fill_(-1)
+        self.blank_kind[row_start:row_end].zero_()
+        self.blank_group[row_start:row_end].fill_(-1)
+        self.blank_group_kind[row_start:row_end].zero_()
+        self.blank_option_index[row_start:row_end].fill_(-1)
+        self.blank_legal_ids[row_start:row_end].zero_()
+        self.blank_legal_mask[row_start:row_end].zero_()
         row_tokens = token_ids[flat_env, flat_step]
         if total_tokens > 0:
             seq_id = torch.repeat_interleave(
@@ -627,6 +1042,7 @@ class TextReplayBuffer:
                     flat_env, flat_step, :blank_width, :blank_legal_width
                 ].to(device=self.device, dtype=torch.bool)
 
+        self._seal_reservation(reservation)
         return rows
 
     def _write_row_packed_tokens(self, row: int, token_ids: Tensor) -> None:

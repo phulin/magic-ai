@@ -41,7 +41,6 @@ from magic_ai.text_encoder.batch import (
     PackedTextBatch,
     TextEncodedBatch,
     pack_batch,
-    packed_sequence_layout,
     subtract_packed_offsets,
 )
 from magic_ai.text_encoder.policy import EncodedSnapshots
@@ -3203,14 +3202,15 @@ def _move_packed_text_batch(batch: PackedTextBatch, device: torch.device) -> Pac
     nb = device.type == "cuda"
     seq_lengths = batch.seq_lengths.to(device, non_blocking=nb)
     cu_seqlens = batch.cu_seqlens.to(device, non_blocking=nb)
-    if batch.seq_id.numel() == 0 and batch.pos_in_seq.numel() == 0:
-        _, _, seq_id, pos_in_seq = packed_sequence_layout(
-            seq_lengths,
-            total_tokens=batch.total_tokens,
+    token_count = int(batch.token_ids.shape[0])
+    if int(batch.seq_id.shape[0]) != token_count or int(batch.pos_in_seq.shape[0]) != token_count:
+        raise ValueError(
+            "packed batch token metadata length must match token_ids length "
+            f"(tokens={token_count}, seq_id={int(batch.seq_id.shape[0])}, "
+            f"pos_in_seq={int(batch.pos_in_seq.shape[0])})"
         )
-    else:
-        seq_id = batch.seq_id.to(device, non_blocking=nb)
-        pos_in_seq = batch.pos_in_seq.to(device, non_blocking=nb)
+    seq_id = batch.seq_id.to(device, non_blocking=nb)
+    pos_in_seq = batch.pos_in_seq.to(device, non_blocking=nb)
     return PackedTextBatch(
         token_ids=batch.token_ids.to(device, non_blocking=nb),
         seq_id=seq_id,

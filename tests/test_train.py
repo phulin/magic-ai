@@ -694,6 +694,55 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(tuple(backend.policy.live_lstm_h.shape), (1, 4, 8))
         build_cache.assert_called_once()
 
+    def test_build_text_backend_default_replay_capacity_is_three_rollouts(self) -> None:
+        from magic_ai.text_encoder.card_cache import CardTokenCache
+
+        class StubTokenizer:
+            pad_token_id = 0
+
+            def __len__(self) -> int:
+                return 32
+
+        cache = CardTokenCache(
+            token_buffer=torch.empty(0, dtype=torch.int32),
+            offsets=torch.tensor([0, 0], dtype=torch.int64),
+            row_to_name=["<unknown>"],
+            engine_card_set_hash="stub",
+        )
+        args = Namespace(
+            card_token_cache=Path("missing-card-cache.pt"),
+            text_d_model=8,
+            text_layers=1,
+            text_heads=2,
+            text_d_ff=16,
+            text_max_tokens=8,
+            hidden_layers=1,
+            num_envs=16,
+            rollout_buffer_capacity=None,
+            rollout_steps=2000,
+            max_steps_per_game=4,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            torch_compile=False,
+            text_native_assembler=False,
+        )
+
+        with (
+            patch("scripts.train.load_tokenizer", return_value=StubTokenizer()),
+            patch("scripts.train.load_oracle_db", return_value={"Mountain": {}}),
+            patch(
+                "scripts.train.fetch_registered_card_names_from_engine",
+                return_value=["Mountain"],
+            ),
+            patch("scripts.train.build_card_cache", return_value=cache),
+            patch("scripts.train.build_assembler_tokens", return_value=object()),
+        ):
+            backend = build_text_backend(args, torch.device("cpu"))
+
+        self.assertEqual(backend.replay_buffer.capacity, 6000)
+
     def test_sample_text_policy_batch_emits_assembles_and_appends_replay(self) -> None:
         from magic_ai.text_encoder.card_cache import CardTokenCache
 
@@ -977,7 +1026,7 @@ class TrainPPOTests(unittest.TestCase):
 
     def test_native_text_staging_commits_completed_env_to_replay(self) -> None:
         replay_buffer = TextReplayBuffer(
-            capacity=4,
+            capacity=6,
             max_tokens=5,
             max_options=3,
             max_targets_per_option=2,
