@@ -72,6 +72,10 @@ class PolicyVersionManager:
         with self._cond:
             return self._version
 
+    @property
+    def device(self) -> torch.device:
+        return next(self._active.parameters()).device
+
     @contextlib.contextmanager
     def acquire_inference_policy(self, max_lag: int | None = None) -> Iterator[tuple[Any, int]]:
         del max_lag

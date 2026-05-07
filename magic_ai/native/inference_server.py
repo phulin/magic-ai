@@ -30,6 +30,23 @@ from magic_ai.text_encoder.actor_critic import NativeTextReplayPayload
 from magic_ai.text_encoder.batch import PackedTextBatch
 
 
+def _infer_policy_device(policy: Any) -> torch.device:
+    device = getattr(policy, "device", None)
+    if device is not None:
+        return torch.device(device)
+    parameters = getattr(policy, "parameters", None)
+    if parameters is not None:
+        try:
+            return next(parameters()).device
+        except StopIteration:
+            pass
+    return torch.device("cpu")
+
+
+def _arena_empty(*shape: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    return torch.empty(shape, dtype=dtype, device=device)
+
+
 class _HeadItemDoesNotFit(Exception):
     pass
 
@@ -295,6 +312,7 @@ class _PendingItem:
     seq_lengths_host: tuple[int, ...]
     blank_cols: int
     legal_cols: int
+    copy_event: torch.cuda.Event | None = None
     released: bool = False
 
 
@@ -307,10 +325,11 @@ class _InferenceWorkRing:
     the policy call, avoiding per-batch ``torch.cat`` work on the critical path.
     """
 
-    def __init__(self, *, capacity_rows: int) -> None:
+    def __init__(self, *, capacity_rows: int, arena_device: torch.device) -> None:
         if capacity_rows < 1:
             raise ValueError("capacity_rows must be >= 1")
         self.capacity_rows = int(capacity_rows)
+        self.arena_device = torch.device(arena_device)
         self.token_capacity = self.capacity_rows * 1024
         self.decision_capacity = self.capacity_rows * 128
         self._cond = threading.Condition()
@@ -389,6 +408,7 @@ class _InferenceWorkRing:
             self._reserved_tokens += token_count
             self._reserved_decisions += decision_count
 
+        copy_event: torch.cuda.Event | None = None
         try:
             self._copy_into_arena(
                 native=native,
@@ -402,6 +422,9 @@ class _InferenceWorkRing:
                 decision_start=decision_start,
                 decision_end=decision_end,
             )
+            if self.arena_device.type == "cuda":
+                copy_event = torch.cuda.Event()
+                copy_event.record(torch.cuda.current_stream(self.arena_device))
         except BaseException:
             with self._cond:
                 self._reserved_rows -= rows
@@ -436,6 +459,7 @@ class _InferenceWorkRing:
                 seq_lengths_host=seq_lengths_host,
                 blank_cols=int(packed.blank_positions.shape[1]),
                 legal_cols=int(packed.blank_legal_ids.shape[2]),
+                copy_event=copy_event,
             )
             self._pending_publish[publish_seq] = item
             while self._next_publish_seq in self._pending_publish:
@@ -664,6 +688,14 @@ class _InferenceWorkRing:
         sliced.blank_legal_mask = sliced.blank_legal_mask[:, :blank_cols, :legal_cols]
         return sliced
 
+    def wait_for_item_copies(self, items: list[_PendingItem]) -> None:
+        if self.arena_device.type != "cuda":
+            return
+        stream = torch.cuda.current_stream(self.arena_device)
+        for item in items:
+            if item.copy_event is not None:
+                stream.wait_event(item.copy_event)
+
     def _validate_item_capacity(self, *, rows: int, tokens: int, decisions: int) -> None:
         if tokens > self.token_capacity:
             raise RuntimeError(
@@ -737,91 +769,103 @@ class _InferenceWorkRing:
                 name = field.name
                 if name in row_names:
                     src = cast(torch.Tensor, getattr(native, name))
-                    self._native_arena[name] = torch.empty(
-                        (self.capacity_rows, *src.shape[1:]),
+                    self._native_arena[name] = _arena_empty(
+                        self.capacity_rows,
+                        *src.shape[1:],
                         dtype=src.dtype,
-                        device=src.device,
+                        device=self.arena_device,
                     )
                 elif name in decision_names:
                     src = cast(torch.Tensor, getattr(native, name))
-                    self._native_arena[name] = torch.empty(
-                        (self.decision_capacity, *src.shape[1:]),
+                    self._native_arena[name] = _arena_empty(
+                        self.decision_capacity,
+                        *src.shape[1:],
                         dtype=src.dtype,
-                        device=src.device,
+                        device=self.arena_device,
                     )
         if self._packed_arena is None:
             blank_capacity = max(64, int(packed.blank_positions.shape[1]))
             legal_capacity = max(64, int(packed.blank_legal_ids.shape[2]))
             self._packed_arena = {
-                "token_ids": torch.empty(
-                    (self.token_capacity,),
+                "token_ids": _arena_empty(
+                    self.token_capacity,
                     dtype=packed.token_ids.dtype,
-                    device=packed.token_ids.device,
+                    device=self.arena_device,
                 ),
-                "seq_id": torch.empty(
-                    (self.token_capacity,),
+                "seq_id": _arena_empty(
+                    self.token_capacity,
                     dtype=torch.int32,
-                    device=packed.seq_id.device,
+                    device=self.arena_device,
                 ),
-                "pos_in_seq": torch.empty(
-                    (self.token_capacity,),
+                "pos_in_seq": _arena_empty(
+                    self.token_capacity,
                     dtype=torch.int32,
-                    device=packed.pos_in_seq.device,
+                    device=self.arena_device,
                 ),
-                "cu_seqlens": torch.empty(
-                    (self.capacity_rows + 1,),
+                "cu_seqlens": _arena_empty(
+                    self.capacity_rows + 1,
                     dtype=torch.int32,
-                    device=packed.cu_seqlens.device,
+                    device=self.arena_device,
                 ),
-                "seq_lengths": torch.empty(
-                    (self.capacity_rows,),
+                "seq_lengths": _arena_empty(
+                    self.capacity_rows,
                     dtype=torch.int32,
-                    device=packed.seq_lengths.device,
+                    device=self.arena_device,
                 ),
-                "state_positions": torch.empty(
-                    (self.capacity_rows,),
+                "state_positions": _arena_empty(
+                    self.capacity_rows,
                     dtype=torch.int32,
-                    device=packed.state_positions.device,
+                    device=self.arena_device,
                 ),
-                "card_ref_positions": torch.empty(
-                    (self.capacity_rows, *packed.card_ref_positions.shape[1:]),
+                "card_ref_positions": _arena_empty(
+                    self.capacity_rows,
+                    *packed.card_ref_positions.shape[1:],
                     dtype=torch.int32,
-                    device=packed.card_ref_positions.device,
+                    device=self.arena_device,
                 ),
-                "blank_positions": torch.empty(
-                    (self.capacity_rows, blank_capacity),
+                "blank_positions": _arena_empty(
+                    self.capacity_rows,
+                    blank_capacity,
                     dtype=torch.int32,
-                    device=packed.blank_positions.device,
+                    device=self.arena_device,
                 ),
-                "blank_kind": torch.empty(
-                    (self.capacity_rows, blank_capacity),
+                "blank_kind": _arena_empty(
+                    self.capacity_rows,
+                    blank_capacity,
                     dtype=torch.int32,
-                    device=packed.blank_kind.device,
+                    device=self.arena_device,
                 ),
-                "blank_group": torch.empty(
-                    (self.capacity_rows, blank_capacity),
+                "blank_group": _arena_empty(
+                    self.capacity_rows,
+                    blank_capacity,
                     dtype=torch.int32,
-                    device=packed.blank_group.device,
+                    device=self.arena_device,
                 ),
-                "blank_group_kind": torch.empty(
-                    (self.capacity_rows, blank_capacity),
+                "blank_group_kind": _arena_empty(
+                    self.capacity_rows,
+                    blank_capacity,
                     dtype=torch.int32,
-                    device=packed.blank_group_kind.device,
+                    device=self.arena_device,
                 ),
-                "blank_option_index": torch.empty(
-                    (self.capacity_rows, blank_capacity),
+                "blank_option_index": _arena_empty(
+                    self.capacity_rows,
+                    blank_capacity,
                     dtype=torch.int32,
-                    device=packed.blank_option_index.device,
+                    device=self.arena_device,
                 ),
-                "blank_legal_ids": torch.empty(
-                    (self.capacity_rows, blank_capacity, legal_capacity),
+                "blank_legal_ids": _arena_empty(
+                    self.capacity_rows,
+                    blank_capacity,
+                    legal_capacity,
                     dtype=torch.int32,
-                    device=packed.blank_legal_ids.device,
+                    device=self.arena_device,
                 ),
-                "blank_legal_mask": torch.empty(
-                    (self.capacity_rows, blank_capacity, legal_capacity),
+                "blank_legal_mask": _arena_empty(
+                    self.capacity_rows,
+                    blank_capacity,
+                    legal_capacity,
                     dtype=torch.bool,
-                    device=packed.blank_legal_mask.device,
+                    device=self.arena_device,
                 ),
             }
 
@@ -1011,11 +1055,12 @@ class TextInferenceServer:
         self._deterministic = bool(deterministic)
         self._timing = timing_stats
         self._queue = _InferenceWorkRing(
+            arena_device=_infer_policy_device(sampling_policy),
             capacity_rows=(
                 int(ring_capacity_rows)
                 if ring_capacity_rows is not None
                 else max(int(max_batch) * 8, int(max_batch))
-            )
+            ),
         )
         self._stop_event = threading.Event()
         # Pause/resume coordination. ``_paused`` is the desired state; the
@@ -1228,6 +1273,7 @@ class TextInferenceServer:
 
     def _process(self, items: list[_PendingItem]) -> None:
         start = time.perf_counter()
+        self._queue.wait_for_item_copies(items)
         merged_native = self._queue.native_batch_for(items)
         merged_packed = self._queue.packed_batch_for(items)
         env_indices: list[int] = [i for it in items for i in it.env_indices]
