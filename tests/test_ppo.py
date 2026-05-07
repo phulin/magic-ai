@@ -361,6 +361,54 @@ class GaeReturnsBatchedParityTest(unittest.TestCase):
         torch.testing.assert_close(got[1, :3], ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(got[1, 3], torch.tensor(0.0))
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the Triton GAE kernel")
+    def test_cuda_triton_parity_max_steps_200(self) -> None:
+        torch.manual_seed(0)
+        batch = 16
+        max_steps = 200
+        values = torch.randn(batch, max_steps, dtype=torch.float32)
+        players = torch.randint(0, 2, (batch, max_steps), dtype=torch.long)
+        step_count = torch.randint(0, max_steps + 1, (batch,), dtype=torch.long)
+        step_count[:3] = torch.tensor([0, 1, max_steps])
+        terminal_p0 = torch.randn(batch, dtype=torch.float32)
+        zero_sum = torch.randint(0, 2, (batch,), dtype=torch.bool)
+        gamma = 0.99
+        gae_lambda = 0.5
+
+        ref = torch.zeros_like(values)
+        for b in range(batch):
+            count = int(step_count[b])
+            advantage_next = torch.tensor(0.0)
+            for t in range(count - 1, -1, -1):
+                reward = torch.tensor(0.0)
+                if t == count - 1:
+                    terminal = terminal_p0[b]
+                    if bool(zero_sum[b]) and int(players[b, t]) == 1:
+                        terminal = -terminal
+                    reward = terminal
+                bootstrap = torch.tensor(0.0)
+                coeff = torch.tensor(0.0)
+                if t + 1 < count:
+                    sign = 1.0
+                    if int(players[b, t]) != int(players[b, t + 1]) and bool(zero_sum[b]):
+                        sign = -1.0
+                    bootstrap = gamma * sign * values[b, t + 1]
+                    coeff = gamma * gae_lambda * sign
+                delta = reward - values[b, t] + bootstrap
+                advantage_next = delta + coeff * advantage_next
+                ref[b, t] = advantage_next + values[b, t]
+
+        got = gae_returns_batched(
+            values.cuda(),
+            players.cuda(),
+            step_count.cuda(),
+            terminal_reward_p0=terminal_p0.cuda(),
+            zero_sum=zero_sum.cuda(),
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+        ).cpu()
+        torch.testing.assert_close(got, ref, atol=2e-5, rtol=2e-5)
+
 
 if __name__ == "__main__":
     unittest.main()

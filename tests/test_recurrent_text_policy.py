@@ -128,6 +128,15 @@ def test_recurrent_init_state_zeros() -> None:
     assert c.device == device
 
 
+def test_normalize_lstm_final_state_squeezes_compiled_singleton_dim() -> None:
+    policy = _make_policy(lstm_hidden=32, lstm_layers=1)
+    state = torch.zeros(1, 1, 5, 32)
+
+    normalized = policy._normalize_lstm_final_state(state, batch_size=5, name="h_out")
+
+    assert normalized.shape == (1, 5, 32)
+
+
 def test_forward_packed_bypasses_compiled_callable_during_fx_trace(monkeypatch) -> None:
     policy = _make_policy()
     packed = pack_batch(_make_batch())

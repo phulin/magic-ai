@@ -97,6 +97,15 @@ class RecurrentTextPolicy(nn.Module):
         c = torch.zeros(shape, device=device)
         return h, c
 
+    def _normalize_lstm_final_state(self, state: Tensor, batch_size: int, name: str) -> Tensor:
+        expected = (self.lstm_layers, batch_size, self.lstm_hidden)
+        if tuple(state.shape) == expected:
+            return state
+        squeezed = state.squeeze(1) if state.dim() == 4 and state.shape[1] == 1 else state
+        if tuple(squeezed.shape) != expected:
+            raise ValueError(f"{name} must have shape {expected}; got {tuple(state.shape)}")
+        return squeezed
+
     def forward(
         self,
         batch: TextEncodedBatch,
@@ -198,6 +207,8 @@ class RecurrentTextPolicy(nn.Module):
             h_in = h_in.to(device=device, dtype=lstm_input.dtype)
             c_in = c_in.to(device=device, dtype=lstm_input.dtype)
             y, (h_out, c_out) = self.lstm(lstm_input.unsqueeze(1), (h_in, c_in))
+            h_out = self._normalize_lstm_final_state(h_out, b, "h_out")
+            c_out = self._normalize_lstm_final_state(c_out, b, "c_out")
             state_hidden = y.squeeze(1)
 
         state_for_heads = self.out_proj(state_hidden)

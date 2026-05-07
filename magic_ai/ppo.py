@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from typing import Any, cast
 
 import torch
+import triton
+import triton.language as tl
 from torch import Tensor, nn
 from torch._dynamo.decorators import mark_unbacked
 from torch.nn import functional as F
@@ -321,6 +324,89 @@ def gae_returns(
     return advantages_t + values_t
 
 
+@triton.jit
+def _gae_affine_combine(
+    left_delta,
+    left_coeff,
+    right_delta,
+    right_coeff,
+):
+    return right_delta + right_coeff * left_delta, right_coeff * left_coeff
+
+
+@triton.jit
+def _gae_returns_batched_kernel(
+    values,
+    players,
+    step_counts,
+    terminal_reward_p0,
+    zero_sum,
+    returns,
+    max_steps: tl.constexpr,
+    block_size: tl.constexpr,
+    gamma: tl.constexpr,
+    gae_lambda: tl.constexpr,
+):
+    row = tl.program_id(0)
+    rev_t = tl.arange(0, block_size)
+    rev_mask = rev_t < max_steps
+    t = max_steps - 1 - rev_t
+    offsets = row * max_steps + t
+
+    count = tl.load(step_counts + row)
+    valid = rev_mask & (t < count)
+    next_valid = valid & ((t + 1) < count)
+
+    value = tl.load(values + offsets, mask=rev_mask, other=0.0)
+    next_value = tl.load(values + offsets + 1, mask=next_valid, other=0.0)
+    player = tl.load(players + offsets, mask=valid, other=0)
+    next_player = tl.load(players + offsets + 1, mask=next_valid, other=0)
+
+    zs = tl.load(zero_sum + row).to(tl.int1)
+    cross_sign = tl.where(zs, -1.0, 1.0)
+    sign = tl.where(player == next_player, 1.0, cross_sign)
+    bootstrap = tl.where(next_valid, gamma * sign * next_value, 0.0)
+
+    terminal_p0 = tl.load(terminal_reward_p0 + row)
+    terminal_flip = zs & (player == 1)
+    terminal = tl.where(terminal_flip, -terminal_p0, terminal_p0)
+    reward = tl.where(valid & (t == (count - 1)), terminal, 0.0)
+
+    delta = tl.where(valid, reward - value + bootstrap, 0.0)
+    coeff = tl.where(next_valid, gamma * gae_lambda * sign, 0.0)
+    advantage_rev, _ = tl.associative_scan((delta, coeff), 0, _gae_affine_combine)
+    out = tl.where(valid, advantage_rev + value, 0.0)
+    tl.store(returns + offsets, out, mask=rev_mask)
+
+
+def _gae_returns_batched_triton(
+    values_f: Tensor,
+    players_i: Tensor,
+    step_count_i: Tensor,
+    terminal_reward_p0_f: Tensor,
+    zero_sum_b: Tensor,
+    gamma: float,
+    gae_lambda: float,
+) -> Tensor:
+    batch_size, max_steps = values_f.shape
+    returns = torch.empty_like(values_f)
+    block_size = triton.next_power_of_2(max_steps)
+    kernel = cast(Any, _gae_returns_batched_kernel)
+    kernel[(batch_size,)](
+        values_f,
+        players_i,
+        step_count_i,
+        terminal_reward_p0_f,
+        zero_sum_b,
+        returns,
+        max_steps,
+        block_size,
+        float(gamma),
+        float(gae_lambda),
+    )
+    return returns
+
+
 @torch.compile(dynamic=True, fullgraph=False)
 def _gae_returns_batched_compiled(
     values_f: Tensor,
@@ -437,18 +523,29 @@ def gae_returns_batched(
         raise ValueError("zero_sum must have shape (B,)")
 
     device = values.device
-    values_f = values.to(torch.float32)
-    step_count_l = step_count.to(device=device, dtype=torch.long)
-    players_l = perspective_player_idx.to(device=device, dtype=torch.long)
-    terminal_f = terminal_reward_p0.to(device=device, dtype=torch.float32)
-    zero_sum_b = zero_sum.to(device=device, dtype=torch.bool)
+    values_f = values.to(torch.float32).contiguous()
+    step_count_i = step_count.to(device=device, dtype=torch.int32).contiguous()
+    players_i = perspective_player_idx.to(device=device, dtype=torch.int32).contiguous()
+    terminal_f = terminal_reward_p0.to(device=device, dtype=torch.float32).contiguous()
+    zero_sum_b = zero_sum.to(device=device, dtype=torch.bool).contiguous()
+    if values_f.is_cuda:
+        return _gae_returns_batched_triton(
+            values_f,
+            players_i,
+            step_count_i,
+            terminal_f,
+            zero_sum_b,
+            float(gamma),
+            float(gae_lambda),
+        )
+
     # Batch dim can be 1 (single-game updates); mark unbacked so the size-1
     # call doesn't get specialized and force a recompile when B grows.
     mark_unbacked(values_f, 0)
     return _gae_returns_batched_compiled(
         values_f,
-        players_l,
-        step_count_l,
+        players_i,
+        step_count_i,
         terminal_f,
         zero_sum_b,
         float(gamma),
