@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
+from torch._dynamo.decorators import mark_unbacked
 from torch.nn import functional as F
 
 from magic_ai.training_interfaces import PPOReplayPolicy
@@ -441,6 +442,9 @@ def gae_returns_batched(
     players_l = perspective_player_idx.to(device=device, dtype=torch.long)
     terminal_f = terminal_reward_p0.to(device=device, dtype=torch.float32)
     zero_sum_b = zero_sum.to(device=device, dtype=torch.bool)
+    # Batch dim can be 1 (single-game updates); mark unbacked so the size-1
+    # call doesn't get specialized and force a recompile when B grows.
+    mark_unbacked(values_f, 0)
     return _gae_returns_batched_compiled(
         values_f,
         players_l,

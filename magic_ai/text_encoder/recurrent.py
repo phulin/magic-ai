@@ -21,6 +21,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch._dynamo.decorators import mark_unbacked
 from torch.fx._symbolic_trace import is_fx_symbolic_tracing
 
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
@@ -143,6 +144,9 @@ class RecurrentTextPolicy(nn.Module):
                 torch.compile(self._forward_packed_impl, dynamic=True),
             )
         if self._compiled_forward_packed is not None and not is_fx_symbolic_tracing():
+            # V_max often arrives at 1 then jumps to 8+; mark unbacked to
+            # bypass Dynamo's 0/1 specialization recompile.
+            mark_unbacked(batch.blank_legal_ids, 2)
             return self._compiled_forward_packed(batch, h_in, c_in, state_hidden_override)
         return self._forward_packed_impl(batch, h_in, c_in, state_hidden_override)
 

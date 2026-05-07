@@ -446,6 +446,7 @@ class TextReplayBuffer:
                 else:
                     self._reserve_cond.wait()
 
+    @torch.no_grad()
     def build_ppo_returns_for_rows(
         self,
         rows: Tensor,
