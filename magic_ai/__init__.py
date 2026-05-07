@@ -1,11 +1,9 @@
 """Utilities for Magic AI experiments."""
 
-# Persistent torch.compile / TorchInductor on-disk cache. Set before *anything*
-# that might trigger a compile (flex_attention, policy forwards, MLM encoder).
-# Subsequent runs — including loading a checkpoint into eval — hit the cache
-# and skip recompilation; without this, every fresh process pays the full
-# compile cost again.
+from __future__ import annotations
+
 import os as _os
+from importlib import import_module as _import_module
 from pathlib import Path as _Path
 
 _os.environ.setdefault(
@@ -16,53 +14,6 @@ _os.environ.setdefault(
 _os.environ.setdefault(
     "TORCH_COMPILE_DEBUG_DIR",
     str(_Path.home() / ".cache" / "magic-ai" / "compile-debug"),
-)
-
-from magic_ai.actions import (  # noqa: E402
-    ActionOptionsEncoder,
-    ActionRequest,
-    ActionTrace,
-    EncodedSelectedAction,
-    LegalActionCandidate,
-    ParsedActionInputs,
-    ParsedStep,
-    PolicyStep,
-    SelectedActionEncoder,
-    action_from_attackers,
-    action_from_blockers,
-    action_from_choice_accepted,
-    action_from_choice_color,
-    action_from_choice_ids,
-    action_from_choice_index,
-    action_from_priority_candidate,
-    build_priority_candidates,
-    selected_priority_candidate_index,
-)
-from magic_ai.game_state import (
-    GameCardState,
-    GameStateSnapshot,
-    ManaPoolState,
-    ParsedGameState,
-    PendingOptionState,
-    PendingState,
-    PlayerState,
-)
-from magic_ai.ppo import (
-    PPOStats,
-    RolloutStep,
-    gae_returns,
-    gae_returns_batched,
-    ppo_update,
-)
-from magic_ai.slot_encoder.buffer import NativeTrajectoryBuffer, RolloutBuffer
-from magic_ai.slot_encoder.game_state import GameStateEncoder
-from magic_ai.slot_encoder.model import (
-    PPOPolicy,
-)
-from magic_ai.slot_encoder.native_encoder import (
-    NativeBatchEncoder,
-    NativeEncodedBatch,
-    NativeEncodingError,
 )
 
 __all__ = [
@@ -104,3 +55,52 @@ __all__ = [
     "ppo_update",
     "selected_priority_candidate_index",
 ]
+
+_LAZY_ATTR_TO_MODULE = {
+    "ActionOptionsEncoder": "magic_ai.actions",
+    "ActionRequest": "magic_ai.actions",
+    "ActionTrace": "magic_ai.actions",
+    "EncodedSelectedAction": "magic_ai.actions",
+    "GameCardState": "magic_ai.game_state",
+    "GameStateEncoder": "magic_ai.slot_encoder.game_state",
+    "GameStateSnapshot": "magic_ai.game_state",
+    "LegalActionCandidate": "magic_ai.actions",
+    "ManaPoolState": "magic_ai.game_state",
+    "NativeBatchEncoder": "magic_ai.slot_encoder.native_encoder",
+    "NativeEncodedBatch": "magic_ai.slot_encoder.native_encoder",
+    "NativeEncodingError": "magic_ai.slot_encoder.native_encoder",
+    "NativeTrajectoryBuffer": "magic_ai.slot_encoder.buffer",
+    "PPOPolicy": "magic_ai.slot_encoder.model",
+    "PPOStats": "magic_ai.ppo",
+    "ParsedActionInputs": "magic_ai.actions",
+    "ParsedGameState": "magic_ai.game_state",
+    "ParsedStep": "magic_ai.actions",
+    "PendingOptionState": "magic_ai.game_state",
+    "PendingState": "magic_ai.game_state",
+    "PlayerState": "magic_ai.game_state",
+    "PolicyStep": "magic_ai.actions",
+    "RolloutBuffer": "magic_ai.slot_encoder.buffer",
+    "RolloutStep": "magic_ai.ppo",
+    "SelectedActionEncoder": "magic_ai.actions",
+    "action_from_attackers": "magic_ai.actions",
+    "action_from_blockers": "magic_ai.actions",
+    "action_from_choice_accepted": "magic_ai.actions",
+    "action_from_choice_color": "magic_ai.actions",
+    "action_from_choice_ids": "magic_ai.actions",
+    "action_from_choice_index": "magic_ai.actions",
+    "action_from_priority_candidate": "magic_ai.actions",
+    "build_priority_candidates": "magic_ai.actions",
+    "gae_returns": "magic_ai.ppo",
+    "gae_returns_batched": "magic_ai.ppo",
+    "ppo_update": "magic_ai.ppo",
+    "selected_priority_candidate_index": "magic_ai.actions",
+}
+
+
+def __getattr__(name: str):
+    module_name = _LAZY_ATTR_TO_MODULE.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(_import_module(module_name), name)
+    globals()[name] = value
+    return value
