@@ -156,6 +156,7 @@ class RecurrentTextPolicy(nn.Module):
             # V_max often arrives at 1 then jumps to 8+; mark unbacked to
             # bypass Dynamo's 0/1 specialization recompile.
             mark_unbacked(batch.blank_legal_ids, 2)
+            mark_unbacked(batch.blank_legal_mask, 2)
             return self._compiled_forward_packed(batch, h_in, c_in, state_hidden_override)
         return self._forward_packed_impl(batch, h_in, c_in, state_hidden_override)
 
