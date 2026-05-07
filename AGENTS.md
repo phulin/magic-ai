@@ -1,6 +1,10 @@
+This is a project to build an AI for Magic: the Gathering.
+
 General instructions:
 - Use `uv run` to run python code in this repository.
 - After writing python code, run `uv run ruff format`, `uv run ruff check --fix`, and `uv run ty check`.
+- Clean code is important. Avoid defensive programming and try to build good abstractions.
+- We care deeply about performance. Make sure to flag possible performance issues, and avoid unforced errors like iterating over PyTorch tensors.
 
 Progressive disclosure:
 - Each code directory contains an `AGENTS.md` with one-line summaries of the files and subpackages inside it. Read the relevant directory's `AGENTS.md` before searching or reading individual files — it's there so you can locate the right file without grepping the whole tree.
