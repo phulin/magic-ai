@@ -2325,7 +2325,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rnad-target-ema",
         type=float,
-        default=0.005,
+        default=0.02,
         help="R-NaD target-network Polyak averaging rate. Paired with the "
         "scaled --rnad-delta-m default so target tracks online inside one "
         "outer iter (delta_m * target_ema ~= 5). Paper uses 1e-3 with "
