@@ -5128,6 +5128,7 @@ def train_text_native_batched_envs(
                 "actor_poll",
                 "actor_encode",
                 "actor_pack",
+                "actor_submit",
                 "actor_wait_inference",
                 "actor_stage",
                 "actor_record",
