@@ -56,7 +56,7 @@ class EpisodeBatch:
 
     ``terminal_reward_p0`` is the resolved terminal reward in p0's
     perspective (+1 / -1 / life-tiebreak / -draw_penalty), and ``zero_sum``
-    selects the cross-perspective sign. Mirrors ``ppo.gae_returns_batched``
+    selects the cross-perspective sign. Mirrors ``returns.gae_returns_batched``
     so engine wins/losses, engine draws, and step-cap timeouts are handled
     identically across both trainers (see :func:`magic_ai.rollout.terminal_reward_for_finish`).
     """

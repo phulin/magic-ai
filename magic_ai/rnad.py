@@ -361,7 +361,7 @@ def two_player_vtrace(
     # Own-turn linear recurrence:
     #   v_hat_own[k] = A[k] + B[k] * v_hat_own[k+1],  v_hat_own[K] = 0
     #
-    # Closed-form on-device scan (mirrors :func:`magic_ai.ppo.gae_returns`
+    # Closed-form on-device scan (mirrors :func:`magic_ai.returns.gae_returns`
     # and the batched v-trace below): no GPU->CPU sync. ``B`` is the
     # coefficient between v[k] and v[k+1]; B[-1] never multiplies a real
     # v[k+1] (terminal) and is dropped. v-trace inputs are detached at every
@@ -526,7 +526,7 @@ def _two_player_vtrace_batched(
     # resetting at episode boundaries. The host-side Python loop this
     # replaced forced three ``.cpu().tolist()`` syncs per call (A, B,
     # own_ep_idx). Same flip + cumprod + cumsum trick as
-    # :func:`magic_ai.ppo.gae_returns_batched`: pad to (n_eps, max_own_per_ep)
+    # :func:`magic_ai.returns.gae_returns_batched`: pad to (n_eps, max_own_per_ep)
     # with A=0 / B=1 outside each episode's valid prefix, do a single
     # reverse scan along dim=1, then gather per own-turn step.
     K_per_ep = torch.zeros(n_eps, dtype=torch.long, device=device)
@@ -1579,7 +1579,7 @@ def _batched_trajectory_loss_from_forwards(
     ``zero_sum`` is ``(n_eps,)`` bool — ``True`` means p1's terminal is
     ``-terminal_reward_p0`` (engine win/loss, life-tiebreak timeout),
     ``False`` means p1 sees the same value (engine-draw symmetric absorbing
-    state). Mirrors PPO's ``gae_returns_batched`` so trainers handle
+    state). Mirrors ``magic_ai.returns.gae_returns_batched`` so trainers handle
     win/loss/draw/timeout identically. ``logp_mu`` is ``(T_total,)``
     (concatenation of episodes' rollout-time log-probs). ``ep_offsets`` is
     ``(n_eps + 1,)`` long with ``ep_offsets[0] == 0``,
@@ -1658,7 +1658,7 @@ def _batched_trajectory_loss_from_forwards(
     # timeout) flip the sign for p1; non-zero-sum (engine draw) keeps it the
     # same — the symmetric absorbing-state branch lets the discounted draw
     # penalty reach every step under both perspectives. See
-    # ``magic_ai.ppo.gae_returns_batched`` for the matching PPO logic.
+    # ``magic_ai.returns.gae_returns_batched`` for the matching PPO logic.
     last_idx = ep_offsets[1:] - 1
     tr_p0 = terminal_reward_p0.to(device=device, dtype=dtype)
     zs_dev = zero_sum.to(device=device, dtype=torch.bool)

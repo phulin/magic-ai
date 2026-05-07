@@ -5,7 +5,8 @@ from collections.abc import Iterator
 from unittest.mock import patch
 
 import torch
-from magic_ai.ppo import gae_returns, gae_returns_batched, ppo_update
+from magic_ai.ppo import ppo_update
+from magic_ai.returns import gae_returns, gae_returns_batched
 from magic_ai.rollout import RolloutStep
 from torch import Tensor, nn
 

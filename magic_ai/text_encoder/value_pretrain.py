@@ -85,7 +85,7 @@ class ValueLabeledBinDataset:
     propagates back as ``γ^steps_to_end * sign``. With ``gamma=1.0`` this
     is just the terminal sign for every span in the trajectory; with
     ``gamma<1`` early-game spans get a softer label than late-game ones,
-    matching ``magic_ai.ppo.gae_returns`` under no-bootstrap λ=1
+    matching ``magic_ai.returns.gae_returns`` under no-bootstrap lambda=1
     conventions. At sample time, the span is right-truncated to
     ``seq_len`` (preserving the ``<bos>`` prefix); spans shorter than
     ``seq_len`` are right-padded with ``pad_token_id``.

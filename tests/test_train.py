@@ -14,7 +14,7 @@ import torch
 from magic_ai.actions import ActionTrace, PolicyStep
 from magic_ai.game_state import GameStateSnapshot, PendingState
 from magic_ai.opponent_pool import OpponentPool, SnapshotSchedule
-from magic_ai.ppo import gae_returns
+from magic_ai.returns import gae_returns
 from magic_ai.rollout import PPOStats, RolloutStep
 from magic_ai.slot_encoder.game_state import GameStateEncoder
 from magic_ai.slot_encoder.model import PPOPolicy

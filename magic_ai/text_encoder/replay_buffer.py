@@ -10,8 +10,8 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from magic_ai.ppo import gae_returns_batched
 from magic_ai.replay_buffer import ReplayCore
+from magic_ai.returns import gae_returns_batched
 from magic_ai.text_encoder.batch import (
     PackedTextBatch,
     TextEncodedBatch,
