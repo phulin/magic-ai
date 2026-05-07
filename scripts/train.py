@@ -74,12 +74,9 @@ from magic_ai.opponent_pool import (  # noqa: E402
     snapshot_tag,
 )
 from magic_ai.ppo import (  # noqa: E402
-    PPOStats,
-    RolloutStep,
     gae_returns,
     gae_returns_batched,
     ppo_update,
-    terminal_reward_for_finish,
 )
 from magic_ai.rnad import RNaDConfig  # noqa: E402
 from magic_ai.rnad_trainer import (  # noqa: E402
@@ -87,6 +84,11 @@ from magic_ai.rnad_trainer import (  # noqa: E402
     RNaDTrainerState,
     build_trainer_state,
     run_rnad_update,
+)
+from magic_ai.rollout import (  # noqa: E402
+    PPOStats,
+    RolloutStep,
+    terminal_reward_for_finish,
 )
 from magic_ai.slot_encoder.buffer import NativeTrajectoryBuffer  # noqa: E402
 from magic_ai.slot_encoder.game_state import GameStateEncoder  # noqa: E402

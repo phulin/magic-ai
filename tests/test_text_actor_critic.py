@@ -1276,9 +1276,9 @@ class TextActorCriticTests(unittest.TestCase):
         from pathlib import Path
 
         import torch.optim as optim
-        from magic_ai.ppo import RolloutStep
         from magic_ai.rnad import RNaDConfig
         from magic_ai.rnad_trainer import EpisodeBatch, build_trainer_state, run_rnad_update
+        from magic_ai.rollout import RolloutStep
 
         torch.manual_seed(0)
         model = _model()

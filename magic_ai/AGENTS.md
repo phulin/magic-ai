@@ -16,6 +16,7 @@ Core training and inference pipeline for a Magic: The Gathering-playing RL agent
 - `opponent_pool.py` — opponent pool with TrueSkill ratings and periodic evaluation
 - `ppo.py` — PPO update helpers (advantages, gradient steps, loss computation)
 - `replay_decisions.py` — backend-neutral decision-group scoring for replay policy evaluation
+- `rollout.py` — shared RolloutStep, trainer stats, and terminal reward resolution helpers
 - `rnad.py` — R-NaD primitives (reward transform, v-trace, NeuRD loss, discretization)
 - `rnad_trainer.py` — R-NaD trainer state and batch-level update dispatch
 - `replay_buffer.py` — backend-neutral ReplayCore for append-only replay rows, rollout metadata, PPO targets, recurrent inputs, and flat decisions

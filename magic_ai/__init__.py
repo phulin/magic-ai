@@ -42,6 +42,7 @@ __all__ = [
     "PolicyStep",
     "RolloutStep",
     "SelectedActionEncoder",
+    "TrainerStats",
     "action_from_attackers",
     "action_from_blockers",
     "action_from_choice_accepted",
@@ -52,8 +53,10 @@ __all__ = [
     "build_priority_candidates",
     "gae_returns",
     "gae_returns_batched",
+    "life_tiebreak_terminal_reward",
     "ppo_update",
     "selected_priority_candidate_index",
+    "terminal_reward_for_finish",
 ]
 
 _LAZY_ATTR_TO_MODULE = {
@@ -71,7 +74,7 @@ _LAZY_ATTR_TO_MODULE = {
     "NativeEncodingError": "magic_ai.slot_encoder.native_encoder",
     "NativeTrajectoryBuffer": "magic_ai.slot_encoder.buffer",
     "PPOPolicy": "magic_ai.slot_encoder.model",
-    "PPOStats": "magic_ai.ppo",
+    "PPOStats": "magic_ai.rollout",
     "ParsedActionInputs": "magic_ai.actions",
     "ParsedGameState": "magic_ai.game_state",
     "ParsedStep": "magic_ai.actions",
@@ -80,8 +83,9 @@ _LAZY_ATTR_TO_MODULE = {
     "PlayerState": "magic_ai.game_state",
     "PolicyStep": "magic_ai.actions",
     "RolloutBuffer": "magic_ai.slot_encoder.buffer",
-    "RolloutStep": "magic_ai.ppo",
+    "RolloutStep": "magic_ai.rollout",
     "SelectedActionEncoder": "magic_ai.actions",
+    "TrainerStats": "magic_ai.rollout",
     "action_from_attackers": "magic_ai.actions",
     "action_from_blockers": "magic_ai.actions",
     "action_from_choice_accepted": "magic_ai.actions",
@@ -92,8 +96,10 @@ _LAZY_ATTR_TO_MODULE = {
     "build_priority_candidates": "magic_ai.actions",
     "gae_returns": "magic_ai.ppo",
     "gae_returns_batched": "magic_ai.ppo",
+    "life_tiebreak_terminal_reward": "magic_ai.rollout",
     "ppo_update": "magic_ai.ppo",
     "selected_priority_candidate_index": "magic_ai.actions",
+    "terminal_reward_for_finish": "magic_ai.rollout",
 }
 
 

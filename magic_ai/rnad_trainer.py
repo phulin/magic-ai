@@ -38,7 +38,6 @@ from typing import cast
 import torch
 from torch import nn
 
-from magic_ai.ppo import PPOStats, RolloutStep
 from magic_ai.rnad import (
     RNaDConfig,
     RNaDStats,
@@ -47,6 +46,7 @@ from magic_ai.rnad import (
     rnad_batched_trajectory_loss,
     save_reg_snapshot,
 )
+from magic_ai.rollout import RolloutStep, TrainerStats
 from magic_ai.training_interfaces import RNaDTrainablePolicy
 
 
@@ -58,7 +58,7 @@ class EpisodeBatch:
     perspective (+1 / -1 / life-tiebreak / -draw_penalty), and ``zero_sum``
     selects the cross-perspective sign. Mirrors ``ppo.gae_returns_batched``
     so engine wins/losses, engine draws, and step-cap timeouts are handled
-    identically across both trainers (see :func:`magic_ai.ppo.terminal_reward_for_finish`).
+    identically across both trainers (see :func:`magic_ai.rollout.terminal_reward_for_finish`).
     """
 
     steps: list[RolloutStep]
@@ -186,7 +186,7 @@ def run_rnad_update(
     episodes: Sequence[EpisodeBatch],
     *,
     entropy_coef: float = 0.0,
-) -> PPOStats:
+) -> TrainerStats:
     """Run R-NaD on a batch of freshly-finished episodes.
 
     Each episode becomes one :func:`rnad_trajectory_loss` call; the resulting
@@ -383,7 +383,7 @@ def run_rnad_update(
             ),
         )
         state.last_stats = [aggregate]
-        return PPOStats(
+        return TrainerStats(
             loss=aggregate.loss,
             policy_loss=aggregate.policy_loss,
             value_loss=aggregate.critic_loss,
@@ -423,7 +423,7 @@ def run_rnad_update(
     )
     state.last_stats = [aggregate]
 
-    return PPOStats(
+    return TrainerStats(
         loss=aggregate.loss,
         policy_loss=aggregate.policy_loss,
         value_loss=aggregate.critic_loss,
