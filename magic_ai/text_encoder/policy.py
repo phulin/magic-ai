@@ -141,18 +141,36 @@ class TextPolicy(nn.Module):
             blank_logits=blank_logits,
         )
 
-    def encode_packed_replay_only(self, batch: PackedTextBatch) -> EncodedSnapshots:
+    def encode_packed_replay_only(
+        self,
+        batch: PackedTextBatch,
+        *,
+        blank_row_mask: Tensor | None = None,
+    ) -> EncodedSnapshots:
         """Run replay scoring encoder outputs without retaining card vectors."""
 
         hidden = self.encoder.forward_packed(batch)
         state_vec = gather_state_vector_packed(hidden, batch)
-        blank_logits = self.inline_blank_policy(
-            hidden,
-            batch.blank_positions,
-            batch.blank_kind,
-            batch.blank_legal_ids,
-            batch.blank_legal_mask,
-        )
+        if blank_row_mask is None:
+            blank_logits = self.inline_blank_policy(
+                hidden,
+                batch.blank_positions,
+                batch.blank_kind,
+                batch.blank_legal_ids,
+                batch.blank_legal_mask,
+            )
+        else:
+            blank_row_mask = blank_row_mask.to(device=hidden.device, dtype=torch.bool)
+            blank_rows = blank_row_mask.nonzero(as_tuple=False).squeeze(-1)
+            blank_logits = hidden.new_full(tuple(batch.blank_legal_ids.shape), float("-inf"))
+            if int(blank_rows.numel()) > 0:
+                blank_logits[blank_rows] = self.inline_blank_policy(
+                    hidden,
+                    batch.blank_positions[blank_rows],
+                    batch.blank_kind[blank_rows],
+                    batch.blank_legal_ids[blank_rows],
+                    batch.blank_legal_mask[blank_rows],
+                )
         return EncodedSnapshots(
             card_vectors=hidden.new_empty((int(batch.seq_lengths.shape[0]), 0, hidden.shape[-1])),
             card_mask=torch.empty(

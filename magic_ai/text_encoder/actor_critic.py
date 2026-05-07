@@ -1280,7 +1280,13 @@ class TextActorCritic(nn.Module):
         with torch.autocast(
             device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
         ):
-            encoded = self.policy.text_policy.encode_packed_replay_only(batch.encoded)
+            blank_row_mask = (batch.decision_count > 0) | (
+                batch.trace_kind_id == TRACE_KIND_TO_ID["may"]
+            )
+            encoded = self.policy.text_policy.encode_packed_replay_only(
+                batch.encoded,
+                blank_row_mask=blank_row_mask,
+            )
             state = self.policy.in_proj(encoded.state_vector)
             perspective = batch.perspective_player_idx.to(device=state.device)
             h_concat = lstm_recompute_per_step_h_out_per_player(
