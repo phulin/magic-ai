@@ -537,7 +537,7 @@ class NativeTextTrajectoryBuffer:
 
         batch_size = len(env_indices)
         encoded = payload.encoded
-        seq_lengths = encoded.seq_lengths.to(device=self.device, dtype=torch.long)
+        seq_lengths = encoded.seq_lengths.to(device=self.device)
         seq_lengths_host = encoded.seq_lengths_host
         if seq_lengths_host is None:
             seq_lengths_host = tuple(int(x) for x in encoded.seq_lengths.detach().cpu().tolist())
@@ -545,8 +545,8 @@ class NativeTextTrajectoryBuffer:
             raise ValueError("encoded packed row token width exceeds staging max_tokens")
         row_tokens = torch.zeros(batch_size, self.max_tokens, dtype=torch.int32, device=self.device)
         row_tokens[
-            encoded.seq_id.to(device=self.device, dtype=torch.long),
-            encoded.pos_in_seq.to(device=self.device, dtype=torch.long),
+            encoded.seq_id.to(device=self.device),
+            encoded.pos_in_seq.to(device=self.device),
         ] = encoded.token_ids.to(device=self.device, dtype=torch.int32)
         self.token_ids[env_t, step_t] = row_tokens
         self.seq_lengths[env_t, step_t] = seq_lengths.to(dtype=torch.int32)
@@ -603,7 +603,7 @@ class NativeTextTrajectoryBuffer:
                     )
                 )
 
-        decision_count = payload.decision_count.to(device=self.device, dtype=torch.long)
+        decision_count = payload.decision_count.to(device=self.device, dtype=torch.int32)
         decision_count_host = payload.decision_count_host
         if decision_count_host is None:
             decision_count_host = tuple(int(x) for x in payload.decision_count.cpu().tolist())
@@ -762,13 +762,13 @@ class NativeTextTrajectoryBuffer:
                 if event is not None:
                     stream.wait_event(event)
 
-        seq_lengths = self.seq_lengths[flat_env, flat_step].to(dtype=torch.long)
+        seq_lengths = self.seq_lengths[flat_env, flat_step]
         seq_lengths_host = tuple(
             self.seq_lengths_host[env_idx][step]
             for env_idx, step in zip(flat_env_host, flat_step_host, strict=True)
         )
         row_count = int(seq_lengths.numel())
-        decision_count = self.decision_count[flat_env, flat_step].to(dtype=torch.long)
+        decision_count = self.decision_count[flat_env, flat_step].to(dtype=torch.int32)
         decision_count_host = tuple(
             self.decision_count_host[env_idx][step]
             for env_idx, step in zip(flat_env_host, flat_step_host, strict=True)
@@ -790,15 +790,15 @@ class NativeTextTrajectoryBuffer:
             )
             option_idx = self.decision_option_idx[flat_env, flat_step][
                 step_for_group, group_in_step
-            ].to(dtype=torch.long)
+            ]
             target_idx = self.decision_target_idx[flat_env, flat_step][
                 step_for_group, group_in_step
-            ].to(dtype=torch.long)
+            ]
             decision_mask = self.decision_mask[flat_env, flat_step][step_for_group, group_in_step]
             uses_none = self.uses_none_head[flat_env, flat_step][step_for_group, group_in_step]
             selected_indices = self.selected_indices[flat_env, flat_step][
                 step_for_group, group_in_step
-            ].to(dtype=torch.long)
+            ]
             behavior_action_log_prob = self.behavior_action_log_prob[flat_env, flat_step][
                 step_for_group, group_in_step
             ]

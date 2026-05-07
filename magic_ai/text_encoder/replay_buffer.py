@@ -335,10 +335,10 @@ class TextReplayBuffer:
     ) -> None:
         """Attach episode/window metadata to already-appended replay rows."""
 
-        rows = replay_rows.to(device=self.device, dtype=torch.long)
+        rows = replay_rows.to(device=self.device)
         if int(rows.numel()) == 0:
             return
-        rows_host = rows.detach().cpu().to(dtype=torch.long).tolist()
+        rows_host = rows.detach().cpu().tolist()
         steps = torch.arange(int(rows.numel()), dtype=torch.long, device=self.device)
         self.episode_id[rows] = int(episode_id)
         self.step_idx[rows] = steps
@@ -454,7 +454,7 @@ class TextReplayBuffer:
         gamma: float,
         gae_lambda: float,
     ) -> Tensor:
-        rows = rows.to(device=self.device, dtype=torch.long)
+        rows = rows.to(device=self.device)
         if int(rows.numel()) == 0:
             return torch.empty(0, dtype=torch.float32, device=self.device)
         episode_ids = self.episode_id[rows]
@@ -462,8 +462,8 @@ class TextReplayBuffer:
             raise ValueError("cannot build returns for incomplete replay rows")
         unique_ids, inverse = torch.unique(episode_ids, sorted=True, return_inverse=True)
         batch_size = int(unique_ids.numel())
-        step_idx = self.step_idx[rows].to(dtype=torch.long)
-        step_count = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        step_idx = self.step_idx[rows].to(dtype=torch.int32)
+        step_count = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
         step_count.scatter_reduce_(
             0,
             inverse,
@@ -473,10 +473,10 @@ class TextReplayBuffer:
         )
         max_steps = int(step_count.max().item())
         values = torch.zeros(batch_size, max_steps, dtype=torch.float32, device=self.device)
-        players = torch.zeros(batch_size, max_steps, dtype=torch.long, device=self.device)
+        players = torch.zeros(batch_size, max_steps, dtype=torch.int32, device=self.device)
         flat_dest = inverse * int(max_steps) + step_idx
         values.view(-1)[flat_dest] = self.value[rows].to(dtype=torch.float32)
-        players.view(-1)[flat_dest] = self.perspective_player_idx[rows].to(dtype=torch.long)
+        players.view(-1)[flat_dest] = self.perspective_player_idx[rows].to(dtype=torch.int32)
         terminal_reward = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
         zero_sum = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
         terminal_reward[inverse] = self.terminal_reward_p0[rows].to(dtype=torch.float32)
@@ -514,19 +514,19 @@ class TextReplayBuffer:
             )
 
     def release_rows(self, replay_rows: Tensor) -> None:
-        rows = replay_rows.to(device=self.device, dtype=torch.long)
+        rows = replay_rows.to(device=self.device)
         if int(rows.numel()) == 0:
             return
         row_count = int(rows.numel())
-        token_lengths = self.row_token_length[rows].to(dtype=torch.long)
-        decision_counts = self.decision_count[rows].to(dtype=torch.long)
+        token_lengths = self.row_token_length[rows]
+        decision_counts = self.decision_count[rows]
         token_count = int(token_lengths.sum().item())
         decision_count = int(decision_counts.sum().item())
         rows_host = rows.detach().cpu().tolist()
         first_row = int(rows_host[0])
         last_row = int(rows_host[-1])
-        token_starts = self.row_token_start[rows].to(dtype=torch.long)
-        decision_starts = self.decision_start[rows].to(dtype=torch.long)
+        token_starts = self.row_token_start[rows]
+        decision_starts = self.decision_start[rows]
         last_token_len = int(token_lengths[-1].item())
         last_decision_len = int(decision_counts[-1].item())
         last_token_start = int(token_starts[-1].item()) if token_count > 0 else 0
@@ -652,8 +652,8 @@ class TextReplayBuffer:
                 raise ValueError("encoded.seq_lengths_host length must match batch size")
             return [int(x) for x in lengths]
         if encoded.seq_lengths.device.type == "cpu":
-            return [int(x) for x in encoded.seq_lengths.to(dtype=torch.long).tolist()]
-        return [int(x) for x in encoded.seq_lengths.detach().cpu().to(dtype=torch.long).tolist()]
+            return [int(x) for x in encoded.seq_lengths.tolist()]
+        return [int(x) for x in encoded.seq_lengths.detach().cpu().tolist()]
 
     def _reserve_append(
         self,
@@ -1171,7 +1171,7 @@ class TextReplayBuffer:
             raise ValueError("rows_host length must match batch size")
         if max(rows_host) >= self.capacity or min(rows_host) < 0:
             raise RuntimeError("TextReplayBuffer fixed replay row is out of range")
-        rows = rows.to(device=self.device, dtype=torch.long)
+        rows = rows.to(device=self.device)
         seq_lengths = encoded.seq_lengths.to(device=self.device)
         seq_lengths_host = self._packed_seq_lengths_host(encoded)
         if self.validate:
@@ -1452,8 +1452,8 @@ class TextReplayBuffer:
 
         cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
         cu_seqlens[1:] = seq_lengths.cumsum(0).to(dtype=torch.int32)
-        flat_env = flat_env.to(device=self.device, dtype=torch.long)
-        flat_step = flat_step.to(device=self.device, dtype=torch.long)
+        flat_env = flat_env.to(device=self.device)
+        flat_step = flat_step.to(device=self.device)
         self.row_token_start[row_start:row_end] = -1
         self.row_token_length[row_start:row_end] = 0
         self.card_ref_positions[row_start:row_end].fill_(-1)
@@ -1479,9 +1479,9 @@ class TextReplayBuffer:
             pos_in_seq = (
                 torch.arange(total_tokens, dtype=torch.int32, device=self.device) - repeated_starts
             )
-            self.packed_token_ids[token_start:token_end] = row_tokens[
-                seq_id.to(dtype=torch.long), pos_in_seq.to(dtype=torch.long)
-            ].to(dtype=torch.int32)
+            self.packed_token_ids[token_start:token_end] = row_tokens[seq_id, pos_in_seq].to(
+                dtype=torch.int32
+            )
         self.row_token_start[rows] = token_start + cu_seqlens[:-1]
         seq_lengths_i32 = seq_lengths.to(dtype=torch.int32)
         self.row_token_length[rows] = seq_lengths_i32
@@ -1537,9 +1537,7 @@ class TextReplayBuffer:
                 raise ValueError("replay_rows must not be empty")
             idx = replay_rows.to(device=self.device)
             idx_host = (
-                [int(x) for x in replay_rows.to(dtype=torch.long).tolist()]
-                if replay_rows.device.type == "cpu"
-                else None
+                [int(x) for x in replay_rows.tolist()] if replay_rows.device.type == "cpu" else None
             )
         else:
             if not replay_rows:

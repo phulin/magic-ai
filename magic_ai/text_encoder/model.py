@@ -791,7 +791,7 @@ class InlineBlankPolicy(nn.Module):
         blank_legal_ids: Tensor,
         blank_legal_mask: Tensor,
     ) -> Tensor:
-        positions = blank_positions.to(device=hidden.device, dtype=torch.long)
+        positions = blank_positions.to(device=hidden.device)
         if hidden.dim() == 3:
             blank_h, _ = _gather_at(hidden, positions)
         elif hidden.dim() == 2:
@@ -800,12 +800,12 @@ class InlineBlankPolicy(nn.Module):
             raise ValueError(f"hidden must be rank 2 or 3, got shape {tuple(hidden.shape)}")
 
         blank_h = self.decoder_norm(F.gelu(self.decoder_dense(blank_h)))
-        legal_ids = blank_legal_ids.to(device=hidden.device, dtype=torch.long)
+        legal_ids = blank_legal_ids.to(device=hidden.device)
         legal_mask = blank_legal_mask.to(device=hidden.device, dtype=torch.bool)
         legal_emb = self.embed(legal_ids)
         logits = (legal_emb * blank_h.unsqueeze(-2)).sum(dim=-1)
 
-        safe_kind = blank_kind.to(device=hidden.device, dtype=torch.long).clamp(
+        safe_kind = blank_kind.to(device=hidden.device).clamp(
             min=0, max=self.kind_temperature.num_embeddings - 1
         )
         temp = self.kind_temperature(safe_kind).squeeze(-1).unsqueeze(-1).to(logits.dtype)

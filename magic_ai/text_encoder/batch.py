@@ -213,7 +213,7 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
         seq_lens,
         total_tokens=total_tokens,
     )
-    token_ids = padded.token_ids[seq_id.to(torch.long), pos_in_seq.to(torch.long)].to(torch.int32)
+    token_ids = padded.token_ids[seq_id, pos_in_seq].to(torch.int32)
 
     if padded.blank_positions.numel():
         blank_positions = add_packed_offsets(padded.blank_positions, state_positions)
