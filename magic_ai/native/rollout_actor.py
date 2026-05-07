@@ -24,6 +24,7 @@ ready-batch.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 import traceback
@@ -57,7 +58,7 @@ class ActorEncodeConfig:
 @dataclass
 class ActorRuntimeConfig:
     max_steps_per_game: int
-    actor_pipeline_depth: int = 8
+    actor_inflight_row_fraction: float = 0.5
 
 
 @dataclass
@@ -122,11 +123,13 @@ class TextRolloutActor:
     _stop_event: threading.Event = field(default_factory=threading.Event)
     _no_more_episodes: bool = False
     _thread: threading.Thread | None = None
+    _env_capacity_seen: int = 1
 
     # ---------------------------------------------------------------- lifecycle
 
     def start(self, initial_games: list[Any]) -> None:
         self._live_games = list(initial_games)
+        self._env_capacity_seen = max(1, len(self._live_games))
         if self._live_games:
             self._no_more_episodes = False
         self._thread = threading.Thread(
@@ -185,7 +188,9 @@ class TextRolloutActor:
 
     def _step_once(self) -> None:
         self._drain_inflight(blocking=False)
-        pipeline_full = len(self._inflight) >= max(1, self.runtime_cfg.actor_pipeline_depth)
+        if self._inflight_rows() >= self._inflight_row_target():
+            self._drain_inflight(blocking=True, flush=False)
+            return
         tick_start = time.perf_counter()
         start = tick_start
         games = [env.game for env in self._live_games]
@@ -197,6 +202,7 @@ class TextRolloutActor:
         winner_l = winner_t.tolist()
 
         start = time.perf_counter()
+        remaining_inflight_capacity = max(0, self._inflight_row_target() - self._inflight_rows())
         ready_envs: list[Any] = []
         ready_players: list[int] = []
         still_live: list[Any] = []
@@ -215,7 +221,7 @@ class TextRolloutActor:
                 )
                 freed_slots.append(int(env.slot_idx))
                 continue
-            if ready_l[idx] and not pipeline_full:
+            if ready_l[idx] and len(ready_envs) < remaining_inflight_capacity:
                 ready_envs.append(env)
                 ready_players.append(int(player_l[idx]))
             else:
@@ -330,10 +336,10 @@ class TextRolloutActor:
         self._record_timing("actor_step", start)
         self._live_games.extend(batch.ready_envs)
 
-    def _drain_inflight(self, *, blocking: bool) -> None:
+    def _drain_inflight(self, *, blocking: bool, flush: bool = True) -> None:
         if not self._inflight:
             return
-        if blocking:
+        if blocking and flush:
             self.inference_server.flush()
         while self._inflight:
             batch = self._inflight[0]
@@ -345,6 +351,13 @@ class TextRolloutActor:
                 return
             self._finish_inflight(batch)
             self._inflight.popleft()
+
+    def _inflight_rows(self) -> int:
+        return sum(len(batch.ready_envs) for batch in self._inflight)
+
+    def _inflight_row_target(self) -> int:
+        fraction = max(0.0, float(self.runtime_cfg.actor_inflight_row_fraction))
+        return max(1, int(math.ceil(fraction * float(self._env_capacity_seen))))
 
     def _encode_packed(self, games: list[Any], perspectives: list[int]) -> tuple[Any, Any]:
         from magic_ai.text_encoder.native_assembler import encode_tokens_packed
@@ -372,6 +385,10 @@ class TextRolloutActor:
             if response.no_more_episodes:
                 self._no_more_episodes = True
             self._live_games.extend(response.games)
+            self._env_capacity_seen = max(
+                self._env_capacity_seen,
+                len(self._live_games) + self._inflight_rows(),
+            )
             if self._stop_event.is_set():
                 return
             if not blocking:

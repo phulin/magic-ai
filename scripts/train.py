@@ -2392,6 +2392,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--actor-inflight-row-fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "actor-path rollout scheduler: each actor keeps about this fraction "
+            "of its env shard in flight for GPU inference before draining results"
+        ),
+    )
+    parser.add_argument(
         "--inference-max-batch",
         type=int,
         default=1024,
@@ -2771,6 +2780,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--inference-batch-wait-ms must be non-negative")
     if not (0.0 < getattr(args, "inference_ready_fraction", 0.45) <= 1.0):
         raise ValueError("--inference-ready-fraction must be in (0, 1]")
+    if not (0.0 < getattr(args, "actor_inflight_row_fraction", 0.5) <= 1.0):
+        raise ValueError("--actor-inflight-row-fraction must be in (0, 1]")
     if getattr(args, "inference_max_batch", 0) < 0:
         raise ValueError("--inference-max-batch must be non-negative")
     if args.minibatch_size < 1:
@@ -4723,6 +4734,7 @@ def train_text_native_batched_envs(
         )
         runtime_cfg = ActorRuntimeConfig(
             max_steps_per_game=int(args.max_steps_per_game),
+            actor_inflight_row_fraction=float(args.actor_inflight_row_fraction),
         )
 
         max_batch = int(args.inference_max_batch) or int(args.num_envs)

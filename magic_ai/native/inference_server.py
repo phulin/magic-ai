@@ -321,6 +321,9 @@ class _InferenceWorkRing:
         self._row_cursor = 0
         self._token_cursor = 0
         self._decision_cursor = 0
+        self._next_reservation_seq = 0
+        self._next_publish_seq = 0
+        self._pending_publish: dict[int, _PendingItem] = {}
         self._closed = False
         self._force_flush = False
         self._native_arena: dict[str, torch.Tensor] | None = None
@@ -356,6 +359,8 @@ class _InferenceWorkRing:
             token_end = token_start + token_count
             decision_start = self._decision_cursor
             decision_end = decision_start + decision_count
+            publish_seq = self._next_reservation_seq
+            self._next_reservation_seq += 1
             native_arena = self._native_arena
             packed_arena = self._packed_arena
             self._row_cursor = row_end
@@ -413,8 +418,14 @@ class _InferenceWorkRing:
                 blank_cols=int(packed.blank_positions.shape[1]),
                 legal_cols=int(packed.blank_legal_ids.shape[2]),
             )
-            self._items.append(item)
-            self._queued_rows += rows
+            self._pending_publish[publish_seq] = item
+            published_rows = 0
+            while self._next_publish_seq in self._pending_publish:
+                published = self._pending_publish.pop(self._next_publish_seq)
+                self._items.append(published)
+                published_rows += published.rows
+                self._next_publish_seq += 1
+            self._queued_rows += published_rows
             self._cond.notify_all()
 
     def close(self) -> None:
@@ -503,6 +514,7 @@ class _InferenceWorkRing:
             items = [item for item in self._items if item is not None]
             self._items.clear()
             self._queued_rows = 0
+            self._pending_publish.clear()
             self._reset_if_empty_locked()
             self._cond.notify_all()
             return items
@@ -645,10 +657,13 @@ class _InferenceWorkRing:
             and self._reserved_rows == 0
             and self._reserved_tokens == 0
             and self._reserved_decisions == 0
+            and not self._pending_publish
         ):
             self._row_cursor = 0
             self._token_cursor = 0
             self._decision_cursor = 0
+            self._next_reservation_seq = 0
+            self._next_publish_seq = 0
 
     def _ensure_arenas(self, native: NativeEncodedBatch, packed: PackedTextBatch) -> None:
         if self._native_arena is None:
