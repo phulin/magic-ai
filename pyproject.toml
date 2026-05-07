@@ -45,3 +45,8 @@ select = ["E", "F", "I", "UP"]
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:`torch\\.jit\\.script_method` is not supported in Python 3\\.14\\+ and may break\\. Please switch to `torch\\.compile` or `torch\\.export`\\.:DeprecationWarning:torch\\.jit\\._script",
+]
