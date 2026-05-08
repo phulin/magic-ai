@@ -2875,8 +2875,10 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if getattr(args, "replay_ring_capacity", None) is None:
         args.replay_ring_capacity = max(
+            4096,
             6 * args.rollout_steps,
             2 * args.num_envs,
+            args.max_steps_per_game,
         )
     if args.learner_min_rows < 1:
         raise ValueError("--learner-min-rows must be at least 1")
