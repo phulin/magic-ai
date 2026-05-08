@@ -106,13 +106,19 @@ class RNaDConfig:
     ``|logit + lr · Clip(Q, c)| <= beta`` rather than the looser
     current-logit predicate ``|logit| <= beta``."""
 
-    diagnostic_v_target_reg_share_every: int = 0
+    diagnostic_v_target_reg_share_every: int = 10
     """Compute the ``v_target_reg_share`` diagnostic every K gradient steps
-    (0 disables it entirely; default off). The diagnostic requires a *second*
+    (0 disables it entirely; default every 10 steps). The diagnostic requires a *second*
     full ``two_player_vtrace`` pass per perspective per episode (fed only
     the terminal ±1 reward), which doubles v-trace work in the R-NaD loss.
     Trainers that want this signal should enable it at a low cadence (e.g.
     50) so the cost is amortized."""
+
+    diagnostic_policy_drift_every: int = 10
+    """Compute sampled-log-ratio and target-lag diagnostics every K gradient
+    steps (0 disables them; default every 10 steps). These diagnostics are useful while
+    tuning R-NaD stability, but they require reductions that eventually sync
+    to the host, so production throughput runs keep them out of the hot path."""
 
     step_minibatch_size: int = 0
     """Approximate per-chunk replay-step budget for the batched R-NaD
@@ -410,6 +416,7 @@ def _two_player_vtrace_batched(
     logp_mu: Tensor,
     perspective_is_player_i: Tensor,
     ep_offsets: Tensor,
+    own_idx: Tensor | None = None,
     max_ep_len: int | None = None,
     rho_bar: float = 1.0,
     c_bar: float = 1.0,
@@ -449,7 +456,10 @@ def _two_player_vtrace_batched(
     r_hat_next_step = torch.zeros(T, dtype=dtype, device=device)
     v_hat_next_step = torch.zeros(T, dtype=dtype, device=device)
 
-    own_idx = is_own.nonzero(as_tuple=False).squeeze(-1)
+    if own_idx is None:
+        own_idx = is_own.nonzero(as_tuple=False).squeeze(-1)
+    else:
+        own_idx = own_idx.to(device=device, dtype=torch.long)
     K = int(own_idx.numel())
     if K == 0:
         return VTraceOutput(
@@ -738,7 +748,7 @@ def critic_loss(
     # Always run the masked sum: ``mask.any()`` would force a sync, and
     # ``diff[all-False].sum()`` already returns a 0-tensor of the right dtype.
     diff = (v_theta - v_hat.detach()).abs()
-    return diff[mask].sum(), count
+    return (diff * mask.to(dtype=diff.dtype)).sum(), count
 
 
 # ---------------------------------------------------------------------------
@@ -1026,19 +1036,20 @@ class _TrajLossPieces:
     pl_sum: Tensor
     pl_count: Tensor
     n_q_clipped: Tensor
-    v_hat_mean: float
-    transformed_mean: float
+    v_hat_sum: Tensor
+    transformed_sum: Tensor
+    transformed_count: int
     # Diagnostics (issue: within-inner-loop policy degradation). All are sums
     # / maxes paired with their counts so the trainer can aggregate across
     # episodes without weighting bias.
-    sampled_log_ratio_sum: float = 0.0
-    sampled_log_ratio_absmax: float = 0.0
+    sampled_log_ratio_sum: Tensor | None = None
+    sampled_log_ratio_absmax: Tensor | None = None
     sampled_log_ratio_count: int = 0
-    is_bias_up_sum: float = 0.0
-    is_bias_up_count: int = 0
-    is_bias_down_sum: float = 0.0
-    is_bias_down_count: int = 0
-    v_target_reg_share_sum: float = 0.0
+    is_bias_up_sum: Tensor | None = None
+    is_bias_up_count: Tensor | None = None
+    is_bias_down_sum: Tensor | None = None
+    is_bias_down_count: Tensor | None = None
+    v_target_reg_share_sum: Tensor | None = None
     v_target_reg_share_count: Tensor | None = None
 
 
@@ -1328,7 +1339,7 @@ def _trajectory_loss_from_forwards(
         else:
             is_bias_down_sum_t = 0.0
 
-    v_target_reg_share_sum_t = 0.0
+    v_target_reg_share_sum_t = torch.zeros((), dtype=dtype, device=device)
     v_target_reg_share_count_t = torch.zeros((), dtype=torch.long, device=device)
 
     # ---- Perspective-independent setup (hoisted out of the (0, 1) loop) ----
@@ -1530,15 +1541,16 @@ def _trajectory_loss_from_forwards(
         pl_sum=pl_sum,
         pl_count=pl_count_total,
         n_q_clipped=n_q_clipped_total,
-        v_hat_mean=sum(v_hat_means) / len(v_hat_means),
-        transformed_mean=sum(transformed_means) / len(transformed_means),
-        sampled_log_ratio_sum=sampled_log_ratio_sum_t,
-        sampled_log_ratio_absmax=sampled_log_ratio_absmax_t,
+        v_hat_sum=v_online.new_tensor(sum(v_hat_means)),
+        transformed_sum=v_online.new_tensor(sum(transformed_means)),
+        transformed_count=max(len(v_hat_means), 1),
+        sampled_log_ratio_sum=v_online.new_tensor(sampled_log_ratio_sum_t),
+        sampled_log_ratio_absmax=v_online.new_tensor(sampled_log_ratio_absmax_t),
         sampled_log_ratio_count=sampled_log_ratio_count_t,
-        is_bias_up_sum=is_bias_up_sum_t,
-        is_bias_up_count=up_count,
-        is_bias_down_sum=is_bias_down_sum_t,
-        is_bias_down_count=down_count,
+        is_bias_up_sum=v_online.new_tensor(is_bias_up_sum_t),
+        is_bias_up_count=torch.tensor(up_count, dtype=torch.long, device=device),
+        is_bias_down_sum=v_online.new_tensor(is_bias_down_sum_t),
+        is_bias_down_count=torch.tensor(down_count, dtype=torch.long, device=device),
         v_target_reg_share_sum=v_target_reg_share_sum_t,
         v_target_reg_share_count=v_target_reg_share_count_t,
     )
@@ -1559,10 +1571,13 @@ def _batched_trajectory_loss_from_forwards(
     zero_sum: Tensor,
     logp_mu: Tensor,
     ep_offsets: Tensor,
+    own_idx_p0: Tensor | None = None,
+    own_idx_p1: Tensor | None = None,
     max_ep_len: int | None = None,
     config: RNaDConfig,
     alpha: float,
     compute_v_target_reg_share: bool = False,
+    compute_policy_drift_diagnostics: bool = False,
 ) -> _TrajLossPieces:
     """Vectorized R-NaD loss assembly across a flat concatenation of episodes.
 
@@ -1633,25 +1648,33 @@ def _batched_trajectory_loss_from_forwards(
         per_group_log_ratio_sampled = torch.zeros(0, dtype=dtype, device=device)
         inv_mu_per_group = torch.zeros(0, dtype=dtype, device=device)
 
-    # Diagnostics: keep these as device tensors and only sync at the end.
-    blended_reg_scalar = alpha * lp_reg_cur_scalar + (1.0 - alpha) * lp_reg_prev_scalar
-    sampled_log_ratio_step = (lp_online_dt - blended_reg_scalar).detach()
-    sampled_log_ratio_sum_t = sampled_log_ratio_step.sum()
-    sampled_log_ratio_absmax_t = (
-        sampled_log_ratio_step.abs().max()
-        if T_total > 0
-        else torch.zeros((), dtype=dtype, device=device)
-    )
-    is_bias_step = (lp_tgt_scalar - logp_mu_dev).detach()
-    online_moved_up = (lp_online_dt > logp_mu_dev).detach()
-    up_count_t = online_moved_up.to(torch.long).sum()
-    down_count_t = (~online_moved_up).to(torch.long).sum()
-    is_bias_up_sum_t = torch.where(
-        online_moved_up, is_bias_step, torch.zeros_like(is_bias_step)
-    ).sum()
-    is_bias_down_sum_t = torch.where(
-        ~online_moved_up, is_bias_step, torch.zeros_like(is_bias_step)
-    ).sum()
+    sampled_log_ratio_sum_t: Tensor | None = None
+    sampled_log_ratio_absmax_t: Tensor | None = None
+    up_count_t: Tensor | None = None
+    down_count_t: Tensor | None = None
+    is_bias_up_sum_t: Tensor | None = None
+    is_bias_down_sum_t: Tensor | None = None
+    if compute_policy_drift_diagnostics:
+        # Keep diagnostics as device tensors; the trainer batches their host
+        # conversion with the other once-per-update scalar stats.
+        blended_reg_scalar = alpha * lp_reg_cur_scalar + (1.0 - alpha) * lp_reg_prev_scalar
+        sampled_log_ratio_step = (lp_online_dt - blended_reg_scalar).detach()
+        sampled_log_ratio_sum_t = sampled_log_ratio_step.sum()
+        sampled_log_ratio_absmax_t = (
+            sampled_log_ratio_step.abs().max()
+            if T_total > 0
+            else torch.zeros((), dtype=dtype, device=device)
+        )
+        is_bias_step = (lp_tgt_scalar - logp_mu_dev).detach()
+        online_moved_up = (lp_online_dt > logp_mu_dev).detach()
+        up_count_t = online_moved_up.to(torch.long).sum()
+        down_count_t = (~online_moved_up).to(torch.long).sum()
+        is_bias_up_sum_t = torch.where(
+            online_moved_up, is_bias_step, torch.zeros_like(is_bias_step)
+        ).sum()
+        is_bias_down_sum_t = torch.where(
+            ~online_moved_up, is_bias_step, torch.zeros_like(is_bias_step)
+        ).sum()
 
     # Terminal rewards: scatter the resolved p0-perspective terminal at each
     # episode's last step. Zero-sum episodes (engine win/loss, life-tiebreak
@@ -1727,7 +1750,10 @@ def _batched_trajectory_loss_from_forwards(
     v_target_reg_share_sum_t = torch.zeros((), dtype=dtype, device=device)
     v_target_reg_share_count_t = torch.zeros((), dtype=torch.long, device=device)
 
-    for rewards_p, is_own_p in ((rewards_p0, is_own_p0), (rewards_p1, is_own_p1)):
+    for rewards_p, is_own_p, own_idx_p in (
+        (rewards_p0, is_own_p0, own_idx_p0),
+        (rewards_p1, is_own_p1, own_idx_p1),
+    ):
         transformed = transform_rewards(
             rewards_p,
             logp_theta=lp_online_dt,
@@ -1744,6 +1770,7 @@ def _batched_trajectory_loss_from_forwards(
             logp_mu=logp_mu_dev,
             perspective_is_player_i=is_own_p,
             ep_offsets=ep_offsets,
+            own_idx=own_idx_p,
             max_ep_len=max_ep_len,
             rho_bar=config.vtrace_rho_bar,
             c_bar=config.vtrace_c_bar,
@@ -1758,16 +1785,17 @@ def _batched_trajectory_loss_from_forwards(
                     logp_mu=logp_mu_dev,
                     perspective_is_player_i=is_own_p,
                     ep_offsets=ep_offsets,
+                    own_idx=own_idx_p,
                     max_ep_len=max_ep_len,
                     rho_bar=config.vtrace_rho_bar,
                     c_bar=config.vtrace_c_bar,
                 )
-                if is_own_p.any():
-                    v_reg_part = (v_out.v_hat - v_out_term.v_hat)[is_own_p].abs()
-                    v_term_part = v_out_term.v_hat[is_own_p].abs()
-                    share = v_reg_part / (v_term_part + v_reg_part + 1e-8)
-                    v_target_reg_share_sum_t = v_target_reg_share_sum_t + share.sum()
-                    v_target_reg_share_count_t += is_own_p.sum().to(dtype=torch.long)
+                own_f = is_own_p.to(dtype=dtype)
+                v_reg_part = (v_out.v_hat - v_out_term.v_hat).abs() * own_f
+                v_term_part = v_out_term.v_hat.abs() * own_f
+                share = v_reg_part / (v_term_part + v_reg_part + 1e-8)
+                v_target_reg_share_sum_t = v_target_reg_share_sum_t + share.sum()
+                v_target_reg_share_count_t += is_own_p.sum().to(dtype=torch.long)
 
         cl_part_sum, cl_part_count = critic_loss(
             v_theta=v_online,
@@ -1858,38 +1886,23 @@ def _batched_trajectory_loss_from_forwards(
         v_hat_sum = v_hat_sum + v_out.v_hat.detach().sum()
         transformed_sum = transformed_sum + transformed.detach().sum()
 
-    diag = torch.stack(
-        [
-            sampled_log_ratio_sum_t.to(dtype=dtype),
-            sampled_log_ratio_absmax_t.to(dtype=dtype),
-            is_bias_up_sum_t.to(dtype=dtype),
-            is_bias_down_sum_t.to(dtype=dtype),
-            up_count_t.to(dtype=dtype),
-            down_count_t.to(dtype=dtype),
-            v_hat_sum.to(dtype=dtype),
-            transformed_sum.to(dtype=dtype),
-            v_target_reg_share_sum_t.to(dtype=dtype),
-        ]
-    )
-    diag_h = diag.detach().cpu().tolist()
-
-    denom_v = max(2 * T_total, 1)
     return _TrajLossPieces(
         cl_sum=cl_sum,
         cl_count=cl_count_total,
         pl_sum=pl_sum,
         pl_count=pl_count_total,
         n_q_clipped=n_q_clipped_total,
-        v_hat_mean=diag_h[6] / denom_v,
-        transformed_mean=diag_h[7] / denom_v,
-        sampled_log_ratio_sum=diag_h[0],
-        sampled_log_ratio_absmax=diag_h[1] if T_total > 0 else 0.0,
-        sampled_log_ratio_count=T_total,
-        is_bias_up_sum=diag_h[2],
-        is_bias_up_count=int(diag_h[4]),
-        is_bias_down_sum=diag_h[3],
-        is_bias_down_count=int(diag_h[5]),
-        v_target_reg_share_sum=diag_h[8],
+        v_hat_sum=v_hat_sum,
+        transformed_sum=transformed_sum,
+        transformed_count=max(2 * T_total, 1),
+        sampled_log_ratio_sum=sampled_log_ratio_sum_t,
+        sampled_log_ratio_absmax=sampled_log_ratio_absmax_t,
+        sampled_log_ratio_count=T_total if compute_policy_drift_diagnostics else 0,
+        is_bias_up_sum=is_bias_up_sum_t,
+        is_bias_up_count=up_count_t,
+        is_bias_down_sum=is_bias_down_sum_t,
+        is_bias_down_count=down_count_t,
+        v_target_reg_share_sum=v_target_reg_share_sum_t if compute_v_target_reg_share else None,
         v_target_reg_share_count=v_target_reg_share_count_t,
     )
 
@@ -1941,6 +1954,7 @@ def rnad_batched_trajectory_loss(
     config: RNaDConfig,
     alpha: float,
     compute_v_target_reg_share: bool = False,
+    compute_policy_drift_diagnostics: bool = False,
 ) -> list[_TrajLossPieces]:
     """Batched per-policy forwards across all episodes; per-episode loss assembly.
 
@@ -1976,12 +1990,24 @@ def rnad_batched_trajectory_loss(
         raise ValueError("episodes_logp_mu length mismatch")
 
     flat_rows: list[int] = []
+    own_idx_p0: list[int] = []
+    own_idx_p1: list[int] = []
     ep_offsets: list[int] = [0]
     max_ep_len = 0
-    for ep in episodes_replay_rows:
+    for ep, perspectives in zip(episodes_replay_rows, episodes_perspective, strict=True):
         if not ep:
             raise ValueError("each episode must contain at least one row")
+        if len(perspectives) != len(ep):
+            raise ValueError("episodes_perspective entries must match episode lengths")
+        base = len(flat_rows)
         flat_rows.extend(int(r) for r in ep)
+        for offset, player in enumerate(perspectives):
+            if int(player) == 0:
+                own_idx_p0.append(base + offset)
+            elif int(player) == 1:
+                own_idx_p1.append(base + offset)
+            else:
+                raise ValueError("episodes_perspective values must be 0 or 1")
         ep_offsets.append(ep_offsets[-1] + len(ep))
         if len(ep) > max_ep_len:
             max_ep_len = len(ep)
@@ -2047,6 +2073,8 @@ def rnad_batched_trajectory_loss(
     target_dtype = v_online_b.dtype
     logp_mu_flat = torch.cat([t.to(device=device, dtype=target_dtype) for t in episodes_logp_mu])
     ep_offsets_t = torch.tensor(ep_offsets, dtype=torch.long, device=device)
+    own_idx_p0_t = torch.tensor(own_idx_p0, dtype=torch.long, device=device)
+    own_idx_p1_t = torch.tensor(own_idx_p1, dtype=torch.long, device=device)
 
     pieces = _batched_trajectory_loss_from_forwards(
         lp_online=lp_online_b,
@@ -2062,10 +2090,13 @@ def rnad_batched_trajectory_loss(
         zero_sum=zero_sum_t,
         logp_mu=logp_mu_flat,
         ep_offsets=ep_offsets_t,
+        own_idx_p0=own_idx_p0_t,
+        own_idx_p1=own_idx_p1_t,
         max_ep_len=max_ep_len,
         config=config,
         alpha=alpha,
         compute_v_target_reg_share=compute_v_target_reg_share,
+        compute_policy_drift_diagnostics=compute_policy_drift_diagnostics,
     )
     return [pieces]
 
@@ -2100,8 +2131,8 @@ def rnad_update_trajectory(
         config=config,
         alpha=alpha,
     )
-    cl = pieces.cl_sum / max(pieces.cl_count, 1)
-    pl = pieces.pl_sum / max(pieces.pl_count, 1)
+    cl = pieces.cl_sum / pieces.cl_count.clamp_min(1).to(dtype=pieces.cl_sum.dtype)
+    pl = pieces.pl_sum / pieces.pl_count.clamp_min(1).to(dtype=pieces.pl_sum.dtype)
     loss = cl + pl
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -2129,13 +2160,24 @@ def rnad_update_trajectory(
     assert isinstance(online, nn.Module)
     polyak_update_(target, online, gamma=config.target_ema_gamma)
 
+    stats_h = (
+        torch.stack(
+            [
+                pieces.v_hat_sum.detach().to(dtype=torch.float32),
+                pieces.transformed_sum.detach().to(dtype=torch.float32),
+            ]
+        )
+        .cpu()
+        .tolist()
+    )
+    stats_denom = max(pieces.transformed_count, 1)
     return RNaDStats(
         loss=float(loss.detach()),
         critic_loss=float(cl.detach()),
         policy_loss=float(pl.detach()),
-        v_hat_mean=pieces.v_hat_mean,
+        v_hat_mean=float(stats_h[0]) / stats_denom,
         grad_norm=grad_norm,
-        transformed_reward_mean=pieces.transformed_mean,
+        transformed_reward_mean=float(stats_h[1]) / stats_denom,
     )
 
 

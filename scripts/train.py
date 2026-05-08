@@ -4831,62 +4831,169 @@ def train_text_native_batched_envs(
             inference_policy=inference_policy,
         )
         policy_versions.publish_from_online(publish_source)
+        import os as _os
+
+        go_timing: dict[str, float | int] = {}
+        _profile_secs = float(_os.environ.get("MAGIC_AI_PROFILE_RL_SECONDS", "0") or 0.0)
+        _profile_out = _os.environ.get("MAGIC_AI_PROFILE_RL_OUTPUT", "/tmp/rl_profile.json.gz")
+        _profile_state: dict[str, Any] = {"prof": None, "started_at": None, "done": False}
+        _go_updates_seen = 0
+
+        def _go_timing_add(name: str, elapsed: float) -> None:
+            go_timing[f"{name}_total_s"] = float(go_timing.get(f"{name}_total_s", 0.0)) + elapsed
+            go_timing[f"{name}_count"] = int(go_timing.get(f"{name}_count", 0)) + 1
+
+        def _print_go_timing() -> None:
+            if not go_timing:
+                return
+            fields = [cli_step_prefix(), "[go_rollout_timing]"]
+            for name in (
+                "go_claim_update",
+                "go_start_games",
+                "go_add_games",
+                "go_next_batch",
+                "go_host_lists",
+                "go_pack_batch",
+                "go_policy_sample",
+                "go_stage_replay",
+                "go_record_actions",
+                "go_submit_choices",
+                "go_finish_games",
+            ):
+                total = float(go_timing.get(f"{name}_total_s", 0.0))
+                if total <= 0.0:
+                    continue
+                count = int(go_timing.get(f"{name}_count", 0))
+                mean_ms = 1000.0 * total / max(count, 1)
+                fields.append(f"{name}={total:.2f}s/{mean_ms:.1f}msx{count}")
+            print(*fields, flush=True)
+            go_timing.clear()
+
+        def _maybe_start_profile() -> None:
+            if (
+                _profile_secs <= 0.0
+                or _profile_state["prof"] is not None
+                or _profile_state["done"]
+                or _go_updates_seen < 1
+            ):
+                return
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            prof = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=False,
+                with_stack=False,
+                profile_memory=False,
+            )
+            prof.start()
+            _profile_state["prof"] = prof
+            _profile_state["started_at"] = time.monotonic()
+            print(
+                cli_step_prefix(),
+                f"[profile] torch.profiler started; will run for "
+                f"{_profile_secs:.0f}s, output={_profile_out}",
+                flush=True,
+            )
+
+        def _maybe_stop_profile() -> None:
+            _profile_started_at = _profile_state["started_at"]
+            if (
+                _profile_state["prof"] is None
+                or _profile_state["done"]
+                or _profile_started_at is None
+                or time.monotonic() - float(_profile_started_at) < _profile_secs
+            ):
+                return
+            prof = _profile_state["prof"]
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            prof.stop()
+            out_path = Path(_profile_out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            prof.export_chrome_trace(str(out_path))
+            print(
+                cli_step_prefix(),
+                f"[profile] torch.profiler stopped; trace written to {out_path}",
+                flush=True,
+            )
+            try:
+                print(
+                    prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25),
+                    flush=True,
+                )
+            except Exception as _e:
+                print(f"[profile] key_averages table failed: {_e}", flush=True)
+            _profile_state["done"] = True
+            _profile_state["prof"] = None
+            raise SystemExit(0)
 
         def _start_games(max_new: int) -> list[LiveGame]:
             nonlocal next_episode_idx
+            t0 = time.perf_counter()
             started: list[LiveGame] = []
-            while free_slots and next_episode_idx < args.episodes and len(started) < max_new:
-                started.append(start_game(free_slots.pop(), next_episode_idx))
-                next_episode_idx += 1
+            with torch.profiler.record_function("go_start_games"):
+                while free_slots and next_episode_idx < args.episodes and len(started) < max_new:
+                    started.append(start_game(free_slots.pop(), next_episode_idx))
+                    next_episode_idx += 1
+            _go_timing_add("go_start_games", time.perf_counter() - t0)
             return started
 
         def _claim_and_update(*, final: bool = False) -> bool:
-            nonlocal pending_step_count
+            nonlocal pending_step_count, _go_updates_seen
             if pending_step_count <= 0:
                 return False
+            t0 = time.perf_counter()
             min_rows = 1 if final else int(args.learner_min_rows)
             target_rows = 1 if final else int(args.learner_target_rows)
-            window = backend.replay_buffer.claim_train_window(
-                min_rows=min_rows,
-                max_rows=int(args.learner_max_rows),
-                target_rows=target_rows,
-                allow_partial=final,
-            )
-            if window is None:
-                return False
-            if window.ready_events and backend.replay_buffer.device.type == "cuda":
-                stream = torch.cuda.current_stream(backend.replay_buffer.device)
-                for event in window.ready_events:
-                    stream.wait_event(event)
-            steps = int(window.rows.numel())
-            if rnad_state is None:
-                returns = backend.replay_buffer.build_ppo_returns_for_rows(
-                    window.rows,
-                    gamma=args.gamma,
-                    gae_lambda=args.gae_lambda,
+            with torch.profiler.record_function("go_claim_update"):
+                window = backend.replay_buffer.claim_train_window(
+                    min_rows=min_rows,
+                    max_rows=int(args.learner_max_rows),
+                    target_rows=target_rows,
+                    allow_partial=final,
                 )
-                run_update(
-                    final=final,
-                    replay_rows_tensor=window.rows,
-                    returns_tensor=returns,
-                    step_count=steps,
-                    completed_games_snapshot=int(completed_games),
-                    win_stats_snapshot=replace(win_stats),
-                    reset_replay=False,
-                )
-            else:
-                run_update(
-                    final=final,
-                    replay_rows_tensor=window.rows,
-                    step_count=steps,
-                    completed_games_snapshot=int(completed_games),
-                    win_stats_snapshot=replace(win_stats),
-                    reset_replay=False,
-                )
-            backend.replay_buffer.release_train_window(window)
-            with pending_step_count_lock:
-                pending_step_count = max(0, pending_step_count - steps)
-            policy_versions.publish_from_online(publish_source)
+                if window is None:
+                    _go_timing_add("go_claim_update", time.perf_counter() - t0)
+                    return False
+                if window.ready_events and backend.replay_buffer.device.type == "cuda":
+                    stream = torch.cuda.current_stream(backend.replay_buffer.device)
+                    for event in window.ready_events:
+                        stream.wait_event(event)
+                steps = int(window.rows.numel())
+                if rnad_state is None:
+                    returns = backend.replay_buffer.build_ppo_returns_for_rows(
+                        window.rows,
+                        gamma=args.gamma,
+                        gae_lambda=args.gae_lambda,
+                    )
+                    run_update(
+                        final=final,
+                        replay_rows_tensor=window.rows,
+                        returns_tensor=returns,
+                        step_count=steps,
+                        completed_games_snapshot=int(completed_games),
+                        win_stats_snapshot=replace(win_stats),
+                        reset_replay=False,
+                    )
+                else:
+                    run_update(
+                        final=final,
+                        replay_rows_tensor=window.rows,
+                        step_count=steps,
+                        completed_games_snapshot=int(completed_games),
+                        win_stats_snapshot=replace(win_stats),
+                        reset_replay=False,
+                    )
+                backend.replay_buffer.release_train_window(window)
+                with pending_step_count_lock:
+                    pending_step_count = max(0, pending_step_count - steps)
+                policy_versions.publish_from_online(publish_source)
+                _go_updates_seen += 1
+            _go_timing_add("go_claim_update", time.perf_counter() - t0)
+            _print_go_timing()
             return True
 
         def _run_periodic_hooks() -> None:
@@ -4968,40 +5075,50 @@ def train_text_native_batched_envs(
                 return scheduler_started
             active_by_episode.update({int(env.episode_idx): env for env in started})
             if scheduler_started:
-                text_rollout.add_games(
-                    [env.game for env in started],
-                    slot_ids=[int(env.slot_idx) for env in started],
-                    episode_ids=[int(env.episode_idx) for env in started],
-                    encoder=encoder,
-                    max_steps_per_game=max_steps_per_game,
-                    max_tokens=int(args.text_max_tokens),
-                    max_card_refs=256,
-                    max_blanks=int(args.max_options),
-                    max_legal_per_blank=int(args.max_cached_choices),
-                )
+                t0 = time.perf_counter()
+                with torch.profiler.record_function("go_add_games"):
+                    text_rollout.add_games(
+                        [env.game for env in started],
+                        slot_ids=[int(env.slot_idx) for env in started],
+                        episode_ids=[int(env.episode_idx) for env in started],
+                        encoder=encoder,
+                        max_steps_per_game=max_steps_per_game,
+                        max_tokens=int(args.text_max_tokens),
+                        max_card_refs=256,
+                        max_blanks=int(args.max_options),
+                        max_legal_per_blank=int(args.max_cached_choices),
+                    )
+                _go_timing_add("go_add_games", time.perf_counter() - t0)
             else:
-                text_rollout.start(
-                    [env.game for env in started],
-                    slot_ids=[int(env.slot_idx) for env in started],
-                    episode_ids=[int(env.episode_idx) for env in started],
-                    encoder=encoder,
-                    max_steps_per_game=max_steps_per_game,
-                    max_tokens=int(args.text_max_tokens),
-                    max_card_refs=256,
-                    max_blanks=int(args.max_options),
-                    max_legal_per_blank=int(args.max_cached_choices),
-                    ready_queue_capacity=max(active_slot_limit, max_batch),
-                    terminal_queue_capacity=active_slot_limit,
-                )
+                t0 = time.perf_counter()
+                with torch.profiler.record_function("go_add_games"):
+                    text_rollout.start(
+                        [env.game for env in started],
+                        slot_ids=[int(env.slot_idx) for env in started],
+                        episode_ids=[int(env.episode_idx) for env in started],
+                        encoder=encoder,
+                        max_steps_per_game=max_steps_per_game,
+                        max_tokens=int(args.text_max_tokens),
+                        max_card_refs=256,
+                        max_blanks=int(args.max_options),
+                        max_legal_per_blank=int(args.max_cached_choices),
+                        ready_queue_capacity=max(active_slot_limit, max_batch),
+                        terminal_queue_capacity=active_slot_limit,
+                    )
+                _go_timing_add("go_add_games", time.perf_counter() - t0)
             return True
 
         scheduler_started = False
         try:
             scheduler_started = _refill_go_slots(scheduler_started=False)
             while scheduler_started and (active_by_episode or next_episode_idx < args.episodes):
+                _maybe_start_profile()
+                _maybe_stop_profile()
                 while pending_step_count >= int(args.learner_min_rows):
                     if not _claim_and_update(final=False):
                         break
+                    _maybe_start_profile()
+                    _maybe_stop_profile()
                 _run_periodic_hooks()
                 scheduler_started = _refill_go_slots(scheduler_started=scheduler_started)
                 if not active_by_episode:
@@ -5009,114 +5126,139 @@ def train_text_native_batched_envs(
                         break
                     continue
 
-                ready = text_rollout.next_text_inference_batch(
-                    encoder,
-                    max_rows=max_batch,
-                    timeout_ms=max(1, int(args.rollout_ready_wait_ms)),
-                    max_tokens=int(args.text_max_tokens),
-                    max_card_refs=256,
-                    max_blanks=int(args.max_options),
-                    max_legal_per_blank=int(args.max_cached_choices),
-                )
-                if ready.rows:
-                    request_ids = [int(x) for x in ready.request_ids.tolist()]
-                    slot_ids = [int(x) for x in ready.slot_ids.tolist()]
-                    episode_ids = [int(x) for x in ready.episode_ids.tolist()]
-                    perspectives = [int(x) for x in ready.perspective_player_indices.tolist()]
-                    packed = ready.packed_outputs.to_packed_text_batch(
-                        trim=True,
-                        derive_token_metadata=True,
+                t0 = time.perf_counter()
+                with torch.profiler.record_function("go_next_batch"):
+                    ready = text_rollout.next_text_inference_batch(
+                        encoder,
+                        max_rows=max_batch,
+                        timeout_ms=max(1, int(args.rollout_ready_wait_ms)),
+                        max_tokens=int(args.text_max_tokens),
+                        max_card_refs=256,
+                        max_blanks=int(args.max_options),
+                        max_legal_per_blank=int(args.max_cached_choices),
                     )
+                _go_timing_add("go_next_batch", time.perf_counter() - t0)
+                if ready.rows:
+                    t0 = time.perf_counter()
+                    with torch.profiler.record_function("go_host_lists"):
+                        request_ids = [int(x) for x in ready.request_ids.tolist()]
+                        slot_ids = [int(x) for x in ready.slot_ids.tolist()]
+                        episode_ids = [int(x) for x in ready.episode_ids.tolist()]
+                        perspectives = [int(x) for x in ready.perspective_player_indices.tolist()]
+                    _go_timing_add("go_host_lists", time.perf_counter() - t0)
+                    t0 = time.perf_counter()
+                    with torch.profiler.record_function("go_pack_batch"):
+                        packed = ready.packed_outputs.to_packed_text_batch(
+                            trim=True,
+                            derive_token_metadata=True,
+                        )
+                    _go_timing_add("go_pack_batch", time.perf_counter() - t0)
                     sample_profile: dict[str, float] | None = None
-                    with torch.no_grad():
-                        with policy_versions.acquire_inference_policy() as (
-                            policy,
-                            policy_version,
-                        ):
-                            policy_batch = policy.sample_native_tensor_batch(
-                                native_batch=ready.native_batch,
-                                env_indices=slot_ids,
-                                perspective_player_indices=perspectives,
-                                packed_batch=packed,
-                                deterministic=args.deterministic_rollout,
-                                append_replay=False,
-                                return_replay_payload=True,
-                                profile_timings=sample_profile,
-                            )
+                    t0 = time.perf_counter()
+                    with torch.profiler.record_function("go_policy_sample"):
+                        with torch.no_grad():
+                            with policy_versions.acquire_inference_policy() as (
+                                policy,
+                                policy_version,
+                            ):
+                                policy_batch = policy.sample_native_tensor_batch(
+                                    native_batch=ready.native_batch,
+                                    env_indices=slot_ids,
+                                    perspective_player_indices=perspectives,
+                                    packed_batch=packed,
+                                    deterministic=args.deterministic_rollout,
+                                    append_replay=False,
+                                    return_replay_payload=True,
+                                    profile_timings=sample_profile,
+                                )
+                    _go_timing_add("go_policy_sample", time.perf_counter() - t0)
                     if policy_batch.replay_payload is None:
                         raise RuntimeError("Go text rollout expected a replay payload")
-                    staging_buffer.stage_batch(
-                        slot_ids,
-                        policy_batch.replay_payload,
-                    )
-                    selected_cursor = 0
-                    for row_idx, episode_id in enumerate(episode_ids):
-                        env = active_by_episode[int(episode_id)]
-                        env.action_count += 1
-                        env.inference_policy_version = int(policy_version)
-                        env.behavior_policy_version = int(policy_version)
-                        count = int(policy_batch.decision_counts[row_idx])
-                        selected_for_step = policy_batch.selected_choice_cols[
-                            selected_cursor : selected_cursor + count
-                        ]
-                        selected_cursor += count
-                        if env.transcript_enabled:
-                            try:
-                                state, pending = _current_transcript_snapshot(env.game)
-                                trace_kind = TRACE_KIND_VALUES[
-                                    int(ready.native_batch.trace_kind_id[row_idx])
-                                ]
-                                if trace_kind == "may":
-                                    action = action_from_choice_accepted(
-                                        bool(policy_batch.may_selected[row_idx])
-                                    )
-                                else:
-                                    _trace, action = _decode_text_action(
-                                        trace_kind,
-                                        pending,
-                                        list(selected_for_step),
-                                    )
-                                env.transcript.append(
-                                    TranscriptAction(
-                                        state=state,
-                                        pending=pending,
-                                        action=copy.deepcopy(action),
-                                    )
-                                )
-                            except Exception as exc:  # noqa: BLE001
-                                disable_transcript(
-                                    env,
-                                    f"{exc} while snapshotting live game for Go text action",
-                                )
-                        env.episode_steps.append(
-                            RolloutStep(
-                                perspective_player_idx=int(perspectives[row_idx]),
-                                old_log_prob=float(policy_batch.old_log_prob[row_idx]),
-                                value=float(policy_batch.value[row_idx]),
-                                replay_idx=None,
-                            )
+                    t0 = time.perf_counter()
+                    with torch.profiler.record_function("go_stage_replay"):
+                        staging_buffer.stage_batch(
+                            slot_ids,
+                            policy_batch.replay_payload,
                         )
-                    text_rollout.submit_text_choices(
-                        request_ids=request_ids,
-                        decision_counts=list(policy_batch.decision_counts),
-                        selected_choice_cols=list(policy_batch.selected_choice_cols),
-                        may_selected=list(policy_batch.may_selected),
-                    )
+                    _go_timing_add("go_stage_replay", time.perf_counter() - t0)
+                    t0 = time.perf_counter()
+                    selected_cursor = 0
+                    with torch.profiler.record_function("go_record_actions"):
+                        for row_idx, episode_id in enumerate(episode_ids):
+                            env = active_by_episode[int(episode_id)]
+                            env.action_count += 1
+                            env.inference_policy_version = int(policy_version)
+                            env.behavior_policy_version = int(policy_version)
+                            count = int(policy_batch.decision_counts[row_idx])
+                            selected_for_step = policy_batch.selected_choice_cols[
+                                selected_cursor : selected_cursor + count
+                            ]
+                            selected_cursor += count
+                            if env.transcript_enabled:
+                                try:
+                                    state, pending = _current_transcript_snapshot(env.game)
+                                    trace_kind = TRACE_KIND_VALUES[
+                                        int(ready.native_batch.trace_kind_id[row_idx])
+                                    ]
+                                    if trace_kind == "may":
+                                        action = action_from_choice_accepted(
+                                            bool(policy_batch.may_selected[row_idx])
+                                        )
+                                    else:
+                                        _trace, action = _decode_text_action(
+                                            trace_kind,
+                                            pending,
+                                            list(selected_for_step),
+                                        )
+                                    env.transcript.append(
+                                        TranscriptAction(
+                                            state=state,
+                                            pending=pending,
+                                            action=copy.deepcopy(action),
+                                        )
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    disable_transcript(
+                                        env,
+                                        f"{exc} while snapshotting live game for Go text action",
+                                    )
+                            env.episode_steps.append(
+                                RolloutStep(
+                                    perspective_player_idx=int(perspectives[row_idx]),
+                                    old_log_prob=float(policy_batch.old_log_prob[row_idx]),
+                                    value=float(policy_batch.value[row_idx]),
+                                    replay_idx=None,
+                                )
+                            )
+                    _go_timing_add("go_record_actions", time.perf_counter() - t0)
+                    t0 = time.perf_counter()
+                    with torch.profiler.record_function("go_submit_choices"):
+                        text_rollout.submit_text_choices(
+                            request_ids=request_ids,
+                            decision_counts=list(policy_batch.decision_counts),
+                            selected_choice_cols=list(policy_batch.selected_choice_cols),
+                            may_selected=list(policy_batch.may_selected),
+                        )
+                    _go_timing_add("go_submit_choices", time.perf_counter() - t0)
 
                 if ready.terminal_events:
+                    t0 = time.perf_counter()
                     finished: list[tuple[LiveGame, int, bool]] = []
-                    for event in ready.terminal_events:
-                        if int(event.winner_idx) < -1:
-                            raise RuntimeError(
-                                "native text rollout worker aborted "
-                                f"episode={event.episode_id} slot={event.slot_id}"
-                            )
-                        env = active_by_episode.pop(int(event.episode_id), None)
-                        if env is None:
-                            continue
-                        finished.append((env, int(event.winner_idx), bool(event.is_timeout)))
-                    finish_games(finished)
+                    with torch.profiler.record_function("go_finish_games"):
+                        for event in ready.terminal_events:
+                            if int(event.winner_idx) < -1:
+                                raise RuntimeError(
+                                    "native text rollout worker aborted "
+                                    f"episode={event.episode_id} slot={event.slot_id}"
+                                )
+                            env = active_by_episode.pop(int(event.episode_id), None)
+                            if env is None:
+                                continue
+                            finished.append((env, int(event.winner_idx), bool(event.is_timeout)))
+                        finish_games(finished)
+                    _go_timing_add("go_finish_games", time.perf_counter() - t0)
                     scheduler_started = _refill_go_slots(scheduler_started=scheduler_started)
+                _maybe_stop_profile()
         finally:
             text_rollout.stop_text_rollout(wait_for_active=True)
         while pending_step_count >= int(args.learner_min_rows):

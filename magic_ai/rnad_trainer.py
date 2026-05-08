@@ -243,8 +243,10 @@ def run_rnad_update(
 
     episodes_logp_mu = [torch.tensor(lp, dtype=torch.float32) for lp in per_episode_logp_mu]
 
-    diag_every = state.config.diagnostic_v_target_reg_share_every
-    compute_v_target_reg_share = diag_every > 0 and (state.gradient_step % diag_every == 0)
+    vshare_every = state.config.diagnostic_v_target_reg_share_every
+    compute_v_target_reg_share = vshare_every > 0 and (state.gradient_step % vshare_every == 0)
+    drift_every = state.config.diagnostic_policy_drift_every
+    compute_policy_drift_diagnostics = drift_every > 0 and (state.gradient_step % drift_every == 0)
 
     n_episodes = len(per_episode_replay_rows)
     step_budget = state.config.step_minibatch_size
@@ -279,6 +281,7 @@ def run_rnad_update(
             config=state.config,
             alpha=alpha,
             compute_v_target_reg_share=compute_v_target_reg_share,
+            compute_policy_drift_diagnostics=compute_policy_drift_diagnostics,
         )
 
     if os.environ.get("RNAD_VERIFY_COUNTS"):
@@ -310,20 +313,21 @@ def run_rnad_update(
     optimizer.zero_grad(set_to_none=True)
     cl_loss_total = 0.0
     pl_loss_total = 0.0
-    n_q_clipped_total = 0
-    flat_active_total = 0
-    v_hat_mean_acc = 0.0
-    transformed_mean_acc = 0.0
+    n_q_clipped_total: torch.Tensor | None = None
+    flat_active_total: torch.Tensor | None = None
+    v_hat_sum_total: torch.Tensor | None = None
+    transformed_sum_total: torch.Tensor | None = None
+    transformed_count_total = 0
     n_pieces = 0
-    diag_lr_sum = 0.0
+    diag_lr_sum: torch.Tensor | None = None
     diag_lr_count = 0
-    diag_lr_absmax = 0.0
-    diag_isup_sum = 0.0
-    diag_isup_count = 0
-    diag_isdn_sum = 0.0
-    diag_isdn_count = 0
-    diag_vshare_sum = 0.0
-    diag_vshare_count = 0
+    diag_lr_absmax: torch.Tensor | None = None
+    diag_isup_sum: torch.Tensor | None = None
+    diag_isup_count: torch.Tensor | None = None
+    diag_isdn_sum: torch.Tensor | None = None
+    diag_isdn_count: torch.Tensor | None = None
+    diag_vshare_sum: torch.Tensor | None = None
+    diag_vshare_count: torch.Tensor | None = None
     for lo, hi in chunks:
         pieces_list = _chunk_pieces(lo, hi)
         cl_chunk = pieces_list[0].cl_sum.new_zeros(())
@@ -331,21 +335,75 @@ def run_rnad_update(
         for pieces in pieces_list:
             cl_chunk = cl_chunk + pieces.cl_sum
             pl_chunk = pl_chunk + pieces.pl_sum
-            n_q_clipped_total += pieces.n_q_clipped
-            flat_active_total += pieces.pl_count
-            v_hat_mean_acc += pieces.v_hat_mean
-            transformed_mean_acc += pieces.transformed_mean
+            n_q_clipped_total = (
+                pieces.n_q_clipped
+                if n_q_clipped_total is None
+                else n_q_clipped_total + pieces.n_q_clipped
+            )
+            flat_active_total = (
+                pieces.pl_count
+                if flat_active_total is None
+                else flat_active_total + pieces.pl_count
+            )
+            v_hat_sum_total = (
+                pieces.v_hat_sum if v_hat_sum_total is None else v_hat_sum_total + pieces.v_hat_sum
+            )
+            transformed_sum_total = (
+                pieces.transformed_sum
+                if transformed_sum_total is None
+                else transformed_sum_total + pieces.transformed_sum
+            )
+            transformed_count_total += pieces.transformed_count
             n_pieces += 1
-            diag_lr_sum += pieces.sampled_log_ratio_sum
+            if pieces.sampled_log_ratio_sum is not None:
+                diag_lr_sum = (
+                    pieces.sampled_log_ratio_sum
+                    if diag_lr_sum is None
+                    else diag_lr_sum + pieces.sampled_log_ratio_sum
+                )
             diag_lr_count += pieces.sampled_log_ratio_count
-            if pieces.sampled_log_ratio_absmax > diag_lr_absmax:
-                diag_lr_absmax = pieces.sampled_log_ratio_absmax
-            diag_isup_sum += pieces.is_bias_up_sum
-            diag_isup_count += pieces.is_bias_up_count
-            diag_isdn_sum += pieces.is_bias_down_sum
-            diag_isdn_count += pieces.is_bias_down_count
-            diag_vshare_sum += pieces.v_target_reg_share_sum
-            diag_vshare_count += pieces.v_target_reg_share_count
+            if pieces.sampled_log_ratio_absmax is not None:
+                diag_lr_absmax = (
+                    pieces.sampled_log_ratio_absmax
+                    if diag_lr_absmax is None
+                    else torch.maximum(diag_lr_absmax, pieces.sampled_log_ratio_absmax)
+                )
+            if pieces.is_bias_up_sum is not None:
+                diag_isup_sum = (
+                    pieces.is_bias_up_sum
+                    if diag_isup_sum is None
+                    else diag_isup_sum + pieces.is_bias_up_sum
+                )
+            if pieces.is_bias_up_count is not None:
+                diag_isup_count = (
+                    pieces.is_bias_up_count
+                    if diag_isup_count is None
+                    else diag_isup_count + pieces.is_bias_up_count
+                )
+            if pieces.is_bias_down_sum is not None:
+                diag_isdn_sum = (
+                    pieces.is_bias_down_sum
+                    if diag_isdn_sum is None
+                    else diag_isdn_sum + pieces.is_bias_down_sum
+                )
+            if pieces.is_bias_down_count is not None:
+                diag_isdn_count = (
+                    pieces.is_bias_down_count
+                    if diag_isdn_count is None
+                    else diag_isdn_count + pieces.is_bias_down_count
+                )
+            if pieces.v_target_reg_share_sum is not None:
+                diag_vshare_sum = (
+                    pieces.v_target_reg_share_sum
+                    if diag_vshare_sum is None
+                    else diag_vshare_sum + pieces.v_target_reg_share_sum
+                )
+            if pieces.v_target_reg_share_count is not None:
+                diag_vshare_count = (
+                    pieces.v_target_reg_share_count
+                    if diag_vshare_count is None
+                    else diag_vshare_count + pieces.v_target_reg_share_count
+                )
         cl_part = cl_chunk / cl_norm
         pl_part = pl_chunk / pl_norm
         (cl_part + pl_part).backward()
@@ -355,6 +413,43 @@ def run_rnad_update(
     trainable = [p for p in policy.parameters() if p.requires_grad]
     grad_norm = float(nn.utils.clip_grad_norm_(trainable, max_norm=state.config.grad_clip))
     loss_total = cl_loss_total + pl_loss_total
+    zero = torch.zeros((), dtype=torch.float32)
+    stats_tensors = [
+        n_q_clipped_total if n_q_clipped_total is not None else zero,
+        flat_active_total if flat_active_total is not None else zero,
+        v_hat_sum_total if v_hat_sum_total is not None else zero,
+        transformed_sum_total if transformed_sum_total is not None else zero,
+        diag_lr_sum if diag_lr_sum is not None else zero,
+        diag_lr_absmax if diag_lr_absmax is not None else zero,
+        diag_isup_sum if diag_isup_sum is not None else zero,
+        diag_isup_count if diag_isup_count is not None else zero,
+        diag_isdn_sum if diag_isdn_sum is not None else zero,
+        diag_isdn_count if diag_isdn_count is not None else zero,
+        diag_vshare_sum if diag_vshare_sum is not None else zero,
+        diag_vshare_count if diag_vshare_count is not None else zero,
+    ]
+    stats_h = torch.stack([t.detach().to(device="cpu", dtype=torch.float32) for t in stats_tensors])
+    (
+        n_q_clipped_h,
+        flat_active_h,
+        v_hat_sum_h,
+        transformed_sum_h,
+        diag_lr_sum_h,
+        diag_lr_absmax_h,
+        diag_isup_sum_h,
+        diag_isup_count_h,
+        diag_isdn_sum_h,
+        diag_isdn_count_h,
+        diag_vshare_sum_h,
+        diag_vshare_count_h,
+    ) = [float(x) for x in stats_h.tolist()]
+    v_hat_mean = v_hat_sum_h / max(transformed_count_total, 1)
+    transformed_mean = transformed_sum_h / max(transformed_count_total, 1)
+    q_clip_fraction = n_q_clipped_h / flat_active_h if flat_active_h > 0 else 0.0
+    sampled_log_ratio_mean = diag_lr_sum_h / diag_lr_count if diag_lr_count > 0 else 0.0
+    is_bias_up_mean = diag_isup_sum_h / diag_isup_count_h if diag_isup_count_h > 0 else 0.0
+    is_bias_down_mean = diag_isdn_sum_h / diag_isdn_count_h if diag_isdn_count_h > 0 else 0.0
+    v_target_reg_share = diag_vshare_sum_h / diag_vshare_count_h if diag_vshare_count_h > 0 else 0.0
     if not math.isfinite(grad_norm) or not math.isfinite(loss_total):
         optimizer.zero_grad(set_to_none=True)
         print(
@@ -366,21 +461,15 @@ def run_rnad_update(
             loss=loss_total,
             critic_loss=cl_loss_total,
             policy_loss=pl_loss_total,
-            v_hat_mean=v_hat_mean_acc / n_pieces,
+            v_hat_mean=v_hat_mean,
             grad_norm=grad_norm,
-            transformed_reward_mean=transformed_mean_acc / n_pieces,
-            q_clip_fraction=(
-                float(n_q_clipped_total) / float(flat_active_total)
-                if flat_active_total > 0
-                else 0.0
-            ),
-            sampled_log_ratio_mean=(diag_lr_sum / diag_lr_count) if diag_lr_count > 0 else 0.0,
-            sampled_log_ratio_absmax=diag_lr_absmax,
-            is_bias_up_mean=(diag_isup_sum / diag_isup_count) if diag_isup_count > 0 else 0.0,
-            is_bias_down_mean=(diag_isdn_sum / diag_isdn_count) if diag_isdn_count > 0 else 0.0,
-            v_target_reg_share=(
-                (diag_vshare_sum / diag_vshare_count) if diag_vshare_count > 0 else 0.0
-            ),
+            transformed_reward_mean=transformed_mean,
+            q_clip_fraction=q_clip_fraction,
+            sampled_log_ratio_mean=sampled_log_ratio_mean,
+            sampled_log_ratio_absmax=diag_lr_absmax_h,
+            is_bias_up_mean=is_bias_up_mean,
+            is_bias_down_mean=is_bias_down_mean,
+            v_target_reg_share=v_target_reg_share,
         )
         state.last_stats = [aggregate]
         return TrainerStats(
@@ -402,24 +491,19 @@ def run_rnad_update(
     if state.gradient_step >= current_delta_m:
         _advance_outer_iteration(state)
 
-    q_clip_fraction = (
-        float(n_q_clipped_total) / float(flat_active_total) if flat_active_total > 0 else 0.0
-    )
     aggregate = RNaDStats(
         loss=cl_loss_total + pl_loss_total,
         critic_loss=cl_loss_total,
         policy_loss=pl_loss_total,
-        v_hat_mean=v_hat_mean_acc / n_pieces,
+        v_hat_mean=v_hat_mean,
         grad_norm=grad_norm,
-        transformed_reward_mean=transformed_mean_acc / n_pieces,
+        transformed_reward_mean=transformed_mean,
         q_clip_fraction=q_clip_fraction,
-        sampled_log_ratio_mean=(diag_lr_sum / diag_lr_count) if diag_lr_count > 0 else 0.0,
-        sampled_log_ratio_absmax=diag_lr_absmax,
-        is_bias_up_mean=(diag_isup_sum / diag_isup_count) if diag_isup_count > 0 else 0.0,
-        is_bias_down_mean=(diag_isdn_sum / diag_isdn_count) if diag_isdn_count > 0 else 0.0,
-        v_target_reg_share=(
-            (diag_vshare_sum / diag_vshare_count) if diag_vshare_count > 0 else 0.0
-        ),
+        sampled_log_ratio_mean=sampled_log_ratio_mean,
+        sampled_log_ratio_absmax=diag_lr_absmax_h,
+        is_bias_up_mean=is_bias_up_mean,
+        is_bias_down_mean=is_bias_down_mean,
+        v_target_reg_share=v_target_reg_share,
     )
     state.last_stats = [aggregate]
 
