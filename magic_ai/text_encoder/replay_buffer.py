@@ -512,17 +512,24 @@ class TextReplayBuffer:
             committed_limit = -1
             completed_limit = -1
             claimable_limit = -1
+            claimed_start = -1
+            claimed_limit = -1
             if self._committed_windows:
                 head = self._committed_windows[0]
                 committed_start, committed_limit = head.row_start, head.row_end
                 _row_start, completed_limit = self._completed_window_prefix_locked()
                 _row_start, claimable_limit = self._claimable_window_prefix_locked()
+            if self._claimed_windows:
+                claimed_start, claimed_limit = self._claimed_windows[0]
             return {
                 "committed_windows": len(self._committed_windows),
                 "committed_start": int(committed_start),
                 "committed_limit": int(committed_limit),
                 "completed_limit": int(completed_limit),
                 "claimable_limit": int(claimable_limit),
+                "claimed_windows": len(self._claimed_windows),
+                "claimed_start": int(claimed_start),
+                "claimed_limit": int(claimed_limit),
                 "row_ring_start": int(self.row_ring.start),
                 "row_ring_used": int(self.row_ring.used),
                 "token_ring_used": int(self.token_ring.used),
@@ -567,11 +574,10 @@ class TextReplayBuffer:
             claimed_start, claimed_end = self._claimed_windows[0]
             if first_row != claimed_start or last_row + 1 != claimed_end:
                 raise RuntimeError("claimed replay windows must be released in FIFO order")
+            if first_row != self.row_ring.start:
+                raise RuntimeError("claimed replay window must begin at the row ring head")
             self._claimed_windows.pop(0)
-            self.row_ring.release(
-                row_count,
-                new_start=last_row + 1 if first_row == self.row_ring.start else None,
-            )
+            self.row_ring.release(row_count, new_start=last_row + 1)
             self.token_ring.release(
                 token_count,
                 new_start=last_token_start + last_token_len if token_count > 0 else None,
