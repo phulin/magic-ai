@@ -26,7 +26,7 @@ import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
 
@@ -348,7 +348,9 @@ class TextRolloutActor:
                     reply.replay_payload,
                     ready_event=getattr(reply, "ready_event", None),
                 )
-                reply.replay_rows = [int(row) for row in rows.detach().cpu().tolist()]
+                reply = replace(
+                    reply, replay_rows=[int(row) for row in rows.detach().cpu().tolist()]
+                )
                 self._record_timing("actor_append_replay", start)
             elif reply.replay_rows is None:
                 start = time.perf_counter()

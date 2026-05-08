@@ -3,7 +3,7 @@ from __future__ import annotations
 import ctypes
 import threading
 from ctypes import POINTER, Structure, byref, c_char_p, c_int64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import torch
@@ -141,6 +141,8 @@ def _load_text_rollout_ctypes_lib(mage: Any) -> ctypes.CDLL | None:
 
         lib.MageStartTextRollout.argtypes = [POINTER(_MageTextRolloutStartRequestC)]
         lib.MageStartTextRollout.restype = _MageEncodeResultC
+        lib.MageAddTextRolloutGames.argtypes = [POINTER(_MageTextRolloutStartRequestC)]
+        lib.MageAddTextRolloutGames.restype = _MageEncodeResultC
         lib.MageNextTextInferenceBatch.argtypes = [
             c_int64,
             c_int64,
@@ -174,6 +176,7 @@ OPTIONAL_STATUS_SYMBOLS = (
 
 REQUIRED_TEXT_ROLLOUT_SYMBOLS = (
     "MageStartTextRollout",
+    "MageAddTextRolloutGames",
     "MageNextTextInferenceBatch",
     "MageSubmitTextChoices",
     "MageStopTextRollout",
@@ -215,6 +218,22 @@ class TextReadyBatch:
     @property
     def rows(self) -> int:
         return int(self.request_ids.numel())
+
+
+@dataclass
+class _TextReadyOutputBuffers:
+    packed_outputs: Any
+    request_ids: torch.Tensor
+    slot_ids: torch.Tensor
+    episode_ids: torch.Tensor
+    step_indices: torch.Tensor
+    perspectives: torch.Tensor
+    terminal_slot_ids: torch.Tensor
+    terminal_episode_ids: torch.Tensor
+    terminal_winner: torch.Tensor
+    terminal_timeout: torch.Tensor
+    terminal_life_p0: torch.Tensor
+    terminal_life_p1: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -485,6 +504,9 @@ class NativeTextRolloutDriver:
     """ctypes wrapper for the Go-owned native text rollout scheduler."""
 
     lib: ctypes.CDLL
+    _output_cache: dict[tuple[int, int, int, int, int, int, int], _TextReadyOutputBuffers] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def for_mage(cls, mage: Any) -> NativeTextRolloutDriver:
@@ -506,7 +528,7 @@ class NativeTextRolloutDriver:
             )
         return cls(lib=lib)
 
-    def start(
+    def _rollout_start_request(
         self,
         games: list[Any],
         *,
@@ -520,7 +542,7 @@ class NativeTextRolloutDriver:
         max_legal_per_blank: int = 64,
         ready_queue_capacity: int | None = None,
         terminal_queue_capacity: int | None = None,
-    ) -> None:
+    ) -> _MageTextRolloutStartRequestC:
         if len(slot_ids) != len(games) or len(episode_ids) != len(games):
             raise ValueError("games, slot_ids, and episode_ids length mismatch")
         handles = torch.tensor(
@@ -555,22 +577,83 @@ class NativeTextRolloutDriver:
                 len(games) if terminal_queue_capacity is None else int(terminal_queue_capacity)
             ),
         )
-        result = self.lib.MageStartTextRollout(ctypes.byref(req))
-        self._raise_for_ctypes_result(result, "MageStartTextRollout")
+        req._magic_ai_handles = handles
+        req._magic_ai_slots = slots
+        req._magic_ai_episodes = episodes
+        return req
 
-    def next_text_inference_batch(
+    def start(
         self,
-        encoder: Any,
+        games: list[Any],
         *,
-        max_rows: int,
-        timeout_ms: int,
+        slot_ids: list[int],
+        episode_ids: list[int],
+        encoder: Any,
+        max_steps_per_game: int,
         max_tokens: int,
         max_card_refs: int = 256,
         max_blanks: int = 64,
         max_legal_per_blank: int = 64,
-    ) -> TextReadyBatch:
-        from magic_ai.actions import TRACE_KIND_VALUES
-        from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
+        ready_queue_capacity: int | None = None,
+        terminal_queue_capacity: int | None = None,
+    ) -> None:
+        req = self._rollout_start_request(
+            games,
+            slot_ids=slot_ids,
+            episode_ids=episode_ids,
+            encoder=encoder,
+            max_steps_per_game=max_steps_per_game,
+            max_tokens=max_tokens,
+            max_card_refs=max_card_refs,
+            max_blanks=max_blanks,
+            max_legal_per_blank=max_legal_per_blank,
+            ready_queue_capacity=ready_queue_capacity,
+            terminal_queue_capacity=terminal_queue_capacity,
+        )
+        result = self.lib.MageStartTextRollout(ctypes.byref(req))
+        self._raise_for_ctypes_result(result, "MageStartTextRollout")
+
+    def add_games(
+        self,
+        games: list[Any],
+        *,
+        slot_ids: list[int],
+        episode_ids: list[int],
+        encoder: Any,
+        max_steps_per_game: int,
+        max_tokens: int,
+        max_card_refs: int = 256,
+        max_blanks: int = 64,
+        max_legal_per_blank: int = 64,
+    ) -> None:
+        if not games:
+            return
+        req = self._rollout_start_request(
+            games,
+            slot_ids=slot_ids,
+            episode_ids=episode_ids,
+            encoder=encoder,
+            max_steps_per_game=max_steps_per_game,
+            max_tokens=max_tokens,
+            max_card_refs=max_card_refs,
+            max_blanks=max_blanks,
+            max_legal_per_blank=max_legal_per_blank,
+            ready_queue_capacity=len(games),
+            terminal_queue_capacity=len(games),
+        )
+        result = self.lib.MageAddTextRolloutGames(ctypes.byref(req))
+        self._raise_for_ctypes_result(result, "MageAddTextRolloutGames")
+
+    def _output_buffers(
+        self,
+        encoder: Any,
+        *,
+        n: int,
+        max_tokens: int,
+        max_card_refs: int,
+        max_blanks: int,
+        max_legal_per_blank: int,
+    ) -> _TextReadyOutputBuffers:
         from magic_ai.text_encoder.native_assembler import (
             _MageBlankAssemblerConfigC,
             _MagePackedBlankOutputsC,
@@ -580,18 +663,18 @@ class NativeTextRolloutDriver:
             allocate_packed_outputs,
         )
 
-        n = int(max_rows)
-        if n < 0:
-            raise ValueError("max_rows must be non-negative")
-        if n == 0:
-            raise ValueError("max_rows must be positive")
-
-        decision_capacity = max(1, n * int(encoder.max_options))
-        buffers = encoder._scratch_buffers(n, decision_capacity)
-        if encoder._scratch.out_c is None:
-            encoder._rebuild_encode_structs()
-        scratch = encoder._scratch
-        assert scratch.out_c is not None
+        key = (
+            int(n),
+            int(max_tokens),
+            int(encoder.max_options),
+            int(encoder.max_targets_per_option),
+            int(max_card_refs),
+            int(max_blanks),
+            int(max_legal_per_blank),
+        )
+        cached = self._output_cache.get(key)
+        if cached is not None:
+            return cached
 
         packed_outputs = allocate_packed_outputs(
             n,
@@ -634,18 +717,70 @@ class NativeTextRolloutDriver:
             blank_count=_tensor_ptr(packed_outputs.blank_count, ctypes.c_int32),
             blank_legal_count=_tensor_ptr(packed_outputs.blank_legal_count, ctypes.c_int32),
         )
+        cached = _TextReadyOutputBuffers(
+            packed_outputs=packed_outputs,
+            request_ids=torch.empty(n, dtype=torch.int64),
+            slot_ids=torch.empty(n, dtype=torch.int64),
+            episode_ids=torch.empty(n, dtype=torch.int64),
+            step_indices=torch.empty(n, dtype=torch.int64),
+            perspectives=torch.empty(n, dtype=torch.int64),
+            terminal_slot_ids=torch.empty(n, dtype=torch.int64),
+            terminal_episode_ids=torch.empty(n, dtype=torch.int64),
+            terminal_winner=torch.empty(n, dtype=torch.int64),
+            terminal_timeout=torch.empty(n, dtype=torch.int64),
+            terminal_life_p0=torch.empty(n, dtype=torch.int64),
+            terminal_life_p1=torch.empty(n, dtype=torch.int64),
+        )
+        self._output_cache[key] = cached
+        return cached
 
-        request_ids = torch.empty(n, dtype=torch.int64)
-        slot_ids = torch.empty(n, dtype=torch.int64)
-        episode_ids = torch.empty(n, dtype=torch.int64)
-        step_indices = torch.empty(n, dtype=torch.int64)
-        perspectives = torch.empty(n, dtype=torch.int64)
-        terminal_slot_ids = torch.empty(n, dtype=torch.int64)
-        terminal_episode_ids = torch.empty(n, dtype=torch.int64)
-        terminal_winner = torch.empty(n, dtype=torch.int64)
-        terminal_timeout = torch.empty(n, dtype=torch.int64)
-        terminal_life_p0 = torch.empty(n, dtype=torch.int64)
-        terminal_life_p1 = torch.empty(n, dtype=torch.int64)
+    def next_text_inference_batch(
+        self,
+        encoder: Any,
+        *,
+        max_rows: int,
+        timeout_ms: int,
+        max_tokens: int,
+        max_card_refs: int = 256,
+        max_blanks: int = 64,
+        max_legal_per_blank: int = 64,
+    ) -> TextReadyBatch:
+        from magic_ai.actions import TRACE_KIND_VALUES
+        from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
+
+        n = int(max_rows)
+        if n < 0:
+            raise ValueError("max_rows must be non-negative")
+        if n == 0:
+            raise ValueError("max_rows must be positive")
+
+        decision_capacity = max(1, n * int(encoder.max_options))
+        buffers = encoder._scratch_buffers(n, decision_capacity)
+        if encoder._scratch.out_c is None:
+            encoder._rebuild_encode_structs()
+        scratch = encoder._scratch
+        assert scratch.out_c is not None
+
+        out_buffers = self._output_buffers(
+            encoder,
+            n=n,
+            max_tokens=max_tokens,
+            max_card_refs=max_card_refs,
+            max_blanks=max_blanks,
+            max_legal_per_blank=max_legal_per_blank,
+        )
+        packed_outputs = out_buffers.packed_outputs
+        request_ids = out_buffers.request_ids
+        slot_ids = out_buffers.slot_ids
+        episode_ids = out_buffers.episode_ids
+        step_indices = out_buffers.step_indices
+        perspectives = out_buffers.perspectives
+        terminal_slot_ids = out_buffers.terminal_slot_ids
+        terminal_episode_ids = out_buffers.terminal_episode_ids
+        terminal_winner = out_buffers.terminal_winner
+        terminal_timeout = out_buffers.terminal_timeout
+        terminal_life_p0 = out_buffers.terminal_life_p0
+        terminal_life_p1 = out_buffers.terminal_life_p1
 
         outputs_c_type = getattr(self.lib, "_magic_ai_text_ready_outputs_c")
         out = outputs_c_type(

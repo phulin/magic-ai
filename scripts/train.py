@@ -5022,13 +5022,13 @@ def train_text_native_batched_envs(
         )
         policy_versions.publish_from_online(publish_source)
 
-        def _start_wave() -> list[LiveGame]:
+        def _start_games(max_new: int) -> list[LiveGame]:
             nonlocal next_episode_idx
-            wave: list[LiveGame] = []
-            while free_slots and next_episode_idx < args.episodes:
-                wave.append(start_game(free_slots.pop(), next_episode_idx))
+            started: list[LiveGame] = []
+            while free_slots and next_episode_idx < args.episodes and len(started) < max_new:
+                started.append(start_game(free_slots.pop(), next_episode_idx))
                 next_episode_idx += 1
-            return wave
+            return started
 
         def _claim_and_update(*, final: bool = False) -> bool:
             nonlocal pending_step_count
@@ -5141,139 +5141,195 @@ def train_text_native_batched_envs(
                         )
 
         max_batch = int(args.inference_max_batch) or int(args.num_envs)
-        while next_episode_idx < args.episodes:
-            while pending_step_count >= int(args.learner_min_rows):
-                if not _claim_and_update(final=False):
-                    break
-            _run_periodic_hooks()
-            wave = _start_wave()
-            if not wave:
-                break
-            active_by_episode = {int(env.episode_idx): env for env in wave}
-            try:
-                text_rollout.start(
-                    [env.game for env in wave],
-                    slot_ids=[int(env.slot_idx) for env in wave],
-                    episode_ids=[int(env.episode_idx) for env in wave],
+        replay_capacity = int(backend.replay_buffer.row_ring.capacity)
+        max_steps_per_game = int(args.max_steps_per_game)
+        if replay_capacity < max_steps_per_game:
+            raise RuntimeError(
+                "--replay-ring-capacity must be at least --max-steps-per-game for "
+                "Go text rollout scheduler"
+            )
+        active_slot_limit = min(
+            int(args.num_envs),
+            max(1, replay_capacity // max_steps_per_game),
+        )
+        max_batch = min(max_batch, active_slot_limit)
+        if active_slot_limit < int(args.num_envs):
+            print(
+                cli_step_prefix(),
+                "warning: Go text rollout active slots clamped "
+                f"to {active_slot_limit}/{args.num_envs} by replay capacity; "
+                "increase --replay-ring-capacity to use more concurrent envs",
+                flush=True,
+            )
+
+        active_by_episode: dict[int, LiveGame] = {}
+
+        def _refill_go_slots(*, scheduler_started: bool) -> bool:
+            if pending_step_count >= int(args.rollout_steps):
+                return scheduler_started
+            free_capacity = active_slot_limit - len(active_by_episode)
+            if free_capacity <= 0:
+                return scheduler_started
+            started = _start_games(free_capacity)
+            if not started:
+                return scheduler_started
+            active_by_episode.update({int(env.episode_idx): env for env in started})
+            if scheduler_started:
+                text_rollout.add_games(
+                    [env.game for env in started],
+                    slot_ids=[int(env.slot_idx) for env in started],
+                    episode_ids=[int(env.episode_idx) for env in started],
                     encoder=encoder,
-                    max_steps_per_game=int(args.max_steps_per_game),
+                    max_steps_per_game=max_steps_per_game,
                     max_tokens=int(args.text_max_tokens),
                     max_card_refs=256,
                     max_blanks=int(args.max_options),
                     max_legal_per_blank=int(args.max_cached_choices),
-                    ready_queue_capacity=max(int(args.num_envs), max_batch),
-                    terminal_queue_capacity=int(args.num_envs),
                 )
-                while active_by_episode:
-                    ready = text_rollout.next_text_inference_batch(
-                        encoder,
-                        max_rows=max_batch,
-                        timeout_ms=max(1, int(args.rollout_ready_wait_ms)),
-                        max_tokens=int(args.text_max_tokens),
-                        max_card_refs=256,
-                        max_blanks=int(args.max_options),
-                        max_legal_per_blank=int(args.max_cached_choices),
-                    )
-                    if ready.rows:
-                        request_ids = [int(x) for x in ready.request_ids.tolist()]
-                        slot_ids = [int(x) for x in ready.slot_ids.tolist()]
-                        episode_ids = [int(x) for x in ready.episode_ids.tolist()]
-                        perspectives = [int(x) for x in ready.perspective_player_indices.tolist()]
-                        packed = ready.packed_outputs.to_packed_text_batch(
-                            trim=True,
-                            derive_token_metadata=True,
-                        )
-                        sample_profile: dict[str, float] | None = None
-                        with torch.no_grad():
-                            with policy_versions.acquire_inference_policy() as (
-                                policy,
-                                policy_version,
-                            ):
-                                policy_batch = policy.sample_native_tensor_batch(
-                                    native_batch=ready.native_batch,
-                                    env_indices=slot_ids,
-                                    perspective_player_indices=perspectives,
-                                    packed_batch=packed,
-                                    deterministic=args.deterministic_rollout,
-                                    append_replay=False,
-                                    return_replay_payload=True,
-                                    profile_timings=sample_profile,
-                                )
-                        if policy_batch.replay_payload is None:
-                            raise RuntimeError("Go text rollout expected a replay payload")
-                        replay_rows_t = backend.replay_buffer.append_native_payload(
-                            policy_batch.replay_payload
-                        )
-                        replay_rows_h = [int(row) for row in replay_rows_t.detach().cpu().tolist()]
-                        selected_cursor = 0
-                        for row_idx, episode_id in enumerate(episode_ids):
-                            env = active_by_episode[int(episode_id)]
-                            env.action_count += 1
-                            env.inference_policy_version = int(policy_version)
-                            env.behavior_policy_version = int(policy_version)
-                            count = int(policy_batch.decision_counts[row_idx])
-                            selected_for_step = policy_batch.selected_choice_cols[
-                                selected_cursor : selected_cursor + count
-                            ]
-                            selected_cursor += count
-                            if env.transcript_enabled:
-                                try:
-                                    state, pending = _current_transcript_snapshot(env.game)
-                                    trace_kind = TRACE_KIND_VALUES[
-                                        int(ready.native_batch.trace_kind_id[row_idx])
-                                    ]
-                                    if trace_kind == "may":
-                                        action = action_from_choice_accepted(
-                                            bool(policy_batch.may_selected[row_idx])
-                                        )
-                                    else:
-                                        _trace, action = _decode_text_action(
-                                            trace_kind,
-                                            pending,
-                                            list(selected_for_step),
-                                        )
-                                    env.transcript.append(
-                                        TranscriptAction(
-                                            state=state,
-                                            pending=pending,
-                                            action=copy.deepcopy(action),
-                                        )
-                                    )
-                                except Exception as exc:  # noqa: BLE001
-                                    disable_transcript(
-                                        env,
-                                        f"{exc} while snapshotting live game for Go text action",
-                                    )
-                            env.episode_steps.append(
-                                RolloutStep(
-                                    perspective_player_idx=int(perspectives[row_idx]),
-                                    old_log_prob=float(policy_batch.old_log_prob[row_idx]),
-                                    value=float(policy_batch.value[row_idx]),
-                                    replay_idx=int(replay_rows_h[row_idx]),
-                                )
-                            )
-                        text_rollout.submit_text_choices(
-                            request_ids=request_ids,
-                            decision_counts=list(policy_batch.decision_counts),
-                            selected_choice_cols=list(policy_batch.selected_choice_cols),
-                            may_selected=list(policy_batch.may_selected),
-                        )
+            else:
+                text_rollout.start(
+                    [env.game for env in started],
+                    slot_ids=[int(env.slot_idx) for env in started],
+                    episode_ids=[int(env.episode_idx) for env in started],
+                    encoder=encoder,
+                    max_steps_per_game=max_steps_per_game,
+                    max_tokens=int(args.text_max_tokens),
+                    max_card_refs=256,
+                    max_blanks=int(args.max_options),
+                    max_legal_per_blank=int(args.max_cached_choices),
+                    ready_queue_capacity=max(active_slot_limit, max_batch),
+                    terminal_queue_capacity=active_slot_limit,
+                )
+            return True
 
-                    if ready.terminal_events:
-                        finished: list[tuple[LiveGame, int, bool]] = []
-                        for event in ready.terminal_events:
-                            env = active_by_episode.pop(int(event.episode_id), None)
-                            if env is None:
-                                continue
-                            finished.append((env, int(event.winner_idx), bool(event.is_timeout)))
-                        finish_games(finished)
-                text_rollout.stop_text_rollout(wait_for_active=True)
-            finally:
-                text_rollout.stop_text_rollout(wait_for_active=True)
-            while pending_step_count >= int(args.learner_min_rows):
-                if not _claim_and_update(final=False):
-                    break
-            _run_periodic_hooks()
+        scheduler_started = False
+        try:
+            scheduler_started = _refill_go_slots(scheduler_started=False)
+            while scheduler_started and (active_by_episode or next_episode_idx < args.episodes):
+                while pending_step_count >= int(args.learner_min_rows):
+                    if not _claim_and_update(final=False):
+                        break
+                _run_periodic_hooks()
+                scheduler_started = _refill_go_slots(scheduler_started=scheduler_started)
+                if not active_by_episode:
+                    if next_episode_idx >= args.episodes:
+                        break
+                    continue
+
+                ready = text_rollout.next_text_inference_batch(
+                    encoder,
+                    max_rows=max_batch,
+                    timeout_ms=max(1, int(args.rollout_ready_wait_ms)),
+                    max_tokens=int(args.text_max_tokens),
+                    max_card_refs=256,
+                    max_blanks=int(args.max_options),
+                    max_legal_per_blank=int(args.max_cached_choices),
+                )
+                if ready.rows:
+                    request_ids = [int(x) for x in ready.request_ids.tolist()]
+                    slot_ids = [int(x) for x in ready.slot_ids.tolist()]
+                    episode_ids = [int(x) for x in ready.episode_ids.tolist()]
+                    perspectives = [int(x) for x in ready.perspective_player_indices.tolist()]
+                    packed = ready.packed_outputs.to_packed_text_batch(
+                        trim=True,
+                        derive_token_metadata=True,
+                    )
+                    sample_profile: dict[str, float] | None = None
+                    with torch.no_grad():
+                        with policy_versions.acquire_inference_policy() as (
+                            policy,
+                            policy_version,
+                        ):
+                            policy_batch = policy.sample_native_tensor_batch(
+                                native_batch=ready.native_batch,
+                                env_indices=slot_ids,
+                                perspective_player_indices=perspectives,
+                                packed_batch=packed,
+                                deterministic=args.deterministic_rollout,
+                                append_replay=False,
+                                return_replay_payload=True,
+                                profile_timings=sample_profile,
+                            )
+                    if policy_batch.replay_payload is None:
+                        raise RuntimeError("Go text rollout expected a replay payload")
+                    replay_rows_t = backend.replay_buffer.append_native_payload(
+                        policy_batch.replay_payload
+                    )
+                    replay_rows_h = [int(row) for row in replay_rows_t.detach().cpu().tolist()]
+                    selected_cursor = 0
+                    for row_idx, episode_id in enumerate(episode_ids):
+                        env = active_by_episode[int(episode_id)]
+                        env.action_count += 1
+                        env.inference_policy_version = int(policy_version)
+                        env.behavior_policy_version = int(policy_version)
+                        count = int(policy_batch.decision_counts[row_idx])
+                        selected_for_step = policy_batch.selected_choice_cols[
+                            selected_cursor : selected_cursor + count
+                        ]
+                        selected_cursor += count
+                        if env.transcript_enabled:
+                            try:
+                                state, pending = _current_transcript_snapshot(env.game)
+                                trace_kind = TRACE_KIND_VALUES[
+                                    int(ready.native_batch.trace_kind_id[row_idx])
+                                ]
+                                if trace_kind == "may":
+                                    action = action_from_choice_accepted(
+                                        bool(policy_batch.may_selected[row_idx])
+                                    )
+                                else:
+                                    _trace, action = _decode_text_action(
+                                        trace_kind,
+                                        pending,
+                                        list(selected_for_step),
+                                    )
+                                env.transcript.append(
+                                    TranscriptAction(
+                                        state=state,
+                                        pending=pending,
+                                        action=copy.deepcopy(action),
+                                    )
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                disable_transcript(
+                                    env,
+                                    f"{exc} while snapshotting live game for Go text action",
+                                )
+                        env.episode_steps.append(
+                            RolloutStep(
+                                perspective_player_idx=int(perspectives[row_idx]),
+                                old_log_prob=float(policy_batch.old_log_prob[row_idx]),
+                                value=float(policy_batch.value[row_idx]),
+                                replay_idx=int(replay_rows_h[row_idx]),
+                            )
+                        )
+                    text_rollout.submit_text_choices(
+                        request_ids=request_ids,
+                        decision_counts=list(policy_batch.decision_counts),
+                        selected_choice_cols=list(policy_batch.selected_choice_cols),
+                        may_selected=list(policy_batch.may_selected),
+                    )
+
+                if ready.terminal_events:
+                    finished: list[tuple[LiveGame, int, bool]] = []
+                    for event in ready.terminal_events:
+                        if int(event.winner_idx) < -1:
+                            raise RuntimeError(
+                                "native text rollout worker aborted "
+                                f"episode={event.episode_id} slot={event.slot_id}"
+                            )
+                        env = active_by_episode.pop(int(event.episode_id), None)
+                        if env is None:
+                            continue
+                        finished.append((env, int(event.winner_idx), bool(event.is_timeout)))
+                    finish_games(finished)
+                    scheduler_started = _refill_go_slots(scheduler_started=scheduler_started)
+        finally:
+            text_rollout.stop_text_rollout(wait_for_active=True)
+        while pending_step_count >= int(args.learner_min_rows):
+            if not _claim_and_update(final=False):
+                break
+        _run_periodic_hooks()
 
         while _claim_and_update(final=True):
             pass
