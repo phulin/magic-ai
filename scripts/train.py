@@ -115,9 +115,11 @@ from magic_ai.text_encoder.card_cache import (  # noqa: E402
     DEFAULT_ORACLE_DB_PATH,
     CardTokenCache,
     build_card_cache,
+    card_cache_is_current,
     fetch_registered_card_names_from_engine,
     load_card_cache,
     load_oracle_db,
+    save_card_cache,
 )
 from magic_ai.text_encoder.mlm import (  # noqa: E402
     BinTokenDataset,
@@ -1058,6 +1060,15 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
     oracle = load_oracle_db(oracle_db_path, names=registered_names)
     if cache_path.exists():
         cache = load_card_cache(cache_path)
+        if not card_cache_is_current(cache, registered_names, oracle):
+            cache = build_card_cache(
+                registered_names,
+                oracle,
+                tokenizer,
+                oracle_db_path=oracle_db_path,
+                missing_policy="warn",
+            )
+            save_card_cache(cache, cache_path)
     else:
         cache = build_card_cache(
             registered_names,

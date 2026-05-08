@@ -744,6 +744,68 @@ class TrainPPOTests(unittest.TestCase):
 
         self.assertEqual(backend.replay_buffer.capacity, 12000)
 
+    def test_build_text_backend_rebuilds_stale_existing_card_cache(self) -> None:
+        from magic_ai.text_encoder.card_cache import CardTokenCache
+
+        class StubTokenizer:
+            pad_token_id = 0
+
+            def __len__(self) -> int:
+                return 32
+
+        stale_cache = CardTokenCache(
+            token_buffer=torch.empty(0, dtype=torch.int32),
+            offsets=torch.tensor([0, 0], dtype=torch.int64),
+            row_to_name=["<unknown>"],
+            engine_card_set_hash="legacy",
+        )
+        fresh_cache = CardTokenCache(
+            token_buffer=torch.empty(0, dtype=torch.int32),
+            offsets=torch.tensor([0, 0, 0], dtype=torch.int64),
+            row_to_name=["<unknown>", "Mountain"],
+            engine_card_set_hash="fresh",
+            content_hash="fresh-content",
+            cache_schema_version=2,
+        )
+        args = Namespace(
+            card_token_cache=Path("existing-card-cache.pt"),
+            text_d_model=8,
+            text_layers=1,
+            text_heads=2,
+            text_d_ff=16,
+            text_max_tokens=8,
+            hidden_layers=1,
+            num_envs=2,
+            rollout_buffer_capacity=8,
+            rollout_steps=4,
+            max_steps_per_game=4,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            torch_compile=False,
+            text_native_assembler=False,
+        )
+
+        with (
+            patch.object(Path, "exists", return_value=True),
+            patch("scripts.train.load_tokenizer", return_value=StubTokenizer()),
+            patch("scripts.train.load_oracle_db", return_value={"Mountain": {}}),
+            patch(
+                "scripts.train.fetch_registered_card_names_from_engine",
+                return_value=["Mountain"],
+            ),
+            patch("scripts.train.load_card_cache", return_value=stale_cache),
+            patch("scripts.train.build_card_cache", return_value=fresh_cache) as build_cache,
+            patch("scripts.train.save_card_cache") as save_cache,
+            patch("scripts.train.build_assembler_tokens", return_value=object()),
+        ):
+            backend = build_text_backend(args, torch.device("cpu"))
+
+        self.assertEqual(backend.cache, fresh_cache)
+        build_cache.assert_called_once()
+        save_cache.assert_called_once_with(fresh_cache, args.card_token_cache)
+
     def test_sample_text_policy_batch_emits_assembles_and_appends_replay(self) -> None:
         from magic_ai.text_encoder.card_cache import CardTokenCache
 

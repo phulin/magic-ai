@@ -29,6 +29,7 @@ from transformers import PreTrainedTokenizerFast
 from magic_ai.text_encoder.render import OracleEntry, OracleFace, render_card_body
 
 DEFAULT_ORACLE_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "oracle-cards.json"
+CACHE_SCHEMA_VERSION = 2
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,8 @@ class CardTokenCache:
     offsets: Tensor  # shape [num_card_rows + 1] dtype torch.int64
     row_to_name: list[str]  # length num_card_rows + 1; index 0 = UNKNOWN_NAME
     engine_card_set_hash: str
+    content_hash: str | None = None
+    cache_schema_version: int = 1
 
     @property
     def num_rows(self) -> int:
@@ -79,6 +82,42 @@ def compute_card_set_hash(registered_names: Sequence[str]) -> str:
 
     payload = json.dumps(sorted(registered_names)).encode()
     return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def compute_card_content_hash(
+    registered_names: Sequence[str],
+    oracle: Mapping[str, OracleEntry],
+) -> str:
+    """Hash the exact rendered card bodies expected for ``registered_names``."""
+
+    h = hashlib.sha256()
+    h.update(f"schema:{CACHE_SCHEMA_VERSION}\n".encode())
+    for name in registered_names:
+        entry = oracle.get(name)
+        body = render_card_body(name, entry) if entry is not None else ""
+        name_b = name.encode()
+        body_b = body.encode()
+        h.update(len(name_b).to_bytes(4, "little"))
+        h.update(name_b)
+        h.update(len(body_b).to_bytes(4, "little"))
+        h.update(body_b)
+    return h.hexdigest()[:16]
+
+
+def card_cache_is_current(
+    cache: CardTokenCache,
+    registered_names: Sequence[str],
+    oracle: Mapping[str, OracleEntry],
+) -> bool:
+    """Return whether ``cache`` matches the current renderer/oracle/card set."""
+
+    expected_rows = [UNKNOWN_NAME, *registered_names]
+    return (
+        cache.cache_schema_version == CACHE_SCHEMA_VERSION
+        and cache.row_to_name == expected_rows
+        and cache.engine_card_set_hash == compute_card_set_hash(registered_names)
+        and cache.content_hash == compute_card_content_hash(registered_names, oracle)
+    )
 
 
 def _scryfall_record_to_entry(record: Mapping[str, Any]) -> OracleEntry:
@@ -204,21 +243,24 @@ def build_card_cache(
         else:
             logger.warning("card_cache: %s", msg)
 
-    # Row 0 = unknown sentinel: empty body.
-    row_to_name: list[str] = [UNKNOWN_NAME]
-    pieces: list[Tensor] = []
-    offsets: list[int] = [0, 0]  # offsets[0] = offsets[1] = 0
-    cursor = 0
+    rendered_bodies: list[str] = []
     for name in names:
         entry = merged.get(name)
         if entry is None and missing_policy != "skip":
             # Will already have been raised above when policy == "raise".
             # For "warn" we still emit the body using just the name.
-            body_text = render_card_body(name, None)
+            rendered_bodies.append(render_card_body(name, None))
         elif entry is None:
-            body_text = ""  # "skip" -> empty body
+            rendered_bodies.append("")  # "skip" -> empty body
         else:
-            body_text = render_card_body(name, entry)
+            rendered_bodies.append(render_card_body(name, entry))
+
+    # Row 0 = unknown sentinel: empty body.
+    row_to_name: list[str] = [UNKNOWN_NAME]
+    pieces: list[Tensor] = []
+    offsets: list[int] = [0, 0]  # offsets[0] = offsets[1] = 0
+    cursor = 0
+    for name, body_text in zip(names, rendered_bodies, strict=True):
         if body_text:
             ids = tokenizer.encode(body_text, add_special_tokens=False)
             arr = torch.tensor(ids, dtype=torch.int32)
@@ -236,6 +278,8 @@ def build_card_cache(
         offsets=offsets_arr,
         row_to_name=row_to_name,
         engine_card_set_hash=compute_card_set_hash(names),
+        content_hash=compute_card_content_hash(names, merged),
+        cache_schema_version=CACHE_SCHEMA_VERSION,
     )
 
 
@@ -255,6 +299,8 @@ def save_card_cache(cache: CardTokenCache, path: Path | str) -> None:
             "offsets": cache.offsets.detach().cpu().to(dtype=torch.int64),
             "row_to_name": cache.row_to_name,
             "engine_card_set_hash": cache.engine_card_set_hash,
+            "content_hash": cache.content_hash,
+            "cache_schema_version": cache.cache_schema_version,
         },
         p,
     )
@@ -269,15 +315,23 @@ def load_card_cache(path: Path | str) -> CardTokenCache:
     offsets = payload.get("offsets")
     row_to_name = payload.get("row_to_name")
     engine_card_set_hash = payload.get("engine_card_set_hash")
+    content_hash = payload.get("content_hash")
+    cache_schema_version = payload.get("cache_schema_version", 1)
     if not isinstance(token_buffer, Tensor) or not isinstance(offsets, Tensor):
         raise RuntimeError(f"card cache {p} is missing tensor buffers")
     if not isinstance(row_to_name, list) or not isinstance(engine_card_set_hash, str):
         raise RuntimeError(f"card cache {p} is missing metadata")
+    if content_hash is not None and not isinstance(content_hash, str):
+        raise RuntimeError(f"card cache {p} has invalid content hash metadata")
+    if not isinstance(cache_schema_version, int):
+        raise RuntimeError(f"card cache {p} has invalid schema version metadata")
     return CardTokenCache(
         token_buffer=token_buffer.to(dtype=torch.int32).contiguous(),
         offsets=offsets.to(dtype=torch.int64).contiguous(),
         row_to_name=[str(name) for name in row_to_name],
         engine_card_set_hash=engine_card_set_hash,
+        content_hash=content_hash,
+        cache_schema_version=cache_schema_version,
     )
 
 

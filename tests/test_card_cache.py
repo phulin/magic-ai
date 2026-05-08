@@ -17,6 +17,8 @@ from magic_ai.text_encoder.card_cache import (
     CardTokenCache,
     MissingOracleTextError,
     build_card_cache,
+    card_cache_is_current,
+    compute_card_content_hash,
     compute_card_set_hash,
     load_card_cache,
     save_card_cache,
@@ -81,6 +83,8 @@ def test_save_and_load_roundtrip(small_cache: CardTokenCache, tmp_path: Path) ->
     assert torch.equal(loaded.offsets, small_cache.offsets)
     assert loaded.row_to_name == small_cache.row_to_name
     assert loaded.engine_card_set_hash == small_cache.engine_card_set_hash
+    assert loaded.content_hash == small_cache.content_hash
+    assert loaded.cache_schema_version == small_cache.cache_schema_version
 
 
 def test_slice_decodes_to_card_name(small_cache: CardTokenCache, tokenizer) -> None:
@@ -127,6 +131,32 @@ def test_build_twice_same_hash(oracle: dict[str, OracleEntry], tokenizer) -> Non
     a = build_card_cache(TEST_NAMES, oracle, tokenizer)
     b = build_card_cache(list(reversed(TEST_NAMES)), oracle, tokenizer)
     assert a.engine_card_set_hash == b.engine_card_set_hash
+
+
+def test_content_hash_changes_when_oracle_body_changes(
+    oracle: dict[str, OracleEntry],
+) -> None:
+    changed = dict(oracle)
+    changed["Lightning Bolt"] = {
+        **changed["Lightning Bolt"],
+        "mana_cost": "{W}",
+    }
+    assert compute_card_content_hash(TEST_NAMES, oracle) != compute_card_content_hash(
+        TEST_NAMES, changed
+    )
+
+
+def test_cache_current_rejects_legacy_metadata(
+    small_cache: CardTokenCache,
+    oracle: dict[str, OracleEntry],
+) -> None:
+    legacy = CardTokenCache(
+        token_buffer=small_cache.token_buffer,
+        offsets=small_cache.offsets,
+        row_to_name=small_cache.row_to_name,
+        engine_card_set_hash=small_cache.engine_card_set_hash,
+    )
+    assert not card_cache_is_current(legacy, TEST_NAMES, oracle)
 
 
 # ---------------------------------------------------------------------------
