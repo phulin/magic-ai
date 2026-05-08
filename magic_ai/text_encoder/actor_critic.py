@@ -152,6 +152,7 @@ class TextActorCritic(nn.Module):
         self.spr_enabled = False
         self.rollout_buffer: TextReplayBuffer | None = None
         self._pending_decision_coverage_checks: list[_PendingDecisionCoverageCheck] = []
+        self._chosen_token_id = cfg.chosen_token_id
 
     @property
     def device(self) -> torch.device:
@@ -470,6 +471,7 @@ class TextActorCritic(nn.Module):
                         layout,
                         step_idx=step_idx,
                         deterministic=deterministic,
+                        chosen_token_id=self._chosen_token_id,
                     )
                     if trace_kind == "priority"
                     else None
@@ -772,6 +774,7 @@ class TextActorCritic(nn.Module):
                     decision_count=decision_count,
                     decision_rows=batch_size,
                     deterministic=deterministic,
+                    chosen_token_id=self._chosen_token_id,
                     profile_timings=profile_timings,
                 )
                 mark_profile("decision_inline_fast")
@@ -1455,6 +1458,7 @@ class TextActorCritic(nn.Module):
                 output,
                 batch,
                 return_per_choice=return_per_choice,
+                chosen_token_id=self._chosen_token_id,
                 group_skip_mask=choice_group_mask | color_group_mask | choice_ids_group_mask,
             )
         )
@@ -1944,6 +1948,7 @@ def _sample_inline_decision_batch(
     decision_count: Tensor,
     decision_rows: int,
     deterministic: bool,
+    chosen_token_id: int | None = None,
     profile_timings: dict[str, float] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
     profile_last = time.perf_counter()
@@ -1969,6 +1974,7 @@ def _sample_inline_decision_batch(
         decision_count=decision_count,
         decision_rows=decision_rows,
         deterministic=deterministic,
+        chosen_token_id=chosen_token_id,
     )
     mark_profile("decision_priority_batch", device)
     choice = _sample_inline_choice_batch(
@@ -2316,6 +2322,22 @@ def _sample_default_blocker_groups_batch(
     )
 
 
+def _priority_chosen_scores(
+    blank_logits: Tensor,
+    blank_legal_ids: Tensor,
+    blank_legal_mask: Tensor,
+    *,
+    chosen_token_id: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    if chosen_token_id is None:
+        raise RuntimeError("inline priority scoring requires chosen_token_id")
+    legal_ids = blank_legal_ids.to(device=blank_logits.device)
+    legal_mask = blank_legal_mask.to(device=blank_logits.device, dtype=torch.bool)
+    chosen_slots = legal_mask & (legal_ids == int(chosen_token_id))
+    scores = torch.logsumexp(blank_logits.masked_fill(~chosen_slots, float("-inf")), dim=-1)
+    return scores, chosen_slots.any(dim=-1)
+
+
 def _sample_inline_priority_batch(
     output: RecurrentTextPolicyOutput,
     batch: TextEncodedBatch | PackedTextBatch,
@@ -2327,6 +2349,7 @@ def _sample_inline_priority_batch(
     decision_count: Tensor,
     decision_rows: int,
     deterministic: bool,
+    chosen_token_id: int | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
     """Vectorized priority sampler for the hot one-decision-group-per-row path."""
 
@@ -2348,12 +2371,14 @@ def _sample_inline_priority_batch(
     eligible = (trace_kind_id.to(device=device) == TRACE_KIND_TO_ID["priority"]) & (
         decision_count.to(device=device) == 1
     )
-    priority_support = (
-        (row_group_kind == BLANK_GROUP_CROSS_BLANK)
-        & (row_option_index >= 0)
-        & row_legal_mask[..., 0]
+    priority_support = (row_group_kind == BLANK_GROUP_CROSS_BLANK) & (row_option_index >= 0)
+    priority_scores, has_chosen_slot = _priority_chosen_scores(
+        blank_logits,
+        batch.blank_legal_ids,
+        row_legal_mask,
+        chosen_token_id=chosen_token_id,
     )
-    priority_scores = blank_logits[:, :, 0]
+    priority_support = priority_support & has_chosen_slot
     dummy_priority = torch.zeros_like(priority_support)
     dummy_priority[:, 0] = True
     has_priority = priority_support.any(dim=-1)
@@ -2446,6 +2471,7 @@ def _sample_inline_priority_for_step(
     *,
     step_idx: int,
     deterministic: bool,
+    chosen_token_id: int | None = None,
 ) -> tuple[list[Tensor], Tensor, Tensor] | None:
     blank_logits = output.blank_logits
     if blank_logits is None or blank_logits.numel() == 0:
@@ -2461,17 +2487,21 @@ def _sample_inline_priority_for_step(
         device=blank_logits.device, dtype=torch.bool
     )
     row_logits = blank_logits[step_idx]
+    priority_scores, has_chosen_slot = _priority_chosen_scores(
+        row_logits,
+        batch.blank_legal_ids[step_idx],
+        row_legal_mask,
+        chosen_token_id=chosen_token_id,
+    )
 
     priority_support = (
-        (row_group_kind == BLANK_GROUP_CROSS_BLANK)
-        & (row_option_index >= 0)
-        & row_legal_mask[..., 0]
+        (row_group_kind == BLANK_GROUP_CROSS_BLANK) & (row_option_index >= 0) & has_chosen_slot
     )
     priority_blanks = priority_support.nonzero(as_tuple=False).squeeze(-1)
     if priority_blanks.numel() == 0:
         return None
 
-    priority_logits = row_logits[priority_blanks, 0]
+    priority_logits = priority_scores[priority_blanks]
     priority_dist = Categorical(logits=priority_logits)
     chosen_priority = torch.argmax(priority_logits) if deterministic else priority_dist.sample()
     chosen_blank = priority_blanks[chosen_priority]
@@ -2639,6 +2669,7 @@ def _evaluate_inline_priority_replay_groups(
     batch: TextReplayBatch,
     *,
     return_per_choice: bool,
+    chosen_token_id: int | None = None,
     group_skip_mask: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice | None]:
     decision_count = batch.decision_count
@@ -2679,22 +2710,26 @@ def _evaluate_inline_priority_replay_groups(
     blank_option_index = batch.encoded.blank_option_index.to(device=device)
     blank_group_kind = batch.encoded.blank_group_kind.to(device=device)
     blank_legal_mask = batch.encoded.blank_legal_mask.to(device=device, dtype=torch.bool)
+    blank_legal_ids = batch.encoded.blank_legal_ids.to(device=device)
 
     row_blank_option = blank_option_index[steps_t]
     row_blank_kind = blank_group_kind[steps_t]
     row_legal_mask = blank_legal_mask[steps_t]
+    row_legal_ids = blank_legal_ids[steps_t]
     if int(row_blank_kind.shape[1]) == 0:
         per_choice = _empty_replay_per_choice(output, n, device) if return_per_choice else None
         return log_probs, entropies, group_mask, per_choice
-    cross_support = (
-        (row_blank_kind == BLANK_GROUP_CROSS_BLANK)
-        & (row_blank_option >= 0)
-        & row_legal_mask[..., 0]
+    cross_support = (row_blank_kind == BLANK_GROUP_CROSS_BLANK) & (row_blank_option >= 0)
+    priority_scores, has_chosen_slot = _priority_chosen_scores(
+        blank_logits[steps_t],
+        row_legal_ids,
+        row_legal_mask,
+        chosen_token_id=chosen_token_id,
     )
+    cross_support = cross_support & has_chosen_slot
     cross_matches = cross_support & (row_blank_option == selected_option.unsqueeze(1))
     cross_count = cross_matches.sum(dim=-1)
 
-    priority_scores = blank_logits[steps_t, :, 0]
     dummy_cross = torch.zeros_like(cross_support)
     if int(dummy_cross.shape[1]) > 0:
         dummy_cross[:, 0] = True

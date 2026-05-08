@@ -35,6 +35,7 @@ class RecurrentTextPolicyConfig:
     lstm_hidden: int = 384  # match d_model by default
     lstm_layers: int = 1
     compile_forward: bool = True
+    chosen_token_id: int | None = None
 
 
 @dataclass

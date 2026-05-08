@@ -1095,10 +1095,14 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             d_ff=args.text_d_ff,
             max_seq_len=args.text_max_tokens,
         )
+    chosen_tid = tokenizer.convert_tokens_to_ids("<chosen>")
+    if isinstance(chosen_tid, list):
+        raise TypeError("convert_tokens_to_ids('<chosen>') returned a list")
     recurrent_cfg = RecurrentTextPolicyConfig(
         encoder=cfg,
         lstm_hidden=cfg.d_model,
         compile_forward=args.torch_compile,
+        chosen_token_id=int(chosen_tid),
     )
     policy = TextActorCritic(recurrent_cfg).to(device)
     policy.init_lstm_env_states(args.num_envs)
