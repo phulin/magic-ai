@@ -879,8 +879,8 @@ class NativeTextTrajectoryBuffer:
         self._record_timing("finish_append_reset_slots", start)
         return rows, counts_all
 
-    def replay_capacity_required(self, env_indices: list[int]) -> tuple[int, int]:
-        """Return ``(row_count, token_count)`` needed to commit envs.
+    def replay_capacity_required(self, env_indices: list[int]) -> tuple[int, int, int]:
+        """Return ``(row_count, token_count, decision_count)`` needed to commit envs.
 
         Uses host mirrors only, so this is a pure CPU capacity check before
         launching any copy kernels.
@@ -889,23 +889,25 @@ class NativeTextTrajectoryBuffer:
         with self._lock:
             row_count = 0
             token_count = 0
+            decision_count = 0
             for env_idx in env_indices:
                 env_idx_i = int(env_idx)
                 count = self.step_count_host[env_idx_i]
                 row_count += count
                 token_count += sum(self.seq_lengths_host[env_idx_i][:count])
-            return row_count, token_count
+                decision_count += sum(self.decision_count_host[env_idx_i][:count])
+            return row_count, token_count, decision_count
 
     def can_append_envs_to_replay(
         self,
         env_indices: list[int],
         replay_buffer: TextReplayBuffer,
     ) -> bool:
-        row_count, token_count = self.replay_capacity_required(env_indices)
+        row_count, token_count, decision_count = self.replay_capacity_required(env_indices)
         return replay_buffer.can_reserve(
             row_count=row_count,
             token_count=token_count,
-            decision_count=row_count * replay_buffer.max_decision_groups,
+            decision_count=decision_count,
         )
 
     def try_append_envs_to_replay_returning_tensor(
@@ -5360,20 +5362,16 @@ def train_text_native_batched_envs(
                 deferred_finishes.extend(finished_batch)
                 fits: list[FinishedEnv] = []
                 if deferred_finishes:
-                    replay_rows_remaining = backend.replay_buffer.available_rows
-                    replay_tokens_remaining = backend.replay_buffer.available_tokens
                     still_deferred: list[FinishedEnv] = []
+                    candidate_slots: list[int] = []
                     for fe in deferred_finishes:
-                        needed_rows, needed_tokens = staging_buffer.replay_capacity_required(
-                            [fe.slot_idx]
-                        )
-                        if (
-                            needed_rows <= replay_rows_remaining
-                            and needed_tokens <= replay_tokens_remaining
+                        next_slots = [*candidate_slots, fe.slot_idx]
+                        if staging_buffer.can_append_envs_to_replay(
+                            next_slots,
+                            backend.replay_buffer,
                         ):
+                            candidate_slots = next_slots
                             fits.append(fe)
-                            replay_rows_remaining -= needed_rows
-                            replay_tokens_remaining -= needed_tokens
                         else:
                             still_deferred.append(fe)
                     deferred_finishes = still_deferred
