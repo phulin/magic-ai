@@ -5141,26 +5141,9 @@ def train_text_native_batched_envs(
                         )
 
         max_batch = int(args.inference_max_batch) or int(args.num_envs)
-        replay_capacity = int(backend.replay_buffer.row_ring.capacity)
         max_steps_per_game = int(args.max_steps_per_game)
-        if replay_capacity < max_steps_per_game:
-            raise RuntimeError(
-                "--replay-ring-capacity must be at least --max-steps-per-game for "
-                "Go text rollout scheduler"
-            )
-        active_slot_limit = min(
-            int(args.num_envs),
-            max(1, replay_capacity // max_steps_per_game),
-        )
+        active_slot_limit = int(args.num_envs)
         max_batch = min(max_batch, active_slot_limit)
-        if active_slot_limit < int(args.num_envs):
-            print(
-                cli_step_prefix(),
-                "warning: Go text rollout active slots clamped "
-                f"to {active_slot_limit}/{args.num_envs} by replay capacity; "
-                "increase --replay-ring-capacity to use more concurrent envs",
-                flush=True,
-            )
 
         active_by_episode: dict[int, LiveGame] = {}
 
@@ -5252,10 +5235,10 @@ def train_text_native_batched_envs(
                             )
                     if policy_batch.replay_payload is None:
                         raise RuntimeError("Go text rollout expected a replay payload")
-                    replay_rows_t = backend.replay_buffer.append_native_payload(
-                        policy_batch.replay_payload
+                    staging_buffer.stage_batch(
+                        slot_ids,
+                        policy_batch.replay_payload,
                     )
-                    replay_rows_h = [int(row) for row in replay_rows_t.detach().cpu().tolist()]
                     selected_cursor = 0
                     for row_idx, episode_id in enumerate(episode_ids):
                         env = active_by_episode[int(episode_id)]
@@ -5300,7 +5283,7 @@ def train_text_native_batched_envs(
                                 perspective_player_idx=int(perspectives[row_idx]),
                                 old_log_prob=float(policy_batch.old_log_prob[row_idx]),
                                 value=float(policy_batch.value[row_idx]),
-                                replay_idx=int(replay_rows_h[row_idx]),
+                                replay_idx=None,
                             )
                         )
                     text_rollout.submit_text_choices(
