@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 
+from magic_ai.aggregate_tensor import AggregateTensor, Field
+
 
 @dataclass(frozen=True)
 class DecisionLayoutBatch:
@@ -78,41 +80,30 @@ class ReplayCore(nn.Module):
         self.index_dtype = index_dtype
         device_t = torch.device(device)
 
-        self.register_buffer(
-            "trace_kind_id",
-            torch.zeros(self.capacity, dtype=trace_dtype, device=device_t),
-            persistent=False,
+        self._per_row = AggregateTensor(
+            length=self.capacity,
+            fields=(
+                Field("trace_kind_id", trace_dtype),
+                Field("may_selected", torch.float32),
+                Field("old_log_prob", torch.float32),
+                Field("value", torch.float32),
+                Field("perspective_player_idx", perspective_dtype),
+                Field("ppo_return", torch.float32),
+                Field("ppo_advantage", torch.float32),
+                Field("decision_start", torch.long),
+                Field("decision_count", torch.long),
+            ),
+            device=device_t,
         )
-        self.register_buffer(
-            "may_selected",
-            torch.zeros(self.capacity, dtype=torch.float32, device=device_t),
-            persistent=False,
-        )
-        self.register_buffer(
-            "old_log_prob",
-            torch.zeros(self.capacity, dtype=torch.float32, device=device_t),
-            persistent=False,
-        )
-        self.register_buffer(
-            "value",
-            torch.zeros(self.capacity, dtype=torch.float32, device=device_t),
-            persistent=False,
-        )
-        self.register_buffer(
-            "perspective_player_idx",
-            torch.zeros(self.capacity, dtype=perspective_dtype, device=device_t),
-            persistent=False,
-        )
-        self.register_buffer(
-            "ppo_return",
-            torch.zeros(self.capacity, dtype=torch.float32, device=device_t),
-            persistent=False,
-        )
-        self.register_buffer(
-            "ppo_advantage",
-            torch.zeros(self.capacity, dtype=torch.float32, device=device_t),
-            persistent=False,
-        )
+        self.trace_kind_id = self._per_row.trace_kind_id
+        self.may_selected = self._per_row.may_selected
+        self.old_log_prob = self._per_row.old_log_prob
+        self.value = self._per_row.value
+        self.perspective_player_idx = self._per_row.perspective_player_idx
+        self.ppo_return = self._per_row.ppo_return
+        self.ppo_advantage = self._per_row.ppo_advantage
+        self.decision_start = self._per_row.decision_start
+        self.decision_count = self._per_row.decision_count
         if self.recurrent_layers > 0:
             recurrent_shape = (
                 self.capacity,
@@ -133,47 +124,25 @@ class ReplayCore(nn.Module):
             self.register_buffer("lstm_h_in", None, persistent=False)
             self.register_buffer("lstm_c_in", None, persistent=False)
 
-        self.register_buffer(
-            "decision_start",
-            torch.zeros(self.capacity, dtype=torch.long, device=device_t),
-            persistent=False,
+        choice_shape = (self.max_cached_choices,)
+        self._per_decision = AggregateTensor(
+            length=self.decision_capacity,
+            fields=(
+                Field("decision_option_idx", self.index_dtype, fill=-1, inner_shape=choice_shape),
+                Field("decision_target_idx", self.index_dtype, fill=-1, inner_shape=choice_shape),
+                Field("decision_mask", torch.bool, fill=False, inner_shape=choice_shape),
+                Field("uses_none_head", torch.bool, fill=False),
+                Field("selected_indices", self.index_dtype, fill=-1),
+                Field("behavior_action_log_prob", torch.float32),
+            ),
+            device=device_t,
         )
-        self.register_buffer(
-            "decision_count",
-            torch.zeros(self.capacity, dtype=torch.long, device=device_t),
-            persistent=False,
-        )
-        decision_shape = (self.decision_capacity, self.max_cached_choices)
-        self.register_buffer(
-            "decision_option_idx",
-            torch.full(decision_shape, -1, dtype=self.index_dtype, device=device_t),
-            persistent=False,
-        )
-        self.register_buffer(
-            "decision_target_idx",
-            torch.full(decision_shape, -1, dtype=self.index_dtype, device=device_t),
-            persistent=False,
-        )
-        self.register_buffer(
-            "decision_mask",
-            torch.zeros(decision_shape, dtype=torch.bool, device=device_t),
-            persistent=False,
-        )
-        self.register_buffer(
-            "uses_none_head",
-            torch.zeros(self.decision_capacity, dtype=torch.bool, device=device_t),
-            persistent=False,
-        )
-        self.register_buffer(
-            "selected_indices",
-            torch.full((self.decision_capacity,), -1, dtype=self.index_dtype, device=device_t),
-            persistent=False,
-        )
-        self.register_buffer(
-            "behavior_action_log_prob",
-            torch.zeros(self.decision_capacity, dtype=torch.float32, device=device_t),
-            persistent=False,
-        )
+        self.decision_option_idx = self._per_decision.decision_option_idx
+        self.decision_target_idx = self._per_decision.decision_target_idx
+        self.decision_mask = self._per_decision.decision_mask
+        self.uses_none_head = self._per_decision.uses_none_head
+        self.selected_indices = self._per_decision.selected_indices
+        self.behavior_action_log_prob = self._per_decision.behavior_action_log_prob
         self._row_cursor = 0
         self._decision_cursor = 0
 
