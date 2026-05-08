@@ -2127,9 +2127,18 @@ def _sample_inline_per_blank_binary_batch(
         & (row_option_index < 0)
         & row_legal_mask.any(dim=-1)
     )
+    any_blocker_support = (
+        row_live & (row_group_kind == BLANK_GROUP_PER_BLANK) & row_legal_mask.any(dim=-1)
+    )
+    generic_blocker_count = generic_blocker_support.sum(dim=-1)
+    blocker_fallback_support = torch.where(
+        (generic_blocker_count > 0).unsqueeze(1),
+        generic_blocker_support,
+        any_blocker_support,
+    )
     support = torch.where(
         ((trace_kind == TRACE_KIND_TO_ID["blockers"]) & (primary_count == 0)).unsqueeze(1),
-        generic_blocker_support,
+        blocker_fallback_support,
         primary_support,
     )
     match_count = support.sum(dim=-1)
