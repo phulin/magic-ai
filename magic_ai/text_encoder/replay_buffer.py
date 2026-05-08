@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,6 +48,61 @@ class TextReplayBatch:
     perspective_player_idx: Tensor
     lstm_h_in: Tensor | None
     lstm_c_in: Tensor | None
+
+
+@dataclass
+class _RingTracker:
+    """Cursor/start/used tracking for one ring buffer dimension."""
+
+    capacity: int
+    start: int = 0
+    used: int = 0
+    cursor: int = 0
+
+    @property
+    def available(self) -> int:
+        return self.capacity - self.used
+
+    def fits(self, count: int) -> bool:
+        if count == 0:
+            return True
+        if count > self.available:
+            return False
+        if self.used == 0:
+            return True
+        c = self.cursor % self.capacity
+        return c + count <= self.capacity or count <= self.start
+
+    def reserve(self, count: int) -> tuple[int, int]:
+        c = self.cursor % self.capacity
+        if count == 0:
+            return c, c
+        if self.used == 0 and c + count > self.capacity:
+            s, e = 0, count
+        elif c + count <= self.capacity:
+            s, e = c, c + count
+        elif count <= self.start:
+            s, e = 0, count
+        else:
+            raise RuntimeError("ring span does not fit")
+        self.cursor = e % self.capacity
+        self.used += count
+        return s, e
+
+    def release(self, count: int, new_start: int | None = None) -> None:
+        if count <= 0:
+            return
+        if new_start is not None:
+            self.start = new_start % self.capacity
+        self.used = max(0, self.used - count)
+        if self.used == 0:
+            self.start = 0
+            self.cursor = 0
+
+    def reset(self) -> None:
+        self.start = 0
+        self.used = 0
+        self.cursor = 0
 
 
 @dataclass
@@ -156,7 +212,6 @@ class TextReplayBuffer:
         )
         self.row_token_length = torch.zeros(self.capacity, dtype=torch.int32, device=self.device)
         self.row_token_length_host = [0] * self.capacity
-        self._token_cursor = 0
         self.card_ref_positions = torch.full(
             (self.capacity, self.max_card_refs), -1, dtype=torch.int32, device=self.device
         )
@@ -231,12 +286,9 @@ class TextReplayBuffer:
         self._commit_reservation_id = 0
         self._committed_row_cursor = 0
         self._train_claim_cursor = 0
-        self._row_ring_start = 0
-        self._row_ring_used = 0
-        self._token_ring_start = 0
-        self._token_ring_used = 0
-        self._decision_ring_start = 0
-        self._decision_ring_used = 0
+        self.row_ring = _RingTracker(capacity=self.capacity)
+        self.token_ring = _RingTracker(capacity=int(self.packed_token_ids.numel()))
+        self.decision_ring = _RingTracker(capacity=self.core.decision_capacity)
         self._ring_active = False
         self._committed_windows: list[tuple[int, int]] = []
         self._reservations: dict[int, _ReplayReservation] = {}
@@ -247,7 +299,7 @@ class TextReplayBuffer:
     @property
     def size(self) -> int:
         with self._reserve_lock:
-            return int(self._row_ring_used) if self._ring_active else self.core.size
+            return int(self.row_ring.used) if self._ring_active else self.core.size
 
     def reset(self) -> None:
         self.core.reset()
@@ -256,18 +308,14 @@ class TextReplayBuffer:
         self.row_token_length_host[:] = [0] * self.capacity
         self.blank.reset()
         self.episode_meta.reset()
-        self._token_cursor = 0
         with self._reserve_lock:
             self._next_reservation_id = 0
             self._commit_reservation_id = 0
             self._committed_row_cursor = 0
             self._train_claim_cursor = 0
-            self._row_ring_start = 0
-            self._row_ring_used = 0
-            self._token_ring_start = 0
-            self._token_ring_used = 0
-            self._decision_ring_start = 0
-            self._decision_ring_used = 0
+            self.row_ring.reset()
+            self.token_ring.reset()
+            self.decision_ring.reset()
             self._ring_active = False
             self._committed_windows.clear()
             self._reservations.clear()
@@ -466,12 +514,12 @@ class TextReplayBuffer:
     @property
     def available_rows(self) -> int:
         with self._reserve_lock:
-            return int(self.capacity - self._row_ring_used)
+            return self.row_ring.available
 
     @property
     def available_tokens(self) -> int:
         with self._reserve_lock:
-            return int(int(self.packed_token_ids.numel()) - self._token_ring_used)
+            return self.token_ring.available
 
     def debug_snapshot(self) -> dict[str, int]:
         with self._reserve_lock:
@@ -489,10 +537,10 @@ class TextReplayBuffer:
                 "committed_limit": int(committed_limit),
                 "completed_limit": int(completed_limit),
                 "claimable_limit": int(claimable_limit),
-                "row_ring_start": int(self._row_ring_start),
-                "row_ring_used": int(self._row_ring_used),
-                "token_ring_used": int(self._token_ring_used),
-                "decision_ring_used": int(self._decision_ring_used),
+                "row_ring_start": int(self.row_ring.start),
+                "row_ring_used": int(self.row_ring.used),
+                "token_ring_used": int(self.token_ring.used),
+                "decision_ring_used": int(self.decision_ring.used),
                 "reservations": len(self._reservations),
             }
 
@@ -523,26 +571,20 @@ class TextReplayBuffer:
         last_token_start = int(token_starts[-1].item()) if token_count > 0 else 0
         last_decision_start = int(decision_starts[-1].item()) if decision_count > 0 else 0
         with self._reserve_cond:
-            if first_row == self._row_ring_start:
-                self._row_ring_start = (last_row + 1) % self.capacity
-            if token_count > 0:
-                self._token_ring_start = (last_token_start + last_token_len) % int(
-                    self.packed_token_ids.numel()
-                )
-            if decision_count > 0:
-                self._decision_ring_start = (
-                    last_decision_start + last_decision_len
-                ) % self.core.decision_capacity
-            self._row_ring_used = max(0, self._row_ring_used - row_count)
-            self._token_ring_used = max(0, self._token_ring_used - token_count)
-            self._decision_ring_used = max(0, self._decision_ring_used - decision_count)
-            if self._row_ring_used == 0:
-                self._row_ring_start = 0
-                self._token_ring_start = 0
-                self._decision_ring_start = 0
-                self.core._row_cursor = 0
-                self._token_cursor = 0
-                self.core._decision_cursor = 0
+            self.row_ring.release(
+                row_count,
+                new_start=last_row + 1 if first_row == self.row_ring.start else None,
+            )
+            self.token_ring.release(
+                token_count,
+                new_start=last_token_start + last_token_len if token_count > 0 else None,
+            )
+            self.decision_ring.release(
+                decision_count,
+                new_start=last_decision_start + last_decision_len if decision_count > 0 else None,
+            )
+            self.core._row_cursor = self.row_ring.cursor
+            self.core._decision_cursor = self.decision_ring.cursor
             self.row_token_start[rows] = -1
             self.row_token_length[rows] = 0
             self.decision_count[rows] = 0
@@ -656,11 +698,11 @@ class TextReplayBuffer:
         row_count = int(row_count)
         token_count = int(token_count)
         decision_count = int(decision_count)
-        if row_count > self.capacity:
+        if row_count > self.row_ring.capacity:
             raise RuntimeError("TextReplayBuffer row request exceeds capacity")
-        if token_count > int(self.packed_token_ids.numel()):
+        if token_count > self.token_ring.capacity:
             raise RuntimeError("TextReplayBuffer token request exceeds capacity")
-        if decision_count > self.core.decision_capacity:
+        if decision_count > self.decision_ring.capacity:
             raise RuntimeError("TextReplayBuffer decision request exceeds capacity")
         with self._reserve_cond:
             while not self._can_reserve_locked(
@@ -669,33 +711,11 @@ class TextReplayBuffer:
                 decision_count=decision_count,
             ):
                 self._reserve_cond.wait()
-            row_start, row_end = self._reserve_ring_span_locked(
-                cursor=self.core._row_cursor,
-                start=self._row_ring_start,
-                used=self._row_ring_used,
-                capacity=self.capacity,
-                count=row_count,
-            )
-            token_start, token_end = self._reserve_ring_span_locked(
-                cursor=self._token_cursor,
-                start=self._token_ring_start,
-                used=self._token_ring_used,
-                capacity=int(self.packed_token_ids.numel()),
-                count=token_count,
-            )
-            decision_start, decision_end = self._reserve_ring_span_locked(
-                cursor=self.core._decision_cursor,
-                start=self._decision_ring_start,
-                used=self._decision_ring_used,
-                capacity=self.core.decision_capacity,
-                count=decision_count,
-            )
-            self.core._row_cursor = row_end % self.capacity
-            self._token_cursor = token_end % int(self.packed_token_ids.numel())
-            self.core._decision_cursor = decision_end % self.core.decision_capacity
-            self._row_ring_used += row_count
-            self._token_ring_used += token_count
-            self._decision_ring_used += decision_count
+            row_start, row_end = self.row_ring.reserve(row_count)
+            token_start, token_end = self.token_ring.reserve(token_count)
+            decision_start, decision_end = self.decision_ring.reserve(decision_count)
+            self.core._row_cursor = self.row_ring.cursor
+            self.core._decision_cursor = self.decision_ring.cursor
             self._ring_active = True
             reservation = _ReplayReservation(
                 reservation_id=self._next_reservation_id,
@@ -742,66 +762,10 @@ class TextReplayBuffer:
         decision_count: int,
     ) -> bool:
         return (
-            row_count <= self.capacity - self._row_ring_used
-            and token_count <= int(self.packed_token_ids.numel()) - self._token_ring_used
-            and decision_count <= self.core.decision_capacity - self._decision_ring_used
-            and self._ring_span_fits(
-                cursor=self.core._row_cursor % self.capacity,
-                start=self._row_ring_start,
-                used=self._row_ring_used,
-                capacity=self.capacity,
-                count=row_count,
-            )
-            and self._ring_span_fits(
-                cursor=self._token_cursor % int(self.packed_token_ids.numel()),
-                start=self._token_ring_start,
-                used=self._token_ring_used,
-                capacity=int(self.packed_token_ids.numel()),
-                count=token_count,
-            )
-            and self._ring_span_fits(
-                cursor=self.core._decision_cursor % self.core.decision_capacity,
-                start=self._decision_ring_start,
-                used=self._decision_ring_used,
-                capacity=self.core.decision_capacity,
-                count=decision_count,
-            )
+            self.row_ring.fits(row_count)
+            and self.token_ring.fits(token_count)
+            and self.decision_ring.fits(decision_count)
         )
-
-    @staticmethod
-    def _ring_span_fits(
-        *,
-        cursor: int,
-        start: int,
-        used: int,
-        capacity: int,
-        count: int,
-    ) -> bool:
-        if count == 0:
-            return True
-        if used == 0:
-            return count <= capacity
-        return cursor + count <= capacity or count <= start
-
-    def _reserve_ring_span_locked(
-        self,
-        *,
-        cursor: int,
-        start: int,
-        used: int,
-        capacity: int,
-        count: int,
-    ) -> tuple[int, int]:
-        cursor = int(cursor) % int(capacity)
-        if count == 0:
-            return cursor, cursor
-        if used == 0 and cursor + count > capacity:
-            return 0, count
-        if cursor + count <= capacity:
-            return cursor, cursor + count
-        if count <= start:
-            return 0, count
-        raise RuntimeError("ring span does not fit")
 
     def _completed_prefix_end_locked(self, row_start: int, row_limit: int) -> int:
         row = int(row_start)
@@ -831,35 +795,26 @@ class TextReplayBuffer:
             row += 1
         return row
 
-    def _completed_window_prefix_locked(self) -> tuple[int, int]:
+    def _window_prefix_locked(self, end_finder: Callable[[int, int], int]) -> tuple[int, int]:
         if not self._committed_windows:
             return 0, 0
         row_start, row_limit = self._committed_windows[0]
-        completed_limit = self._completed_prefix_end_locked(row_start, row_limit)
+        limit = end_finder(row_start, row_limit)
         idx = 1
-        while completed_limit == row_limit and idx < len(self._committed_windows):
+        while limit == row_limit and idx < len(self._committed_windows):
             next_start, next_limit = self._committed_windows[idx]
-            if int(next_start) != int(completed_limit):
+            if int(next_start) != int(limit):
                 break
             row_limit = next_limit
-            completed_limit = self._completed_prefix_end_locked(next_start, next_limit)
+            limit = end_finder(next_start, next_limit)
             idx += 1
-        return int(row_start), int(completed_limit)
+        return int(row_start), int(limit)
+
+    def _completed_window_prefix_locked(self) -> tuple[int, int]:
+        return self._window_prefix_locked(self._completed_prefix_end_locked)
 
     def _claimable_window_prefix_locked(self) -> tuple[int, int]:
-        if not self._committed_windows:
-            return 0, 0
-        row_start, row_limit = self._committed_windows[0]
-        claimable_limit = self._claimable_prefix_end_locked(row_start, row_limit)
-        idx = 1
-        while claimable_limit == row_limit and idx < len(self._committed_windows):
-            next_start, next_limit = self._committed_windows[idx]
-            if int(next_start) != int(claimable_limit):
-                break
-            row_limit = next_limit
-            claimable_limit = self._claimable_prefix_end_locked(next_start, next_limit)
-            idx += 1
-        return int(row_start), int(claimable_limit)
+        return self._window_prefix_locked(self._claimable_prefix_end_locked)
 
     def _consume_committed_prefix_locked(self, row_end: int) -> None:
         row_end = int(row_end)
@@ -1213,11 +1168,11 @@ class TextReplayBuffer:
             self.row_token_length_host[int(row)] = int(seq_len)
 
         total_tokens = int(encoded.token_ids.numel())
-        token_start = self._token_cursor
+        token_start = self.token_ring.cursor
         token_end = token_start + total_tokens
-        if token_end > int(self.packed_token_ids.numel()):
+        if token_end > self.token_ring.capacity:
             raise RuntimeError("TextReplayBuffer packed token arena is full")
-        self._token_cursor = token_end
+        self.token_ring.cursor = token_end
         seq_lengths_i32 = seq_lengths.to(dtype=torch.int32)
         self.row_token_length[rows] = seq_lengths_i32
         self.seq_lengths[rows] = seq_lengths_i32
@@ -1551,11 +1506,11 @@ class TextReplayBuffer:
 
     def _write_row_packed_tokens(self, row: int, token_ids: Tensor) -> None:
         token_count = int(token_ids.numel())
-        token_start = self._token_cursor
+        token_start = self.token_ring.cursor
         token_end = token_start + token_count
-        if token_end > int(self.packed_token_ids.numel()):
+        if token_end > self.token_ring.capacity:
             raise RuntimeError("TextReplayBuffer packed token arena is full")
-        self._token_cursor = token_end
+        self.token_ring.cursor = token_end
         self.row_token_start[row] = token_start
         self.row_token_length[row] = token_count
         self.row_token_length_host[row] = token_count
