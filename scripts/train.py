@@ -4316,6 +4316,9 @@ def train_text_native_batched_envs(
     pending_replay_rows: list[torch.Tensor] = []
     pending_returns: list[torch.Tensor] = []
     pending_step_count: int = 0
+    # Guards read-modify-write of pending_step_count between the driver thread
+    # (increments on env-finish) and the learner thread (decrement on claim).
+    pending_step_count_lock = threading.Lock()
     pending_episodes: list[EpisodeBatch] = []
     # PPO-only path: accumulate per-finished-batch device tensors here and
     # do a single host split at run_update time, instead of one per batch.
@@ -4585,7 +4588,8 @@ def train_text_native_batched_envs(
                     and hasattr(backend.replay_buffer, "seal_staged_rows")
                 ):
                     backend.replay_buffer.seal_staged_rows(flat_rows)
-                pending_step_count += n_new
+                with pending_step_count_lock:
+                    pending_step_count += n_new
                 total_generated_rollout_steps += n_new
             timing_stats = getattr(staging_buffer, "timing_stats", None)
             if timing_stats is not None:
@@ -4903,7 +4907,8 @@ def train_text_native_batched_envs(
             pending_episodes.clear()
             pending_flat_rows_chunks.clear()
             pending_episode_step_counts.clear()
-            pending_step_count = 0
+            with pending_step_count_lock:
+                pending_step_count = 0
         if reset_replay:
             backend.replay_buffer.reset()
         if win_stats_snapshot is None:
@@ -5248,7 +5253,8 @@ def train_text_native_batched_envs(
                                 reset_replay=False,
                             )
                         backend.replay_buffer.release_train_window(window)
-                        pending_step_count = max(0, pending_step_count - steps)
+                        with pending_step_count_lock:
+                            pending_step_count = max(0, pending_step_count - steps)
                         if force_partial:
                             learner_force_partial.clear()
                         policy_versions.publish_from_online(publish_source)
