@@ -799,6 +799,68 @@ class TextReplayBuffer:
             _start, limit = self._committed_windows[0]
             self._committed_windows[0] = (row_end, limit)
 
+    def _split_recurrent(
+        self,
+        lstm_h_in: Tensor | None,
+        lstm_c_in: Tensor | None,
+    ) -> tuple[Tensor | None, Tensor | None]:
+        if self.lstm_h_in is not None and self.lstm_c_in is not None:
+            if lstm_h_in is None or lstm_c_in is None:
+                raise ValueError("h_in and c_in are required for recurrent text replay")
+            return lstm_h_in.permute(1, 0, 2), lstm_c_in.permute(1, 0, 2)
+        if lstm_h_in is not None or lstm_c_in is not None:
+            raise ValueError("buffer was constructed without recurrent state storage")
+        return None, None
+
+    def _compute_total_stored_decisions(
+        self,
+        decision_count: Tensor,
+        decision_count_host: tuple[int, ...] | None,
+        total_stored_decision_groups: int | None,
+    ) -> int:
+        if total_stored_decision_groups is not None:
+            return int(total_stored_decision_groups)
+        if decision_count_host is not None:
+            return sum(min(int(c), self.max_decision_groups) for c in decision_count_host)
+        return int(
+            decision_count.to(device=self.device).clamp(max=self.max_decision_groups).sum().item()
+        )
+
+    def _write_common_metadata(
+        self,
+        rows: Tensor,
+        *,
+        trace_kind_id: Tensor,
+        may_selected: Tensor,
+        old_log_prob: Tensor,
+        value: Tensor,
+        perspective_player_idx: Tensor,
+        h_store: Tensor | None,
+        c_store: Tensor | None,
+    ) -> None:
+        self.trace_kind_id[rows] = trace_kind_id.to(
+            device=self.device, dtype=self.trace_kind_id.dtype
+        )
+        self.may_selected[rows] = may_selected.to(device=self.device, dtype=torch.float32)
+        self.old_log_prob[rows] = old_log_prob.to(device=self.device, dtype=torch.float32)
+        self.value[rows] = value.to(device=self.device, dtype=torch.float32)
+        self.perspective_player_idx[rows] = perspective_player_idx.to(
+            device=self.device, dtype=self.perspective_player_idx.dtype
+        )
+        if self.lstm_h_in is not None and self.lstm_c_in is not None:
+            assert h_store is not None and c_store is not None
+            self.lstm_h_in[rows] = h_store.to(device=self.device, dtype=torch.float32)
+            self.lstm_c_in[rows] = c_store.to(device=self.device, dtype=torch.float32)
+
+    def _clear_blank_rows(self, rows: Tensor) -> None:
+        self.blank.positions.index_fill_(0, rows, -1)
+        self.blank.kind.index_fill_(0, rows, 0)
+        self.blank.group.index_fill_(0, rows, -1)
+        self.blank.group_kind.index_fill_(0, rows, 0)
+        self.blank.option_index.index_fill_(0, rows, -1)
+        self.blank.legal_ids.index_fill_(0, rows, 0)
+        self.blank.legal_mask.index_fill_(0, rows, 0)
+
     def _write_decision_batch_at(
         self,
         *,
@@ -952,30 +1014,10 @@ class TextReplayBuffer:
         seq_lengths_host = self._packed_seq_lengths_host(encoded)
         if decision_count_host is not None and len(decision_count_host) != batch_size:
             raise ValueError("decision_count_host length must match batch size")
-        total_stored = (
-            int(total_stored_decision_groups)
-            if total_stored_decision_groups is not None
-            else (
-                sum(map(lambda c: min(int(c), self.max_decision_groups), decision_count_host))
-                if decision_count_host is not None
-                else int(
-                    decision_count.to(device=self.device)
-                    .clamp(max=self.max_decision_groups)
-                    .sum()
-                    .item()
-                )
-            )
+        total_stored = self._compute_total_stored_decisions(
+            decision_count, decision_count_host, total_stored_decision_groups
         )
-        if self.lstm_h_in is not None and self.lstm_c_in is not None:
-            if lstm_h_in is None or lstm_c_in is None:
-                raise ValueError("h_in and c_in are required for recurrent text replay")
-            h_store = lstm_h_in.permute(1, 0, 2)
-            c_store = lstm_c_in.permute(1, 0, 2)
-        elif lstm_h_in is not None or lstm_c_in is not None:
-            raise ValueError("buffer was constructed without recurrent state storage")
-        else:
-            h_store = None
-            c_store = None
+        h_store, c_store = self._split_recurrent(lstm_h_in, lstm_c_in)
 
         try:
             reservation = self._reserve_append(
@@ -1006,36 +1048,23 @@ class TextReplayBuffer:
             selected_indices=selected_indices,
             behavior_action_log_prob=behavior_action_log_prob,
         )
-        self.trace_kind_id[rows] = trace_kind_id.to(
-            device=self.device, dtype=self.trace_kind_id.dtype
+        self._write_common_metadata(
+            rows,
+            trace_kind_id=trace_kind_id,
+            may_selected=may_selected,
+            old_log_prob=old_log_prob,
+            value=value,
+            perspective_player_idx=perspective_player_idx,
+            h_store=h_store,
+            c_store=c_store,
         )
-        self.may_selected[rows] = may_selected.to(device=self.device, dtype=torch.float32)
-        self.old_log_prob[rows] = old_log_prob.to(device=self.device, dtype=torch.float32)
-        self.value[rows] = value.to(device=self.device, dtype=torch.float32)
-        self.perspective_player_idx[rows] = perspective_player_idx.to(
-            device=self.device, dtype=self.perspective_player_idx.dtype
-        )
-        if self.lstm_h_in is not None and self.lstm_c_in is not None:
-            if h_store is None or c_store is None:
-                raise ValueError("h_in and c_in are required for recurrent text replay")
-            self.lstm_h_in[rows] = h_store.to(device=self.device, dtype=torch.float32)
-            self.lstm_c_in[rows] = c_store.to(device=self.device, dtype=torch.float32)
         self.row_token_length_host[row_start : row_start + batch_size] = seq_lengths_host
         blank_width = min(int(encoded.blank_positions.shape[1]), self.max_blanks_per_row)
         blank_legal_width = min(int(encoded.blank_legal_ids.shape[2]), self.max_legal_per_blank)
         seq_lengths_i32 = seq_lengths.to(dtype=torch.int32)
-        self.row_token_start[rows] = -1
-        self.row_token_length[rows] = 0
         self.card_ref_positions.index_fill_(0, rows, -1)
         self.seq_lengths[rows] = seq_lengths_i32
-
-        self.blank.positions.index_fill_(0, rows, -1)
-        self.blank.kind.index_fill_(0, rows, 0)
-        self.blank.group.index_fill_(0, rows, -1)
-        self.blank.group_kind.index_fill_(0, rows, 0)
-        self.blank.option_index.index_fill_(0, rows, -1)
-        self.blank.legal_ids.index_fill_(0, rows, 0)
-        self.blank.legal_mask.index_fill_(0, rows, 0)
+        self._clear_blank_rows(rows)
         token_ids = encoded.token_ids.to(device=self.device, dtype=torch.int32)
         if total_tokens > 0:
             self.packed_token_ids[token_start:token_end] = token_ids
@@ -1133,30 +1162,10 @@ class TextReplayBuffer:
         total_tokens = sum(int(x) for x in seq_lengths_host)
         if decision_count_host is not None and len(decision_count_host) != batch_size:
             raise ValueError("decision_count_host length must match batch size")
-        total_stored = (
-            int(total_stored_decision_groups)
-            if total_stored_decision_groups is not None
-            else (
-                sum(min(int(c), self.max_decision_groups) for c in decision_count_host)
-                if decision_count_host is not None
-                else int(
-                    decision_count.to(device=self.device)
-                    .clamp(max=self.max_decision_groups)
-                    .sum()
-                    .item()
-                )
-            )
+        total_stored = self._compute_total_stored_decisions(
+            decision_count, decision_count_host, total_stored_decision_groups
         )
-        if self.lstm_h_in is not None and self.lstm_c_in is not None:
-            if lstm_h_in is None or lstm_c_in is None:
-                raise ValueError("h_in and c_in are required for recurrent text replay")
-            h_store = lstm_h_in.permute(1, 0, 2)
-            c_store = lstm_c_in.permute(1, 0, 2)
-        elif lstm_h_in is not None or lstm_c_in is not None:
-            raise ValueError("buffer was constructed without recurrent state storage")
-        else:
-            h_store = None
-            c_store = None
+        h_store, c_store = self._split_recurrent(lstm_h_in, lstm_c_in)
 
         try:
             reservation = self._reserve_append(
@@ -1191,35 +1200,23 @@ class TextReplayBuffer:
             selected_indices=selected_indices,
             behavior_action_log_prob=behavior_action_log_prob,
         )
-        self.trace_kind_id[row_start:row_end] = trace_kind_id.to(
-            device=self.device, dtype=self.trace_kind_id.dtype
+        self._write_common_metadata(
+            rows,
+            trace_kind_id=trace_kind_id,
+            may_selected=may_selected,
+            old_log_prob=old_log_prob,
+            value=value,
+            perspective_player_idx=perspective_player_idx,
+            h_store=h_store,
+            c_store=c_store,
         )
-        self.may_selected[row_start:row_end] = may_selected.to(
-            device=self.device, dtype=torch.float32
-        )
-        self.old_log_prob[row_start:row_end] = old_log_prob.to(
-            device=self.device, dtype=torch.float32
-        )
-        self.value[row_start:row_end] = value.to(device=self.device, dtype=torch.float32)
-        self.perspective_player_idx[row_start:row_end] = perspective_player_idx.to(
-            device=self.device, dtype=self.perspective_player_idx.dtype
-        )
-        self.core._write_recurrent_batch(row_start, row_end, h_store, c_store)
 
         cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
         cu_seqlens[1:] = seq_lengths.cumsum(0).to(dtype=torch.int32)
         flat_env = flat_env.to(device=self.device)
         flat_step = flat_step.to(device=self.device)
-        self.row_token_start[row_start:row_end] = -1
-        self.row_token_length[row_start:row_end] = 0
-        self.card_ref_positions[row_start:row_end].fill_(-1)
-        self.blank.positions[row_start:row_end].fill_(-1)
-        self.blank.kind[row_start:row_end].zero_()
-        self.blank.group[row_start:row_end].fill_(-1)
-        self.blank.group_kind[row_start:row_end].zero_()
-        self.blank.option_index[row_start:row_end].fill_(-1)
-        self.blank.legal_ids[row_start:row_end].zero_()
-        self.blank.legal_mask[row_start:row_end].zero_()
+        self.card_ref_positions.index_fill_(0, rows, -1)
+        self._clear_blank_rows(rows)
         row_tokens = token_ids[flat_env, flat_step]
         if total_tokens > 0:
             seq_id = torch.repeat_interleave(
@@ -1363,26 +1360,9 @@ class TextReplayBuffer:
         else:
             token_ids, seq_id, pos_in_seq = gathered_encoded
 
-        card_ref_positions = add_packed_offsets(self.card_ref_positions[idx], state_positions)
         common = self.core.gather_common(idx)
-        trace_kind_id = common.trace_kind_id
-        may_selected = common.may_selected
-        old_log_prob = common.old_log_prob
-        value = common.value
-        perspective_player_idx = common.perspective_player_idx
-        h_in = common.lstm_h_in
-        c_in = common.lstm_c_in
-        blank_positions = add_packed_offsets(self.blank.positions[idx], state_positions)
-        blank_kind = self.blank.kind[idx]
-        blank_group = self.blank.group[idx]
-        blank_group_kind = self.blank.group_kind[idx]
-        blank_option_index = self.blank.option_index[idx]
-        blank_legal_ids = self.blank.legal_ids[idx]
-        blank_legal_mask = self.blank.legal_mask[idx]
-
-        gathered_decisions = None
         if self.use_triton_gather:
-            gathered_decisions = gather_decisions_triton(
+            decisions = gather_decisions_triton(
                 rows=idx,
                 decision_start=self.decision_start,
                 decision_count=self.decision_count,
@@ -1393,26 +1373,12 @@ class TextReplayBuffer:
                 selected_indices=self.selected_indices,
                 max_decision_groups=self.max_decision_groups,
             )
-        if gathered_decisions is None:
-            decision_batch = self.core.gather_decisions(idx)
-            decision_start = decision_batch.decision_start
-            decision_count = decision_batch.decision_count
-            decision_option_idx = decision_batch.decision_option_idx
-            decision_target_idx = decision_batch.decision_target_idx
-            decision_mask = decision_batch.decision_mask
-            uses_none_head = decision_batch.uses_none_head
-            selected_indices = decision_batch.selected_indices
-            behavior_action_log_prob = decision_batch.behavior_action_log_prob
-            step_for_decision_group = decision_batch.step_for_group
         else:
-            decision_start = gathered_decisions.decision_start
-            decision_count = gathered_decisions.decision_count
-            decision_option_idx = gathered_decisions.decision_option_idx
-            decision_target_idx = gathered_decisions.decision_target_idx
-            decision_mask = gathered_decisions.decision_mask
-            uses_none_head = gathered_decisions.uses_none_head
-            selected_indices = gathered_decisions.selected_indices
-            step_for_decision_group = gathered_decisions.step_for_group
+            decisions = None
+        if decisions is None:
+            decisions = self.core.gather_decisions(idx)
+            behavior_action_log_prob = decisions.behavior_action_log_prob
+        else:
             behavior_action_log_prob = self.core.gather_decision_behavior_action_log_prob(idx)
         encoded = PackedTextBatch(
             token_ids=token_ids,
@@ -1421,37 +1387,37 @@ class TextReplayBuffer:
             cu_seqlens=cu_seqlens,
             seq_lengths=seq_lengths,
             state_positions=state_positions,
-            card_ref_positions=card_ref_positions,
+            card_ref_positions=add_packed_offsets(self.card_ref_positions[idx], state_positions),
             total_tokens=int(token_ids.numel()) if total_tokens_host is None else total_tokens_host,
             seq_lengths_host=tuple(self.row_token_length_host[row] for row in idx_host)
             if idx_host is not None
             else None,
-            blank_positions=blank_positions,
-            blank_kind=blank_kind,
-            blank_group=blank_group,
-            blank_group_kind=blank_group_kind,
-            blank_option_index=blank_option_index,
-            blank_legal_ids=blank_legal_ids,
-            blank_legal_mask=blank_legal_mask,
+            blank_positions=add_packed_offsets(self.blank.positions[idx], state_positions),
+            blank_kind=self.blank.kind[idx],
+            blank_group=self.blank.group[idx],
+            blank_group_kind=self.blank.group_kind[idx],
+            blank_option_index=self.blank.option_index[idx],
+            blank_legal_ids=self.blank.legal_ids[idx],
+            blank_legal_mask=self.blank.legal_mask[idx],
         )
         return TextReplayBatch(
             encoded=encoded,
-            trace_kind_id=trace_kind_id,
-            decision_start=decision_start,
-            decision_count=decision_count,
-            decision_option_idx=decision_option_idx,
-            decision_target_idx=decision_target_idx,
-            decision_mask=decision_mask,
-            uses_none_head=uses_none_head,
-            selected_indices=selected_indices,
+            trace_kind_id=common.trace_kind_id,
+            decision_start=decisions.decision_start,
+            decision_count=decisions.decision_count,
+            decision_option_idx=decisions.decision_option_idx,
+            decision_target_idx=decisions.decision_target_idx,
+            decision_mask=decisions.decision_mask,
+            uses_none_head=decisions.uses_none_head,
+            selected_indices=decisions.selected_indices,
             behavior_action_log_prob=behavior_action_log_prob,
-            step_for_decision_group=step_for_decision_group,
-            may_selected=may_selected,
-            old_log_prob=old_log_prob,
-            value=value,
-            perspective_player_idx=perspective_player_idx,
-            lstm_h_in=h_in,
-            lstm_c_in=c_in,
+            step_for_decision_group=decisions.step_for_group,
+            may_selected=common.may_selected,
+            old_log_prob=common.old_log_prob,
+            value=common.value,
+            perspective_player_idx=common.perspective_player_idx,
+            lstm_h_in=common.lstm_h_in,
+            lstm_c_in=common.lstm_c_in,
         )
 
     def write_projected_state(self, rows: Tensor, projected: Tensor) -> None:
