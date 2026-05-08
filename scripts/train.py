@@ -5324,6 +5324,18 @@ def train_text_native_batched_envs(
                                 "".join(_traceback.format_stack(frame, limit=8)),
                                 flush=True,
                             )
+                    learner_ident = learner_thread.ident
+                    if learner_ident is not None:
+                        frame = sys._current_frames().get(learner_ident)
+                        if frame is not None:
+                            import traceback as _traceback
+
+                            print(
+                                cli_step_prefix(),
+                                "[watchdog_learner_stack]",
+                                "".join(_traceback.format_stack(frame, limit=12)),
+                                flush=True,
+                            )
                     for actor in actors:
                         thread = actor._thread
                         actor_ident = None if thread is None else thread.ident
@@ -5428,7 +5440,9 @@ def train_text_native_batched_envs(
                     # actor_free_slots[aid] above. Pull from there.
                     new_games: list[Any] = []
                     no_more = False
-                    if pending_step_count < int(args.learner_max_rows):
+                    if pending_step_count < int(args.learner_max_rows) or (
+                        learner_force_partial.is_set() and actor_free_slots[aid]
+                    ):
                         while (
                             requested and actor_free_slots[aid] and next_episode_idx < args.episodes
                         ):
