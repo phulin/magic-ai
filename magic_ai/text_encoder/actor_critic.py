@@ -2693,7 +2693,6 @@ def _evaluate_inline_priority_replay_groups(
     )
     cross_matches = cross_support & (row_blank_option == selected_option.unsqueeze(1))
     cross_count = cross_matches.sum(dim=-1)
-    cross_blank_idx = cross_matches.to(dtype=torch.int32).argmax(dim=-1)
 
     priority_scores = blank_logits[steps_t, :, 0]
     dummy_cross = torch.zeros_like(cross_support)
@@ -2718,7 +2717,10 @@ def _evaluate_inline_priority_replay_groups(
         cross_log_probs_dense.new_zeros(()),
     )
     cross_entropy = -(cross_probs * safe_cross_log_probs).sum(dim=-1)
-    cross_log_prob = cross_log_probs_dense.gather(1, cross_blank_idx.unsqueeze(1)).squeeze(1)
+    cross_log_prob = torch.logsumexp(
+        cross_log_probs_dense.masked_fill(~cross_matches, float("-inf")),
+        dim=-1,
+    )
 
     target_required = selected_target >= 0
     target_support = (
@@ -2751,7 +2753,7 @@ def _evaluate_inline_priority_replay_groups(
         is_priority_step
         & selected_in_range
         & selected_masked
-        & (cross_count == 1)
+        & (cross_count >= 1)
         & target_group_valid
     )
     if group_skip_mask is not None:
@@ -2823,11 +2825,20 @@ def _evaluate_inline_priority_replay_groups(
         col_cross_matches = cross_support[group_ids] & (
             row_blank_option[group_ids] == col_options.unsqueeze(1)
         )
-        col_cross_blank = col_cross_matches.to(dtype=torch.int32).argmax(dim=-1)
-        col_cross_log_probs = cross_log_probs_dense[group_ids, col_cross_blank]
-        col_cross_logits = priority_scores[group_ids, col_cross_blank]
+        col_cross_log_probs = torch.logsumexp(
+            cross_log_probs_dense[group_ids].masked_fill(~col_cross_matches, float("-inf")),
+            dim=-1,
+        )
+        col_cross_logits = torch.logsumexp(
+            priority_scores[group_ids].masked_fill(~col_cross_matches, float("-inf")),
+            dim=-1,
+        )
 
-        col_target_matches = target_support[group_ids]
+        col_target_matches = (
+            (row_blank_kind[group_ids] == BLANK_GROUP_PER_BLANK)
+            & (row_blank_option[group_ids] == col_options.unsqueeze(1))
+            & row_legal_mask[group_ids].any(dim=-1)
+        )
         col_target_blank = col_target_matches.to(dtype=torch.int32).argmax(dim=-1)
         safe_col_targets = col_targets.clamp(min=0, max=target_width - 1)
         col_target_log_probs = target_log_probs_dense[group_ids, safe_col_targets]
