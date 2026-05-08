@@ -4488,9 +4488,7 @@ def train_text_native_batched_envs(
                 flat_rows, counts = staging_buffer.append_envs_to_replay_returning_tensor(
                     slot_idxs,
                     backend.replay_buffer,
-                    seal=False,
                 )
-                needs_staged_seal = True
                 counts_h = counts.detach().cpu().tolist()
                 split_rows = torch.split(flat_rows.detach().cpu(), counts_h)
                 per_env_rows_h = tuple(map(lambda rows: tuple(map(int, rows.tolist())), split_rows))
@@ -4597,12 +4595,6 @@ def train_text_native_batched_envs(
                         ),
                     )
                 )
-                if (
-                    needs_staging_commit
-                    and needs_staged_seal
-                    and hasattr(backend.replay_buffer, "seal_staged_rows")
-                ):
-                    backend.replay_buffer.seal_staged_rows(flat_rows)
                 with pending_step_count_lock:
                     pending_step_count += n_new
                 total_generated_rollout_steps += n_new
