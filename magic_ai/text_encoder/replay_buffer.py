@@ -290,9 +290,11 @@ class TextReplayBuffer:
         self.decision_ring = _RingTracker(capacity=self.core.decision_capacity)
         self._ring_active = False
         self._committed_windows: list[tuple[int, int]] = []
+        self._claimed_windows: list[tuple[int, int]] = []
         self._reservations: dict[int, _ReplayReservation] = {}
         self._unsealed_staged_reservations: dict[tuple[int, int], int] = {}
         self._row_complete_host = [False] * self.capacity
+        self._row_append_ready_events: list[Any | None] = [None] * self.capacity
         self._row_ready_events: list[Any | None] = [None] * self.capacity
 
     @property
@@ -301,13 +303,13 @@ class TextReplayBuffer:
             return int(self.row_ring.used) if self._ring_active else self.core.size
 
     def reset(self) -> None:
-        self.core.reset()
-        self.row_token_start.fill_(-1)
-        self.row_token_length.zero_()
-        self.row_token_length_host[:] = [0] * self.capacity
-        self.blank.reset()
-        self.episode_meta.reset()
         with self._reserve_lock:
+            self.core.reset()
+            self.row_token_start.fill_(-1)
+            self.row_token_length.zero_()
+            self.row_token_length_host[:] = [0] * self.capacity
+            self.blank.reset()
+            self.episode_meta.reset()
             self._next_reservation_id = 0
             self._commit_reservation_id = 0
             self._committed_row_cursor = 0
@@ -317,9 +319,11 @@ class TextReplayBuffer:
             self.decision_ring.reset()
             self._ring_active = False
             self._committed_windows.clear()
+            self._claimed_windows.clear()
             self._reservations.clear()
             self._unsealed_staged_reservations.clear()
             self._row_complete_host[:] = [False] * self.capacity
+            self._row_append_ready_events[:] = [None] * self.capacity
             self._row_ready_events[:] = [None] * self.capacity
             self._reserve_cond.notify_all()
 
@@ -425,6 +429,7 @@ class TextReplayBuffer:
                 return None
             row_end = row_start + min(available, int(max_rows))
             self._consume_committed_prefix_locked(row_end)
+            self._claimed_windows.append((row_start, row_end))
         return TextReplayTrainWindow(
             row_start=row_start,
             row_end=row_end,
@@ -529,13 +534,18 @@ class TextReplayBuffer:
         if int(rows.numel()) == 0:
             return
         row_count = int(rows.numel())
+        rows_host = rows.detach().cpu().tolist()
+        first_row = int(rows_host[0])
+        last_row = int(rows_host[-1])
+        if any(
+            int(row) != expected
+            for row, expected in zip(rows_host, range(first_row, first_row + row_count))
+        ):
+            raise RuntimeError("replay rows must be released as a contiguous FIFO window")
         token_lengths = self.row_token_length[rows]
         decision_counts = self.decision_count[rows]
         token_count = int(token_lengths.sum().item())
         decision_count = int(decision_counts.sum().item())
-        rows_host = rows.detach().cpu().tolist()
-        first_row = int(rows_host[0])
-        last_row = int(rows_host[-1])
         token_starts = self.row_token_start[rows]
         decision_starts = self.decision_start[rows]
         last_token_len = int(token_lengths[-1].item())
@@ -543,6 +553,12 @@ class TextReplayBuffer:
         last_token_start = int(token_starts[-1].item()) if token_count > 0 else 0
         last_decision_start = int(decision_starts[-1].item()) if decision_count > 0 else 0
         with self._reserve_cond:
+            if not self._claimed_windows:
+                raise RuntimeError("replay rows must be claimed before release")
+            claimed_start, claimed_end = self._claimed_windows[0]
+            if first_row != claimed_start or last_row + 1 != claimed_end:
+                raise RuntimeError("claimed replay windows must be released in FIFO order")
+            self._claimed_windows.pop(0)
             self.row_ring.release(
                 row_count,
                 new_start=last_row + 1 if first_row == self.row_ring.start else None,
@@ -562,6 +578,12 @@ class TextReplayBuffer:
             self.decision_count[rows] = 0
             tuple(map(lambda row: self.row_token_length_host.__setitem__(int(row), 0), rows_host))
             tuple(map(lambda row: self._row_complete_host.__setitem__(int(row), False), rows_host))
+            tuple(
+                map(
+                    lambda row: self._row_append_ready_events.__setitem__(int(row), None), rows_host
+                )
+            )
+            tuple(map(lambda row: self._row_ready_events.__setitem__(int(row), None), rows_host))
             self._reserve_cond.notify_all()
 
     def gather_ppo_targets(self, replay_rows: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -587,25 +609,47 @@ class TextReplayBuffer:
         lstm_c_in: Tensor | None = None,
     ) -> int:
         self._validate_batch_index(encoded, batch_index)
+        seq_length = int(encoded.seq_lengths[batch_index].item())
+        decision_groups = int(decision_option_idx.shape[0])
+        stored_decisions = min(decision_groups, self.max_decision_groups)
         try:
-            row = self.core.append_row(
-                trace_kind_id=trace_kind_id,
-                decision_option_idx=decision_option_idx,
-                decision_target_idx=decision_target_idx,
-                decision_mask=decision_mask,
-                uses_none_head=uses_none_head,
-                selected_indices=selected_indices,
-                behavior_action_log_prob=behavior_action_log_prob,
-                may_selected=may_selected,
-                old_log_prob=old_log_prob,
-                value=value,
-                perspective_player_idx=perspective_player_idx,
-                lstm_h_in=lstm_h_in,
-                lstm_c_in=lstm_c_in,
+            reservation = self._reserve_append(
+                row_count=1,
+                token_count=seq_length,
+                decision_count=stored_decisions,
+                block=False,
             )
         except RuntimeError as exc:
             raise RuntimeError("TextReplayBuffer is full") from exc
-        self._write_encoded_row(row, encoded, batch_index)
+        row = int(reservation.row_start)
+        self._write_decision_batch_at(
+            row_start=row,
+            row_end=row + 1,
+            decision_start=reservation.decision_start,
+            decision_count=torch.tensor([decision_groups], dtype=torch.long, device=self.device),
+            decision_count_host=(decision_groups,),
+            total_decision_groups=decision_groups,
+            total_stored_decision_groups=stored_decisions,
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            selected_indices=selected_indices,
+            behavior_action_log_prob=behavior_action_log_prob,
+        )
+        self.core._write_common_row(
+            row,
+            trace_kind_id=int(trace_kind_id),
+            may_selected=float(may_selected),
+            old_log_prob=float(old_log_prob),
+            value=float(value),
+            perspective_player_idx=int(perspective_player_idx),
+            lstm_h_in=lstm_h_in,
+            lstm_c_in=lstm_c_in,
+        )
+        self._write_encoded_row(row, reservation.token_start, encoded, batch_index)
+        self._mark_append_ready_range(row, row + 1)
+        self._seal_reservation(reservation)
         return row
 
     def append_packed(
@@ -628,25 +672,49 @@ class TextReplayBuffer:
         lstm_c_in: Tensor | None = None,
     ) -> int:
         self._validate_packed_batch_index(encoded, batch_index)
+        start = int(encoded.cu_seqlens[batch_index].item())
+        end = int(encoded.cu_seqlens[batch_index + 1].item())
+        token_width = end - start
+        decision_groups = int(decision_option_idx.shape[0])
+        stored_decisions = min(decision_groups, self.max_decision_groups)
         try:
-            row = self.core.append_row(
-                trace_kind_id=trace_kind_id,
-                decision_option_idx=decision_option_idx,
-                decision_target_idx=decision_target_idx,
-                decision_mask=decision_mask,
-                uses_none_head=uses_none_head,
-                selected_indices=selected_indices,
-                behavior_action_log_prob=behavior_action_log_prob,
-                may_selected=may_selected,
-                old_log_prob=old_log_prob,
-                value=value,
-                perspective_player_idx=perspective_player_idx,
-                lstm_h_in=lstm_h_in,
-                lstm_c_in=lstm_c_in,
+            reservation = self._reserve_append(
+                row_count=1,
+                token_count=token_width,
+                decision_count=stored_decisions,
+                block=False,
             )
         except RuntimeError as exc:
             raise RuntimeError("TextReplayBuffer is full") from exc
-        self._write_packed_encoded_row(row, encoded, batch_index)
+        row = int(reservation.row_start)
+        self._write_decision_batch_at(
+            row_start=row,
+            row_end=row + 1,
+            decision_start=reservation.decision_start,
+            decision_count=torch.tensor([decision_groups], dtype=torch.long, device=self.device),
+            decision_count_host=(decision_groups,),
+            total_decision_groups=decision_groups,
+            total_stored_decision_groups=stored_decisions,
+            decision_option_idx=decision_option_idx,
+            decision_target_idx=decision_target_idx,
+            decision_mask=decision_mask,
+            uses_none_head=uses_none_head,
+            selected_indices=selected_indices,
+            behavior_action_log_prob=behavior_action_log_prob,
+        )
+        self.core._write_common_row(
+            row,
+            trace_kind_id=int(trace_kind_id),
+            may_selected=float(may_selected),
+            old_log_prob=float(old_log_prob),
+            value=float(value),
+            perspective_player_idx=int(perspective_player_idx),
+            lstm_h_in=lstm_h_in,
+            lstm_c_in=lstm_c_in,
+        )
+        self._write_packed_encoded_row(row, reservation.token_start, encoded, batch_index)
+        self._mark_append_ready_range(row, row + 1)
+        self._seal_reservation(reservation)
         return row
 
     def _packed_seq_lengths_host(self, encoded: PackedTextBatch) -> list[int]:
@@ -664,6 +732,7 @@ class TextReplayBuffer:
         row_count: int,
         token_count: int,
         decision_count: int,
+        block: bool = True,
     ) -> _ReplayReservation:
         row_count = int(row_count)
         token_count = int(token_count)
@@ -675,6 +744,12 @@ class TextReplayBuffer:
         if decision_count > self.decision_ring.capacity:
             raise RuntimeError("TextReplayBuffer decision request exceeds capacity")
         with self._reserve_cond:
+            if not block and not self._can_reserve_locked(
+                row_count=row_count,
+                token_count=token_count,
+                decision_count=decision_count,
+            ):
+                raise RuntimeError("TextReplayBuffer is full")
             while not self._can_reserve_locked(
                 row_count=row_count,
                 token_count=token_count,
@@ -727,11 +802,25 @@ class TextReplayBuffer:
             self._publish_committable_locked()
             self._reserve_cond.notify_all()
 
+    def _mark_append_ready_range(self, row_start: int, row_end: int) -> None:
+        ready_event: Any | None = None
+        if self.device.type == "cuda":
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream(self.device))
+        with self._reserve_cond:
+            for row in range(int(row_start), int(row_end)):
+                self._row_append_ready_events[row % self.capacity] = ready_event
+            self._reserve_cond.notify_all()
+
     def seal_staged_rows(self, rows: Tensor) -> None:
         if int(rows.numel()) == 0:
             return
         rows_host = rows.detach().cpu().tolist()
-        key = (int(rows_host[0]), int(rows_host[-1]) + 1)
+        row_start = int(rows_host[0])
+        row_end = row_start + len(rows_host)
+        if any(int(row) != expected for row, expected in zip(rows_host, range(row_start, row_end))):
+            raise RuntimeError("staged replay rows must be sealed as one contiguous reservation")
+        key = (row_start, row_end)
         with self._reserve_cond:
             reservation_id = self._unsealed_staged_reservations.pop(key)
             reservation = self._reservations[reservation_id]
@@ -773,6 +862,8 @@ class TextReplayBuffer:
             row_slot = row % self.capacity
             if not self._row_complete_host[row_slot]:
                 break
+            if not self._ready_event_complete(self._row_append_ready_events[row_slot]):
+                break
             if not self._ready_event_complete(self._row_ready_events[row_slot]):
                 break
             row += 1
@@ -804,6 +895,7 @@ class TextReplayBuffer:
         if self._committed_windows:
             start = int(self._committed_windows[0][0])
             for row in range(start, row_end):
+                self._row_append_ready_events[row % self.capacity] = None
                 self._row_ready_events[row % self.capacity] = None
         while self._committed_windows and self._committed_windows[0][1] <= row_end:
             self._committed_windows.pop(0)
@@ -1121,6 +1213,7 @@ class TextReplayBuffer:
                     )
                 )
 
+        self._mark_append_ready_range(row_start, row_end)
         self._seal_reservation(reservation)
         return rows
 
@@ -1280,6 +1373,7 @@ class TextReplayBuffer:
                     flat_env, flat_step, :blank_width, :blank_legal_width
                 ].to(device=self.device, dtype=torch.bool)
 
+        self._mark_append_ready_range(row_start, row_end)
         if seal:
             self._seal_reservation(reservation)
         else:
@@ -1290,13 +1384,11 @@ class TextReplayBuffer:
                 self._reserve_cond.notify_all()
         return rows
 
-    def _write_row_packed_tokens(self, row: int, token_ids: Tensor) -> None:
+    def _write_row_packed_tokens(self, row: int, token_start: int, token_ids: Tensor) -> None:
         token_count = int(token_ids.numel())
-        token_start = self.token_ring.cursor
         token_end = token_start + token_count
         if token_end > self.token_ring.capacity:
             raise RuntimeError("TextReplayBuffer packed token arena is full")
-        self.token_ring.cursor = token_end
         self.row_token_start[row] = token_start
         self.row_token_length[row] = token_count
         self.row_token_length_host[row] = token_count
@@ -1451,6 +1543,7 @@ class TextReplayBuffer:
     def _write_encoded_row(
         self,
         row: int,
+        token_start: int,
         encoded: TextEncodedBatch,
         batch_index: int,
     ) -> None:
@@ -1460,6 +1553,7 @@ class TextReplayBuffer:
         self._clear_blank_row(row)
         self._write_row_packed_tokens(
             row,
+            token_start,
             encoded.token_ids[batch_index, :seq_length].to(device=self.device, dtype=torch.int32),
         )
         self.card_ref_positions[row].copy_(
@@ -1480,6 +1574,7 @@ class TextReplayBuffer:
     def _write_packed_encoded_row(
         self,
         row: int,
+        token_start: int,
         encoded: PackedTextBatch,
         batch_index: int,
     ) -> None:
@@ -1495,6 +1590,7 @@ class TextReplayBuffer:
 
         self._write_row_packed_tokens(
             row,
+            token_start,
             encoded.token_ids[start:end].to(device=self.device, dtype=torch.int32),
         )
 

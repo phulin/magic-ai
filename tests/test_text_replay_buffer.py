@@ -549,43 +549,127 @@ class TextReplayBufferTests(unittest.TestCase):
             use_triton_gather=False,
         )
 
-        def append_one(token: int) -> torch.Tensor:
+        def append_tokens(tokens: list[int]) -> torch.Tensor:
             encoded = TextEncodedBatch(
-                token_ids=torch.tensor([[token, 0]]),
-                attention_mask=torch.tensor([[1, 0]]),
-                card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
-                seq_lengths=torch.tensor([1]),
-                seq_lengths_host=(1,),
+                token_ids=torch.tensor([[token, 0] for token in tokens]),
+                attention_mask=torch.tensor([[1, 0] for _token in tokens]),
+                card_ref_positions=torch.full((len(tokens), MAX_CARD_REFS), -1, dtype=torch.long),
+                seq_lengths=torch.ones(len(tokens), dtype=torch.long),
+                seq_lengths_host=tuple(1 for _token in tokens),
             )
             return buffer.append_batch(
                 encoded=pack_batch(encoded),
-                trace_kind_id=torch.tensor([1]),
-                decision_count=torch.tensor([1]),
-                decision_option_idx=torch.tensor([[0, -1]]),
-                decision_target_idx=torch.tensor([[-1, -1]]),
-                decision_mask=torch.tensor([[True, False]]),
-                uses_none_head=torch.tensor([False]),
-                selected_indices=torch.tensor([0]),
-                may_selected=torch.tensor([0.0]),
-                old_log_prob=torch.tensor([-0.1]),
-                value=torch.tensor([0.0]),
-                perspective_player_idx=torch.tensor([0]),
+                trace_kind_id=torch.ones(len(tokens), dtype=torch.long),
+                decision_count=torch.ones(len(tokens), dtype=torch.long),
+                decision_option_idx=torch.tensor([[0, -1] for _token in tokens]),
+                decision_target_idx=torch.tensor([[-1, -1] for _token in tokens]),
+                decision_mask=torch.tensor([[True, False] for _token in tokens]),
+                uses_none_head=torch.zeros(len(tokens), dtype=torch.bool),
+                selected_indices=torch.zeros(len(tokens), dtype=torch.long),
+                may_selected=torch.zeros(len(tokens)),
+                old_log_prob=torch.full((len(tokens),), -0.1),
+                value=torch.zeros(len(tokens)),
+                perspective_player_idx=torch.zeros(len(tokens), dtype=torch.long),
             )
 
-        row0 = append_one(101)
-        row1 = append_one(102)
-        buffer.release_rows(row0)
-        row2 = append_one(103)
-        buffer.release_rows(row1)
-        row0_reused = append_one(104)
+        rows = append_tokens([101, 102, 103])
+        buffer.write_episode_metadata(rows, episode_id=1, terminal_reward_p0=0.0, zero_sum=True)
+        window = buffer.claim_train_window(min_rows=2, max_rows=2)
+        self.assertIsNotNone(window)
+        assert window is not None
+        buffer.release_train_window(window)
+        reused = append_tokens([104, 105])
 
-        torch.testing.assert_close(row2.cpu(), torch.tensor([2]))
-        torch.testing.assert_close(row0_reused.cpu(), torch.tensor([0]))
-        gathered = buffer.gather(torch.cat((row2, row0_reused)))
+        torch.testing.assert_close(reused.cpu(), torch.tensor([0, 1]))
+        gathered = buffer.gather(torch.cat((rows[2:], reused)))
         torch.testing.assert_close(
             gathered.encoded.token_ids.cpu(),
-            torch.tensor([103, 104], dtype=torch.int32),
+            torch.tensor([103, 104, 105], dtype=torch.int32),
         )
+
+    def test_release_rejects_non_fifo_rows(self) -> None:
+        buffer = TextReplayBuffer(
+            capacity=3,
+            max_tokens=2,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            use_triton_gather=False,
+        )
+
+        rows = buffer.append_batch(
+            encoded=pack_batch(
+                TextEncodedBatch(
+                    token_ids=torch.tensor([[101, 0], [102, 0]]),
+                    attention_mask=torch.tensor([[1, 0], [1, 0]]),
+                    card_ref_positions=torch.full((2, MAX_CARD_REFS), -1, dtype=torch.long),
+                    seq_lengths=torch.tensor([1, 1]),
+                    seq_lengths_host=(1, 1),
+                )
+            ),
+            trace_kind_id=torch.tensor([1, 1]),
+            decision_count=torch.tensor([1, 1]),
+            decision_option_idx=torch.tensor([[0, -1], [0, -1]]),
+            decision_target_idx=torch.tensor([[-1, -1], [-1, -1]]),
+            decision_mask=torch.tensor([[True, False], [True, False]]),
+            uses_none_head=torch.tensor([False, False]),
+            selected_indices=torch.tensor([0, 0]),
+            may_selected=torch.tensor([0.0, 0.0]),
+            old_log_prob=torch.tensor([-0.1, -0.2]),
+            value=torch.tensor([0.0, 0.0]),
+            perspective_player_idx=torch.tensor([0, 0]),
+        )
+        buffer.write_episode_metadata(rows, episode_id=1, terminal_reward_p0=0.0, zero_sum=True)
+        window = buffer.claim_train_window(min_rows=2, max_rows=2)
+        self.assertIsNotNone(window)
+        assert window is not None
+        with self.assertRaisesRegex(RuntimeError, "contiguous FIFO"):
+            buffer.release_rows(rows.flip(0))
+
+        buffer.release_train_window(window)
+
+    def test_claimed_window_must_be_released_exactly(self) -> None:
+        buffer = TextReplayBuffer(
+            capacity=3,
+            max_tokens=2,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            use_triton_gather=False,
+        )
+        rows = buffer.append_batch(
+            encoded=pack_batch(
+                TextEncodedBatch(
+                    token_ids=torch.tensor([[101, 0], [102, 0]]),
+                    attention_mask=torch.tensor([[1, 0], [1, 0]]),
+                    card_ref_positions=torch.full((2, MAX_CARD_REFS), -1, dtype=torch.long),
+                    seq_lengths=torch.tensor([1, 1]),
+                    seq_lengths_host=(1, 1),
+                )
+            ),
+            trace_kind_id=torch.tensor([1, 1]),
+            decision_count=torch.tensor([1, 1]),
+            decision_option_idx=torch.tensor([[0, -1], [0, -1]]),
+            decision_target_idx=torch.tensor([[-1, -1], [-1, -1]]),
+            decision_mask=torch.tensor([[True, False], [True, False]]),
+            uses_none_head=torch.tensor([False, False]),
+            selected_indices=torch.tensor([0, 0]),
+            may_selected=torch.tensor([0.0, 0.0]),
+            old_log_prob=torch.tensor([-0.1, -0.2]),
+            value=torch.tensor([0.0, 0.0]),
+            perspective_player_idx=torch.tensor([0, 0]),
+        )
+        buffer.write_episode_metadata(rows, episode_id=1, terminal_reward_p0=0.0, zero_sum=True)
+        window = buffer.claim_train_window(min_rows=2, max_rows=2)
+        self.assertIsNotNone(window)
+        assert window is not None
+
+        with self.assertRaisesRegex(RuntimeError, "claimed replay windows"):
+            buffer.release_rows(rows[:1])
+
+        buffer.release_train_window(window)
 
     def test_append_only_rows_and_reset_clears_occupancy(self) -> None:
         buffer = _buffer()
