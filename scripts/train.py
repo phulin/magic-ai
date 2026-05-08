@@ -5312,6 +5312,17 @@ def train_text_native_batched_envs(
                         f"actor_done={actor_done}",
                         flush=True,
                     )
+                    starved_refills = [
+                        aid
+                        for aid, requested in enumerate(pending_refill_slots)
+                        if requested and actor_free_slots[aid] and next_episode_idx < args.episodes
+                    ]
+                    if starved_refills:
+                        print(
+                            cli_step_prefix(),
+                            f"[watchdog_refill_starved] actors={starved_refills}",
+                            flush=True,
+                        )
                     server_ident = server._thread.ident
                     if server_ident is not None:
                         frame = sys._current_frames().get(server_ident)
@@ -5440,18 +5451,11 @@ def train_text_native_batched_envs(
                     # actor_free_slots[aid] above. Pull from there.
                     new_games: list[Any] = []
                     no_more = False
-                    if pending_step_count < int(args.learner_max_rows) or (
-                        learner_force_partial.is_set() and actor_free_slots[aid]
-                    ):
-                        while (
-                            requested and actor_free_slots[aid] and next_episode_idx < args.episodes
-                        ):
-                            requested.pop()
-                            slot_idx = actor_free_slots[aid].pop()
-                            new_games.append(start_game(slot_idx, next_episode_idx))
-                            next_episode_idx += 1
-                    elif pending_step_count > 0:
-                        _schedule_update(force_partial=True)
+                    while requested and actor_free_slots[aid] and next_episode_idx < args.episodes:
+                        requested.pop()
+                        slot_idx = actor_free_slots[aid].pop()
+                        new_games.append(start_game(slot_idx, next_episode_idx))
+                        next_episode_idx += 1
                     if next_episode_idx >= args.episodes:
                         no_more = True
                         requested.clear()
