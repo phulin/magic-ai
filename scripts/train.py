@@ -97,6 +97,7 @@ from magic_ai.slot_encoder.native_encoder import (  # noqa: E402,F401
 from magic_ai.slot_encoder.native_rollout import (  # noqa: E402
     NativeRolloutDriver,  # noqa: F401
     NativeRolloutUnavailable,
+    NativeTextRolloutDriver,
 )
 from magic_ai.text_encoder.actor_critic import (  # noqa: E402
     NativeTextReplayPayload,
@@ -2490,6 +2491,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-policy-lag", type=int, default=2)
+    parser.add_argument(
+        "--go-text-rollout-scheduler",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "for --encoder text --native-text-rollout, let mage-go own env workers, "
+            "readiness, stepping, and terminal events. Pass --no-go-text-rollout-scheduler "
+            "to use the older Python actor/staging scheduler."
+        ),
+    )
     parser.add_argument("--learner-min-rows", type=int, default=None)
     parser.add_argument("--learner-target-rows", type=int, default=None)
     parser.add_argument("--learner-max-rows", type=int, default=None)
@@ -4967,6 +4978,308 @@ def train_text_native_batched_envs(
             win_stats.reset()
         trained_completed_games = log_completed_games
 
+    def run_text_rollouts_go_scheduler() -> bool:
+        """Go-owned env scheduler; Python owns inference, replay, and learning."""
+
+        if not getattr(args, "text_native_assembler", True):
+            print(
+                cli_step_prefix(),
+                "warning: Go text rollout scheduler requires --text-native-assembler; "
+                "falling back to Python rollout scheduler",
+                flush=True,
+            )
+            return False
+        try:
+            text_rollout = NativeTextRolloutDriver.for_mage(mage)
+        except NativeRolloutUnavailable as exc:
+            print(
+                cli_step_prefix(),
+                f"warning: Go text rollout scheduler unavailable ({exc}); "
+                "falling back to Python rollout scheduler",
+                flush=True,
+            )
+            return False
+        if not getattr(native_encoder, "encoders", None):
+            print(
+                cli_step_prefix(),
+                "warning: Go text rollout scheduler requires concrete native encoders; "
+                "falling back to Python rollout scheduler",
+                flush=True,
+            )
+            return False
+
+        nonlocal sampling_policy, next_episode_idx, last_saved_games, pending_step_count
+        encoder = native_encoder.encoders[0]
+        publish_source: TextActorCritic = (
+            cast(TextActorCritic, rnad_state.target) if rnad_state is not None else backend.policy
+        )
+        inference_policy = publish_source.clone_for_rnad().to(backend.policy.device)
+        inference_policy.init_lstm_env_states(args.num_envs)
+        sampling_policy = inference_policy
+        policy_versions = PolicyVersionManager(
+            online_policy=publish_source,
+            inference_policy=inference_policy,
+        )
+        policy_versions.publish_from_online(publish_source)
+
+        def _start_wave() -> list[LiveGame]:
+            nonlocal next_episode_idx
+            wave: list[LiveGame] = []
+            while free_slots and next_episode_idx < args.episodes:
+                wave.append(start_game(free_slots.pop(), next_episode_idx))
+                next_episode_idx += 1
+            return wave
+
+        def _claim_and_update(*, final: bool = False) -> bool:
+            nonlocal pending_step_count
+            if pending_step_count <= 0:
+                return False
+            min_rows = 1 if final else int(args.learner_min_rows)
+            target_rows = 1 if final else int(args.learner_target_rows)
+            window = backend.replay_buffer.claim_train_window(
+                min_rows=min_rows,
+                max_rows=int(args.learner_max_rows),
+                target_rows=target_rows,
+                allow_partial=final,
+            )
+            if window is None:
+                return False
+            if window.ready_events and backend.replay_buffer.device.type == "cuda":
+                stream = torch.cuda.current_stream(backend.replay_buffer.device)
+                for event in window.ready_events:
+                    stream.wait_event(event)
+            steps = int(window.rows.numel())
+            if rnad_state is None:
+                returns = backend.replay_buffer.build_ppo_returns_for_rows(
+                    window.rows,
+                    gamma=args.gamma,
+                    gae_lambda=args.gae_lambda,
+                )
+                run_update(
+                    final=final,
+                    replay_rows_tensor=window.rows,
+                    returns_tensor=returns,
+                    step_count=steps,
+                    completed_games_snapshot=int(completed_games),
+                    win_stats_snapshot=replace(win_stats),
+                    reset_replay=False,
+                )
+            else:
+                run_update(
+                    final=final,
+                    replay_rows_tensor=window.rows,
+                    step_count=steps,
+                    completed_games_snapshot=int(completed_games),
+                    win_stats_snapshot=replace(win_stats),
+                    reset_replay=False,
+                )
+            backend.replay_buffer.release_train_window(window)
+            with pending_step_count_lock:
+                pending_step_count = max(0, pending_step_count - steps)
+            policy_versions.publish_from_online(publish_source)
+            return True
+
+        def _run_periodic_hooks() -> None:
+            nonlocal last_saved_games
+            if (
+                args.save_every
+                and trained_completed_games > 0
+                and trained_completed_games >= last_saved_games + args.save_every
+            ):
+                save_checkpoint(
+                    args.output,
+                    backend.policy,
+                    optimizer,
+                    args,
+                    opponent_pool=opponent_pool,
+                    snapshot_schedule=snapshot_schedule,
+                    retrospective_schedule=retrospective_schedule,
+                    resume_state=TrainingResumeState(
+                        completed_games=trained_completed_games,
+                        last_saved_games=trained_completed_games,
+                        total_rollout_steps=total_rollout_steps,
+                        total_generated_rollout_steps=total_generated_rollout_steps,
+                        total_wandb_logs=total_wandb_logs,
+                    ),
+                    rnad_state=rnad_state,
+                )
+                last_saved_games = trained_completed_games
+
+            if (
+                opponent_pool is not None
+                and snapshot_schedule is not None
+                and opponent_policy is not None
+            ):
+                for threshold in snapshot_schedule.fire(completed_games):
+                    take_snapshot_and_eval(
+                        args=args,
+                        threshold=threshold,
+                        policy=backend.policy,
+                        opponent_policy=opponent_policy,
+                        opponent_pool=opponent_pool,
+                        native_encoder=native_encoder,
+                        native_rollout=native_rollout,
+                        mage=mage,
+                        deck_pool=deck_pool,
+                        rng=eval_rng,
+                        step_prefix=cli_step_prefix(),
+                        log_fn=tracked_wandb_log,
+                    )
+
+            if opponent_pool is not None and retrospective_schedule is not None:
+                for horizon_pct, horizon_step_count in retrospective_schedule.fire(completed_games):
+                    if wandb.run is not None:
+                        log_retrospective_table(
+                            wandb.run,
+                            horizon_pct=horizon_pct,
+                            horizon_step_count=horizon_step_count,
+                            ratings=retrospective_rating_rows(
+                                opponent_pool,
+                                total_episodes=args.episodes,
+                            ),
+                            log_fn=tracked_wandb_log,
+                        )
+
+        max_batch = int(args.inference_max_batch) or int(args.num_envs)
+        while next_episode_idx < args.episodes:
+            while pending_step_count >= int(args.learner_min_rows):
+                if not _claim_and_update(final=False):
+                    break
+            _run_periodic_hooks()
+            wave = _start_wave()
+            if not wave:
+                break
+            active_by_episode = {int(env.episode_idx): env for env in wave}
+            try:
+                text_rollout.start(
+                    [env.game for env in wave],
+                    slot_ids=[int(env.slot_idx) for env in wave],
+                    episode_ids=[int(env.episode_idx) for env in wave],
+                    encoder=encoder,
+                    max_steps_per_game=int(args.max_steps_per_game),
+                    max_tokens=int(args.text_max_tokens),
+                    max_card_refs=256,
+                    max_blanks=int(args.max_options),
+                    max_legal_per_blank=int(args.max_cached_choices),
+                    ready_queue_capacity=max(int(args.num_envs), max_batch),
+                    terminal_queue_capacity=int(args.num_envs),
+                )
+                while active_by_episode:
+                    ready = text_rollout.next_text_inference_batch(
+                        encoder,
+                        max_rows=max_batch,
+                        timeout_ms=max(1, int(args.rollout_ready_wait_ms)),
+                        max_tokens=int(args.text_max_tokens),
+                        max_card_refs=256,
+                        max_blanks=int(args.max_options),
+                        max_legal_per_blank=int(args.max_cached_choices),
+                    )
+                    if ready.rows:
+                        request_ids = [int(x) for x in ready.request_ids.tolist()]
+                        slot_ids = [int(x) for x in ready.slot_ids.tolist()]
+                        episode_ids = [int(x) for x in ready.episode_ids.tolist()]
+                        perspectives = [int(x) for x in ready.perspective_player_indices.tolist()]
+                        packed = ready.packed_outputs.to_packed_text_batch(
+                            trim=True,
+                            derive_token_metadata=True,
+                        )
+                        sample_profile: dict[str, float] | None = None
+                        with torch.no_grad():
+                            with policy_versions.acquire_inference_policy() as (
+                                policy,
+                                policy_version,
+                            ):
+                                policy_batch = policy.sample_native_tensor_batch(
+                                    native_batch=ready.native_batch,
+                                    env_indices=slot_ids,
+                                    perspective_player_indices=perspectives,
+                                    packed_batch=packed,
+                                    deterministic=args.deterministic_rollout,
+                                    append_replay=False,
+                                    return_replay_payload=True,
+                                    profile_timings=sample_profile,
+                                )
+                        if policy_batch.replay_payload is None:
+                            raise RuntimeError("Go text rollout expected a replay payload")
+                        replay_rows_t = backend.replay_buffer.append_native_payload(
+                            policy_batch.replay_payload
+                        )
+                        replay_rows_h = [int(row) for row in replay_rows_t.detach().cpu().tolist()]
+                        selected_cursor = 0
+                        for row_idx, episode_id in enumerate(episode_ids):
+                            env = active_by_episode[int(episode_id)]
+                            env.action_count += 1
+                            env.inference_policy_version = int(policy_version)
+                            env.behavior_policy_version = int(policy_version)
+                            count = int(policy_batch.decision_counts[row_idx])
+                            selected_for_step = policy_batch.selected_choice_cols[
+                                selected_cursor : selected_cursor + count
+                            ]
+                            selected_cursor += count
+                            if env.transcript_enabled:
+                                try:
+                                    state, pending = _current_transcript_snapshot(env.game)
+                                    trace_kind = TRACE_KIND_VALUES[
+                                        int(ready.native_batch.trace_kind_id[row_idx])
+                                    ]
+                                    if trace_kind == "may":
+                                        action = action_from_choice_accepted(
+                                            bool(policy_batch.may_selected[row_idx])
+                                        )
+                                    else:
+                                        _trace, action = _decode_text_action(
+                                            trace_kind,
+                                            pending,
+                                            list(selected_for_step),
+                                        )
+                                    env.transcript.append(
+                                        TranscriptAction(
+                                            state=state,
+                                            pending=pending,
+                                            action=copy.deepcopy(action),
+                                        )
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    disable_transcript(
+                                        env,
+                                        f"{exc} while snapshotting live game for Go text action",
+                                    )
+                            env.episode_steps.append(
+                                RolloutStep(
+                                    perspective_player_idx=int(perspectives[row_idx]),
+                                    old_log_prob=float(policy_batch.old_log_prob[row_idx]),
+                                    value=float(policy_batch.value[row_idx]),
+                                    replay_idx=int(replay_rows_h[row_idx]),
+                                )
+                            )
+                        text_rollout.submit_text_choices(
+                            request_ids=request_ids,
+                            decision_counts=list(policy_batch.decision_counts),
+                            selected_choice_cols=list(policy_batch.selected_choice_cols),
+                            may_selected=list(policy_batch.may_selected),
+                        )
+
+                    if ready.terminal_events:
+                        finished: list[tuple[LiveGame, int, bool]] = []
+                        for event in ready.terminal_events:
+                            env = active_by_episode.pop(int(event.episode_id), None)
+                            if env is None:
+                                continue
+                            finished.append((env, int(event.winner_idx), bool(event.is_timeout)))
+                        finish_games(finished)
+                text_rollout.stop_text_rollout(wait_for_active=True)
+            finally:
+                text_rollout.stop_text_rollout(wait_for_active=True)
+            while pending_step_count >= int(args.learner_min_rows):
+                if not _claim_and_update(final=False):
+                    break
+            _run_periodic_hooks()
+
+        while _claim_and_update(final=True):
+            pass
+        backend.replay_buffer.reset()
+        return True
+
     def run_text_rollouts_actor_loop() -> None:
         """IMPALA-style coordinator. Spins up N actor threads + 1 GPU server.
 
@@ -5725,6 +6038,19 @@ def train_text_native_batched_envs(
             for actor in actors:
                 actor.join(timeout=1.0)
             learner_thread.join(timeout=1.0)
+
+    if bool(getattr(args, "go_text_rollout_scheduler", True)):
+        if run_text_rollouts_go_scheduler():
+            return (
+                TrainingResumeState(
+                    completed_games=trained_completed_games,
+                    last_saved_games=last_saved_games,
+                    total_rollout_steps=total_rollout_steps,
+                    total_generated_rollout_steps=total_generated_rollout_steps,
+                    total_wandb_logs=total_wandb_logs,
+                ),
+                rnad_state,
+            )
 
     if int(getattr(args, "num_rollout_actors", 1)) > 1:
         run_text_rollouts_actor_loop()  # nested below; uses surrounding closures
