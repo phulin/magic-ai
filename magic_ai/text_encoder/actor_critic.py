@@ -2716,7 +2716,7 @@ def _evaluate_inline_priority_replay_groups(
     row_blank_kind = blank_group_kind[steps_t]
     row_legal_mask = blank_legal_mask[steps_t]
     row_legal_ids = blank_legal_ids[steps_t]
-    if int(row_blank_kind.shape[1]) == 0:
+    if int(row_blank_kind.shape[1]) == 0 or int(row_legal_mask.shape[2]) == 0:
         per_choice = _empty_replay_per_choice(output, n, device) if return_per_choice else None
         return log_probs, entropies, group_mask, per_choice
     cross_support = (row_blank_kind == BLANK_GROUP_CROSS_BLANK) & (row_blank_option >= 0)
@@ -2758,6 +2758,63 @@ def _evaluate_inline_priority_replay_groups(
     )
 
     target_required = selected_target >= 0
+    action_support = (
+        (row_blank_kind == BLANK_GROUP_PER_BLANK)
+        & (row_blank_option == selected_option.unsqueeze(1))
+        & row_legal_mask.any(dim=-1)
+    )
+    action_count = action_support.sum(dim=-1)
+    action_blank_idx = action_support.to(dtype=torch.int32).argmax(dim=-1)
+    action_legal_mask = row_legal_mask[
+        torch.arange(g_total, dtype=torch.long, device=device),
+        action_blank_idx,
+    ]
+    action_width = int(action_legal_mask.shape[1])
+    selected_action_in_range = (selected >= 0) & (selected < action_width)
+    safe_selected_action = selected.clamp(min=0, max=action_width - 1)
+    selected_action_legal = action_legal_mask.gather(
+        1,
+        safe_selected_action.unsqueeze(1),
+    ).squeeze(1)
+    action_group_valid = (
+        (~target_required)
+        & (cross_count == 0)
+        & (action_count >= 1)
+        & selected_action_in_range
+        & selected_action_legal
+    )
+    row_action_logits = blank_logits[
+        steps_t,
+        action_blank_idx,
+    ]
+    dummy_action_mask = torch.zeros_like(action_legal_mask)
+    dummy_action_mask[:, 0] = True
+    effective_action_mask = torch.where(
+        action_group_valid.unsqueeze(1),
+        action_legal_mask,
+        dummy_action_mask,
+    )
+    safe_action_logits = torch.where(
+        action_group_valid.unsqueeze(1),
+        row_action_logits,
+        torch.zeros_like(row_action_logits),
+    )
+    action_log_probs_dense = torch.log_softmax(
+        safe_action_logits.masked_fill(~effective_action_mask, float("-inf")),
+        dim=-1,
+    )
+    action_probs = action_log_probs_dense.exp()
+    safe_action_log_probs = torch.where(
+        effective_action_mask,
+        action_log_probs_dense,
+        action_log_probs_dense.new_zeros(()),
+    )
+    action_entropy = -(action_probs * safe_action_log_probs).sum(dim=-1)
+    action_log_prob = action_log_probs_dense.gather(
+        1,
+        safe_selected_action.unsqueeze(1),
+    ).squeeze(1)
+
     target_support = (
         (row_blank_kind == BLANK_GROUP_PER_BLANK)
         & (row_blank_option == selected_option.unsqueeze(1))
@@ -2781,14 +2838,14 @@ def _evaluate_inline_priority_replay_groups(
     ).squeeze(1)
 
     target_group_valid = (~target_required) | (
-        (target_count == 1) & selected_target_in_range & selected_target_legal
+        (target_count >= 1) & selected_target_in_range & selected_target_legal
     )
     is_priority_step = trace_kind[steps_t] == TRACE_KIND_TO_ID["priority"]
     group_mask = (
         is_priority_step
         & selected_in_range
         & selected_masked
-        & (cross_count >= 1)
+        & ((cross_count >= 1) | action_group_valid)
         & target_group_valid
     )
     if group_skip_mask is not None:
@@ -2834,12 +2891,12 @@ def _evaluate_inline_priority_replay_groups(
 
     per_group_log_prob = torch.where(
         group_mask,
-        cross_log_prob + target_log_prob,
+        torch.where(action_group_valid, action_log_prob, cross_log_prob + target_log_prob),
         cross_log_prob.new_zeros(()),
     )
     per_group_entropy = torch.where(
         group_mask,
-        cross_entropy + target_entropy,
+        torch.where(action_group_valid, action_entropy, cross_entropy + target_entropy),
         cross_entropy.new_zeros(()),
     )
     log_probs = log_probs.scatter_add(0, steps_t, per_group_log_prob.to(dtype=log_probs.dtype))
@@ -2878,15 +2935,41 @@ def _evaluate_inline_priority_replay_groups(
         safe_col_targets = col_targets.clamp(min=0, max=target_width - 1)
         col_target_log_probs = target_log_probs_dense[group_ids, safe_col_targets]
         col_target_logits = blank_logits[steps_t[group_ids], col_target_blank, safe_col_targets]
+        safe_choice_cols = choice_cols.clamp(max=max(action_width - 1, 0))
+        col_action_valid = (
+            (choice_cols < action_width)
+            & action_legal_mask[group_ids, safe_choice_cols]
+            & action_group_valid[group_ids]
+        )
+        col_action_log_probs = action_log_probs_dense[group_ids, safe_choice_cols]
+        col_action_logits = row_action_logits[group_ids, safe_choice_cols]
         flat_log_probs = torch.where(
-            col_target_required,
-            col_cross_log_probs + col_target_log_probs,
-            col_cross_log_probs,
+            action_group_valid[group_ids],
+            torch.where(col_action_valid, col_action_log_probs, col_action_log_probs.detach()),
+            torch.where(
+                col_target_required,
+                col_cross_log_probs + col_target_log_probs,
+                col_cross_log_probs,
+            ),
         )
         flat_logits = torch.where(
-            col_target_required,
-            col_cross_logits + col_target_logits,
-            col_cross_logits,
+            action_group_valid[group_ids],
+            torch.where(col_action_valid, col_action_logits, col_action_logits.detach()),
+            torch.where(
+                col_target_required,
+                col_cross_logits + col_target_logits,
+                col_cross_logits,
+            ),
+        )
+        flat_log_probs = torch.where(
+            action_group_valid[group_ids] & ~col_action_valid,
+            flat_log_probs.new_full((), float("-inf")),
+            flat_log_probs,
+        )
+        flat_logits = torch.where(
+            action_group_valid[group_ids] & ~col_action_valid,
+            flat_logits.new_full((), float("-inf")),
+            flat_logits,
         )
         per_choice = ReplayPerChoice(
             flat_logits=flat_logits,
@@ -3099,7 +3182,7 @@ def _evaluate_inline_blocker_replay_groups(
     safe_selected = selected.clamp(min=0, max=legal_width - 1)
     selected_legal = row_legal_mask.gather(1, safe_selected.unsqueeze(1)).squeeze(1)
     is_matching_step = trace_kind[steps_t] == trace_kind_id
-    group_mask = is_matching_step & (match_count == 1) & selected_in_range & selected_legal
+    group_mask = is_matching_step & (match_count >= 1) & selected_in_range & selected_legal
     if group_skip_mask is not None:
         group_mask = group_mask & ~group_skip_mask.to(device=device, dtype=torch.bool)
 
