@@ -588,9 +588,6 @@ class TextReplayBuffer:
             )
             self.core._row_cursor = self.row_ring.cursor
             self.core._decision_cursor = self.decision_ring.cursor
-            self.row_token_start[rows] = -1
-            self.row_token_length[rows] = 0
-            self.decision_count[rows] = 0
             tuple(map(lambda row: self.row_token_length_host.__setitem__(int(row), 0), rows_host))
             tuple(map(lambda row: self._row_complete_host.__setitem__(int(row), False), rows_host))
             tuple(
@@ -1464,6 +1461,12 @@ class TextReplayBuffer:
             if idx_host is not None
             else None
         )
+        if idx_host is None:
+            raise ValueError("replay gather requires host replay row ids")
+        if self.validate:
+            bad_host = next((row for row in idx_host if self.row_token_length_host[row] <= 0), None)
+            if bad_host is not None:
+                raise ValueError(f"replay row {bad_host} is not occupied")
         if self.validate:
             in_range = (idx >= 0) & (idx < self.capacity)
             if not bool(in_range.all().item()):
@@ -1486,8 +1489,6 @@ class TextReplayBuffer:
             state_positions = cu_seqlens[:-1]
             seq_id = torch.empty(0, dtype=torch.int32, device=self.device)
             pos_in_seq = torch.empty(0, dtype=torch.int32, device=self.device)
-        if idx_host is None:
-            raise ValueError("replay gather requires host replay row ids")
         max_seqlen = max((self.row_token_length_host[row] for row in idx_host), default=0)
         if self.validate:
             token_starts = self.row_token_start[idx]
