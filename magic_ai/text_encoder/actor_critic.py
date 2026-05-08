@@ -807,6 +807,14 @@ class TextActorCritic(nn.Module):
                     handled_groups = handled_groups | combat_active_groups
                     step_log_probs = step_log_probs + combat_log_prob
                     step_entropies = step_entropies + combat_entropy
+                blocker_default = _sample_default_blocker_groups_batch(
+                    trace_kind_id=trace_kind_id,
+                    decision_count=decision_count,
+                    decision_mask=decision_mask,
+                    group_steps=group_steps,
+                )
+                default_update_groups = blocker_default & ~handled_groups
+                handled_groups = handled_groups | default_update_groups
                 mark_profile("decision_accept_check")
                 self._enqueue_decision_coverage_check(
                     handled_groups=handled_groups,
@@ -2284,6 +2292,28 @@ def _sample_inline_combat_groups_batch(
     )
     step_entropy = torch.zeros_like(step_log_prob)
     return selected, step_log_prob, step_entropy, active_group
+
+
+def _sample_default_blocker_groups_batch(
+    *,
+    trace_kind_id: Tensor,
+    decision_count: Tensor,
+    decision_mask: Tensor,
+    group_steps: Tensor,
+) -> Tensor:
+    """Return blocker groups that can legally choose the no-block column."""
+
+    device = decision_mask.device
+    if int(decision_mask.shape[0]) == 0 or int(decision_mask.shape[1]) == 0:
+        return torch.zeros(int(decision_mask.shape[0]), dtype=torch.bool, device=device)
+    trace_kind = trace_kind_id.to(device=device)
+    counts = decision_count.to(device=device)
+    steps = group_steps.to(device=device)
+    return (
+        (trace_kind[steps] == TRACE_KIND_TO_ID["blockers"])
+        & (counts[steps] > 0)
+        & decision_mask[:, 0].to(device=device, dtype=torch.bool)
+    )
 
 
 def _sample_inline_priority_batch(

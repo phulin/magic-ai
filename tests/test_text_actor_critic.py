@@ -1071,6 +1071,33 @@ class TextActorCriticTests(unittest.TestCase):
         self.assertFalse(torch.equal(model.live_lstm_h[:, 0], torch.zeros(1, 8)))
         self.assertFalse(torch.equal(model.live_lstm_h[:, 2], torch.zeros(1, 8)))
 
+    def test_sample_native_tensor_batch_defaults_unmatched_blocker_to_none(self) -> None:
+        torch.manual_seed(0)
+        model = _model()
+        model.rollout_buffer = None
+        model.init_lstm_env_states(1)
+        native_batch = SimpleNamespace(
+            trace_kind_id=torch.tensor([TRACE_KIND_TO_ID["blockers"]], dtype=torch.long),
+            decision_count=torch.tensor([1], dtype=torch.long),
+            decision_rows_written=1,
+            decision_option_idx=torch.tensor([[-1, 0]], dtype=torch.long),
+            decision_target_idx=torch.tensor([[-1, 0]], dtype=torch.long),
+            decision_mask=torch.tensor([[True, True]], dtype=torch.bool),
+            uses_none_head=torch.tensor([True], dtype=torch.bool),
+        )
+
+        out = model.sample_native_tensor_batch(
+            native_batch=native_batch,
+            env_indices=[0],
+            perspective_player_indices=[0],
+            text_batch=_batch(batch_size=1),
+            deterministic=True,
+        )
+
+        self.assertEqual(out.decision_counts, [1])
+        self.assertEqual(out.selected_choice_cols, [0])
+        self.assertEqual(out.replay_rows, [-1])
+
     def test_sample_native_tensor_batch_uses_inline_may_blank(self) -> None:
         model = _model()
         model.rollout_buffer = None
