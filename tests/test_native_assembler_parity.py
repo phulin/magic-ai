@@ -321,6 +321,65 @@ class NativeAssemblerParityTests(unittest.TestCase):
             outputs=outputs,
         )
 
+    def test_packed_native_dedup_refs_emit_dict_identity(self) -> None:
+        """Deduped direct-token refs must point back to the dict prologue."""
+
+        from magic_ai.slot_encoder.native_encoder import NativeBatchEncoder
+
+        encoder = NativeBatchEncoder(
+            max_options=16,
+            max_targets_per_option=4,
+            max_cached_choices=64,
+            zone_slot_count=50,
+            game_info_dim=90,
+            option_scalar_dim=14,
+            target_scalar_dim=2,
+            lib=self.mage._lib,
+            ffi=self.mage._ffi,
+            validate=True,
+            emit_render_plan=True,
+            render_plan_capacity=4096,
+            dedup_card_bodies=True,
+        )
+        self.assertTrue(encoder.is_available)
+        encoder.register_card_rows({name: idx for idx, name in enumerate(self.cache.row_to_name)})
+
+        game = self.mage.new_game(self.deck_a, self.deck_b, seed=7, shuffle=True, hand_size=7)
+        try:
+            game.refresh_state()
+            pending = cast(dict[str, Any] | None, game.pending or game.legal())
+            self.assertIsNotNone(pending)
+            player_idx = int(cast(dict[str, Any], pending).get("player_idx", 0) or 0)
+            if player_idx not in (0, 1):
+                player_idx = 0
+            from magic_ai.text_encoder.native_assembler import encode_tokens_packed
+
+            _native_batch, outputs = encode_tokens_packed(
+                encoder,
+                [game],
+                perspective_player_indices=[player_idx],
+                max_tokens=self.max_tokens_native,
+                max_options=self.max_options_native,
+                max_targets=self.max_targets_native,
+                max_card_refs=self.max_card_refs_native,
+            )
+            packed = outputs.to_packed_text_batch()
+            decoded = self.tokenizer.decode(packed.token_ids.tolist())
+
+            self.assertIn("<dict>", decoded)
+            self.assertIn("<card-ref:", decoded)
+            self.assertIn("<dict-entry:", decoded)
+            self.assertGreater(
+                decoded.count("<dict-entry:"),
+                decoded.count("<dict>"),
+                "dict entries should appear in both the prologue and card refs",
+            )
+        finally:
+            try:
+                game.close()
+            except Exception:
+                pass
+
     def test_packed_native_matches_pack_batch_of_dense(self) -> None:
         """Go's MageEncodeTokensPacked must produce the same result as
         running the dense path and then ``pack_batch`` in Python."""
