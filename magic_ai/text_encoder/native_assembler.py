@@ -153,8 +153,7 @@ class NativePackedAssemblerOutputs:
         """Slice the live region into a :class:`PackedTextBatch`.
 
         Trims anchor tensors to per-batch maxima so the result matches
-        ``pack_batch(assemble_batch(...))`` shape-for-shape, rather than the
-        full pre-allocated capacity.
+        compact packed-batch shapes rather than the full pre-allocated capacity.
         """
 
         active_n = self.active_batch_size or int(self.seq_lengths.shape[0])

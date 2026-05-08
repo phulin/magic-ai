@@ -43,13 +43,13 @@ from magic_ai.text_encoder.batch import (
     pack_batch,
     subtract_packed_offsets,
 )
+from magic_ai.text_encoder.inline_blanks import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.policy import EncodedSnapshots
 from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
     RecurrentTextPolicyConfig,
     RecurrentTextPolicyOutput,
 )
-from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 
 
@@ -344,7 +344,7 @@ class TextActorCritic(nn.Module):
     ) -> list[PolicyStep]:
         """Sample a live text-encoded batch and append replay rows.
 
-        The caller owns render-plan emission and assembly. This method owns
+        The caller owns text encoding. This method owns
         recurrent state, decision-group sampling, and replay-buffer writes so
         PPO/R-NaD can re-score the exact sampled text rows later.
         """

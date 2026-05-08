@@ -1,10 +1,7 @@
-"""Precomputed token-id tables covering every string the assembler emits.
+"""Precomputed token-id tables covering native text assembly emissions.
 
-Phase 1 of the option-(c) cutover (see chat history): the assembler's runtime
-string vocabulary is closed, so we can replace every ``tokenizer.encode``
-call with a table lookup. Once all emissions go through this module, the
-assembler stops needing the live tokenizer at runtime, which lets us port
-the dispatch loop to native code that just does table lookups + memcpy.
+The runtime string vocabulary is closed, so native assembly can use table
+lookups instead of calling ``tokenizer.encode`` while stepping environments.
 
 This module is the **single source of truth** for which (kind, scalar)
 pairs the assembler is allowed to emit. Phase 4 (Go-side native assembler)
@@ -24,7 +21,7 @@ from magic_ai.text_encoder.card_cache import CardTokenCache
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, MAX_NUM
 
 # ---------------------------------------------------------------------------
-# Closed vocabulary constants (mirrored from assembler.py / render_plan.py).
+# Closed vocabulary constants mirrored by mage-go.
 # ---------------------------------------------------------------------------
 
 CARD_CLOSER_TEXT = "</card>"

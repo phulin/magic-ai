@@ -88,7 +88,7 @@ class TextEncodedBatch:
     blank_group: Tensor = field(  # [B, K] int32, -1 = absent
         default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
     )
-    blank_group_kind: Tensor = field(  # [B, K] int32, see render_plan.BLANK_GROUP_*
+    blank_group_kind: Tensor = field(  # [B, K] int32, see inline_blanks.BLANK_GROUP_*
         default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
     )
     blank_option_index: Tensor = field(  # [B, K] int32, -1 = absent / not engine-option-backed
@@ -323,7 +323,7 @@ def tokenize_snapshot(
     # the produced ``token_ids`` stream. Render order is deterministic, so we
     # scan left-to-right and pair the n-th occurrence of any blank-kind token
     # with the n-th anchor (across all kinds, in render order).
-    from magic_ai.text_encoder.render_plan import blank_group_kind_id
+    from magic_ai.text_encoder.inline_blanks import blank_group_kind_id
 
     blank_positions: list[int] = []
     blank_kind_ids: list[int] = []

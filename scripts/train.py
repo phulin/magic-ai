@@ -106,11 +106,7 @@ from magic_ai.text_encoder.actor_critic import (  # noqa: E402
     build_text_decision_layout,
     infer_text_trace_kind,
 )
-from magic_ai.text_encoder.assembler import (  # noqa: E402
-    AssemblerTokens,
-    assemble_batch,
-    build_assembler_tokens,
-)
+from magic_ai.text_encoder.batch import collate, tokenize_snapshot  # noqa: E402
 from magic_ai.text_encoder.card_cache import (  # noqa: E402
     DEFAULT_ORACLE_DB_PATH,
     CardTokenCache,
@@ -132,10 +128,11 @@ from magic_ai.text_encoder.model import (  # noqa: E402
     text_encoder_config_from_hf,
 )
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig  # noqa: E402
-from magic_ai.text_encoder.render import OracleEntry  # noqa: E402
-from magic_ai.text_encoder.render_plan import emit_render_plan  # noqa: E402
+from magic_ai.text_encoder.render import OracleEntry, render_snapshot  # noqa: E402
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer  # noqa: E402
 from magic_ai.text_encoder.tokenizer import (  # noqa: E402
+    MAX_CARD_REFS,
+    MAX_NUM,
     MODERNBERT_REPO,
     MODERNBERT_REVISION,
     TOKENIZER_DIR,
@@ -368,11 +365,6 @@ class TextTrainingBackend:
     cache: CardTokenCache
     oracle: dict[str, OracleEntry]
     tokenizer: Any
-    # Pre-resolved assembler structural-token table (and its lazily-attached
-    # status prefixes + per-cache body_lists memo). Built once at backend
-    # init and threaded through every assemble_batch call so we don't
-    # re-encode the static fragment table or re-derive body_lists per call.
-    assembler_tokens: AssemblerTokens
     native_encoder: ShardedNativeBatchEncoder | None = None
     batch_pool: ThreadPoolExecutor | None = None
     batch_workers: int = 1
@@ -1150,8 +1142,8 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             option_scalar_dim=OPTION_SCALAR_DIM,
             target_scalar_dim=TARGET_SCALAR_DIM,
             card_name_to_row=_build_text_card_name_to_row(cache),
-            emit_render_plan=True,
-            render_plan_capacity=args.render_plan_capacity,
+            emit_render_plan=False,
+            render_plan_capacity=0,
             validate=not getattr(args, "no_validate", False),
             workers=batch_workers,
             pool=batch_pool,
@@ -1164,7 +1156,6 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         cache=cache,
         oracle=oracle,
         tokenizer=tokenizer,
-        assembler_tokens=build_assembler_tokens(tokenizer),
         native_encoder=native_encoder,
         batch_pool=batch_pool,
         batch_workers=batch_workers,
@@ -1186,7 +1177,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         except Exception as exc:  # pragma: no cover - environment-dependent
             print(
                 f"warning: MageRegisterTokenTables unavailable ({exc}); "
-                "falling back to Python assembler. Rebuild libmage.so to enable."
+                "native packed-token assembly is unavailable. Rebuild libmage.so to enable."
             )
             args.text_native_assembler = False
     return backend
@@ -1202,37 +1193,36 @@ def sample_text_policy_batch(
     perspective_player_indices: list[int],
     deterministic: bool = False,
 ) -> list[Any]:
-    """Emit/assemble text batches and sample policy actions with replay rows."""
+    """Render/tokenize text batches and sample policy actions with replay rows."""
 
     n = len(snapshots)
     if n == 0:
         return []
     if len(pendings) != n or len(env_indices) != n or len(perspective_player_indices) != n:
         raise ValueError("snapshots, pendings, env_indices, and players differ")
-    if getattr(args, "native_render_plan", False):
-        raise NotImplementedError("native render-plan emission is not wired into train.py yet")
-
-    card_row_lookup = _build_text_card_row_lookup(backend.cache)
-
-    def tokenize(text: str) -> list[int]:
-        return list(backend.tokenizer.encode(text, add_special_tokens=False))
-
-    plans = []
+    examples = []
     layouts = []
     max_cached_choices = backend.replay_buffer.max_cached_choices
+    render_token_ids = _render_token_ids(backend.tokenizer)
     for snapshot, pending in zip(snapshots, pendings, strict=True):
-        snapshot_for_render = copy.deepcopy(snapshot)
-        snapshot_for_render["pending"] = pending
         options = list(pending.get("options", []) or [])
-        plans.append(
-            emit_render_plan(
-                snapshot_for_render,
-                options,
-                card_row_lookup=card_row_lookup,
-                tokenize=tokenize,
-                oracle=backend.oracle,
-            )
+        rendered = render_snapshot(
+            snapshot,
+            options,
+            oracle=backend.oracle,
+            chosen_token_id=cast(int, render_token_ids["chosen"]),
+            none_token_id=cast(int, render_token_ids["none"]),
+            yes_token_id=cast(int, render_token_ids["yes"]),
+            no_token_id=cast(int, render_token_ids["no"]),
+            mulligan_token_id=cast(int, render_token_ids["mulligan"]),
+            keep_token_id=cast(int, render_token_ids["keep"]),
+            self_token_id=cast(int, render_token_ids["self"]),
+            opp_token_id=cast(int, render_token_ids["opp"]),
+            num_token_ids=cast(list[int], render_token_ids["num"]),
+            mana_token_ids=cast(list[int], render_token_ids["mana"]),
+            card_ref_token_ids=cast(list[int], render_token_ids["card_ref"]),
         )
+        examples.append(tokenize_snapshot(rendered, backend.tokenizer))
         trace_kind = infer_text_trace_kind(pending)
         layouts.append(
             build_text_decision_layout(
@@ -1244,14 +1234,12 @@ def sample_text_policy_batch(
             )
         )
 
-    encoded = assemble_batch(
-        plans,
-        backend.cache,
-        backend.tokenizer,
-        max_tokens=args.text_max_tokens,
-        on_overflow="truncate",
-        assembler_tokens=backend.assembler_tokens,
-    )
+    pad_id = backend.tokenizer.pad_token_id
+    if pad_id is None:
+        raise ValueError("text tokenizer must define pad_token_id")
+    encoded = collate(examples, pad_id=int(pad_id))
+    if int(encoded.token_ids.shape[1]) > int(args.text_max_tokens):
+        encoded = _truncate_text_batch(encoded, max_tokens=int(args.text_max_tokens))
     return backend.policy.sample_text_batch(
         encoded,
         env_indices=env_indices,
@@ -1261,13 +1249,58 @@ def sample_text_policy_batch(
     )
 
 
-def _build_text_card_row_lookup(cache: CardTokenCache) -> Callable[[str], int]:
-    name_to_row = _build_text_card_name_to_row(cache)
+def _single_token_id(tokenizer: Any, token: str) -> int:
+    tid = tokenizer.convert_tokens_to_ids(token)
+    if isinstance(tid, list):
+        raise TypeError(f"convert_tokens_to_ids({token!r}) returned a list")
+    return int(tid)
 
-    def lookup(name: str) -> int:
-        return name_to_row.get(name, 0)
 
-    return lookup
+def _render_token_ids(tokenizer: Any) -> dict[str, int | list[int]]:
+    return {
+        "chosen": _single_token_id(tokenizer, "<chosen>"),
+        "none": _single_token_id(tokenizer, "<none>"),
+        "yes": _single_token_id(tokenizer, "<yes>"),
+        "no": _single_token_id(tokenizer, "<no>"),
+        "mulligan": _single_token_id(tokenizer, "<mulligan>"),
+        "keep": _single_token_id(tokenizer, "<keep>"),
+        "self": _single_token_id(tokenizer, "<self>"),
+        "opp": _single_token_id(tokenizer, "<opp>"),
+        "num": [_single_token_id(tokenizer, f"<num:{k}>") for k in range(MAX_NUM)],
+        "mana": [
+            _single_token_id(tokenizer, f"<mana:{s}>") for s in ("W", "U", "B", "R", "G", "C")
+        ],
+        "card_ref": [_single_token_id(tokenizer, f"<card-ref:{k}>") for k in range(MAX_CARD_REFS)],
+    }
+
+
+def _truncate_text_batch(batch: Any, *, max_tokens: int) -> Any:
+    seq_lengths = batch.seq_lengths.clamp(max=max_tokens)
+    attention_mask = batch.attention_mask[:, :max_tokens].clone()
+    for row, seq_len in enumerate(seq_lengths.tolist()):
+        attention_mask[row, int(seq_len) :] = 0
+    card_ref_positions = batch.card_ref_positions.clone()
+    card_ref_positions[card_ref_positions >= max_tokens] = -1
+    blank_positions = batch.blank_positions.clone()
+    blank_positions[blank_positions >= max_tokens] = -1
+    blank_legal_mask = batch.blank_legal_mask.clone()
+    if blank_positions.numel() > 0:
+        blank_legal_mask = blank_legal_mask & (blank_positions.unsqueeze(-1) >= 0)
+    return type(batch)(
+        token_ids=batch.token_ids[:, :max_tokens].contiguous(),
+        attention_mask=attention_mask,
+        card_ref_positions=card_ref_positions,
+        seq_lengths=seq_lengths,
+        total_tokens=int(seq_lengths.sum().item()),
+        seq_lengths_host=tuple(int(v) for v in seq_lengths.tolist()),
+        blank_positions=blank_positions,
+        blank_kind=batch.blank_kind,
+        blank_group=batch.blank_group,
+        blank_group_kind=batch.blank_group_kind,
+        blank_option_index=batch.blank_option_index,
+        blank_legal_ids=batch.blank_legal_ids,
+        blank_legal_mask=blank_legal_mask,
+    )
 
 
 def _build_text_card_name_to_row(cache: CardTokenCache) -> dict[str, int]:
@@ -1652,7 +1685,7 @@ def train_selected_backend(
 
         if getattr(args, "native_render_plan", False):
             if text_backend.native_encoder is None:
-                raise ValueError("text backend is missing native render-plan encoder")
+                raise ValueError("text backend is missing native text encoder")
             try:
                 native_rollout = ShardedNativeRolloutDriver.for_mage(
                     mage, workers=text_backend.batch_workers, pool=batch_pool
@@ -2648,22 +2681,18 @@ def parse_args() -> argparse.Namespace:
             "is kept as an alias."
         ),
     )
-    parser.add_argument("--render-plan-capacity", type=int, default=4096)
     parser.add_argument(
         "--card-body-dedup",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="emit each unique card body once at the top of the snapshot and "
-        "reference it from per-zone occurrences (~3-4x token reduction on "
-        "card-heavy snapshots; default: on)",
+        help="enable card-body deduplication in the native packed-token assembler.",
     )
     parser.add_argument(
         "--text-native-assembler",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="run the text-encoder assembler natively in mage-go via "
-        "MageEncodeTokensPacked (default: on; pass --no-text-native-assembler "
-        "to fall back to the Python assemble_batch path)",
+        "MageEncodeTokensPacked (default: on)",
     )
     parser.add_argument(
         "--lstm",
@@ -2898,8 +2927,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--text-d-ff must be at least 1")
     if getattr(args, "text_hf_layers", None) is not None and args.text_hf_layers < 1:
         raise ValueError("--text-hf-layers must be at least 1")
-    if getattr(args, "render_plan_capacity", 1) < 1:
-        raise ValueError("--render-plan-capacity must be at least 1")
     if getattr(args, "max_decision_groups", 1) < 1:
         raise ValueError("--max-decision-groups must be at least 1")
     max_options = getattr(args, "max_options", 1)
@@ -4231,36 +4258,11 @@ def sample_native_text_policy_batch(
     if packed_text_batch is not None:
         encoded = None
     elif text_batch is not None:
-        # Phase 5: native assembler already produced the TextEncodedBatch.
-        # Skip the render-plan slice + Python ``assemble_batch`` call.
         encoded = text_batch
     else:
-        if native_batch.render_plan is None or native_batch.render_plan_lengths is None:
-            raise NativeEncodingError("native encoder did not return render plans")
-        if native_batch.render_plan_overflow is not None and bool(
-            native_batch.render_plan_overflow.any()
-        ):
-            overflow_idx = int(
-                native_batch.render_plan_overflow.nonzero(as_tuple=False)[0, 0].item()
-            )
-            raise NativeEncodingError(f"native render plan overflowed for batch row {overflow_idx}")
-
-        # ``render_plan_lengths`` is a small CPU int64 tensor — ``.tolist()``
-        # is a single C-loop materialization, no GPU sync. Slice the CPU
-        # int32 render-plan tensor directly into the assembler; no numpy
-        # round-trip.
-        lengths = native_batch.render_plan_lengths.tolist()
-        render_plan_cpu = native_batch.render_plan
-        plans: list[torch.Tensor] = [
-            render_plan_cpu[row_idx, : int(length)] for row_idx, length in enumerate(lengths)
-        ]
-        encoded = assemble_batch(
-            plans,
-            backend.cache,
-            backend.tokenizer,
-            max_tokens=args.text_max_tokens,
-            on_overflow="truncate",
-            assembler_tokens=backend.assembler_tokens,
+        raise NativeEncodingError(
+            "native text policy sampling requires packed_text_batch or text_batch; "
+            "the Python render-plan assembler has been removed"
         )
 
     # The native encoder writes these directly into pinned CPU scratch — no

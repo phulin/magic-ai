@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import torch
 from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.inline_blanks import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.recurrent import (
     RecurrentTextPolicy,
     RecurrentTextPolicyConfig,
 )
-from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from magic_ai.text_encoder.training import (
     TextEncoderTrainer,

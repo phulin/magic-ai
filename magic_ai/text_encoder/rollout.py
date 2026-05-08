@@ -1,7 +1,7 @@
 """Text-only Python rollout worker (PR 13-D / §10 PR #4).
 
 End-to-end pipeline that plays real Magic games using the text encoder
-(cache + render-plan emitter + assembler + RecurrentTextPolicy) without
+(renderer + tokenizer + RecurrentTextPolicy) without
 touching ``magic_ai/model.py`` or the slot-encoder ``PPOPolicy``.
 
 This is the slow Python path that proves the pipeline. It produces
@@ -25,7 +25,6 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 import mage
-import numpy as np
 import torch
 from torch import Tensor
 from transformers import PreTrainedTokenizerFast
@@ -40,21 +39,13 @@ from magic_ai.actions import (
     build_priority_candidates,
 )
 from magic_ai.game_state import (
-    GAME_INFO_DIM,
-    ZONE_SLOT_COUNT,
     GameStateSnapshot,
     PendingOptionState,
     PendingState,
 )
-from magic_ai.slot_encoder.native_encoder import NativeBatchEncoder, NativeEncodingError
-from magic_ai.text_encoder.assembler import assemble_batch
 from magic_ai.text_encoder.card_cache import CardTokenCache
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy
 from magic_ai.text_encoder.render import OracleEntry
-from magic_ai.text_encoder.render_plan import emit_render_plan
-
-OPTION_SCALAR_DIM = 14
-TARGET_SCALAR_DIM = 2
 
 logger = logging.getLogger(__name__)
 
@@ -79,53 +70,6 @@ class TextRolloutEpisode:
     steps: list[TextRolloutStep] = field(default_factory=list)
     winner_player_idx: int | None = None
     turns: int = 0
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_card_row_lookup(cache: CardTokenCache):
-    """Return a callable mapping card name -> 1-indexed cache row id (0 = unknown)."""
-
-    name_to_row: dict[str, int] = {}
-    for idx, name in enumerate(cache.row_to_name):
-        if idx == 0:
-            continue  # row 0 = UNKNOWN_NAME sentinel
-        if name and name not in name_to_row:
-            name_to_row[name] = idx
-
-    def lookup(name: str) -> int:
-        return name_to_row.get(name, 0)
-
-    return lookup
-
-
-def _make_tokenize_fn(tokenizer: PreTrainedTokenizerFast):
-    def tokenize(s: str) -> list[int]:
-        return list(tokenizer.encode(s, add_special_tokens=False))
-
-    return tokenize
-
-
-def _build_card_name_to_row(cache: CardTokenCache) -> dict[str, int]:
-    out: dict[str, int] = {}
-    for idx, name in enumerate(cache.row_to_name):
-        if idx == 0 or not name:
-            continue
-        out.setdefault(name, idx)
-    return out
-
-
-def _load_mage_ffi() -> tuple[Any, Any]:
-    if getattr(mage, "_lib", None) is None or getattr(mage, "_ffi", None) is None:
-        mage.load()
-    lib = getattr(mage, "_lib", None)
-    ffi = getattr(mage, "_ffi", None)
-    if lib is None or ffi is None:
-        raise NativeEncodingError("mage native library is not loaded")
-    return lib, ffi
 
 
 def _categorical_sample(
@@ -287,11 +231,8 @@ class TextRolloutWorker:
         sampling_temperature: float = 1.0,
         oracle: dict[str, OracleEntry] | None = None,
         seed: int | None = None,
-        use_native_render_plan: bool = False,
-        render_plan_capacity: int = 4096,
         max_options: int = 64,
         max_targets_per_option: int = 4,
-        dedup_card_bodies: bool = False,
     ) -> None:
         self.policy = policy
         self.cache = cache
@@ -300,39 +241,10 @@ class TextRolloutWorker:
         self.device = torch.device(device)
         self.sampling_temperature = float(sampling_temperature)
         self.oracle = oracle
-        self.use_native_render_plan = bool(use_native_render_plan)
-        self.render_plan_capacity = int(render_plan_capacity)
         self.max_options = int(max_options)
         self.max_targets_per_option = int(max_targets_per_option)
-        self.dedup_card_bodies = bool(dedup_card_bodies)
         self.policy.to(self.device)
         self.policy.eval()
-
-        self._card_row_lookup = _build_card_row_lookup(cache)
-        self._tokenize_fn = _make_tokenize_fn(tokenizer)
-        self._native_encoder: NativeBatchEncoder | None = None
-        if self.use_native_render_plan:
-            lib, ffi = _load_mage_ffi()
-            self._native_encoder = NativeBatchEncoder(
-                max_options=self.max_options,
-                max_targets_per_option=self.max_targets_per_option,
-                max_cached_choices=max(
-                    self.max_options,
-                    self.max_options * max(1, self.max_targets_per_option),
-                ),
-                zone_slot_count=ZONE_SLOT_COUNT,
-                game_info_dim=GAME_INFO_DIM,
-                option_scalar_dim=OPTION_SCALAR_DIM,
-                target_scalar_dim=TARGET_SCALAR_DIM,
-                lib=lib,
-                ffi=ffi,
-                card_name_to_row=_build_card_name_to_row(cache),
-                emit_render_plan=True,
-                render_plan_capacity=self.render_plan_capacity,
-                dedup_card_bodies=self.dedup_card_bodies,
-            )
-            if not self._native_encoder.is_available:
-                raise NativeEncodingError("native render-plan encoder is unavailable")
 
         if seed is not None:
             self._gen: torch.Generator | None = torch.Generator(device="cpu")
@@ -359,65 +271,11 @@ class TextRolloutWorker:
     ) -> tuple[int, int | None, _PlayerLSTM] | None:
         """Run policy for one priority step. Returns (opt_idx, tgt_idx, new_state) or None.
 
-        ``None`` means the assembler / emitter could not produce a usable
-        batch (overflow, missing cards, etc.) and the caller should punt.
+        ``None`` means the legacy single-env policy path should punt to the
+        deterministic fallback action.
         """
 
-        if self._native_encoder is not None:
-            try:
-                native = self._native_encoder.encode_handles(
-                    [game],
-                    perspective_player_indices=[perspective_player_idx],
-                )
-                if native.render_plan is None or native.render_plan_lengths is None:
-                    logger.warning("native encoder returned no render plan; punting to default")
-                    return None
-                if (
-                    native.render_plan_overflow is not None
-                    and int(native.render_plan_overflow[0]) != 0
-                ):
-                    logger.warning("native render plan overflowed; punting to default")
-                    return None
-                length = int(native.render_plan_lengths[0])
-                plan = native.render_plan[0, :length].clone()
-            except Exception as exc:
-                logger.warning("native render-plan encode failed: %s; punting to default", exc)
-                return None
-        else:
-            try:
-                plan = emit_render_plan(
-                    snapshot,
-                    list(legal_options),
-                    card_row_lookup=self._card_row_lookup,
-                    tokenize=self._tokenize_fn,
-                    oracle=self.oracle,
-                    dedup_card_bodies=self.dedup_card_bodies,
-                )
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("emit_render_plan failed: %s; punting to default", exc)
-                return None
-
-        try:
-            batch = assemble_batch(
-                [plan],
-                self.cache,
-                self.tokenizer,
-                max_tokens=self.max_tokens,
-                on_overflow="truncate",
-            )
-        except Exception as exc:
-            logger.warning("assemble_batch failed: %s; punting to default", exc)
-            return None
-
-        # Move tensors to device.
-        moved = type(batch)(
-            token_ids=batch.token_ids.to(self.device),
-            attention_mask=batch.attention_mask.to(self.device),
-            card_ref_positions=batch.card_ref_positions.to(self.device),
-            seq_lengths=batch.seq_lengths.to(self.device),
-        )
-
-        del moved
+        del game, snapshot, legal_options, state, perspective_player_idx
         logger.warning("legacy text rollout scoring is disabled after inline-blank migration")
         return None
 
@@ -595,8 +453,3 @@ __all__ = [
     "TextRolloutStep",
     "TextRolloutWorker",
 ]
-
-
-# Numpy used only inside emit_render_plan; ensure it's imported (silences
-# "unused import" if a static checker doesn't see the transitive use).
-_ = np

@@ -23,9 +23,9 @@ from magic_ai.text_encoder.actor_critic import (
     infer_text_trace_kind,
 )
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch, pack_batch
+from magic_ai.text_encoder.inline_blanks import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig, RecurrentTextPolicyOutput
-from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.replay_buffer import TextReplayBatch, TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 

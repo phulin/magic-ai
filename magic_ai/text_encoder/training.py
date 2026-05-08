@@ -25,8 +25,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.text_encoder.inline_blanks import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy
-from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK, BLANK_GROUP_PER_BLANK
 
 # ---------------------------------------------------------------------------
 # Loss functions

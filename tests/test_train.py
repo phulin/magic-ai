@@ -20,7 +20,7 @@ from magic_ai.slot_encoder.game_state import GameStateEncoder
 from magic_ai.slot_encoder.model import PPOPolicy
 from magic_ai.text_encoder.actor_critic import NativeTextReplayPayload
 from magic_ai.text_encoder.batch import TextEncodedBatch, pack_batch
-from magic_ai.text_encoder.render_plan import BLANK_GROUP_CROSS_BLANK
+from magic_ai.text_encoder.inline_blanks import BLANK_GROUP_CROSS_BLANK
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from scripts.train import (
@@ -683,7 +683,6 @@ class TrainPPOTests(unittest.TestCase):
                 return_value=["Mountain"],
             ),
             patch("scripts.train.build_card_cache", return_value=cache) as build_cache,
-            patch("scripts.train.build_assembler_tokens", return_value=object()),
         ):
             args.text_native_assembler = False
             backend = build_text_backend(args, torch.device("cpu"))
@@ -738,7 +737,6 @@ class TrainPPOTests(unittest.TestCase):
                 return_value=["Mountain"],
             ),
             patch("scripts.train.build_card_cache", return_value=cache),
-            patch("scripts.train.build_assembler_tokens", return_value=object()),
         ):
             backend = build_text_backend(args, torch.device("cpu"))
 
@@ -798,7 +796,6 @@ class TrainPPOTests(unittest.TestCase):
             patch("scripts.train.load_card_cache", return_value=stale_cache),
             patch("scripts.train.build_card_cache", return_value=fresh_cache) as build_cache,
             patch("scripts.train.save_card_cache") as save_cache,
-            patch("scripts.train.build_assembler_tokens", return_value=object()),
         ):
             backend = build_text_backend(args, torch.device("cpu"))
 
@@ -885,9 +882,25 @@ class TrainPPOTests(unittest.TestCase):
                 return_value=["Mountain"],
             ),
             patch("scripts.train.build_card_cache", return_value=cache),
-            patch("scripts.train.emit_render_plan", return_value=object()) as emit,
-            patch("scripts.train.assemble_batch", return_value=encoded_batch()) as assemble,
-            patch("scripts.train.build_assembler_tokens", return_value=object()),
+            patch(
+                "scripts.train._render_token_ids",
+                return_value={
+                    "chosen": 1,
+                    "none": 2,
+                    "yes": 3,
+                    "no": 4,
+                    "mulligan": 5,
+                    "keep": 6,
+                    "self": 7,
+                    "opp": 8,
+                    "num": [],
+                    "mana": [],
+                    "card_ref": [],
+                },
+            ),
+            patch("scripts.train.render_snapshot", return_value=object()) as render,
+            patch("scripts.train.tokenize_snapshot", return_value=object()) as tokenize,
+            patch("scripts.train.collate", return_value=encoded_batch()) as collate_batch,
         ):
             args.text_native_assembler = False
             backend = build_text_backend(args, torch.device("cpu"))
@@ -904,8 +917,9 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(len(steps), 1)
         self.assertIsNotNone(steps[0].replay_idx)
         self.assertEqual(backend.replay_buffer.size, 1)
-        emit.assert_called_once()
-        assemble.assert_called_once()
+        render.assert_called_once()
+        tokenize.assert_called_once()
+        collate_batch.assert_called_once()
 
     def test_train_text_envs_single_game_rollout_smoke(self) -> None:
         class FakeReplayBuffer:

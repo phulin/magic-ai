@@ -313,13 +313,13 @@ CARD_REF_TOKENS: tuple[str, ...] = tuple(card_ref_token(k) for k in range(MAX_CA
 # ---------------------------------------------------------------------------
 # Per-snapshot card-body dictionary references.
 #
-# Under the v2 render plan, each unique card body is emitted once at the top
-# of the snapshot inside a ``<dict>...</dict>`` block, prefixed by a
-# ``<dict-entry:R>`` token (R = card-token-cache row). Each occurrence of a
-# card in any zone is then a short ``<card-ref:K> <card> <dict-entry:R> ...
-# </card>`` reference instead of a full body splice. ``<card-ref:K>`` is the
-# per-permanent identity handle (range MAX_CARD_REFS); ``<dict-entry:R>`` is
-# the per-cache-row body handle (range MAX_DICT_ENTRIES). The two namespaces
+# The native packed-token assembler can emit each unique card body once inside
+# a ``<dict>...</dict>`` block, prefixed by a ``<dict-entry:R>`` token
+# (R = card-token-cache row). Each occurrence of a card in any zone is then a
+# short ``<card-ref:K> <card> <dict-entry:R> ... </card>`` reference instead of
+# a full body splice. ``<card-ref:K>`` is the per-permanent identity handle
+# (range MAX_CARD_REFS); ``<dict-entry:R>`` is the per-cache-row body handle
+# (range MAX_DICT_ENTRIES). The two namespaces
 # are deliberately disjoint so the encoder can learn distinct roles.
 # ---------------------------------------------------------------------------
 
