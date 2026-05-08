@@ -10,6 +10,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from magic_ai.aggregate_tensor import AggregateTensor, Field
 from magic_ai.replay_buffer import ReplayCore
 from magic_ai.returns import gae_returns_batched
 from magic_ai.text_encoder.batch import (
@@ -159,42 +160,19 @@ class TextReplayBuffer:
         self.card_ref_positions = torch.full(
             (self.capacity, self.max_card_refs), -1, dtype=torch.int32, device=self.device
         )
-        self.blank_positions = torch.full(
-            (self.capacity, self.max_blanks_per_row),
-            -1,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.blank_kind = torch.zeros(
-            self.capacity, self.max_blanks_per_row, dtype=torch.int32, device=self.device
-        )
-        self.blank_group = torch.full(
-            (self.capacity, self.max_blanks_per_row),
-            -1,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.blank_group_kind = torch.zeros(
-            self.capacity, self.max_blanks_per_row, dtype=torch.int32, device=self.device
-        )
-        self.blank_option_index = torch.full(
-            (self.capacity, self.max_blanks_per_row),
-            -1,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.blank_legal_ids = torch.zeros(
-            self.capacity,
-            self.max_blanks_per_row,
-            self.max_legal_per_blank,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.blank_legal_mask = torch.zeros(
-            self.capacity,
-            self.max_blanks_per_row,
-            self.max_legal_per_blank,
-            dtype=torch.bool,
+        blank_shape = (self.max_blanks_per_row,)
+        legal_shape = (self.max_blanks_per_row, self.max_legal_per_blank)
+        self.blank = AggregateTensor(
+            length=self.capacity,
+            fields=(
+                Field("positions", torch.int32, fill=-1, inner_shape=blank_shape),
+                Field("kind", torch.int32, fill=0, inner_shape=blank_shape),
+                Field("group", torch.int32, fill=-1, inner_shape=blank_shape),
+                Field("group_kind", torch.int32, fill=0, inner_shape=blank_shape),
+                Field("option_index", torch.int32, fill=-1, inner_shape=blank_shape),
+                Field("legal_ids", torch.int32, fill=0, inner_shape=legal_shape),
+                Field("legal_mask", torch.bool, fill=False, inner_shape=legal_shape),
+            ),
             device=self.device,
         )
         self.seq_lengths = torch.zeros(self.capacity, dtype=torch.int32, device=self.device)
@@ -232,22 +210,20 @@ class TextReplayBuffer:
         self.uses_none_head = self.core.uses_none_head
         self.selected_indices = self.core.selected_indices
         self.behavior_action_log_prob = self.core.behavior_action_log_prob
-        self.episode_id = torch.full((self.capacity,), -1, dtype=torch.long, device=self.device)
-        self.step_idx = torch.full((self.capacity,), -1, dtype=torch.long, device=self.device)
-        self.is_terminal = torch.zeros(self.capacity, dtype=torch.bool, device=self.device)
-        self.terminal_reward_p0 = torch.zeros(
-            self.capacity, dtype=torch.float32, device=self.device
-        )
-        self.zero_sum = torch.zeros(self.capacity, dtype=torch.bool, device=self.device)
-        self.actor_id = torch.full((self.capacity,), -1, dtype=torch.long, device=self.device)
-        self.behavior_policy_version = torch.zeros(
-            self.capacity, dtype=torch.long, device=self.device
-        )
-        self.inference_policy_version = torch.zeros(
-            self.capacity, dtype=torch.long, device=self.device
-        )
-        self.target_policy_version = torch.full(
-            (self.capacity,), -1, dtype=torch.long, device=self.device
+        self.episode_meta = AggregateTensor(
+            length=self.capacity,
+            fields=(
+                Field("episode_id", torch.long, fill=-1),
+                Field("step_idx", torch.long, fill=-1),
+                Field("is_terminal", torch.bool, fill=False),
+                Field("terminal_reward_p0", torch.float32, fill=0.0),
+                Field("zero_sum", torch.bool, fill=False),
+                Field("actor_id", torch.long, fill=-1),
+                Field("behavior_policy_version", torch.long, fill=0),
+                Field("inference_policy_version", torch.long, fill=0),
+                Field("target_policy_version", torch.long, fill=-1),
+            ),
+            device=self.device,
         )
         self._reserve_lock = threading.RLock()
         self._reserve_cond = threading.Condition(self._reserve_lock)
@@ -278,22 +254,8 @@ class TextReplayBuffer:
         self.row_token_start.fill_(-1)
         self.row_token_length.zero_()
         self.row_token_length_host[:] = [0] * self.capacity
-        self.blank_positions.fill_(-1)
-        self.blank_kind.zero_()
-        self.blank_group.fill_(-1)
-        self.blank_group_kind.zero_()
-        self.blank_option_index.fill_(-1)
-        self.blank_legal_ids.zero_()
-        self.blank_legal_mask.zero_()
-        self.episode_id.fill_(-1)
-        self.step_idx.fill_(-1)
-        self.is_terminal.zero_()
-        self.terminal_reward_p0.zero_()
-        self.zero_sum.zero_()
-        self.actor_id.fill_(-1)
-        self.behavior_policy_version.zero_()
-        self.inference_policy_version.zero_()
-        self.target_policy_version.fill_(-1)
+        self.blank.reset()
+        self.episode_meta.reset()
         self._token_cursor = 0
         with self._reserve_lock:
             self._next_reservation_id = 0
@@ -342,16 +304,19 @@ class TextReplayBuffer:
             return
         rows_host = rows.detach().cpu().tolist()
         steps = torch.arange(int(rows.numel()), dtype=torch.long, device=self.device)
-        self.episode_id[rows] = int(episode_id)
-        self.step_idx[rows] = steps
-        self.is_terminal[rows] = False
-        self.is_terminal[rows[-1]] = True
-        self.terminal_reward_p0[rows] = float(terminal_reward_p0)
-        self.zero_sum[rows] = bool(zero_sum)
-        self.actor_id[rows] = int(actor_id)
-        self.behavior_policy_version[rows] = int(behavior_policy_version)
-        self.inference_policy_version[rows] = int(inference_policy_version)
-        self.target_policy_version[rows] = int(target_policy_version)
+        self.episode_meta.write(
+            rows,
+            episode_id=int(episode_id),
+            step_idx=steps,
+            is_terminal=False,
+            terminal_reward_p0=float(terminal_reward_p0),
+            zero_sum=bool(zero_sum),
+            actor_id=int(actor_id),
+            behavior_policy_version=int(behavior_policy_version),
+            inference_policy_version=int(inference_policy_version),
+            target_policy_version=int(target_policy_version),
+        )
+        self.episode_meta.is_terminal[rows[-1]] = True
         ready_event: Any | None = None
         if self.device.type == "cuda":
             ready_event = torch.cuda.Event()
@@ -458,12 +423,12 @@ class TextReplayBuffer:
         rows = rows.to(device=self.device)
         if int(rows.numel()) == 0:
             return torch.empty(0, dtype=torch.float32, device=self.device)
-        episode_ids = self.episode_id[rows]
+        episode_ids = self.episode_meta.episode_id[rows]
         if bool((episode_ids < 0).any().item()):
             raise ValueError("cannot build returns for incomplete replay rows")
         unique_ids, inverse = torch.unique(episode_ids, sorted=True, return_inverse=True)
         batch_size = int(unique_ids.numel())
-        step_idx = self.step_idx[rows].to(dtype=torch.int32)
+        step_idx = self.episode_meta.step_idx[rows].to(dtype=torch.int32)
         step_count = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
         step_count.scatter_reduce_(
             0,
@@ -480,8 +445,10 @@ class TextReplayBuffer:
         players.view(-1)[flat_dest] = self.perspective_player_idx[rows].to(dtype=torch.int32)
         terminal_reward = torch.zeros(batch_size, dtype=torch.float32, device=self.device)
         zero_sum = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
-        terminal_reward[inverse] = self.terminal_reward_p0[rows].to(dtype=torch.float32)
-        zero_sum[inverse] = self.zero_sum[rows]
+        terminal_reward[inverse] = self.episode_meta.terminal_reward_p0[rows].to(
+            dtype=torch.float32
+        )
+        zero_sum[inverse] = self.episode_meta.zero_sum[rows]
         returns = gae_returns_batched(
             values,
             players,
@@ -1136,13 +1103,13 @@ class TextReplayBuffer:
         self.card_ref_positions.index_fill_(0, rows, -1)
         self.seq_lengths[rows] = seq_lengths_i32
 
-        self.blank_positions.index_fill_(0, rows, -1)
-        self.blank_kind.index_fill_(0, rows, 0)
-        self.blank_group.index_fill_(0, rows, -1)
-        self.blank_group_kind.index_fill_(0, rows, 0)
-        self.blank_option_index.index_fill_(0, rows, -1)
-        self.blank_legal_ids.index_fill_(0, rows, 0)
-        self.blank_legal_mask.index_fill_(0, rows, 0)
+        self.blank.positions.index_fill_(0, rows, -1)
+        self.blank.kind.index_fill_(0, rows, 0)
+        self.blank.group.index_fill_(0, rows, -1)
+        self.blank.group_kind.index_fill_(0, rows, 0)
+        self.blank.option_index.index_fill_(0, rows, -1)
+        self.blank.legal_ids.index_fill_(0, rows, 0)
+        self.blank.legal_mask.index_fill_(0, rows, 0)
         token_ids = encoded.token_ids.to(device=self.device, dtype=torch.int32)
         if total_tokens > 0:
             self.packed_token_ids[token_start:token_end] = token_ids
@@ -1159,29 +1126,29 @@ class TextReplayBuffer:
         )
         if blank_width > 0:
             state_positions = encoded.state_positions.to(device=self.device, dtype=torch.int32)
-            self.blank_positions[rows, :blank_width] = subtract_packed_offsets(
+            self.blank.positions[rows, :blank_width] = subtract_packed_offsets(
                 encoded.blank_positions[:, :blank_width].to(device=self.device),
                 state_positions,
             )
-            self.blank_kind[rows, :blank_width] = encoded.blank_kind[:, :blank_width].to(
+            self.blank.kind[rows, :blank_width] = encoded.blank_kind[:, :blank_width].to(
                 device=self.device, dtype=torch.int32
             )
-            self.blank_group[rows, :blank_width] = encoded.blank_group[:, :blank_width].to(
+            self.blank.group[rows, :blank_width] = encoded.blank_group[:, :blank_width].to(
                 device=self.device, dtype=torch.int32
             )
-            self.blank_group_kind[rows, :blank_width] = encoded.blank_group_kind[
+            self.blank.group_kind[rows, :blank_width] = encoded.blank_group_kind[
                 :, :blank_width
             ].to(device=self.device, dtype=torch.int32)
-            self.blank_option_index[rows, :blank_width] = encoded.blank_option_index[
+            self.blank.option_index[rows, :blank_width] = encoded.blank_option_index[
                 :, :blank_width
             ].to(device=self.device, dtype=torch.int32)
             if blank_legal_width > 0:
-                self.blank_legal_ids[rows, :blank_width, :blank_legal_width] = (
+                self.blank.legal_ids[rows, :blank_width, :blank_legal_width] = (
                     encoded.blank_legal_ids[:, :blank_width, :blank_legal_width].to(
                         device=self.device, dtype=torch.int32
                     )
                 )
-                self.blank_legal_mask[rows, :blank_width, :blank_legal_width] = (
+                self.blank.legal_mask[rows, :blank_width, :blank_legal_width] = (
                     encoded.blank_legal_mask[:, :blank_width, :blank_legal_width].to(
                         device=self.device, dtype=torch.bool
                     )
@@ -1268,39 +1235,39 @@ class TextReplayBuffer:
             encoded.card_ref_positions.to(device=self.device),
             state_positions,
         )
-        self.blank_positions.index_fill_(0, rows, -1)
-        self.blank_kind.index_fill_(0, rows, 0)
-        self.blank_group.index_fill_(0, rows, -1)
-        self.blank_group_kind.index_fill_(0, rows, 0)
-        self.blank_option_index.index_fill_(0, rows, -1)
-        self.blank_legal_ids.index_fill_(0, rows, 0)
-        self.blank_legal_mask.index_fill_(0, rows, 0)
+        self.blank.positions.index_fill_(0, rows, -1)
+        self.blank.kind.index_fill_(0, rows, 0)
+        self.blank.group.index_fill_(0, rows, -1)
+        self.blank.group_kind.index_fill_(0, rows, 0)
+        self.blank.option_index.index_fill_(0, rows, -1)
+        self.blank.legal_ids.index_fill_(0, rows, 0)
+        self.blank.legal_mask.index_fill_(0, rows, 0)
         blank_width = min(int(encoded.blank_positions.shape[1]), self.max_blanks_per_row)
         blank_legal_width = min(int(encoded.blank_legal_ids.shape[2]), self.max_legal_per_blank)
         if blank_width > 0:
-            self.blank_positions[rows, :blank_width] = subtract_packed_offsets(
+            self.blank.positions[rows, :blank_width] = subtract_packed_offsets(
                 encoded.blank_positions[:, :blank_width].to(device=self.device),
                 state_positions,
             )
-            self.blank_kind[rows, :blank_width] = encoded.blank_kind[:, :blank_width].to(
+            self.blank.kind[rows, :blank_width] = encoded.blank_kind[:, :blank_width].to(
                 device=self.device, dtype=torch.int32
             )
-            self.blank_group[rows, :blank_width] = encoded.blank_group[:, :blank_width].to(
+            self.blank.group[rows, :blank_width] = encoded.blank_group[:, :blank_width].to(
                 device=self.device, dtype=torch.int32
             )
-            self.blank_group_kind[rows, :blank_width] = encoded.blank_group_kind[
+            self.blank.group_kind[rows, :blank_width] = encoded.blank_group_kind[
                 :, :blank_width
             ].to(device=self.device, dtype=torch.int32)
-            self.blank_option_index[rows, :blank_width] = encoded.blank_option_index[
+            self.blank.option_index[rows, :blank_width] = encoded.blank_option_index[
                 :, :blank_width
             ].to(device=self.device, dtype=torch.int32)
             if blank_legal_width > 0:
-                self.blank_legal_ids[rows, :blank_width, :blank_legal_width] = (
+                self.blank.legal_ids[rows, :blank_width, :blank_legal_width] = (
                     encoded.blank_legal_ids[:, :blank_width, :blank_legal_width].to(
                         device=self.device, dtype=torch.int32
                     )
                 )
-                self.blank_legal_mask[rows, :blank_width, :blank_legal_width] = (
+                self.blank.legal_mask[rows, :blank_width, :blank_legal_width] = (
                     encoded.blank_legal_mask[:, :blank_width, :blank_legal_width].to(
                         device=self.device, dtype=torch.bool
                     )
@@ -1514,13 +1481,13 @@ class TextReplayBuffer:
         self.row_token_start[row_start:row_end] = -1
         self.row_token_length[row_start:row_end] = 0
         self.card_ref_positions[row_start:row_end].fill_(-1)
-        self.blank_positions[row_start:row_end].fill_(-1)
-        self.blank_kind[row_start:row_end].zero_()
-        self.blank_group[row_start:row_end].fill_(-1)
-        self.blank_group_kind[row_start:row_end].zero_()
-        self.blank_option_index[row_start:row_end].fill_(-1)
-        self.blank_legal_ids[row_start:row_end].zero_()
-        self.blank_legal_mask[row_start:row_end].zero_()
+        self.blank.positions[row_start:row_end].fill_(-1)
+        self.blank.kind[row_start:row_end].zero_()
+        self.blank.group[row_start:row_end].fill_(-1)
+        self.blank.group_kind[row_start:row_end].zero_()
+        self.blank.option_index[row_start:row_end].fill_(-1)
+        self.blank.legal_ids[row_start:row_end].zero_()
+        self.blank.legal_mask[row_start:row_end].zero_()
         row_tokens = token_ids[flat_env, flat_step]
         if total_tokens > 0:
             seq_id = torch.repeat_interleave(
@@ -1549,26 +1516,26 @@ class TextReplayBuffer:
         blank_width = min(int(blank_positions.shape[2]), self.max_blanks_per_row)
         blank_legal_width = min(int(blank_legal_ids.shape[3]), self.max_legal_per_blank)
         if blank_width > 0:
-            self.blank_positions[rows, :blank_width] = blank_positions[
+            self.blank.positions[rows, :blank_width] = blank_positions[
                 flat_env, flat_step, :blank_width
             ].to(device=self.device, dtype=torch.int32)
-            self.blank_kind[rows, :blank_width] = blank_kind[flat_env, flat_step, :blank_width].to(
+            self.blank.kind[rows, :blank_width] = blank_kind[flat_env, flat_step, :blank_width].to(
                 device=self.device, dtype=torch.int32
             )
-            self.blank_group[rows, :blank_width] = blank_group[
+            self.blank.group[rows, :blank_width] = blank_group[
                 flat_env, flat_step, :blank_width
             ].to(device=self.device, dtype=torch.int32)
-            self.blank_group_kind[rows, :blank_width] = blank_group_kind[
+            self.blank.group_kind[rows, :blank_width] = blank_group_kind[
                 flat_env, flat_step, :blank_width
             ].to(device=self.device, dtype=torch.int32)
-            self.blank_option_index[rows, :blank_width] = blank_option_index[
+            self.blank.option_index[rows, :blank_width] = blank_option_index[
                 flat_env, flat_step, :blank_width
             ].to(device=self.device, dtype=torch.int32)
             if blank_legal_width > 0:
-                self.blank_legal_ids[rows, :blank_width, :blank_legal_width] = blank_legal_ids[
+                self.blank.legal_ids[rows, :blank_width, :blank_legal_width] = blank_legal_ids[
                     flat_env, flat_step, :blank_width, :blank_legal_width
                 ].to(device=self.device, dtype=torch.int32)
-                self.blank_legal_mask[rows, :blank_width, :blank_legal_width] = blank_legal_mask[
+                self.blank.legal_mask[rows, :blank_width, :blank_legal_width] = blank_legal_mask[
                     flat_env, flat_step, :blank_width, :blank_legal_width
                 ].to(device=self.device, dtype=torch.bool)
 
@@ -1673,13 +1640,13 @@ class TextReplayBuffer:
         perspective_player_idx = common.perspective_player_idx
         h_in = common.lstm_h_in
         c_in = common.lstm_c_in
-        blank_positions = add_packed_offsets(self.blank_positions[idx], state_positions)
-        blank_kind = self.blank_kind[idx]
-        blank_group = self.blank_group[idx]
-        blank_group_kind = self.blank_group_kind[idx]
-        blank_option_index = self.blank_option_index[idx]
-        blank_legal_ids = self.blank_legal_ids[idx]
-        blank_legal_mask = self.blank_legal_mask[idx]
+        blank_positions = add_packed_offsets(self.blank.positions[idx], state_positions)
+        blank_kind = self.blank.kind[idx]
+        blank_group = self.blank.group[idx]
+        blank_group_kind = self.blank.group_kind[idx]
+        blank_option_index = self.blank.option_index[idx]
+        blank_legal_ids = self.blank.legal_ids[idx]
+        blank_legal_mask = self.blank.legal_mask[idx]
 
         gathered_decisions = None
         if self.use_triton_gather:
@@ -1844,13 +1811,13 @@ class TextReplayBuffer:
         )
 
     def _clear_blank_row(self, row: int) -> None:
-        self.blank_positions[row].fill_(-1)
-        self.blank_kind[row].zero_()
-        self.blank_group[row].fill_(-1)
-        self.blank_group_kind[row].zero_()
-        self.blank_option_index[row].fill_(-1)
-        self.blank_legal_ids[row].zero_()
-        self.blank_legal_mask[row].zero_()
+        self.blank.positions[row].fill_(-1)
+        self.blank.kind[row].zero_()
+        self.blank.group[row].fill_(-1)
+        self.blank.group_kind[row].zero_()
+        self.blank.option_index[row].fill_(-1)
+        self.blank.legal_ids[row].zero_()
+        self.blank.legal_mask[row].zero_()
 
     def _copy_padded_blank_row(
         self,
@@ -1863,35 +1830,35 @@ class TextReplayBuffer:
     ) -> None:
         if blank_width == 0:
             return
-        self.blank_positions[row, :blank_width].copy_(
+        self.blank.positions[row, :blank_width].copy_(
             encoded.blank_positions[batch_index, :blank_width].to(
                 device=self.device, dtype=torch.int32
             )
         )
-        self.blank_kind[row, :blank_width].copy_(
+        self.blank.kind[row, :blank_width].copy_(
             encoded.blank_kind[batch_index, :blank_width].to(device=self.device, dtype=torch.int32)
         )
-        self.blank_group[row, :blank_width].copy_(
+        self.blank.group[row, :blank_width].copy_(
             encoded.blank_group[batch_index, :blank_width].to(device=self.device, dtype=torch.int32)
         )
-        self.blank_group_kind[row, :blank_width].copy_(
+        self.blank.group_kind[row, :blank_width].copy_(
             encoded.blank_group_kind[batch_index, :blank_width].to(
                 device=self.device, dtype=torch.int32
             )
         )
-        self.blank_option_index[row, :blank_width].copy_(
+        self.blank.option_index[row, :blank_width].copy_(
             encoded.blank_option_index[batch_index, :blank_width].to(
                 device=self.device, dtype=torch.int32
             )
         )
         if blank_legal_width == 0:
             return
-        self.blank_legal_ids[row, :blank_width, :blank_legal_width].copy_(
+        self.blank.legal_ids[row, :blank_width, :blank_legal_width].copy_(
             encoded.blank_legal_ids[batch_index, :blank_width, :blank_legal_width].to(
                 device=self.device, dtype=torch.int32
             )
         )
-        self.blank_legal_mask[row, :blank_width, :blank_legal_width].copy_(
+        self.blank.legal_mask[row, :blank_width, :blank_legal_width].copy_(
             encoded.blank_legal_mask[batch_index, :blank_width, :blank_legal_width].to(
                 device=self.device
             )
@@ -1909,7 +1876,7 @@ class TextReplayBuffer:
     ) -> None:
         if blank_width == 0:
             return
-        self.blank_positions[row, :blank_width].copy_(
+        self.blank.positions[row, :blank_width].copy_(
             subtract_packed_offsets(
                 encoded.blank_positions[batch_index : batch_index + 1, :blank_width].to(
                     device=self.device
@@ -1919,30 +1886,30 @@ class TextReplayBuffer:
             .squeeze(0)
             .to(device=self.device, dtype=torch.int32)
         )
-        self.blank_kind[row, :blank_width].copy_(
+        self.blank.kind[row, :blank_width].copy_(
             encoded.blank_kind[batch_index, :blank_width].to(device=self.device, dtype=torch.int32)
         )
-        self.blank_group[row, :blank_width].copy_(
+        self.blank.group[row, :blank_width].copy_(
             encoded.blank_group[batch_index, :blank_width].to(device=self.device, dtype=torch.int32)
         )
-        self.blank_group_kind[row, :blank_width].copy_(
+        self.blank.group_kind[row, :blank_width].copy_(
             encoded.blank_group_kind[batch_index, :blank_width].to(
                 device=self.device, dtype=torch.int32
             )
         )
-        self.blank_option_index[row, :blank_width].copy_(
+        self.blank.option_index[row, :blank_width].copy_(
             encoded.blank_option_index[batch_index, :blank_width].to(
                 device=self.device, dtype=torch.int32
             )
         )
         if blank_legal_width == 0:
             return
-        self.blank_legal_ids[row, :blank_width, :blank_legal_width].copy_(
+        self.blank.legal_ids[row, :blank_width, :blank_legal_width].copy_(
             encoded.blank_legal_ids[batch_index, :blank_width, :blank_legal_width].to(
                 device=self.device, dtype=torch.int32
             )
         )
-        self.blank_legal_mask[row, :blank_width, :blank_legal_width].copy_(
+        self.blank.legal_mask[row, :blank_width, :blank_legal_width].copy_(
             encoded.blank_legal_mask[batch_index, :blank_width, :blank_legal_width].to(
                 device=self.device
             )

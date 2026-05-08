@@ -506,20 +506,21 @@ class TextReplayBufferTests(unittest.TestCase):
         assert window is not None
         self.assertEqual((window.row_start, window.row_end), (0, 2))
         torch.testing.assert_close(window.rows.cpu(), torch.tensor([0, 1]))
-        torch.testing.assert_close(buffer.episode_id[:2].cpu(), torch.tensor([42, 42]))
-        torch.testing.assert_close(buffer.step_idx[:2].cpu(), torch.tensor([0, 1]))
-        torch.testing.assert_close(buffer.is_terminal[:2].cpu(), torch.tensor([False, True]))
-        torch.testing.assert_close(buffer.actor_id[:2].cpu(), torch.tensor([7, 7]))
+        meta = buffer.episode_meta
+        torch.testing.assert_close(meta.episode_id[:2].cpu(), torch.tensor([42, 42]))
+        torch.testing.assert_close(meta.step_idx[:2].cpu(), torch.tensor([0, 1]))
+        torch.testing.assert_close(meta.is_terminal[:2].cpu(), torch.tensor([False, True]))
+        torch.testing.assert_close(meta.actor_id[:2].cpu(), torch.tensor([7, 7]))
         torch.testing.assert_close(
-            buffer.behavior_policy_version[:2].cpu(),
+            meta.behavior_policy_version[:2].cpu(),
             torch.tensor([3, 3]),
         )
         torch.testing.assert_close(
-            buffer.inference_policy_version[:2].cpu(),
+            meta.inference_policy_version[:2].cpu(),
             torch.tensor([4, 4]),
         )
         torch.testing.assert_close(
-            buffer.target_policy_version[:2].cpu(),
+            meta.target_policy_version[:2].cpu(),
             torch.tensor([5, 5]),
         )
         buffer.release_train_window(window)

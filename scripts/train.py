@@ -4692,8 +4692,18 @@ def train_text_native_batched_envs(
             torch.cuda.memory._record_memory_history(max_entries=100_000)
         if rnad_state is not None and replay_rows_tensor is not None and not update_episodes:
             rows_h = rollout_replay_rows.detach().cpu().tolist()
-            ep_h = backend.replay_buffer.episode_id[rollout_replay_rows].detach().cpu().tolist()
-            step_h = backend.replay_buffer.step_idx[rollout_replay_rows].detach().cpu().tolist()
+            ep_h = (
+                backend.replay_buffer.episode_meta.episode_id[rollout_replay_rows]
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            step_h = (
+                backend.replay_buffer.episode_meta.step_idx[rollout_replay_rows]
+                .detach()
+                .cpu()
+                .tolist()
+            )
             player_h = (
                 backend.replay_buffer.perspective_player_idx[rollout_replay_rows]
                 .detach()
@@ -4705,12 +4715,17 @@ def train_text_native_batched_envs(
             )
             value_h = backend.replay_buffer.value[rollout_replay_rows].detach().cpu().tolist()
             terminal_h = (
-                backend.replay_buffer.terminal_reward_p0[rollout_replay_rows]
+                backend.replay_buffer.episode_meta.terminal_reward_p0[rollout_replay_rows]
                 .detach()
                 .cpu()
                 .tolist()
             )
-            zero_h = backend.replay_buffer.zero_sum[rollout_replay_rows].detach().cpu().tolist()
+            zero_h = (
+                backend.replay_buffer.episode_meta.zero_sum[rollout_replay_rows]
+                .detach()
+                .cpu()
+                .tolist()
+            )
             grouped_rnad: dict[int, list[tuple[int, int, int, float, float, float, bool]]] = {}
             cursor = 0
             while cursor < len(rows_h):
@@ -4795,8 +4810,18 @@ def train_text_native_batched_envs(
             ep_rows_snapshot: list[list[int]] = []
             if replay_rows_tensor is not None:
                 rows_h = rollout_replay_rows.detach().cpu().tolist()
-                ep_h = backend.replay_buffer.episode_id[rollout_replay_rows].detach().cpu().tolist()
-                step_h = backend.replay_buffer.step_idx[rollout_replay_rows].detach().cpu().tolist()
+                ep_h = (
+                    backend.replay_buffer.episode_meta.episode_id[rollout_replay_rows]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                step_h = (
+                    backend.replay_buffer.episode_meta.step_idx[rollout_replay_rows]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
                 grouped: dict[int, list[tuple[int, int]]] = {}
                 cursor = 0
                 while cursor < len(rows_h):

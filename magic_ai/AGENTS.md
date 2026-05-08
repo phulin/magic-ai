@@ -9,6 +9,7 @@ Core training and inference pipeline for a Magic: The Gathering-playing RL agent
 
 ## Files
 - `__init__.py` — public API exports for actions, buffers, and game state
+- `aggregate_tensor.py` — struct-of-arrays container for parallel per-row tensors with named fields, shared reset, and batched scatter-write
 - `actions.py` — encode/decode legal action options; shared policy types (TraceKind, ActionTrace, PolicyStep, ParsedStep, ParsedBatch) and build_decision_layout_rows
 - `game_state.py` — shared TypedDicts (GameStateSnapshot, PlayerState, PendingState, etc.), zone constants, and ParsedGameState/ParsedGameStateBatch
 - `lstm_recompute.py` — four LSTM input-state recompute strategies for R-NaD trajectory loss
