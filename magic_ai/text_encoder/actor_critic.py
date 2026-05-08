@@ -3022,6 +3022,7 @@ def _evaluate_inline_choice_index_replay_groups(
 
     blank_group_kind = batch.encoded.blank_group_kind.to(device=device)
     blank_option_index = batch.encoded.blank_option_index.to(device=device)
+    blank_positions = batch.encoded.blank_positions.to(device=device)
     blank_legal_mask = batch.encoded.blank_legal_mask.to(device=device, dtype=torch.bool)
     if int(blank_group_kind.shape[1]) == 0 or int(blank_legal_mask.shape[2]) == 0:
         per_choice = _empty_replay_per_choice(output, n, device) if return_per_choice else None
@@ -3029,9 +3030,11 @@ def _evaluate_inline_choice_index_replay_groups(
 
     row_group_kind = blank_group_kind[steps_t]
     row_option_index = blank_option_index[steps_t]
+    row_positions = blank_positions[steps_t]
     row_legal_mask = blank_legal_mask[steps_t]
     support = (
-        (row_group_kind == BLANK_GROUP_PER_BLANK)
+        (row_positions >= 0)
+        & (row_group_kind == BLANK_GROUP_PER_BLANK)
         & (row_option_index < 0)
         & row_legal_mask.any(dim=-1)
     )
