@@ -655,9 +655,7 @@ class TextReplayBuffer:
             if len(lengths) != batch_size:
                 raise ValueError("encoded.seq_lengths_host length must match batch size")
             return [int(x) for x in lengths]
-        if encoded.seq_lengths.device.type == "cpu":
-            return [int(x) for x in encoded.seq_lengths.tolist()]
-        return [int(x) for x in encoded.seq_lengths.detach().cpu().tolist()]
+        raise ValueError("packed replay append requires seq_lengths_host")
 
     def _reserve_append(
         self,
@@ -1004,14 +1002,14 @@ class TextReplayBuffer:
         batch_size = int(encoded.seq_lengths.shape[0])
         if batch_size == 0:
             return torch.empty(0, dtype=torch.long, device=self.device)
+        seq_lengths_host = self._packed_seq_lengths_host(encoded)
         seq_lengths = encoded.seq_lengths.to(device=self.device)
         if self.validate:
-            max_seq_length = int(seq_lengths.max().item()) if batch_size > 0 else 0
+            max_seq_length = max(seq_lengths_host, default=0)
             if max_seq_length > self.max_tokens:
                 raise ValueError("encoded packed row token width exceeds buffer max_tokens")
             self._validate_packed_blank_widths(encoded)
         total_tokens = int(encoded.token_ids.numel())
-        seq_lengths_host = self._packed_seq_lengths_host(encoded)
         if decision_count_host is not None and len(decision_count_host) != batch_size:
             raise ValueError("decision_count_host length must match batch size")
         total_stored = self._compute_total_stored_decisions(
@@ -1331,6 +1329,9 @@ class TextReplayBuffer:
             state_positions = cu_seqlens[:-1]
             seq_id = torch.empty(0, dtype=torch.int32, device=self.device)
             pos_in_seq = torch.empty(0, dtype=torch.int32, device=self.device)
+        if idx_host is None:
+            raise ValueError("replay gather requires host replay row ids")
+        max_seqlen = max((self.row_token_length_host[row] for row in idx_host), default=0)
         if self.validate:
             token_starts = self.row_token_start[idx]
             if bool((token_starts < 0).any().item()):
@@ -1399,6 +1400,7 @@ class TextReplayBuffer:
             blank_option_index=self.blank.option_index[idx],
             blank_legal_ids=self.blank.legal_ids[idx],
             blank_legal_mask=self.blank.legal_mask[idx],
+            max_seqlen=max_seqlen,
         )
         return TextReplayBatch(
             encoded=encoded,

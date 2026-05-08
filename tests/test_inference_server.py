@@ -64,6 +64,8 @@ def _make_packed_batch(
         seq_lengths=rows_t,
         state_positions=state_pos,
         card_ref_positions=card_ref_pos,
+        seq_lengths_host=tuple(rows),
+        max_seqlen=max(rows, default=0),
         **kwargs,
     )
 

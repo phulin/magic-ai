@@ -150,11 +150,9 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
 
     seq_lengths = torch.cat([b.seq_lengths for b in batches], dim=0)
     token_ids = torch.cat([b.token_ids for b in batches], dim=0)
-    seq_lengths_host: tuple[int, ...] | None = None
-    if all(b.seq_lengths_host is not None for b in batches):
-        seq_lengths_host = tuple(
-            n for b in batches for n in cast(tuple[int, ...], b.seq_lengths_host)
-        )
+    if not all(b.seq_lengths_host is not None for b in batches):
+        raise ValueError("packed batch concat requires seq_lengths_host")
+    seq_lengths_host = tuple(n for b in batches for n in cast(tuple[int, ...], b.seq_lengths_host))
 
     # Per-batch token offset (cumulative live-token count of preceding shards).
     token_totals = torch.tensor(
@@ -241,6 +239,7 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
         blank_option_index=_pad_blank_2d("blank_option_index", fill=-1),
         blank_legal_ids=_pad_blank_legal("blank_legal_ids", dtype=torch.int32),
         blank_legal_mask=_pad_blank_legal("blank_legal_mask", dtype=torch.bool),
+        max_seqlen=max(seq_lengths_host, default=0),
     )
 
 
@@ -261,6 +260,8 @@ def _slice_packed_text_batch(
     seq_lengths_host = (
         batch.seq_lengths_host[row_start:row_end] if batch.seq_lengths_host is not None else None
     )
+    if seq_lengths_host is None:
+        raise ValueError("packed batch slicing requires seq_lengths_host")
     token_ids = batch.token_ids[token_start:token_end]
     cu_seqlens = batch.cu_seqlens[row_start : row_end + 1].to(torch.int32) - int(token_start)
     total_tokens = int(token_end - token_start)
@@ -447,7 +448,7 @@ class _InferenceWorkRing:
                 raise RuntimeError("inference work ring is closed")
             seq_lengths_host = packed.seq_lengths_host
             if seq_lengths_host is None:
-                seq_lengths_host = tuple(int(x) for x in packed.seq_lengths.cpu().tolist())
+                raise ValueError("inference requests require packed seq_lengths_host")
             item = _PendingItem(
                 future=future,
                 rows=rows,
@@ -676,7 +677,7 @@ class _InferenceWorkRing:
             state_positions=self._packed_arena["state_positions"],
             card_ref_positions=self._packed_arena["card_ref_positions"],
             total_tokens=self._token_cursor,
-            seq_lengths_host=None,
+            seq_lengths_host=seq_lengths_host,
             blank_positions=self._packed_arena["blank_positions"],
             blank_kind=self._packed_arena["blank_kind"],
             blank_group=self._packed_arena["blank_group"],
@@ -1309,11 +1310,10 @@ class TextInferenceServer:
         perspective: list[int] = [p for it in items for p in it.perspective_player_indices]
         if self._timing is not None:
             self._timing.add("server_concat", time.perf_counter() - start)
-            max_seq = (
-                int(merged_packed.seq_lengths.max().item())
-                if int(merged_packed.seq_lengths.numel()) > 0
-                else 0
-            )
+            seq_lengths_host = merged_packed.seq_lengths_host
+            if seq_lengths_host is None:
+                raise ValueError("merged packed batch missing seq_lengths_host")
+            max_seq = max(seq_lengths_host, default=0)
             self._timing.add_batch(
                 rows=len(env_indices),
                 tokens=int(merged_packed.token_ids.shape[0]),
@@ -1377,7 +1377,7 @@ class TextInferenceServer:
         trace_kind_ids = merged_native.trace_kind_id.tolist()
         seq_lengths_host = merged_packed.seq_lengths_host
         if seq_lengths_host is None:
-            seq_lengths_host = tuple(int(x) for x in merged_packed.seq_lengths.cpu().tolist())
+            raise ValueError("merged packed batch missing seq_lengths_host")
         for it in items:
             n = len(it.env_indices)
             row_end = row_cursor + n

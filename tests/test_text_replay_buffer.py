@@ -33,6 +33,7 @@ def _encoded_batch() -> TextEncodedBatch:
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
         seq_lengths=seq_lengths,
+        seq_lengths_host=tuple(int(x) for x in seq_lengths.tolist()),
         blank_positions=blank_positions,
         blank_kind=blank_kind,
         blank_group=blank_group,
@@ -74,6 +75,7 @@ def _unpack(batch: PackedTextBatch, *, max_tokens: int, pad_id: int = 0) -> Text
         attention_mask=attention_mask,
         card_ref_positions=rebase(batch.card_ref_positions, (b, 1)),
         seq_lengths=batch.seq_lengths,
+        seq_lengths_host=batch.seq_lengths_host,
         blank_positions=rebase(batch.blank_positions, (b, 1)),
         blank_kind=batch.blank_kind,
         blank_group=batch.blank_group,
@@ -93,6 +95,8 @@ def _packed_to_device(batch: PackedTextBatch, device: torch.device) -> PackedTex
         seq_lengths=batch.seq_lengths.to(device),
         state_positions=batch.state_positions.to(device),
         card_ref_positions=batch.card_ref_positions.to(device),
+        seq_lengths_host=batch.seq_lengths_host,
+        max_seqlen=batch.max_seqlen,
         blank_positions=batch.blank_positions.to(device),
         blank_kind=batch.blank_kind.to(device),
         blank_group=batch.blank_group.to(device),
@@ -101,6 +105,10 @@ def _packed_to_device(batch: PackedTextBatch, device: torch.device) -> PackedTex
         blank_legal_ids=batch.blank_legal_ids.to(device),
         blank_legal_mask=batch.blank_legal_mask.to(device),
     )
+
+
+def _host_rows(rows: torch.Tensor) -> list[int]:
+    return [int(row) for row in rows.detach().cpu().tolist()]
 
 
 def _staged_encoded_kwargs(
@@ -383,6 +391,7 @@ class TextReplayBufferTests(unittest.TestCase):
             attention_mask=torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 0, 0, 0, 0]]),
             card_ref_positions=torch.full((2, MAX_CARD_REFS), -1, dtype=torch.long),
             seq_lengths=torch.tensor([4, 2]),
+            seq_lengths_host=(4, 2),
         )
         encoded_a.card_ref_positions[0, 4] = 2
         encoded_a.card_ref_positions[1, 5] = 1
@@ -391,6 +400,7 @@ class TextReplayBufferTests(unittest.TestCase):
             attention_mask=torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 0]]),
             card_ref_positions=torch.full((2, MAX_CARD_REFS), -1, dtype=torch.long),
             seq_lengths=torch.tensor([3, 5]),
+            seq_lengths_host=(3, 5),
         )
         encoded_b.card_ref_positions[0, 6] = 0
         encoded_b.card_ref_positions[1, 7] = 4
@@ -437,6 +447,7 @@ class TextReplayBufferTests(unittest.TestCase):
         gathered = buffer.gather([int(rows_b[1]), int(rows_a[0]), int(rows_b[0])])
         gathered_encoded = _unpack(gathered.encoded, max_tokens=buffer.max_tokens)
 
+        self.assertEqual(gathered.encoded.max_seqlen, 5)
         torch.testing.assert_close(
             gathered_encoded.token_ids[0], encoded_b.token_ids[1], check_dtype=False
         )
@@ -542,6 +553,7 @@ class TextReplayBufferTests(unittest.TestCase):
                 attention_mask=torch.tensor([[1, 0]]),
                 card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
                 seq_lengths=torch.tensor([1]),
+                seq_lengths_host=(1,),
             )
             return buffer.append_batch(
                 encoded=pack_batch(encoded),
@@ -753,8 +765,8 @@ class TextReplayBufferTests(unittest.TestCase):
         torch.testing.assert_close(rows_triton, rows_torch)
         _assert_replay_batch_close(
             self,
-            triton_buffer.gather(rows_triton),
-            torch_buffer.gather(rows_torch),
+            triton_buffer.gather(_host_rows(rows_triton)),
+            torch_buffer.gather(_host_rows(rows_torch)),
         )
 
     @unittest.skipUnless(
@@ -828,8 +840,8 @@ class TextReplayBufferTests(unittest.TestCase):
         rows_torch = torch_buffer.append_batch(**kwargs)
         _assert_replay_batch_close(
             self,
-            triton_buffer.gather(rows_triton),
-            torch_buffer.gather(rows_torch),
+            triton_buffer.gather(_host_rows(rows_triton)),
+            torch_buffer.gather(_host_rows(rows_torch)),
         )
 
     def test_append_staged_batch_matches_packed_append_torch_path(self) -> None:
@@ -1006,6 +1018,7 @@ class TextReplayBufferTests(unittest.TestCase):
                     attention_mask=torch.tensor([[1, 0]]),
                     card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
                     seq_lengths=torch.tensor([1]),
+                    seq_lengths_host=(1,),
                 )
             ),
             trace_kind_id=torch.tensor([1]),
@@ -1096,8 +1109,8 @@ class TextReplayBufferTests(unittest.TestCase):
         rows_torch = torch_buffer.append_staged_batch(**staged_kwargs, **meta)
         _assert_replay_batch_close(
             self,
-            triton_buffer.gather(rows_triton),
-            torch_buffer.gather(rows_torch),
+            triton_buffer.gather(_host_rows(rows_triton)),
+            torch_buffer.gather(_host_rows(rows_torch)),
         )
 
     @unittest.skipUnless(
@@ -1157,8 +1170,8 @@ class TextReplayBufferTests(unittest.TestCase):
         rows_torch = torch_buffer.append_batch(**kwargs)
         _assert_replay_batch_close(
             self,
-            triton_buffer.gather(rows_triton.flip(0)),
-            torch_buffer.gather(rows_torch.flip(0)),
+            triton_buffer.gather(_host_rows(rows_triton.flip(0))),
+            torch_buffer.gather(_host_rows(rows_torch.flip(0))),
         )
 
 

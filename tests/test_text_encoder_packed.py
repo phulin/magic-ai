@@ -41,6 +41,7 @@ def _make_batch(vocab_size: int = 1000) -> TextEncodedBatch:
         attention_mask=attention_mask,
         card_ref_positions=card_ref_positions,
         seq_lengths=seq_lens,
+        seq_lengths_host=tuple(int(n) for n in seq_lens.tolist()),
     )
 
 

@@ -259,9 +259,7 @@ class NativePackedAssemblerOutputs:
             blank_legal_ids = blank_legal_ids_full
             blank_legal_mask = blank_legal_mask_full.bool()
 
-        # seq_lengths is on pinned CPU memory; .max() here is a host-only op
-        # (no GPU sync) and gives flash_attn_varlen a tight per-batch tile bound.
-        max_seqlen = int(seq_lengths.max().item()) if seq_lengths.numel() else 0
+        max_seqlen = max(seq_lengths_host, default=0)
         return PackedTextBatch(
             token_ids=token_ids,
             seq_id=seq_id,

@@ -205,6 +205,9 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
     sentinels preserved through a ``where``.
     """
 
+    if padded.seq_lengths_host is None:
+        raise ValueError("pack_batch requires seq_lengths_host")
+
     seq_lens = padded.seq_lengths.to(torch.int32)
     total_tokens = padded.total_tokens
     if total_tokens is None:
@@ -219,6 +222,7 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
         blank_positions = add_packed_offsets(padded.blank_positions, state_positions)
     else:
         blank_positions = padded.blank_positions
+    max_seqlen = max(padded.seq_lengths_host, default=0)
     return PackedTextBatch(
         token_ids=token_ids,
         seq_id=seq_id,
@@ -236,6 +240,7 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
         blank_option_index=padded.blank_option_index,
         blank_legal_ids=padded.blank_legal_ids,
         blank_legal_mask=padded.blank_legal_mask,
+        max_seqlen=max_seqlen,
     )
 
 

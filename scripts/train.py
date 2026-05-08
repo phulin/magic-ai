@@ -533,7 +533,7 @@ class NativeTextTrajectoryBuffer:
         seq_lengths = encoded.seq_lengths.to(device=self.device)
         seq_lengths_host = encoded.seq_lengths_host
         if seq_lengths_host is None:
-            seq_lengths_host = tuple(int(x) for x in encoded.seq_lengths.detach().cpu().tolist())
+            raise ValueError("native text staging requires encoded.seq_lengths_host")
         if self.validate and max(seq_lengths_host, default=0) > self.max_tokens:
             raise ValueError("encoded packed row token width exceeds staging max_tokens")
         row_tokens = torch.zeros(batch_size, self.max_tokens, dtype=torch.int32, device=self.device)
