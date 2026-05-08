@@ -300,14 +300,21 @@ class TextRolloutActor:
             # reusable encoder scratch. Retry synchronously until the server
             # copies them into its arena; do not store the views in the actor
             # queue and then encode over them. While waiting, drain completed
-            # inference so previous arena slots can be released.
+            # inference so previous arena slots can be released, then park on
+            # the ring's cond until something changes.
             while True:
                 future = try_submit(request)
                 if future is not None:
                     break
+                if not self.inference_server.is_alive() or self._stop_event.is_set():
+                    # Server is gone (or we're shutting down); ``submit`` will
+                    # return a future with the server's exception so the actor
+                    # surfaces it through the normal completion path.
+                    future = self.inference_server.submit(request)
+                    break
                 self.inference_server.flush()
                 self._drain_completed_inference()
-                time.sleep(0.001)
+                self.inference_server.wait_for_capacity(timeout=0.05)
         self._record_timing("actor_submit", start)
         in_flight = _InFlightBatch(
             ready_envs=batch.ready_envs,

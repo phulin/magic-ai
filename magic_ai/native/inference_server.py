@@ -586,6 +586,20 @@ class _InferenceWorkRing:
         with self._cond:
             return self._waiting_producers > 0
 
+    def wait_for_release(self, timeout: float) -> None:
+        """Block briefly until the ring's state changes.
+
+        Wakes on any item finish, publish, flush, or close. Callers re-check
+        their condition after waking; this is a notification primitive, not a
+        capacity check. Bounded by ``timeout`` so a stuck server can't park
+        the caller forever.
+        """
+
+        with self._cond:
+            if self._closed:
+                return
+            self._cond.wait(timeout=timeout)
+
     def finish_items(self, items: list[_PendingItem]) -> None:
         with self._cond:
             for item in items:
@@ -1152,6 +1166,18 @@ class TextInferenceServer:
         """Force the next queued partial batch to run below min_batch_rows."""
 
         self._queue.request_flush()
+
+    def wait_for_capacity(self, timeout: float) -> None:
+        """Park the caller until the ring's state changes or ``timeout`` elapses.
+
+        Used by actor producers when ``try_submit`` returned ``None``. Wakes on
+        any release/publish/flush/close so the caller can retry promptly.
+        """
+
+        self._queue.wait_for_release(timeout)
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive() and not self._stop_event.is_set()
 
     def stop(self) -> None:
         with self._cond:
