@@ -1256,7 +1256,10 @@ class TrainPPOTests(unittest.TestCase):
                 self,
                 env_indices: list[int],
                 _replay_buffer: FakeReplayBuffer,
+                *,
+                seal: bool = True,
             ) -> tuple[torch.Tensor, torch.Tensor]:
+                del seal
                 env_t = torch.tensor(env_indices, dtype=torch.long)
                 counts = self.step_count[env_t].clone()
                 n_total = int(counts.sum().item())

@@ -719,6 +719,8 @@ class NativeTextTrajectoryBuffer:
         self,
         env_indices: list[int],
         replay_buffer: TextReplayBuffer,
+        *,
+        seal: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Append finished episodes from the staging buffer to ``replay_buffer``
         and reset the staging slots. Returns ``(flat_rows, counts_all)``
@@ -861,6 +863,7 @@ class NativeTextTrajectoryBuffer:
             ),
             lstm_h_in=lstm_h,
             lstm_c_in=lstm_c,
+            seal=seal,
         )
         if replay_buffer.projected_state is not None and self.projected_state is not None:
             replay_buffer.write_projected_state(rows, self.projected_state[flat_env, flat_step])
@@ -956,6 +959,8 @@ class NativeTextTrajectoryBuffer:
         self,
         env_indices: list[int],
         replay_buffer: TextReplayBuffer,
+        *,
+        seal: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Like :meth:`append_envs_to_replay` but returns ``(flat_rows,
         counts_all)`` on-device, skipping the per-env host conversions
@@ -966,7 +971,7 @@ class NativeTextTrajectoryBuffer:
         self._lock.acquire()
         self._record_timing("finish_append_wait_lock", start)
         try:
-            return self._append_envs_to_replay_core(env_indices, replay_buffer)
+            return self._append_envs_to_replay_core(env_indices, replay_buffer, seal=seal)
         finally:
             self._lock.release()
 
@@ -3355,7 +3360,11 @@ def train_native_batched_envs(
             )
             terminal_p0_h.append(tp0)
             zero_sum_h.append(zs)
-        slot_h = torch.tensor([env.slot_idx for env in envs], dtype=torch.long, pin_memory=True)
+        slot_h = torch.tensor(
+            [env.slot_idx for env in envs],
+            dtype=torch.long,
+            pin_memory=device.type == "cuda",
+        )
         slot_t = slot_h.to(device, non_blocking=True)
         step_counts = staging_buffer.step_count[slot_t]
         max_steps = int(staging_buffer.max_steps_per_trajectory)
@@ -3365,12 +3374,16 @@ def train_native_batched_envs(
         values_padded = staging_buffer.value[slot_t]
 
         if rnad_state is None:
-            terminal_p0_t = torch.tensor(terminal_p0_h, dtype=torch.float32, pin_memory=True).to(
-                device, non_blocking=True
-            )
-            zero_sum_t = torch.tensor(zero_sum_h, dtype=torch.bool, pin_memory=True).to(
-                device, non_blocking=True
-            )
+            terminal_p0_t = torch.tensor(
+                terminal_p0_h,
+                dtype=torch.float32,
+                pin_memory=device.type == "cuda",
+            ).to(device, non_blocking=True)
+            zero_sum_t = torch.tensor(
+                zero_sum_h,
+                dtype=torch.bool,
+                pin_memory=device.type == "cuda",
+            ).to(device, non_blocking=True)
             returns_padded = gae_returns_batched(
                 values_padded,
                 players_padded,
@@ -4448,14 +4461,18 @@ def train_text_native_batched_envs(
             )
             if needs_staging_commit:
                 slot_idxs = list(map(lambda done: done[0].slot_idx, finished_with_steps))
-                slot_t = torch.tensor(slot_idxs, dtype=torch.long, pin_memory=True).to(
-                    device, non_blocking=True
-                )
+                slot_t = torch.tensor(
+                    slot_idxs,
+                    dtype=torch.long,
+                    pin_memory=device.type == "cuda",
+                ).to(device, non_blocking=True)
                 step_counts = staging_buffer.step_count[slot_t].clone()
                 flat_rows, counts = staging_buffer.append_envs_to_replay_returning_tensor(
                     slot_idxs,
                     backend.replay_buffer,
+                    seal=False,
                 )
+                needs_staged_seal = True
                 counts_h = counts.detach().cpu().tolist()
                 split_rows = torch.split(flat_rows.detach().cpu(), counts_h)
                 per_env_rows_h = tuple(map(lambda rows: tuple(map(int, rows.tolist())), split_rows))
@@ -4480,11 +4497,15 @@ def train_text_native_batched_envs(
                 pending_replay_rows.append(flat_rows)
                 if rnad_state is None:
                     terminal_p0_t = torch.tensor(
-                        terminal_p0_h, dtype=torch.float32, pin_memory=True
+                        terminal_p0_h,
+                        dtype=torch.float32,
+                        pin_memory=device.type == "cuda",
                     ).to(device, non_blocking=True)
-                    zero_sum_t = torch.tensor(zero_sum_h, dtype=torch.bool, pin_memory=True).to(
-                        device, non_blocking=True
-                    )
+                    zero_sum_t = torch.tensor(
+                        zero_sum_h,
+                        dtype=torch.bool,
+                        pin_memory=device.type == "cuda",
+                    ).to(device, non_blocking=True)
                     max_steps = staging_buffer.max_steps
                     step_arange = torch.arange(max_steps, device=device).unsqueeze(0)
                     valid_mask = step_arange < step_counts.unsqueeze(1)
@@ -4519,8 +4540,6 @@ def train_text_native_batched_envs(
             )
             n_new = int(flat_rows.numel())
             if n_new > 0:
-                pending_step_count += n_new
-                total_generated_rollout_steps += n_new
 
                 def _write_text_episode_metadata(item: Any) -> None:
                     if not hasattr(backend.replay_buffer, "write_episode_metadata"):
@@ -4560,6 +4579,14 @@ def train_text_native_batched_envs(
                         ),
                     )
                 )
+                if (
+                    needs_staging_commit
+                    and needs_staged_seal
+                    and hasattr(backend.replay_buffer, "seal_staged_rows")
+                ):
+                    backend.replay_buffer.seal_staged_rows(flat_rows)
+                pending_step_count += n_new
+                total_generated_rollout_steps += n_new
             timing_stats = getattr(staging_buffer, "timing_stats", None)
             if timing_stats is not None:
                 timing_stats.add("finish_metadata", time.perf_counter() - finish_part_start)

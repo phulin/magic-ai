@@ -919,6 +919,68 @@ class TextReplayBufferTests(unittest.TestCase):
             packed_buffer.gather(rows_packed),
         )
 
+    def test_unsealed_staged_batch_is_invisible_until_metadata_ready(self) -> None:
+        device = torch.device("cpu")
+        encoded_dense = _encoded_batch()
+        staged_kwargs = _staged_encoded_kwargs(encoded_dense, device=device)
+        meta: dict[str, Any] = dict(
+            trace_kind_id=torch.tensor([1, 2], device=device),
+            decision_count=torch.tensor([1, 1], device=device),
+            decision_count_host=(1, 1),
+            total_decision_groups=2,
+            total_stored_decision_groups=2,
+            decision_option_idx=torch.tensor(
+                [[0, 1, -1, -1], [2, -1, -1, -1]],
+                device=device,
+            ),
+            decision_target_idx=torch.tensor(
+                [[-1, 0, -1, -1], [1, -1, -1, -1]],
+                device=device,
+            ),
+            decision_mask=torch.tensor(
+                [[True, True, False, False], [True, False, False, False]],
+                device=device,
+            ),
+            uses_none_head=torch.tensor([False, True], device=device),
+            selected_indices=torch.tensor([1, 0], device=device),
+            may_selected=torch.tensor([0.0, 1.0], device=device),
+            old_log_prob=torch.tensor([-0.25, -0.5], device=device),
+            value=torch.tensor([0.75, -0.125], device=device),
+            perspective_player_idx=torch.tensor([0, 1], device=device),
+        )
+        buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=5,
+            max_options=3,
+            max_targets_per_option=2,
+            max_decision_groups=3,
+            max_cached_choices=4,
+            device=device,
+            use_triton_append=False,
+            use_triton_gather=False,
+        )
+
+        rows = buffer.append_staged_batch(**staged_kwargs, **meta, seal=False)
+        self.assertIsNone(buffer.claim_train_window(min_rows=1, max_rows=2, allow_partial=True))
+        buffer.write_episode_metadata(
+            rows,
+            episode_id=10,
+            terminal_reward_p0=1.0,
+            zero_sum=True,
+            actor_id=3,
+            behavior_policy_version=4,
+            inference_policy_version=5,
+            target_policy_version=6,
+        )
+        self.assertIsNone(buffer.claim_train_window(min_rows=1, max_rows=2, allow_partial=True))
+
+        buffer.seal_staged_rows(rows)
+        window = buffer.claim_train_window(min_rows=2, max_rows=2)
+        self.assertIsNotNone(window)
+        assert window is not None
+        torch.testing.assert_close(window.rows.cpu(), rows.cpu())
+        buffer.release_train_window(window)
+
     @unittest.skipUnless(
         torch.cuda.is_available() and TRITON_AVAILABLE,
         "requires CUDA and Triton",

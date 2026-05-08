@@ -264,6 +264,7 @@ class TextReplayBuffer:
         self._ring_active = False
         self._committed_windows: list[tuple[int, int]] = []
         self._reservations: dict[int, _ReplayReservation] = {}
+        self._unsealed_staged_reservations: dict[tuple[int, int], int] = {}
         self._row_complete_host = [False] * self.capacity
         self._row_ready_events: list[Any | None] = [None] * self.capacity
 
@@ -308,6 +309,7 @@ class TextReplayBuffer:
             self._ring_active = False
             self._committed_windows.clear()
             self._reservations.clear()
+            self._unsealed_staged_reservations.clear()
             self._row_complete_host[:] = [False] * self.capacity
             self._row_ready_events[:] = [None] * self.capacity
             self._reserve_cond.notify_all()
@@ -358,8 +360,6 @@ class TextReplayBuffer:
             row_i = int(row)
             self._row_ready_events[row_i % self.capacity] = ready_event
             self._row_complete_host[row_i % self.capacity] = True
-        with self._reserve_cond:
-            self._reserve_cond.notify_all()
         with self._reserve_cond:
             self._reserve_cond.notify_all()
 
@@ -754,6 +754,16 @@ class TextReplayBuffer:
                 del self._reservations[self._commit_reservation_id]
                 self._commit_reservation_id += 1
             self._reserve_cond.notify_all()
+
+    def seal_staged_rows(self, rows: Tensor) -> None:
+        if int(rows.numel()) == 0:
+            return
+        rows_host = rows.detach().cpu().tolist()
+        key = (int(rows_host[0]), int(rows_host[-1]) + 1)
+        with self._reserve_cond:
+            reservation_id = self._unsealed_staged_reservations.pop(key)
+            reservation = self._reservations[reservation_id]
+        self._seal_reservation(reservation)
 
     def _can_reserve_locked(
         self,
@@ -1383,6 +1393,7 @@ class TextReplayBuffer:
         behavior_action_log_prob: Tensor | None = None,
         lstm_h_in: Tensor | None = None,
         lstm_c_in: Tensor | None = None,
+        seal: bool = True,
     ) -> Tensor:
         """Append replay rows directly from padded native staging tensors."""
 
@@ -1537,7 +1548,14 @@ class TextReplayBuffer:
                     flat_env, flat_step, :blank_width, :blank_legal_width
                 ].to(device=self.device, dtype=torch.bool)
 
-        self._seal_reservation(reservation)
+        if seal:
+            self._seal_reservation(reservation)
+        else:
+            with self._reserve_cond:
+                self._unsealed_staged_reservations[(row_start, row_end)] = (
+                    reservation.reservation_id
+                )
+                self._reserve_cond.notify_all()
         return rows
 
     def _write_row_packed_tokens(self, row: int, token_ids: Tensor) -> None:
