@@ -1143,7 +1143,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             target_scalar_dim=TARGET_SCALAR_DIM,
             card_name_to_row=_build_text_card_name_to_row(cache),
             emit_render_plan=False,
-            render_plan_capacity=0,
+            render_plan_capacity=4096,
             validate=not getattr(args, "no_validate", False),
             workers=batch_workers,
             pool=batch_pool,
