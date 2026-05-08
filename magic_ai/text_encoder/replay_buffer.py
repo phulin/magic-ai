@@ -117,6 +117,14 @@ class _ReplayReservation:
 
 
 @dataclass(frozen=True)
+class _CommittedWindow:
+    row_start: int
+    row_end: int
+    append_ready_events: tuple[Any | None, ...]
+    metadata_ready_events: tuple[Any | None, ...]
+
+
+@dataclass(frozen=True)
 class TextReplayTrainWindow:
     row_start: int
     row_end: int
@@ -289,7 +297,7 @@ class TextReplayBuffer:
         self.token_ring = _RingTracker(capacity=int(self.packed_token_ids.numel()))
         self.decision_ring = _RingTracker(capacity=self.core.decision_capacity)
         self._ring_active = False
-        self._committed_windows: list[tuple[int, int]] = []
+        self._committed_windows: list[_CommittedWindow] = []
         self._claimed_windows: list[tuple[int, int]] = []
         self._reservations: dict[int, _ReplayReservation] = {}
         self._unsealed_staged_reservations: dict[tuple[int, int], int] = {}
@@ -505,7 +513,8 @@ class TextReplayBuffer:
             completed_limit = -1
             claimable_limit = -1
             if self._committed_windows:
-                committed_start, committed_limit = self._committed_windows[0]
+                head = self._committed_windows[0]
+                committed_start, committed_limit = head.row_start, head.row_end
                 _row_start, completed_limit = self._completed_window_prefix_locked()
                 _row_start, claimable_limit = self._claimable_window_prefix_locked()
             return {
@@ -791,7 +800,22 @@ class TextReplayBuffer:
             ):
                 break
             self._committed_row_cursor = head.row_end
-            self._committed_windows.append((head.row_start, head.row_end))
+            append_events = tuple(
+                self._row_append_ready_events[row % self.capacity]
+                for row in range(int(head.row_start), int(head.row_end))
+            )
+            metadata_events = tuple(
+                self._row_ready_events[row % self.capacity]
+                for row in range(int(head.row_start), int(head.row_end))
+            )
+            self._committed_windows.append(
+                _CommittedWindow(
+                    row_start=head.row_start,
+                    row_end=head.row_end,
+                    append_ready_events=append_events,
+                    metadata_ready_events=metadata_events,
+                )
+            )
             del self._reservations[self._commit_reservation_id]
             self._commit_reservation_id += 1
 
@@ -840,11 +864,8 @@ class TextReplayBuffer:
         )
 
     def _completed_prefix_end_locked(self, row_start: int, row_limit: int) -> int:
-        row = int(row_start)
-        limit = int(row_limit)
-        while row < limit and self._row_complete_host[row % self.capacity]:
-            row += 1
-        return row
+        del row_start
+        return int(row_limit)
 
     @staticmethod
     def _ready_event_complete(event: Any | None) -> bool:
@@ -855,28 +876,32 @@ class TextReplayBuffer:
             return True
         return bool(query())
 
-    def _claimable_prefix_end_locked(self, row_start: int, row_limit: int) -> int:
+    def _claimable_prefix_end_for_window_locked(
+        self,
+        window: _CommittedWindow,
+        row_start: int,
+    ) -> int:
+        offset = int(row_start) - int(window.row_start)
         row = int(row_start)
-        limit = int(row_limit)
-        while row < limit:
-            row_slot = row % self.capacity
-            if not self._row_complete_host[row_slot]:
+        while row < int(window.row_end):
+            if not self._ready_event_complete(window.append_ready_events[offset]):
                 break
-            if not self._ready_event_complete(self._row_append_ready_events[row_slot]):
-                break
-            if not self._ready_event_complete(self._row_ready_events[row_slot]):
+            if not self._ready_event_complete(window.metadata_ready_events[offset]):
                 break
             row += 1
+            offset += 1
         return row
 
     def _window_prefix_locked(self, end_finder: Callable[[int, int], int]) -> tuple[int, int]:
         if not self._committed_windows:
             return 0, 0
-        row_start, row_limit = self._committed_windows[0]
+        head = self._committed_windows[0]
+        row_start, row_limit = head.row_start, head.row_end
         limit = end_finder(row_start, row_limit)
         idx = 1
         while limit == row_limit and idx < len(self._committed_windows):
-            next_start, next_limit = self._committed_windows[idx]
+            next_window = self._committed_windows[idx]
+            next_start, next_limit = next_window.row_start, next_window.row_end
             if int(next_start) != int(limit):
                 break
             row_limit = next_limit
@@ -888,20 +913,40 @@ class TextReplayBuffer:
         return self._window_prefix_locked(self._completed_prefix_end_locked)
 
     def _claimable_window_prefix_locked(self) -> tuple[int, int]:
-        return self._window_prefix_locked(self._claimable_prefix_end_locked)
+        if not self._committed_windows:
+            return 0, 0
+        head = self._committed_windows[0]
+        row_start = head.row_start
+        row_limit = head.row_end
+        limit = self._claimable_prefix_end_for_window_locked(head, row_start)
+        idx = 1
+        while limit == row_limit and idx < len(self._committed_windows):
+            next_window = self._committed_windows[idx]
+            if int(next_window.row_start) != int(limit):
+                break
+            row_limit = next_window.row_end
+            limit = self._claimable_prefix_end_for_window_locked(next_window, next_window.row_start)
+            idx += 1
+        return int(row_start), int(limit)
 
     def _consume_committed_prefix_locked(self, row_end: int) -> None:
         row_end = int(row_end)
         if self._committed_windows:
-            start = int(self._committed_windows[0][0])
+            start = int(self._committed_windows[0].row_start)
             for row in range(start, row_end):
                 self._row_append_ready_events[row % self.capacity] = None
                 self._row_ready_events[row % self.capacity] = None
-        while self._committed_windows and self._committed_windows[0][1] <= row_end:
+        while self._committed_windows and self._committed_windows[0].row_end <= row_end:
             self._committed_windows.pop(0)
-        if self._committed_windows and self._committed_windows[0][0] < row_end:
-            _start, limit = self._committed_windows[0]
-            self._committed_windows[0] = (row_end, limit)
+        if self._committed_windows and self._committed_windows[0].row_start < row_end:
+            window = self._committed_windows[0]
+            offset = int(row_end) - int(window.row_start)
+            self._committed_windows[0] = _CommittedWindow(
+                row_start=row_end,
+                row_end=window.row_end,
+                append_ready_events=window.append_ready_events[offset:],
+                metadata_ready_events=window.metadata_ready_events[offset:],
+            )
 
     def _split_recurrent(
         self,
