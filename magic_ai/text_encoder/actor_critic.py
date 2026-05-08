@@ -2114,11 +2114,23 @@ def _sample_inline_per_blank_binary_batch(
         torch.zeros_like(first_option),
         first_option,
     )
-    support = (
+    primary_support = (
         row_live
         & (row_group_kind == BLANK_GROUP_PER_BLANK)
         & (row_option_index == desired_option.unsqueeze(1))
         & row_legal_mask.any(dim=-1)
+    )
+    primary_count = primary_support.sum(dim=-1)
+    generic_blocker_support = (
+        row_live
+        & (row_group_kind == BLANK_GROUP_PER_BLANK)
+        & (row_option_index < 0)
+        & row_legal_mask.any(dim=-1)
+    )
+    support = torch.where(
+        ((trace_kind == TRACE_KIND_TO_ID["blockers"]) & (primary_count == 0)).unsqueeze(1),
+        generic_blocker_support,
+        primary_support,
     )
     match_count = support.sum(dim=-1)
     blank_idx = support.to(dtype=torch.int32).argmax(dim=-1)

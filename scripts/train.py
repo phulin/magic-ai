@@ -5093,6 +5093,7 @@ def train_text_native_batched_envs(
         benchmark_done = threading.Event()
         learner_stop = threading.Event()
         learner_wakeup = threading.Event()
+        learner_force_partial = threading.Event()
         learner_errors: list[tuple[BaseException, str]] = []
 
         def _print_rollout_timing(stats: dict[str, float | int]) -> None:
@@ -5158,8 +5159,9 @@ def train_text_native_batched_envs(
                     fields.append(f"{name}={total:.2f}s/{mean:.1f}msx{count}")
             print(*fields, flush=True)
 
-        def _schedule_update(*, final: bool = False) -> bool:
-            del final
+        def _schedule_update(*, final: bool = False, force_partial: bool = False) -> bool:
+            if final or force_partial:
+                learner_force_partial.set()
             if pending_step_count <= 0:
                 return False
             learner_wakeup.set()
@@ -5170,13 +5172,14 @@ def train_text_native_batched_envs(
             try:
                 while not learner_stop.is_set() or pending_step_count > 0:
                     draining = learner_stop.is_set()
-                    min_rows = 1 if draining else int(args.learner_min_rows)
-                    target_rows = 1 if draining else int(args.learner_target_rows)
+                    force_partial = learner_force_partial.is_set()
+                    min_rows = 1 if draining or force_partial else int(args.learner_min_rows)
+                    target_rows = 1 if draining or force_partial else int(args.learner_target_rows)
                     window = backend.replay_buffer.claim_train_window(
                         min_rows=min_rows,
                         max_rows=int(args.learner_max_rows),
                         target_rows=target_rows,
-                        allow_partial=draining,
+                        allow_partial=draining or force_partial,
                     )
                     if window is None:
                         if draining:
@@ -5217,6 +5220,8 @@ def train_text_native_batched_envs(
                             )
                         backend.replay_buffer.release_train_window(window)
                         pending_step_count = max(0, pending_step_count - steps)
+                        if force_partial:
+                            learner_force_partial.clear()
                         policy_versions.publish_from_online(publish_source)
                         update_elapsed = time.perf_counter() - update_start
                         timing_stats.add("learner_update", update_elapsed)
@@ -5293,9 +5298,15 @@ def train_text_native_batched_envs(
                         f"next_ep={next_episode_idx} "
                         f"server_alive={server._thread.is_alive()} "
                         f"server_q={server._queue.qsize()} "
+                        f"server_queued_rows={server._queue.queued_rows()} "
                         f"finished_q={finished_q.qsize()} "
+                        f"deferred_finishes={len(deferred_finishes)} "
                         f"refill_req_q={refill_req_q.qsize()} "
+                        f"pending_refill_slots={[len(s) for s in pending_refill_slots]} "
                         f"actor_free_slots={[len(s) for s in actor_free_slots]} "
+                        f"replay_available_rows={backend.replay_buffer.available_rows} "
+                        f"replay_available_tokens={backend.replay_buffer.available_tokens} "
+                        f"learner_force_partial={learner_force_partial.is_set()} "
                         f"actor_done={actor_done}",
                         flush=True,
                     )
@@ -5398,6 +5409,8 @@ def train_text_native_batched_envs(
                             filter(lambda item: bool(item[1]), enumerate(per_actor_freed)),
                         )
                     )
+                if deferred_finishes and pending_step_count > 0:
+                    _schedule_update(force_partial=True)
 
                 if pending_step_count >= int(args.learner_min_rows):
                     _schedule_update()
@@ -5425,6 +5438,8 @@ def train_text_native_batched_envs(
                             slot_idx = actor_free_slots[aid].pop()
                             new_games.append(start_game(slot_idx, next_episode_idx))
                             next_episode_idx += 1
+                    elif pending_step_count > 0:
+                        _schedule_update(force_partial=True)
                     if next_episode_idx >= args.episodes:
                         no_more = True
                         requested.clear()
