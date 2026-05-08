@@ -77,6 +77,16 @@ class CachedReplayForward:
 
 
 @dataclass(frozen=True)
+class _PendingDecisionCoverageCheck:
+    unhandled_count_cpu: Tensor
+    ready_event: torch.cuda.Event | None
+    handled_groups: Tensor
+    group_steps: Tensor
+    trace_kind_id: Tensor
+    decision_count: Tensor
+
+
+@dataclass(frozen=True)
 class TextDecisionLayout:
     trace_kind: TraceKind
     decision_option_idx: Tensor
@@ -141,10 +151,95 @@ class TextActorCritic(nn.Module):
         self._players_per_env = 2
         self.spr_enabled = False
         self.rollout_buffer: TextReplayBuffer | None = None
+        self._pending_decision_coverage_checks: list[_PendingDecisionCoverageCheck] = []
 
     @property
     def device(self) -> torch.device:
         return next(self.parameters()).device
+
+    def _raise_unhandled_vectorized_decisions(
+        self,
+        *,
+        handled_groups: Tensor,
+        group_steps: Tensor,
+        trace_kind_id: Tensor,
+        decision_count: Tensor,
+    ) -> None:
+        unhandled = (~handled_groups).nonzero(as_tuple=False).squeeze(-1)
+        shown = unhandled[:16].detach().cpu()
+        group_steps_cpu = group_steps.detach().cpu()
+        trace_kind_cpu = trace_kind_id.detach().cpu()
+        decision_count_cpu = decision_count.detach().cpu()
+        detail = []
+        id_to_trace = {int(v): k for k, v in TRACE_KIND_TO_ID.items()}
+        for group_idx_t in shown:
+            group_idx = int(group_idx_t)
+            step_idx = int(group_steps_cpu[group_idx])
+            trace_id = int(trace_kind_cpu[step_idx])
+            detail.append(
+                {
+                    "group": group_idx,
+                    "step": step_idx,
+                    "trace": id_to_trace.get(trace_id, str(trace_id)),
+                    "decision_count": int(decision_count_cpu[step_idx]),
+                }
+            )
+        raise RuntimeError(
+            "native text sampling has unhandled vectorized decision groups: "
+            f"total={int(unhandled.numel())} examples={detail}"
+        )
+
+    def _drain_decision_coverage_checks(self) -> None:
+        pending: list[_PendingDecisionCoverageCheck] = []
+        for check in self._pending_decision_coverage_checks:
+            if check.ready_event is not None and not check.ready_event.query():
+                pending.append(check)
+                continue
+            if int(check.unhandled_count_cpu.item()) > 0:
+                self._pending_decision_coverage_checks = pending
+                self._raise_unhandled_vectorized_decisions(
+                    handled_groups=check.handled_groups,
+                    group_steps=check.group_steps,
+                    trace_kind_id=check.trace_kind_id,
+                    decision_count=check.decision_count,
+                )
+        self._pending_decision_coverage_checks = pending
+
+    def _enqueue_decision_coverage_check(
+        self,
+        *,
+        handled_groups: Tensor,
+        group_steps: Tensor,
+        trace_kind_id: Tensor,
+        decision_count: Tensor,
+    ) -> None:
+        unhandled_count = (~handled_groups).sum().to(dtype=torch.int32)
+        if handled_groups.device.type != "cuda":
+            count_cpu = unhandled_count.detach().cpu()
+            if int(count_cpu.item()) > 0:
+                self._raise_unhandled_vectorized_decisions(
+                    handled_groups=handled_groups,
+                    group_steps=group_steps,
+                    trace_kind_id=trace_kind_id,
+                    decision_count=decision_count,
+                )
+            return
+
+        count_cpu = torch.empty((), dtype=torch.int32, pin_memory=True)
+        count_cpu.copy_(unhandled_count.detach(), non_blocking=True)
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(handled_groups.device))
+        self._pending_decision_coverage_checks.append(
+            _PendingDecisionCoverageCheck(
+                unhandled_count_cpu=count_cpu,
+                ready_event=event,
+                handled_groups=handled_groups.detach(),
+                group_steps=group_steps.detach(),
+                trace_kind_id=trace_kind_id.detach(),
+                decision_count=decision_count.detach(),
+            )
+        )
+        self._drain_decision_coverage_checks()
 
     def clone_for_rnad(self) -> TextActorCritic:
         """Deep-copy parameter state, share the replay buffer.
@@ -158,6 +253,7 @@ class TextActorCritic(nn.Module):
         clone = cast(TextActorCritic, _clone)
         clone._num_envs = 0  # type: ignore[attr-defined]
         clone._players_per_env = self._players_per_env  # type: ignore[attr-defined]
+        clone._pending_decision_coverage_checks = []  # type: ignore[attr-defined]
         clone.live_lstm_h = torch.zeros(  # type: ignore[attr-defined]
             int(self.lstm_layers),
             0,
@@ -559,6 +655,7 @@ class TextActorCritic(nn.Module):
     ) -> NativeTextSampleBatch:
         """Sample a native text batch without Python loops over tensor rows/groups."""
 
+        self._drain_decision_coverage_checks()
         if text_batch is None and packed_batch is None:
             raise ValueError("text_batch or packed_batch is required")
         batch_size = (
@@ -711,172 +808,12 @@ class TextActorCritic(nn.Module):
                     step_log_probs = step_log_probs + combat_log_prob
                     step_entropies = step_entropies + combat_entropy
                 mark_profile("decision_accept_check")
-                if not bool(handled_groups.all().item()):
-                    step_log_probs = output.values.new_zeros(batch_size)
-                    step_entropies = output.values.new_zeros(batch_size)
-                    uses_none = native_batch.uses_none_head[:decision_rows].to(
-                        device, dtype=torch.bool, non_blocking=device.type == "cuda"
-                    )
-                    id_to_trace = {int(v): k for k, v in TRACE_KIND_TO_ID.items()}
-                    selected_chunks: list[Tensor] = []
-                    cursor = 0
-                    for step_idx in range(batch_size):
-                        group_count = int(decision_count[step_idx].item())
-                        if group_count == 0:
-                            continue
-                        group_slice = slice(cursor, cursor + group_count)
-                        cursor += group_count
-                        raw_trace = int(trace_kind_id[step_idx].item())
-                        trace_kind = id_to_trace[raw_trace]
-                        layout = TextDecisionLayout(
-                            trace_kind=trace_kind,
-                            decision_option_idx=option_idx[group_slice].detach().cpu(),
-                            decision_target_idx=target_idx[group_slice].detach().cpu(),
-                            decision_mask=decision_mask[group_slice].detach().cpu(),
-                            uses_none_head=uses_none[group_slice].detach().cpu(),
-                            pending=cast(PendingState, {"kind": trace_kind}),
-                        )
-                        inline_choice_sample = (
-                            _sample_inline_choice_index_for_step(
-                                output,
-                                inline_batch,
-                                step_idx=step_idx,
-                                deterministic=deterministic,
-                            )
-                            if trace_kind in ("choice_index", "choice_ids", "choice_color")
-                            else None
-                        )
-                        inline_priority_sample = (
-                            _sample_inline_priority_for_step(
-                                output,
-                                inline_batch,
-                                layout,
-                                step_idx=step_idx,
-                                deterministic=deterministic,
-                            )
-                            if trace_kind == "priority"
-                            else None
-                        )
-                        inline_block_sample = (
-                            _sample_inline_blockers_for_step(
-                                output,
-                                inline_batch,
-                                layout,
-                                step_idx=step_idx,
-                                deterministic=deterministic,
-                            )
-                            if trace_kind == "blockers"
-                            else None
-                        )
-                        inline_attacker_sample = (
-                            _sample_inline_attackers_for_step(
-                                output,
-                                inline_batch,
-                                layout,
-                                step_idx=step_idx,
-                                deterministic=deterministic,
-                            )
-                            if trace_kind == "attackers"
-                            else None
-                        )
-                        inline_sample = (
-                            inline_choice_sample
-                            or inline_priority_sample
-                            or inline_block_sample
-                            or inline_attacker_sample
-                        )
-                        if inline_sample is None:
-                            live_blank_count = 0
-                            detail = ""
-                            if inline_batch.blank_positions.numel() > 0:
-                                live = (
-                                    (inline_batch.blank_positions[step_idx] >= 0)
-                                    .nonzero(as_tuple=False)
-                                    .squeeze(-1)
-                                )
-                                live_blank_count = int(live.numel())
-                                blank_options = (
-                                    inline_batch.blank_option_index[step_idx, live]
-                                    .detach()
-                                    .cpu()
-                                    .tolist()
-                                )
-                                blank_group_kind = (
-                                    inline_batch.blank_group_kind[step_idx, live]
-                                    .detach()
-                                    .cpu()
-                                    .tolist()
-                                )
-                                blank_kind = (
-                                    inline_batch.blank_kind[step_idx, live].detach().cpu().tolist()
-                                )
-                                blank_legal_counts = (
-                                    inline_batch.blank_legal_mask[step_idx, live]
-                                    .sum(dim=-1)
-                                    .detach()
-                                    .cpu()
-                                    .tolist()
-                                )
-                                decision_option_idx = (
-                                    layout.decision_option_idx.detach().cpu().tolist()
-                                )
-                                decision_target_idx = (
-                                    layout.decision_target_idx.detach().cpu().tolist()
-                                )
-                                decision_mask_list = (
-                                    layout.decision_mask.detach()
-                                    .cpu()
-                                    .to(dtype=torch.int8)
-                                    .tolist()
-                                )
-                                detail = (
-                                    " "
-                                    f"blank_options={blank_options} "
-                                    f"blank_group_kind={blank_group_kind} "
-                                    f"blank_kind={blank_kind} "
-                                    f"blank_legal_counts={blank_legal_counts} "
-                                    f"decision_option_idx={decision_option_idx} "
-                                    f"decision_target_idx={decision_target_idx} "
-                                    f"decision_mask={decision_mask_list}"
-                                )
-                            pending = layout.pending or {}
-                            options = (
-                                pending.get("options", []) if isinstance(pending, dict) else []
-                            )
-                            option_detail = []
-                            if isinstance(options, list):
-                                for option in options[:8]:
-                                    if not isinstance(option, dict):
-                                        continue
-                                    option_detail.append(
-                                        {
-                                            "kind": option.get("kind"),
-                                            "card_id": option.get("card_id"),
-                                            "permanent_id": option.get("permanent_id"),
-                                            "id": option.get("id"),
-                                            "targets": len(option.get("valid_targets", []) or []),
-                                        }
-                                    )
-                            pending_kind = (
-                                pending.get("kind") if isinstance(pending, dict) else None
-                            )
-                            raise ValueError(
-                                "native text sampling requires inline blank metadata for "
-                                f"trace_kind={trace_kind!r} at batch row {step_idx}; "
-                                f"decision_groups={int(layout.decision_option_idx.shape[0])} "
-                                f"live_blanks={live_blank_count}{detail} "
-                                f"pending_kind={pending_kind!r} "
-                                f"pending_options={option_detail!r}"
-                            )
-                        selected_tensors, log_prob, entropy = inline_sample
-                        selected_chunks.extend(selected_tensors)
-                        step_log_probs[step_idx] = step_log_probs[step_idx] + log_prob
-                        step_entropies[step_idx] = step_entropies[step_idx] + entropy
-                    selected = (
-                        torch.stack(selected_chunks)
-                        if selected_chunks
-                        else torch.empty(0, dtype=torch.long, device=device)
-                    )
+                self._enqueue_decision_coverage_check(
+                    handled_groups=handled_groups,
+                    group_steps=group_steps,
+                    trace_kind_id=trace_kind_id,
+                    decision_count=decision_count,
+                )
             else:
                 option_idx = torch.empty((0, max_cached_choices), dtype=torch.long, device=device)
                 target_idx = torch.empty_like(option_idx)
@@ -2151,12 +2088,16 @@ def _sample_inline_per_blank_binary_batch(
     if decision_rows != n:
         return None
     device = blank_logits.device
-    row_positions = batch.blank_positions.to(device=device)
     row_group_kind = batch.blank_group_kind.to(device=device)
     row_option_index = batch.blank_option_index.to(device=device)
     row_legal_mask = batch.blank_legal_mask.to(device=device, dtype=torch.bool)
     if int(row_group_kind.shape[1]) == 0 or int(row_legal_mask.shape[2]) < 2:
         return None
+    row_live = (
+        batch.blank_positions.to(device=device) >= 0
+        if batch.blank_positions.numel() > 0
+        else torch.ones_like(row_group_kind, dtype=torch.bool)
+    )
 
     trace_kind = trace_kind_id.to(device=device)
     binary_trace = (trace_kind == TRACE_KIND_TO_ID["attackers"]) | (
@@ -2168,26 +2109,50 @@ def _sample_inline_per_blank_binary_batch(
     valid_option = torch.where(option_idx >= 0, option_idx, torch.full_like(option_idx, 2**30))
     first_option = valid_option.min(dim=-1).values
     has_option = first_option < 2**30
+    desired_option = torch.where(
+        (trace_kind == TRACE_KIND_TO_ID["blockers"]) & ~has_option,
+        torch.zeros_like(first_option),
+        first_option,
+    )
     support = (
-        (row_positions >= 0)
+        row_live
         & (row_group_kind == BLANK_GROUP_PER_BLANK)
-        & (row_option_index == first_option.unsqueeze(1))
-        & row_legal_mask[..., :2].all(dim=-1)
+        & (row_option_index == desired_option.unsqueeze(1))
+        & row_legal_mask.any(dim=-1)
     )
     match_count = support.sum(dim=-1)
     blank_idx = support.to(dtype=torch.int32).argmax(dim=-1)
     row_idx = torch.arange(n, dtype=torch.long, device=device)
-    logits = blank_logits[row_idx, blank_idx, :2]
-    active = eligible & has_option & (match_count == 1)
-    safe_logits = torch.where(active.unsqueeze(1), logits, torch.zeros_like(logits))
-    chosen = (
-        torch.argmax(safe_logits, dim=-1)
-        if deterministic
-        else (safe_logits - torch.empty_like(safe_logits).exponential_().log()).argmax(dim=-1)
-    )
-    log_probs = torch.log_softmax(safe_logits, dim=-1)
-    log_prob = log_probs.gather(1, chosen.unsqueeze(1)).squeeze(1)
+    legal_mask = row_legal_mask[row_idx, blank_idx]
     choice_width = int(decision_mask.shape[1])
+    choice_mask = torch.zeros_like(legal_mask)
+    if choice_width > 0:
+        valid_width = min(choice_width, int(legal_mask.shape[1]))
+        choice_mask[:, :valid_width] = decision_mask[:, :valid_width]
+    valid_legal_mask = legal_mask & choice_mask
+    legal_count = valid_legal_mask.sum(dim=-1)
+    legal_enough = torch.where(
+        trace_kind == TRACE_KIND_TO_ID["attackers"], legal_count >= 2, legal_count >= 1
+    )
+    active = (
+        eligible
+        & (has_option | (trace_kind == TRACE_KIND_TO_ID["blockers"]))
+        & (match_count == 1)
+        & legal_enough
+    )
+    logits = blank_logits[row_idx, blank_idx]
+    dummy_mask = torch.zeros_like(valid_legal_mask)
+    dummy_mask[:, 0] = True
+    effective_mask = torch.where(active.unsqueeze(1), valid_legal_mask, dummy_mask)
+    safe_logits = torch.where(active.unsqueeze(1), logits, torch.zeros_like(logits))
+    masked_logits = safe_logits.masked_fill(~effective_mask, float("-inf"))
+    chosen = (
+        torch.argmax(masked_logits, dim=-1)
+        if deterministic
+        else (masked_logits - torch.empty_like(masked_logits).exponential_().log()).argmax(dim=-1)
+    )
+    log_probs = torch.log_softmax(masked_logits, dim=-1)
+    log_prob = log_probs.gather(1, chosen.unsqueeze(1)).squeeze(1)
     selected_in_range = chosen < choice_width
     safe_selected = chosen.clamp(max=max(choice_width - 1, 0))
     selected_valid = (

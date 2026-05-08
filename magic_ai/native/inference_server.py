@@ -16,6 +16,7 @@ PPO/R-NaD update window or for snapshot eval.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from concurrent.futures import Future
@@ -28,6 +29,8 @@ import torch
 from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
 from magic_ai.text_encoder.actor_critic import NativeTextReplayPayload
 from magic_ai.text_encoder.batch import PackedTextBatch
+
+_PROFILE_SAMPLE_COMPONENTS = os.environ.get("MAGIC_AI_PROFILE_SAMPLE_COMPONENTS") == "1"
 
 
 def _infer_policy_device(policy: Any) -> torch.device:
@@ -1293,6 +1296,9 @@ class TextInferenceServer:
 
         start = time.perf_counter()
         policy_version = 0
+        sample_profile: dict[str, float] | None = (
+            {} if self._timing is not None and _PROFILE_SAMPLE_COMPONENTS else None
+        )
         with torch.no_grad():
             if self._policy_version_manager is not None:
                 with self._policy_version_manager.acquire_inference_policy() as (
@@ -1307,6 +1313,7 @@ class TextInferenceServer:
                         deterministic=self._deterministic,
                         append_replay=False,
                         return_replay_payload=True,
+                        profile_timings=sample_profile,
                     )
             else:
                 sample = self._policy.sample_native_tensor_batch(
@@ -1317,9 +1324,13 @@ class TextInferenceServer:
                     deterministic=self._deterministic,
                     append_replay=False,
                     return_replay_payload=True,
+                    profile_timings=sample_profile,
                 )
         if self._timing is not None:
             self._timing.add("server_sample", time.perf_counter() - start)
+            if sample_profile is not None:
+                for name, elapsed in sample_profile.items():
+                    self._timing.add(f"server_sample_{name}", elapsed)
         if sample.replay_payload is None:
             raise RuntimeError("inference server expected a replay payload")
         ready_event: Any | None = None
