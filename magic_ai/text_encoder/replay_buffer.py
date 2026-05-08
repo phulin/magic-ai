@@ -360,6 +360,8 @@ class TextReplayBuffer:
             self._row_complete_host[row_i % self.capacity] = True
         with self._reserve_cond:
             self._reserve_cond.notify_all()
+        with self._reserve_cond:
+            self._reserve_cond.notify_all()
 
     @property
     def committed_size(self) -> int:
@@ -504,6 +506,26 @@ class TextReplayBuffer:
     def available_tokens(self) -> int:
         with self._reserve_lock:
             return int(int(self.packed_token_ids.numel()) - self._token_ring_used)
+
+    def debug_snapshot(self) -> dict[str, int]:
+        with self._reserve_lock:
+            committed_start = -1
+            committed_limit = -1
+            completed_limit = -1
+            if self._committed_windows:
+                committed_start, committed_limit = self._committed_windows[0]
+                _row_start, completed_limit = self._completed_window_prefix_locked()
+            return {
+                "committed_windows": len(self._committed_windows),
+                "committed_start": int(committed_start),
+                "committed_limit": int(committed_limit),
+                "completed_limit": int(completed_limit),
+                "row_ring_start": int(self._row_ring_start),
+                "row_ring_used": int(self._row_ring_used),
+                "token_ring_used": int(self._token_ring_used),
+                "decision_ring_used": int(self._decision_ring_used),
+                "reservations": len(self._reservations),
+            }
 
     def can_reserve(self, *, row_count: int, token_count: int, decision_count: int = 0) -> bool:
         with self._reserve_lock:

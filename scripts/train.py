@@ -5312,6 +5312,17 @@ def train_text_native_batched_envs(
                         f"actor_done={actor_done}",
                         flush=True,
                     )
+                    replay_debug = (
+                        backend.replay_buffer.debug_snapshot()
+                        if hasattr(backend.replay_buffer, "debug_snapshot")
+                        else {}
+                    )
+                    if replay_debug:
+                        print(
+                            cli_step_prefix(),
+                            f"[watchdog_replay] {replay_debug}",
+                            flush=True,
+                        )
                     starved_refills = [
                         aid
                         for aid, requested in enumerate(pending_refill_slots)
