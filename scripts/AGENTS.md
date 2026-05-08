@@ -13,6 +13,7 @@ Utility scripts for building data pipelines, evaluating card embeddings, pretrai
 - `build_text_encoder_vocab.py` — Register custom tokens in ModernBERT tokenizer and save augmented vocab.
 - `compare_reports.py` — Display side-by-side comparison of eval_card_embeddings JSON reports with delta highlighting.
 - `eval_card_embeddings.py` — Evaluate embeddings against triplet/synonym/cluster labels and compute composite scores.
+- `extract_forge_choice_situations.py` — Stream Forge game ZIP logs and write one reloadable choice situation per game as gzip JSONL with token ids, observed choice metadata, and terminal outcome labels.
 - `jsonl_games_to_bin.py` — Convert recorded `*.jsonl.gz` game logs into per-game uint16 `.bin` token streams (one rendered snapshot per decision point) for MLM pretraining; pass `--with-value-labels` to also emit a `<gameId>.json` sidecar (winner_id, players, per-span perspective-signed labels) for value-head pretraining.
 - `inline_blank_bc_parity.py` — Priority-only inline-blank BC smoke gate on fixed JSONL traces or a synthetic fixture.
 - `play_text_rollout.py` — Run smoke-test episodes with RecurrentTextPolicy against the mage engine; can emit priority JSONL traces for the inline-blank BC gate.
