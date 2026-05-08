@@ -368,11 +368,12 @@ class TextReplayBuffer:
         if self.device.type == "cuda":
             ready_event = torch.cuda.Event()
             ready_event.record(torch.cuda.current_stream(self.device))
-        for row in rows_host:
-            row_i = int(row)
-            self._row_ready_events[row_i % self.capacity] = ready_event
-            self._row_complete_host[row_i % self.capacity] = True
         with self._reserve_cond:
+            for row in rows_host:
+                row_i = int(row)
+                self._row_ready_events[row_i % self.capacity] = ready_event
+                self._row_complete_host[row_i % self.capacity] = True
+            self._publish_committable_locked()
             self._reserve_cond.notify_all()
 
     @property
@@ -699,18 +700,31 @@ class TextReplayBuffer:
             self._next_reservation_id += 1
             return reservation
 
+    def _reservation_rows_complete_locked(self, reservation: _ReplayReservation) -> bool:
+        return all(
+            self._row_complete_host[row % self.capacity]
+            for row in range(int(reservation.row_start), int(reservation.row_end))
+        )
+
+    def _publish_committable_locked(self) -> None:
+        while True:
+            head = self._reservations.get(self._commit_reservation_id)
+            if (
+                head is None
+                or not head.complete
+                or not self._reservation_rows_complete_locked(head)
+            ):
+                break
+            self._committed_row_cursor = head.row_end
+            self._committed_windows.append((head.row_start, head.row_end))
+            del self._reservations[self._commit_reservation_id]
+            self._commit_reservation_id += 1
+
     def _seal_reservation(self, reservation: _ReplayReservation) -> None:
         with self._reserve_cond:
             stored = self._reservations[reservation.reservation_id]
             stored.complete = True
-            while True:
-                head = self._reservations.get(self._commit_reservation_id)
-                if head is None or not head.complete:
-                    break
-                self._committed_row_cursor = head.row_end
-                self._committed_windows.append((head.row_start, head.row_end))
-                del self._reservations[self._commit_reservation_id]
-                self._commit_reservation_id += 1
+            self._publish_committable_locked()
             self._reserve_cond.notify_all()
 
     def seal_staged_rows(self, rows: Tensor) -> None:

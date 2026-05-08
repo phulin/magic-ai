@@ -501,7 +501,8 @@ class TextReplayBufferTests(unittest.TestCase):
         self.assertIsNone(buffer.claim_train_window(min_rows=1, max_rows=4))
 
         buffer.commit(first)
-        self.assertEqual(buffer.committed_size, 3)
+        self.assertEqual(buffer.committed_size, 0)
+        self.assertIsNone(buffer.claim_train_window(min_rows=1, max_rows=4))
         buffer.write_episode_metadata(
             torch.tensor([0, 1]),
             episode_id=42,
@@ -512,6 +513,7 @@ class TextReplayBufferTests(unittest.TestCase):
             inference_policy_version=4,
             target_policy_version=5,
         )
+        self.assertEqual(buffer.committed_size, 2)
         window = buffer.claim_train_window(min_rows=2, max_rows=2)
         self.assertIsNotNone(window)
         assert window is not None
