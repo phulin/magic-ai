@@ -33,7 +33,6 @@ from scripts.train import (
     _prune_pool_to_schedule,
     _restore_opponent_pool,
     _should_run_mlm_pretrain,
-    _should_run_value_pretrain,
     append_priority_trace_jsonl,
     append_sample_game_log,
     build_slot_backend,
@@ -107,25 +106,21 @@ class TrainPPOTests(unittest.TestCase):
         self.assertTrue(_checkpoint_has_policy({"policy": {}}))
 
     def test_pretrain_gates_skip_full_policy_checkpoint(self) -> None:
-        args = Namespace(pretrain_mlm_dir=Path("mlm"), pretrain_value_dir=Path("value"))
+        args = Namespace(pretrain_mlm_dir=Path("choices"))
         checkpoint = {"policy": {}, "metadata": {"encoder": "text"}}
 
         self.assertFalse(_should_run_mlm_pretrain(args, checkpoint))
-        self.assertFalse(_should_run_value_pretrain(args, checkpoint))
 
-    def test_pretrain_gates_allow_value_after_post_mlm_checkpoint(self) -> None:
-        args = Namespace(pretrain_mlm_dir=Path("mlm"), pretrain_value_dir=Path("value"))
+    def test_pretrain_gates_run_without_policy_checkpoint(self) -> None:
+        args = Namespace(pretrain_mlm_dir=Path("choices"))
+
+        self.assertTrue(_should_run_mlm_pretrain(args, None))
+
+    def test_pretrain_gates_skip_post_policy_value_checkpoint(self) -> None:
+        args = Namespace(pretrain_mlm_dir=Path("choices"))
         checkpoint = {"policy": {}, "metadata": {"encoder": "text", "post_mlm": True}}
 
         self.assertFalse(_should_run_mlm_pretrain(args, checkpoint))
-        self.assertTrue(_should_run_value_pretrain(args, checkpoint))
-
-    def test_pretrain_gates_skip_post_value_checkpoint(self) -> None:
-        args = Namespace(pretrain_mlm_dir=Path("mlm"), pretrain_value_dir=Path("value"))
-        checkpoint = {"policy": {}, "metadata": {"encoder": "text", "post_value": True}}
-
-        self.assertFalse(_should_run_mlm_pretrain(args, checkpoint))
-        self.assertFalse(_should_run_value_pretrain(args, checkpoint))
 
     def test_validate_checkpoint_encoder_rejects_text_config_mismatch(self) -> None:
         args = Namespace(

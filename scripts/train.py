@@ -118,15 +118,17 @@ from magic_ai.text_encoder.card_cache import (  # noqa: E402
     load_oracle_db,
     save_card_cache,
 )
-from magic_ai.text_encoder.mlm import (  # noqa: E402
-    BinTokenDataset,
-    MLMConfig,
-    MLMTrainer,
-)
 from magic_ai.text_encoder.model import (  # noqa: E402
     DEFAULT_HF_ENCODER_MODEL,
     TextEncoderConfig,
     text_encoder_config_from_hf,
+)
+from magic_ai.text_encoder.policy_value_pretrain import (  # noqa: E402
+    ForgeChoiceDataset,
+    ForgePolicyValueConfig,
+    ForgePolicyValueTrainer,
+    _batch_to_device,
+    batches_per_epoch,
 )
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig  # noqa: E402
 from magic_ai.text_encoder.render import OracleEntry, render_snapshot  # noqa: E402
@@ -138,11 +140,6 @@ from magic_ai.text_encoder.tokenizer import (  # noqa: E402
     MODERNBERT_REVISION,
     TOKENIZER_DIR,
     load_tokenizer,
-)
-from magic_ai.text_encoder.value_pretrain import (  # noqa: E402
-    ValueLabeledBinDataset,
-    ValuePretrainConfig,
-    ValuePretrainTrainer,
 )
 
 DEFAULT_DECK = {
@@ -1412,10 +1409,6 @@ def _is_post_mlm_checkpoint(checkpoint: dict[str, Any] | None) -> bool:
     return bool(_checkpoint_metadata(checkpoint).get("post_mlm", False))
 
 
-def _is_post_value_checkpoint(checkpoint: dict[str, Any] | None) -> bool:
-    return bool(_checkpoint_metadata(checkpoint).get("post_value", False))
-
-
 def _checkpoint_wandb_run_id(checkpoint: dict[str, Any] | None) -> str | None:
     run_id = _checkpoint_metadata(checkpoint).get("wandb_run_id")
     return str(run_id) if isinstance(run_id, str) and run_id else None
@@ -1429,14 +1422,6 @@ def _should_run_mlm_pretrain(args: argparse.Namespace, checkpoint: dict[str, Any
     return getattr(args, "pretrain_mlm_dir", None) is not None and not _checkpoint_has_policy(
         checkpoint
     )
-
-
-def _should_run_value_pretrain(args: argparse.Namespace, checkpoint: dict[str, Any] | None) -> bool:
-    if getattr(args, "pretrain_value_dir", None) is None:
-        return False
-    if _is_post_value_checkpoint(checkpoint):
-        return False
-    return not (_checkpoint_has_policy(checkpoint) and not _is_post_mlm_checkpoint(checkpoint))
 
 
 def checkpoint_encoder_kind(checkpoint: dict[str, Any] | None) -> str:
@@ -1790,9 +1775,9 @@ def _build_opponent_schedules(
     if getattr(args, "disable_opponent_pool", False):
         return None, None, None
     if _is_post_mlm_checkpoint(checkpoint_cpu):
-        # Resuming from a post-MLM checkpoint: no RL games have happened yet,
-        # so start the opponent pool fresh and ignore any pre-existing
-        # snapshots in args.opponent_pool_dir.
+        # Resuming from a post-policy/value-pretrain checkpoint: no RL games
+        # have happened yet, so start the opponent pool fresh and ignore any
+        # pre-existing snapshots in args.opponent_pool_dir.
         opponent_pool = OpponentPool()
     else:
         opponent_pool = _restore_opponent_pool(checkpoint_cpu, args.opponent_pool_dir)
@@ -1866,232 +1851,111 @@ def run_mlm_pretrain(
     text_backend: TextTrainingBackend,
     device: torch.device,
 ) -> None:
-    """Pretrain the text encoder trunk with a masked language model objective.
+    """Pretrain the text policy/value heads on extracted Forge choices.
 
-    Reads ``*.bin`` files of raw uint16 tokens from ``args.pretrain_mlm_dir``,
-    samples random fixed-length spans, masks 15% of non-special tokens and
-    trains the encoder via tied-embedding cross-entropy. The encoder lives
-    inside ``text_backend.policy`` (TextActorCritic.policy.text_policy.encoder),
-    so the resulting checkpoint slots straight into a ``--checkpoint``-resumed
-    RL run with the same ``--text-*`` hyperparameters.
+    ``--pretrain-mlm-dir`` now points at the JSONL/JSONL.GZ artifact produced
+    by ``scripts/extract_forge_choice_situations.py``. The historical flag name
+    is kept so checkpoint and launch scripts do not need a second pretrain
+    phase; the objective is no longer MLM. Each row reconstructs conservative
+    inline blanks for the observed choice and trains both the taken-action
+    policy target and a runtime-selected value target derived from the game
+    result.
     """
 
     tokenizer = text_backend.tokenizer
-    encoder = text_backend.policy.policy.text_policy.encoder
-
+    text_policy = text_backend.policy.policy
     pad_id = int(tokenizer.pad_token_id)
-    mask_token_id = tokenizer.mask_token_id
-    if mask_token_id is None:
-        raise ValueError("tokenizer must define mask_token_id for MLM pretraining")
-    bos_id = tokenizer.convert_tokens_to_ids("<bos>")
-    eos_id = tokenizer.convert_tokens_to_ids("<eos>")
-    custom_pad_id = tokenizer.convert_tokens_to_ids("<pad>")
-    special_ids = tuple(
-        s for s in (pad_id, custom_pad_id, mask_token_id, bos_id, eos_id) if s is not None
-    )
 
-    seq_len = args.pretrain_mlm_seq_len
-    if seq_len > args.text_max_tokens:
+    cfg = ForgePolicyValueConfig(
+        data_path=args.pretrain_mlm_dir,
+        batch_size=args.pretrain_mlm_batch_size,
+        eval_fraction=args.pretrain_mlm_eval_fraction,
+        gamma=args.gamma,
+        value_target_mode=args.pretrain_mlm_value_target,
+        value_loss_weight=args.pretrain_mlm_value_loss_weight,
+        policy_loss_weight=args.pretrain_mlm_policy_loss_weight,
+        pad_token_id=pad_id,
+    )
+    train_ds = ForgeChoiceDataset(
+        cfg,
+        tokenizer=tokenizer,
+        oracle=text_backend.oracle,
+        split="train",
+    )
+    eval_ds: ForgeChoiceDataset | None = None
+    if cfg.eval_fraction > 0:
+        try:
+            eval_ds = ForgeChoiceDataset(
+                cfg,
+                tokenizer=tokenizer,
+                oracle=text_backend.oracle,
+                split="eval",
+            )
+        except ValueError:
+            eval_ds = None
+
+    batches = batches_per_epoch(train_ds.n_examples, cfg.batch_size)
+    print(
+        "[policy-value] "
+        f"examples={train_ds.n_examples} batches/epoch={batches} "
+        f"epochs={args.pretrain_mlm_epochs} kinds={train_ds.kind_counts()} "
+        f"value_target={cfg.value_target_mode}"
+    )
+    if batches == 0:
         raise ValueError(
-            f"--pretrain-mlm-seq-len ({seq_len}) must be <= --text-max-tokens "
-            f"({args.text_max_tokens})"
+            f"Forge choice corpus has {train_ds.n_examples} examples; "
+            f"need at least batch_size={cfg.batch_size}"
+        )
+    if eval_ds is not None:
+        print(
+            f"[policy-value] eval_examples={eval_ds.n_examples} eval_kinds={eval_ds.kind_counts()}"
         )
 
-    cfg = MLMConfig(
-        data_dir=args.pretrain_mlm_dir,
-        seq_len=seq_len,
-        batch_size=args.pretrain_mlm_batch_size,
-        mask_prob=args.pretrain_mlm_mask_prob,
-        mask_token_id=int(mask_token_id),
-        pad_token_id=pad_id,
-        vocab_size=len(tokenizer),
-        special_token_ids=special_ids,
-    )
-    dataset = BinTokenDataset(cfg.data_dir, seq_len=cfg.seq_len)
     if args.torch_compile:
-        # Cached on disk via TORCHINDUCTOR_CACHE_DIR (see magic_ai.__init__).
-        # ``dynamic=True`` lets the dataset's variable-length spans share a
-        # single compiled graph instead of recompiling per shape.
-        _compiled_forward: Any = torch.compile(encoder.forward, dynamic=True)
-        object.__setattr__(encoder, "forward", _compiled_forward)
-    trainer = MLMTrainer(
-        encoder=encoder,
-        cfg=cfg,
+        _compiled_forward: Any = torch.compile(text_policy.forward, dynamic=True)
+        object.__setattr__(text_policy, "forward", _compiled_forward)
+
+    trainer = ForgePolicyValueTrainer(
+        text_policy,
+        cfg,
         lr=args.pretrain_mlm_lr,
         grad_clip=args.pretrain_mlm_grad_clip,
-        encoder_cfg=encoder.cfg,
     )
-    if trainer.hf_head_initialized:
-        print("[mlm] LM head warm-initialized from HF checkpoint")
-
     np_rng = np.random.default_rng(args.seed)
-    torch_rng = torch.Generator(device=device)
-    torch_rng.manual_seed(args.seed)
-
-    spans = dataset.spans_per_epoch()
-    batches_per_epoch = spans // cfg.batch_size
-    print(
-        f"[mlm] corpus tokens={dataset.total_tokens} spans={spans} "
-        f"batches/epoch={batches_per_epoch} epochs={args.pretrain_mlm_epochs}"
-    )
-    if batches_per_epoch == 0:
-        raise ValueError(
-            f"corpus has only {spans} non-overlapping spans of length "
-            f"{cfg.seq_len}; need at least batch_size={cfg.batch_size}"
-        )
+    eval_rng = np.random.default_rng(args.seed + 1)
 
     log_every = max(1, args.pretrain_mlm_log_every)
+    eval_every = max(0, args.pretrain_mlm_eval_every)
     use_amp = bool(args.pretrain_mlm_amp) and device.type == "cuda"
     if use_amp:
         amp_ctx: Any = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     else:
         amp_ctx = contextlib.nullcontext()
     if not args.no_wandb and wandb.run is not None:
-        wandb.define_metric("pretrain_mlm/step")
-        wandb.define_metric("pretrain_mlm/*", step_metric="pretrain_mlm/step")
+        wandb.define_metric("pretrain_policy_value/step")
+        wandb.define_metric("pretrain_policy_value/*", step_metric="pretrain_policy_value/step")
     global_step = 0
     for epoch in range(args.pretrain_mlm_epochs):
-        for batch_np in dataset.iter_epoch(cfg.batch_size, np_rng):
-            token_ids = torch.from_numpy(batch_np).to(device=device, dtype=torch.long)
-            with amp_ctx:
-                stats = trainer.step(token_ids, torch_rng)
-            if global_step % log_every == 0:
-                print(
-                    f"[mlm] epoch={epoch} step={global_step:6d} loss={stats['loss']:.4f} "
-                    f"ppl={stats['perplexity']:.2f} acc={stats['accuracy']:.3f} "
-                    f"grad_norm={stats['grad_norm']:.3f} n_masked={int(stats['n_masked'])}"
-                )
-                if not args.no_wandb and wandb.run is not None:
-                    wandb.log(
-                        {
-                            **{f"pretrain_mlm/{k}": v for k, v in stats.items()},
-                            "pretrain_mlm/step": global_step,
-                        }
-                    )
-            global_step += 1
-    print(f"[mlm] finished epochs={args.pretrain_mlm_epochs} steps={global_step}")
-
-
-def run_value_pretrain(
-    args: argparse.Namespace,
-    text_backend: TextTrainingBackend,
-    device: torch.device,
-) -> None:
-    """Pretrain the encoder + value head against terminal win/loss outcomes.
-
-    Stage 3a of ``docs/text_encoder_value_pretrain_plan.md``. Reads paired
-    ``*.bin`` (uint16 token spans, ``<bos>``-delimited) + ``*.json``
-    (perspective-signed labels per span) from ``args.pretrain_value_dir``,
-    runs the encoder forward over each span and minimises MSE between
-    ``value_head(hidden[:, 0, :])`` and the label. The encoder + value head
-    parameters trained here are the same ``nn.Module`` instances used in
-    RL, so a checkpoint slots straight into a ``--checkpoint``-resumed RL
-    run with the same ``--text-*`` hyperparameters.
-    """
-
-    tokenizer = text_backend.tokenizer
-    text_policy = text_backend.policy.policy.text_policy
-    encoder = text_policy.encoder
-    value_head = text_policy.value_head
-
-    pad_id = int(tokenizer.pad_token_id)
-    seq_len = args.pretrain_value_seq_len
-    if seq_len > args.text_max_tokens:
-        raise ValueError(
-            f"--pretrain-value-seq-len ({seq_len}) must be <= --text-max-tokens "
-            f"({args.text_max_tokens})"
-        )
-
-    cfg = ValuePretrainConfig(
-        data_dir=args.pretrain_value_dir,
-        seq_len=seq_len,
-        batch_size=args.pretrain_value_batch_size,
-        pad_token_id=pad_id,
-        eval_fraction=args.pretrain_value_eval_fraction,
-        gamma=args.gamma,
-    )
-    train_ds = ValueLabeledBinDataset(
-        cfg.data_dir,
-        seq_len=cfg.seq_len,
-        pad_token_id=cfg.pad_token_id,
-        split="train",
-        eval_fraction=cfg.eval_fraction,
-        gamma=cfg.gamma,
-    )
-    eval_ds: ValueLabeledBinDataset | None = None
-    if cfg.eval_fraction > 0:
-        try:
-            eval_ds = ValueLabeledBinDataset(
-                cfg.data_dir,
-                seq_len=cfg.seq_len,
-                pad_token_id=cfg.pad_token_id,
-                split="eval",
-                eval_fraction=cfg.eval_fraction,
-                gamma=cfg.gamma,
-            )
-        except ValueError:
-            # Corpus too small for the requested eval split; train-only is fine.
-            eval_ds = None
-
-    counts = train_ds.label_counts()
-    total = sum(counts.values()) or 1
-    print(
-        f"[value] train_games={train_ds.n_games} train_spans={train_ds.n_spans} "
-        f"wins={counts['wins']} losses={counts['losses']} draws={counts['draws']} "
-        f"(draw_frac={counts['draws'] / total:.2%})"
-    )
-    if eval_ds is not None:
-        ec = eval_ds.label_counts()
-        print(
-            f"[value] eval_games={eval_ds.n_games} eval_spans={eval_ds.n_spans} "
-            f"wins={ec['wins']} losses={ec['losses']} draws={ec['draws']}"
-        )
-
-    if args.torch_compile:
-        _compiled_forward: Any = torch.compile(encoder.forward, dynamic=True)
-        object.__setattr__(encoder, "forward", _compiled_forward)
-
-    trainer = ValuePretrainTrainer(
-        encoder=encoder,
-        value_head=value_head,
-        cfg=cfg,
-        lr=args.pretrain_value_lr,
-        grad_clip=args.pretrain_value_grad_clip,
-    )
-
-    np_rng = np.random.default_rng(args.seed)
-    eval_rng = np.random.default_rng(args.seed + 1)
-
-    log_every = max(1, args.pretrain_value_log_every)
-    eval_every = max(0, args.pretrain_value_eval_every)
-    use_amp = bool(args.pretrain_value_amp) and device.type == "cuda"
-    if use_amp:
-        amp_ctx: Any = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    else:
-        amp_ctx = contextlib.nullcontext()
-    if not args.no_wandb and wandb.run is not None:
-        wandb.define_metric("pretrain_value/step")
-        wandb.define_metric("pretrain_value/*", step_metric="pretrain_value/step")
-    global_step = 0
-    for epoch in range(args.pretrain_value_epochs):
-        for tokens_np, labels_np in train_ds.iter_epoch(cfg.batch_size, np_rng):
-            token_ids = torch.from_numpy(tokens_np).to(device=device, dtype=torch.long)
-            labels = torch.from_numpy(labels_np).to(device=device, dtype=torch.float32)
+        for host_batch in train_ds.iter_epoch(cfg.batch_size, np_rng):
+            batch = _batch_to_device(host_batch, device)
             log_now = global_step % log_every == 0
             with amp_ctx:
-                stats = trainer.step(token_ids, labels, compute_stats=log_now)
+                stats = trainer.step(batch, compute_stats=log_now)
             if log_now:
                 print(
-                    f"[value] epoch={epoch} step={global_step:6d} loss={stats['loss']:.4f} "
-                    f"sign_acc={stats['sign_accuracy']:.3f} "
-                    f"pred_abs={stats['pred_abs_mean']:.3f} "
+                    f"[policy-value] epoch={epoch} step={global_step:6d} "
+                    f"loss={stats['loss']:.4f} policy={stats['policy_loss']:.4f} "
+                    f"value={stats['value_loss']:.4f} "
+                    f"pri_acc={stats['priority_accuracy']:.3f} "
+                    f"blank_acc={stats['per_blank_accuracy']:.3f} "
+                    f"value_sign={stats['value_sign_accuracy']:.3f} "
                     f"grad_norm={stats['grad_norm']:.3f}"
                 )
                 if not args.no_wandb and wandb.run is not None:
                     wandb.log(
                         {
-                            **{f"pretrain_value/{k}": v for k, v in stats.items()},
-                            "pretrain_value/step": global_step,
+                            **{f"pretrain_policy_value/{k}": v for k, v in stats.items()},
+                            "pretrain_policy_value/step": global_step,
                         }
                     )
             if (
@@ -2101,21 +1965,26 @@ def run_value_pretrain(
                 and global_step % eval_every == 0
             ):
                 with amp_ctx:
-                    eval_stats = trainer.evaluate(eval_ds, eval_rng)
+                    eval_stats = trainer.evaluate(
+                        eval_ds,
+                        eval_rng,
+                        device=device,
+                    )
                 print(
-                    f"[value] eval step={global_step} loss={eval_stats['eval_loss']:.4f} "
-                    f"sign_acc={eval_stats['eval_sign_accuracy']:.3f} "
-                    f"n={int(eval_stats['eval_n'])}"
+                    f"[policy-value] eval step={global_step} "
+                    f"policy={eval_stats.get('eval_policy_loss', 0.0):.4f} "
+                    f"value={eval_stats.get('eval_value_loss', 0.0):.4f} "
+                    f"batches={int(eval_stats['eval_batches'])}"
                 )
                 if not args.no_wandb and wandb.run is not None:
                     wandb.log(
                         {
-                            **{f"pretrain_value/{k}": v for k, v in eval_stats.items()},
-                            "pretrain_value/step": global_step,
+                            **{f"pretrain_policy_value/{k}": v for k, v in eval_stats.items()},
+                            "pretrain_policy_value/step": global_step,
                         }
                     )
             global_step += 1
-    print(f"[value] finished epochs={args.pretrain_value_epochs} steps={global_step}")
+    print(f"[policy-value] finished epochs={args.pretrain_mlm_epochs} steps={global_step}")
 
 
 def main() -> None:
@@ -2198,39 +2067,24 @@ def main() -> None:
             optimizer.load_state_dict(checkpoint["optimizer"])
 
     resumed_post_mlm = _is_post_mlm_checkpoint(checkpoint_cpu)
-    resumed_post_value = _is_post_value_checkpoint(checkpoint_cpu)
     resumed_policy_checkpoint = _checkpoint_has_policy(checkpoint_cpu)
-    if resumed_post_value:
+    if resumed_post_mlm:
         print(
-            "[value] resuming from post-value-pretrain checkpoint "
-            f"{args.checkpoint}: skipping MLM and value pretraining, opponent pool starts empty"
+            "[policy-value] resuming from post-policy/value-pretrain checkpoint "
+            f"{args.checkpoint}: skipping pretraining, opponent pool starts empty"
         )
-    elif resumed_post_mlm:
+    elif resumed_policy_checkpoint and getattr(args, "pretrain_mlm_dir", None) is not None:
         print(
-            "[mlm] resuming from post-MLM checkpoint "
-            f"{args.checkpoint}: skipping MLM pretraining, opponent pool starts empty"
-        )
-    elif resumed_policy_checkpoint and (
-        getattr(args, "pretrain_mlm_dir", None) is not None
-        or getattr(args, "pretrain_value_dir", None) is not None
-    ):
-        print(
-            "[resume] checkpoint contains saved policy weights: skipping MLM and value pretraining"
+            "[resume] checkpoint contains saved policy weights: skipping policy/value pretraining"
         )
     run_mlm_now = _should_run_mlm_pretrain(args, checkpoint_cpu)
     if run_mlm_now:
         if encoder_kind != "text" or text_backend is None:
             raise ValueError("--pretrain-mlm-dir requires --encoder text")
         run_mlm_pretrain(args, text_backend, device)
-    run_value_now = _should_run_value_pretrain(args, checkpoint_cpu)
-    if run_value_now:
-        if encoder_kind != "text" or text_backend is None:
-            raise ValueError("--pretrain-value-dir requires --encoder text")
-        run_value_pretrain(args, text_backend, device)
-    if run_mlm_now or run_value_now or resumed_post_mlm or resumed_post_value:
-        # Reset optimizer state: MLM used a separate AdamW; the RL optimizer
-        # tracks the still-randomly-initialized policy heads alongside the
-        # pretrained encoder, so its moments must start fresh.
+    if run_mlm_now or resumed_post_mlm:
+        # Reset optimizer state: pretraining used a separate AdamW, so RL
+        # moments must start fresh.
         if args.trainer == "rnad":
             optimizer = torch.optim.Adam(
                 policy.parameters(),
@@ -2256,32 +2110,13 @@ def main() -> None:
                 post_mlm=True,
             )
             print(
-                f"[mlm] saved post-MLM checkpoint -> {args.post_mlm_checkpoint} "
+                f"[policy-value] saved post-pretrain checkpoint -> {args.post_mlm_checkpoint} "
                 f"(resume RL with --checkpoint {args.post_mlm_checkpoint})"
-            )
-        if run_value_now and getattr(args, "post_value_checkpoint", None) is not None:
-            save_checkpoint(
-                args.post_value_checkpoint,
-                policy,
-                optimizer,
-                args,
-                opponent_pool=None,
-                snapshot_schedule=None,
-                retrospective_schedule=None,
-                resume_state=None,
-                wandb_run_id=active_wandb_run_id,
-                run_artifact_dir=run_artifact_dir,
-                rnad_state=None,
-                post_value=True,
-            )
-            print(
-                f"[value] saved post-value-pretrain checkpoint -> {args.post_value_checkpoint} "
-                f"(resume RL with --checkpoint {args.post_value_checkpoint})"
             )
         # Linear LR warmup over the first N RL updates to absorb the
         # pretrained-encoder × random-RL-heads mismatch. AdamW's first step
         # bias correction would otherwise land a sign-of-grad sized step that
-        # saturates the LSTM/projections post-MLM.
+        # saturates the LSTM/projections after supervised pretraining.
         attach_rl_lr_warmup(optimizer, args.learning_rate, args.rl_warmup_updates)
 
     mage = importlib.import_module("mage")
@@ -2604,16 +2439,15 @@ def parse_args() -> argparse.Namespace:
         "--pretrain-mlm-dir",
         type=Path,
         default=None,
-        help="if set, run masked-LM pretraining of the text encoder over a "
-        "directory of *.bin files (raw uint16 tokens delimited by <bos>/<eos>) "
-        "before starting RL training. Requires --encoder text.",
+        help="if set, run joint policy/value pretraining over the Forge choice "
+        "JSONL/JSONL.GZ artifact produced by scripts/extract_forge_choice_situations.py "
+        "before starting RL training. Historical flag name retained. Requires --encoder text.",
     )
     parser.add_argument(
         "--pretrain-mlm-epochs",
         type=int,
         default=1,
-        help="number of full passes over the corpus (one pass = each "
-        "non-overlapping seq_len-length span seen exactly once)",
+        help="number of full passes over the Forge choice corpus",
     )
     parser.add_argument(
         "--rl-warmup-updates",
@@ -2628,66 +2462,42 @@ def parse_args() -> argparse.Namespace:
         "--post-mlm-checkpoint",
         type=Path,
         default=None,
-        help="if set, after MLM pretraining completes, save a checkpoint with "
-        "post-MLM weights (and a `post_mlm` metadata flag) to this path before "
-        "starting RL. Pass this path back as --checkpoint to skip MLM and "
-        "start RL from the pretrained encoder; opponent pool will start empty.",
+        help="if set, after policy/value pretraining completes, save a checkpoint with "
+        "post-pretrain weights (and a `post_mlm` metadata flag) to this path before "
+        "starting RL. Pass this path back as --checkpoint to skip pretraining; "
+        "opponent pool will start empty.",
     )
     parser.add_argument("--pretrain-mlm-batch-size", type=int, default=64)
-    parser.add_argument("--pretrain-mlm-seq-len", type=int, default=512)
-    parser.add_argument("--pretrain-mlm-mask-prob", type=float, default=0.15)
     parser.add_argument("--pretrain-mlm-lr", type=float, default=2e-4)
     parser.add_argument("--pretrain-mlm-grad-clip", type=float, default=1.0)
     parser.add_argument("--pretrain-mlm-log-every", type=int, default=50)
     parser.add_argument(
-        "--pretrain-mlm-amp",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="run the MLM forward+backward under torch.autocast(bf16) on CUDA. No-op on CPU.",
-    )
-    parser.add_argument(
-        "--pretrain-value-dir",
-        type=Path,
-        default=None,
-        help="if set, after MLM (or instead of MLM if --pretrain-mlm-dir is unset) "
-        "run supervised value-head pretraining over a directory of paired "
-        "*.bin (uint16 tokens, <bos>-delimited spans) + *.json (per-span "
-        "perspective-signed terminal-outcome labels) produced by "
-        "scripts/jsonl_games_to_value_bin.py. Requires --encoder text.",
-    )
-    parser.add_argument(
-        "--post-value-checkpoint",
-        type=Path,
-        default=None,
-        help="if set, after value-head pretraining completes, save a checkpoint "
-        "with post-value weights (and a `post_value` metadata flag) to this path "
-        "before starting RL. Pass this path back as --checkpoint to skip both "
-        "pretraining phases; opponent pool will start empty.",
-    )
-    parser.add_argument("--pretrain-value-epochs", type=int, default=1)
-    parser.add_argument("--pretrain-value-batch-size", type=int, default=128)
-    parser.add_argument("--pretrain-value-seq-len", type=int, default=512)
-    parser.add_argument("--pretrain-value-lr", type=float, default=1e-4)
-    parser.add_argument("--pretrain-value-grad-clip", type=float, default=1.0)
-    parser.add_argument("--pretrain-value-log-every", type=int, default=50)
-    parser.add_argument(
-        "--pretrain-value-eval-every",
+        "--pretrain-mlm-eval-every",
         type=int,
         default=500,
         help="run evaluation on the held-out shard every N training steps (0 disables)",
     )
     parser.add_argument(
-        "--pretrain-value-eval-fraction",
+        "--pretrain-mlm-eval-fraction",
         type=float,
         default=0.05,
         help="fraction of games to hold out for evaluation (deterministic via "
         "hash(game_id) %% bucket); 0 disables the eval split",
     )
     parser.add_argument(
-        "--pretrain-value-amp",
+        "--pretrain-mlm-value-target",
+        choices=("terminal", "gae", "vtrace"),
+        default="terminal",
+        help="runtime value target semantics for Forge outcomes; with one extracted "
+        "choice per game, gae/vtrace use a discounted terminal sign proxy.",
+    )
+    parser.add_argument("--pretrain-mlm-value-loss-weight", type=float, default=1.0)
+    parser.add_argument("--pretrain-mlm-policy-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--pretrain-mlm-amp",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="run the value-pretrain forward+backward under torch.autocast(bf16) on CUDA.",
+        help="run policy/value pretraining under torch.autocast(bf16) on CUDA. No-op on CPU.",
     )
     parser.add_argument(
         "--native-text-rollout",
@@ -6602,7 +6412,6 @@ def save_checkpoint(
     run_artifact_dir: Path | None = None,
     rnad_state: RNaDTrainerState | None = None,
     post_mlm: bool = False,
-    post_value: bool = False,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     effective_run_artifact_dir = run_artifact_dir or args.opponent_pool_dir.parent
@@ -6642,8 +6451,6 @@ def save_checkpoint(
     }
     if post_mlm:
         metadata["post_mlm"] = True
-    if post_value:
-        metadata["post_value"] = True
     if getattr(args, "encoder", "slots") == "text":
         cache_path = Path(getattr(args, "card_token_cache", ""))
         actual_text_cfg = getattr(
