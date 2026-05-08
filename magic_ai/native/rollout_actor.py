@@ -119,6 +119,7 @@ class TextRolloutActor:
     rollout_driver: NativeRolloutDriver
     inference_server: TextInferenceServer
     staging_buffer: Any
+    replay_buffer: Any | None
     encode_cfg: ActorEncodeConfig
     runtime_cfg: ActorRuntimeConfig
     finished_queue: Queue[FinishedEnv]
@@ -339,7 +340,17 @@ class TextRolloutActor:
         reply = batch.future.result()
         self._record_timing("actor_wait_inference", batch.submitted_at)
         try:
-            if reply.replay_rows is None:
+            if reply.replay_rows is None and self.replay_buffer is not None:
+                start = time.perf_counter()
+                if reply.replay_payload is None:
+                    raise RuntimeError("text inference reply missing replay payload")
+                rows = self.replay_buffer.append_native_payload(
+                    reply.replay_payload,
+                    ready_event=getattr(reply, "ready_event", None),
+                )
+                reply.replay_rows = [int(row) for row in rows.detach().cpu().tolist()]
+                self._record_timing("actor_append_replay", start)
+            elif reply.replay_rows is None:
                 start = time.perf_counter()
                 self.staging_buffer.stage_batch(
                     batch.ready_env_indices,

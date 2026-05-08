@@ -1265,6 +1265,41 @@ class TextReplayBuffer:
         self._seal_reservation(reservation)
         return rows
 
+    def append_native_payload(self, payload: Any, ready_event: Any | None = None) -> Tensor:
+        """Append a sampled native text replay payload directly into replay.
+
+        Native rollout inference returns a ``NativeTextReplayPayload`` whose
+        tensors already match the packed replay schema. Keeping this as a
+        replay-buffer method gives actor/scheduler code one durable append
+        path without routing through the old per-env padded staging buffer.
+        """
+
+        if ready_event is not None and self.device.type == "cuda":
+            torch.cuda.current_stream(self.device).wait_event(ready_event)
+        rows = self.append_batch(
+            encoded=payload.encoded,
+            trace_kind_id=payload.trace_kind_id,
+            decision_count=payload.decision_count,
+            decision_count_host=payload.decision_count_host,
+            total_decision_groups=payload.total_decision_groups,
+            total_stored_decision_groups=payload.total_stored_decision_groups,
+            decision_option_idx=payload.decision_option_idx,
+            decision_target_idx=payload.decision_target_idx,
+            decision_mask=payload.decision_mask,
+            uses_none_head=payload.uses_none_head,
+            selected_indices=payload.selected_indices,
+            behavior_action_log_prob=payload.behavior_action_log_prob,
+            may_selected=payload.may_selected,
+            old_log_prob=payload.old_log_prob,
+            value=payload.value,
+            perspective_player_idx=payload.perspective_player_idx,
+            lstm_h_in=payload.lstm_h_in,
+            lstm_c_in=payload.lstm_c_in,
+        )
+        if self.projected_state is not None and payload.projected_state is not None:
+            self.write_projected_state(rows, payload.projected_state)
+        return rows
+
     def append_staged_batch(
         self,
         *,

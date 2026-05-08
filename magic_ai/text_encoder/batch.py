@@ -101,6 +101,12 @@ class TextEncodedBatch:
         default_factory=lambda: torch.zeros((0, 0, 0), dtype=torch.bool)
     )
 
+    def __post_init__(self) -> None:
+        if self.seq_lengths_host is None and self.seq_lengths.device.type == "cpu":
+            self.seq_lengths_host = tuple(int(x) for x in self.seq_lengths.tolist())
+        if self.total_tokens is None and self.seq_lengths_host is not None:
+            self.total_tokens = sum(self.seq_lengths_host)
+
 
 @dataclass
 class PackedTextBatch:

@@ -1095,9 +1095,15 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             d_ff=args.text_d_ff,
             max_seq_len=args.text_max_tokens,
         )
-    chosen_tid = tokenizer.convert_tokens_to_ids("<chosen>")
-    if isinstance(chosen_tid, list):
-        raise TypeError("convert_tokens_to_ids('<chosen>') returned a list")
+    if hasattr(tokenizer, "convert_tokens_to_ids"):
+        chosen_tid = tokenizer.convert_tokens_to_ids("<chosen>")
+        if isinstance(chosen_tid, list):
+            raise TypeError("convert_tokens_to_ids('<chosen>') returned a list")
+    else:
+        try:
+            chosen_tid = cast(int, _render_token_ids(tokenizer)["chosen"])
+        except AttributeError:
+            chosen_tid = int(pad_id)
     recurrent_cfg = RecurrentTextPolicyConfig(
         encoder=cfg,
         lstm_hidden=cfg.d_model,
@@ -4602,7 +4608,12 @@ def train_text_native_batched_envs(
                         ),
                     )
                 )
-                if needs_staging_commit and needs_staged_seal and n_new > 0:
+                if (
+                    needs_staging_commit
+                    and needs_staged_seal
+                    and n_new > 0
+                    and hasattr(backend.replay_buffer, "seal_staged_rows")
+                ):
                     backend.replay_buffer.seal_staged_rows(flat_rows)
                 with pending_step_count_lock:
                     pending_step_count += n_new
@@ -5109,6 +5120,7 @@ def train_text_native_batched_envs(
                 rollout_driver=drivers_pool[actor_id],
                 inference_server=server,
                 staging_buffer=staging_buffer,
+                replay_buffer=backend.replay_buffer,
                 encode_cfg=encode_cfg,
                 runtime_cfg=runtime_cfg,
                 finished_queue=finished_q,
@@ -5188,6 +5200,7 @@ def train_text_native_batched_envs(
                 "actor_pack",
                 "actor_submit",
                 "actor_wait_inference",
+                "actor_append_replay",
                 "actor_stage",
                 "actor_record",
                 "actor_step",
@@ -5852,7 +5865,15 @@ def train_text_native_batched_envs(
                 )
             if policy_batch.replay_payload is None:
                 raise RuntimeError("native text rollout expected a replay payload")
-            staging_buffer.stage_batch(ready_env_indices, policy_batch.replay_payload)
+            replay_rows_h: list[int | None] = []
+            if hasattr(backend.replay_buffer, "append_native_payload"):
+                replay_rows_t = backend.replay_buffer.append_native_payload(
+                    policy_batch.replay_payload
+                )
+                replay_rows_h = [int(row) for row in replay_rows_t.detach().cpu().tolist()]
+            else:
+                staging_buffer.stage_batch(ready_env_indices, policy_batch.replay_payload)
+                replay_rows_h = [None for _ in ready_envs]
             counts = policy_batch.decision_counts
             starts: list[int] = list(itertools.accumulate(counts, initial=0))[:-1]
             selected_cols = policy_batch.selected_choice_cols
@@ -5902,7 +5923,7 @@ def train_text_native_batched_envs(
                         perspective_player_idx=int(player_idx),
                         old_log_prob=float(log_probs_cpu[step_idx]),
                         value=float(values_cpu[step_idx]),
-                        replay_idx=None,
+                        replay_idx=replay_rows_h[step_idx],
                     )
                 )
             native_rollout.step_by_choice(
