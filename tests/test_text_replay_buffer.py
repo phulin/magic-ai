@@ -981,6 +981,61 @@ class TextReplayBufferTests(unittest.TestCase):
         torch.testing.assert_close(window.rows.cpu(), rows.cpu())
         buffer.release_train_window(window)
 
+    def test_pending_ready_event_blocks_train_window_claim(self) -> None:
+        class FakeReadyEvent:
+            def __init__(self) -> None:
+                self.ready = False
+
+            def query(self) -> bool:
+                return self.ready
+
+        buffer = TextReplayBuffer(
+            capacity=2,
+            max_tokens=2,
+            max_options=2,
+            max_targets_per_option=1,
+            max_decision_groups=1,
+            max_cached_choices=2,
+            use_triton_gather=False,
+        )
+        rows = buffer.append_batch(
+            encoded=pack_batch(
+                TextEncodedBatch(
+                    token_ids=torch.tensor([[101, 0]]),
+                    attention_mask=torch.tensor([[1, 0]]),
+                    card_ref_positions=torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long),
+                    seq_lengths=torch.tensor([1]),
+                )
+            ),
+            trace_kind_id=torch.tensor([1]),
+            decision_count=torch.tensor([1]),
+            decision_option_idx=torch.tensor([[0, -1]]),
+            decision_target_idx=torch.tensor([[-1, -1]]),
+            decision_mask=torch.tensor([[True, False]]),
+            uses_none_head=torch.tensor([False]),
+            selected_indices=torch.tensor([0]),
+            may_selected=torch.tensor([0.0]),
+            old_log_prob=torch.tensor([-0.1]),
+            value=torch.tensor([0.0]),
+            perspective_player_idx=torch.tensor([0]),
+        )
+        buffer.write_episode_metadata(
+            rows,
+            episode_id=11,
+            terminal_reward_p0=0.0,
+            zero_sum=True,
+        )
+        event = FakeReadyEvent()
+        buffer._row_ready_events[int(rows[0])] = event
+
+        self.assertIsNone(buffer.claim_train_window(min_rows=1, max_rows=1, allow_partial=True))
+        event.ready = True
+        window = buffer.claim_train_window(min_rows=1, max_rows=1, allow_partial=True)
+        self.assertIsNotNone(window)
+        assert window is not None
+        torch.testing.assert_close(window.rows.cpu(), rows.cpu())
+        buffer.release_train_window(window)
+
     @unittest.skipUnless(
         torch.cuda.is_available() and TRITON_AVAILABLE,
         "requires CUDA and Triton",

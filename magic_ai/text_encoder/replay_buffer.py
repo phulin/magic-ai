@@ -404,20 +404,19 @@ class TextReplayBuffer:
         with self._reserve_lock:
             if not self._committed_windows:
                 return None
-            row_start, completed_limit = self._completed_window_prefix_locked()
-            available = int(completed_limit - row_start)
+            row_start, claimable_limit = self._claimable_window_prefix_locked()
+            available = int(claimable_limit - row_start)
             if available < int(min_rows):
                 return None
             if not allow_partial and available < target:
                 return None
             row_end = row_start + min(available, int(max_rows))
-            ready_events = self._ready_events_for_rows_locked(row_start, row_end)
             self._consume_committed_prefix_locked(row_end)
         return TextReplayTrainWindow(
             row_start=row_start,
             row_end=row_end,
             rows=torch.arange(row_start, row_end, dtype=torch.long, device=self.device),
-            ready_events=ready_events,
+            ready_events=(),
         )
 
     def wait_for_train_window(
@@ -512,14 +511,17 @@ class TextReplayBuffer:
             committed_start = -1
             committed_limit = -1
             completed_limit = -1
+            claimable_limit = -1
             if self._committed_windows:
                 committed_start, committed_limit = self._committed_windows[0]
                 _row_start, completed_limit = self._completed_window_prefix_locked()
+                _row_start, claimable_limit = self._claimable_window_prefix_locked()
             return {
                 "committed_windows": len(self._committed_windows),
                 "committed_start": int(committed_start),
                 "committed_limit": int(committed_limit),
                 "completed_limit": int(completed_limit),
+                "claimable_limit": int(claimable_limit),
                 "row_ring_start": int(self._row_ring_start),
                 "row_ring_used": int(self._row_ring_used),
                 "token_ring_used": int(self._token_ring_used),
@@ -841,6 +843,27 @@ class TextReplayBuffer:
             row += 1
         return row
 
+    @staticmethod
+    def _ready_event_complete(event: Any | None) -> bool:
+        if event is None:
+            return True
+        query = getattr(event, "query", None)
+        if query is None:
+            return True
+        return bool(query())
+
+    def _claimable_prefix_end_locked(self, row_start: int, row_limit: int) -> int:
+        row = int(row_start)
+        limit = int(row_limit)
+        while row < limit:
+            row_slot = row % self.capacity
+            if not self._row_complete_host[row_slot]:
+                break
+            if not self._ready_event_complete(self._row_ready_events[row_slot]):
+                break
+            row += 1
+        return row
+
     def _completed_window_prefix_locked(self) -> tuple[int, int]:
         if not self._committed_windows:
             return 0, 0
@@ -856,19 +879,20 @@ class TextReplayBuffer:
             idx += 1
         return int(row_start), int(completed_limit)
 
-    def _ready_events_for_rows_locked(self, row_start: int, row_end: int) -> tuple[Any, ...]:
-        events: list[Any] = []
-        seen: set[int] = set()
-        for row in range(int(row_start), int(row_end)):
-            event = self._row_ready_events[row % self.capacity]
-            if event is None:
-                continue
-            event_id = id(event)
-            if event_id in seen:
-                continue
-            seen.add(event_id)
-            events.append(event)
-        return tuple(events)
+    def _claimable_window_prefix_locked(self) -> tuple[int, int]:
+        if not self._committed_windows:
+            return 0, 0
+        row_start, row_limit = self._committed_windows[0]
+        claimable_limit = self._claimable_prefix_end_locked(row_start, row_limit)
+        idx = 1
+        while claimable_limit == row_limit and idx < len(self._committed_windows):
+            next_start, next_limit = self._committed_windows[idx]
+            if int(next_start) != int(claimable_limit):
+                break
+            row_limit = next_limit
+            claimable_limit = self._claimable_prefix_end_locked(next_start, next_limit)
+            idx += 1
+        return int(row_start), int(claimable_limit)
 
     def _consume_committed_prefix_locked(self, row_end: int) -> None:
         row_end = int(row_end)
