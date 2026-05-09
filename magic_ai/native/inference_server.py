@@ -2,10 +2,10 @@
 
 A single background thread owns the GPU policy: it drains encoded-batch
 requests submitted by N actor threads, dynamically batches them into one
-forward pass, calls ``TextActorCritic.sample_native_tensor_batch`` on the
-merged batch, and scatters per-request replay payload slices plus host-side
-scalars (decision counts, selected choices, may-bit, log-prob, value,
-trace-kind) back to the actors via per-request ``Future`` objects.
+forward pass, runs the policy's decoder forward on the merged batch, and
+scatters per-request replay payload slices plus host-side scalars
+(decision counts, selected tokens, log-prob, value, trace-kind) back to
+the actors via per-request ``Future`` objects.
 
 All concat / scatter operations are vectorized — no Python ``for`` loops over
 tensor rows. The server is the only thread that touches the policy's
@@ -314,9 +314,9 @@ def _slice_packed_text_batch(
     )
 
 
-# The protocol the server calls. Concretely this is
-# ``TextActorCritic.sample_native_tensor_batch`` but parameterizing keeps the
-# server testable against fakes.
+# The protocol the server calls. Concretely this is the decoder-pipeline
+# forward path on ``TextActorCritic`` but parameterizing keeps the server
+# testable against fakes.
 ForwardCallable = Any
 
 

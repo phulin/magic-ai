@@ -1,7 +1,7 @@
 """Tests for magic_ai.native.inference_server.
 
 These tests exercise the dynamic-batching inference server against a fake
-``sample_native_tensor_batch`` callable; we verify that:
+forward callable; we verify that:
 
 * requests from concurrent submitters are coalesced into one forward call
   when enough rows are queued,
