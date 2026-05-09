@@ -16,20 +16,17 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch._dynamo.decorators import mark_unbacked
 from torch.fx._symbolic_trace import is_fx_symbolic_tracing
 
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
+from magic_ai.text_encoder.decoder import GrammarDecoderConfig
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.policy import EncodedSnapshots, TextPolicy
-
-if TYPE_CHECKING:
-    from magic_ai.text_encoder.decoder import GrammarDecoderConfig
 
 
 @dataclass
@@ -38,8 +35,6 @@ class RecurrentTextPolicyConfig:
     lstm_hidden: int = 384  # match d_model by default
     lstm_layers: int = 1
     compile_forward: bool = True
-    chosen_token_id: int | None = None
-    use_grammar_decoder: bool = False
     grammar_decoder_cfg: GrammarDecoderConfig | None = None
 
 
@@ -49,7 +44,6 @@ class RecurrentTextPolicyOutput:
     state_hidden: Tensor  # [B, lstm_hidden]
     card_vectors: Tensor
     card_mask: Tensor
-    blank_logits: Tensor | None = None
     lstm_input: Tensor | None = None  # [B, lstm_hidden] in_proj(state_vector); None when bypassed
 
 
@@ -61,7 +55,6 @@ class RecurrentTextPolicy(nn.Module):
         self.cfg = cfg
         self.text_policy = TextPolicy(
             cfg.encoder,
-            use_grammar_decoder=cfg.use_grammar_decoder,
             decoder_cfg=cfg.grammar_decoder_cfg,
         )
 
@@ -163,10 +156,6 @@ class RecurrentTextPolicy(nn.Module):
                 torch.compile(self._forward_packed_impl, dynamic=True),
             )
         if self._compiled_forward_packed is not None and not is_fx_symbolic_tracing():
-            # V_max often arrives at 1 then jumps to 8+; mark unbacked to
-            # bypass Dynamo's 0/1 specialization recompile.
-            mark_unbacked(batch.blank_legal_ids, 2)
-            mark_unbacked(batch.blank_legal_mask, 2)
             return self._compiled_forward_packed(batch, h_in, c_in, state_hidden_override)
         return self._forward_packed_impl(batch, h_in, c_in, state_hidden_override)
 
@@ -230,7 +219,6 @@ class RecurrentTextPolicy(nn.Module):
             state_hidden=state_hidden,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,
-            blank_logits=encoded.blank_logits,
             lstm_input=lstm_input,
         )
         return out, (h_out, c_out)
@@ -262,7 +250,6 @@ class RecurrentTextPolicy(nn.Module):
             state_hidden=state_hidden,
             card_vectors=encoded.card_vectors,
             card_mask=encoded.card_mask,
-            blank_logits=encoded.blank_logits,
         )
 
 
