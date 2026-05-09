@@ -1876,6 +1876,7 @@ def run_mlm_pretrain(
         value_loss_weight=args.pretrain_mlm_value_loss_weight,
         policy_loss_weight=args.pretrain_mlm_policy_loss_weight,
         pad_token_id=pad_id,
+        decoder=bool(getattr(args, "pretrain_mlm_decoder", False)),
     )
     train_ds = ForgeChoiceDataset(
         cfg,
@@ -2495,6 +2496,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pretrain-mlm-value-loss-weight", type=float, default=1.0)
     parser.add_argument("--pretrain-mlm-policy-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--pretrain-mlm-decoder",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Train the autoregressive grammar decoder (decoder pipeline) "
+            "instead of the legacy inline-blank policy. Requires the policy "
+            "to be constructed with use_grammar_decoder=True."
+        ),
+    )
     parser.add_argument(
         "--pretrain-mlm-amp",
         action=argparse.BooleanOptionalAction,

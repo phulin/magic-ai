@@ -2,10 +2,30 @@
 
 Consumes the sharded torch or gzip JSONL artifact produced by
 ``scripts/extract_forge_choice_situations.py``. Each record stores a
-pre-choice snapshot, the action text Forge actually took, and the terminal
-outcome. This loader reconstructs a conservative inline-blank legal set from
-the visible state, maps the observed choice onto the corresponding blank
-target, and trains both the inline policy scorer and value head.
+pre-choice snapshot, the action text Forge actually took, and the
+terminal outcome.
+
+Two policy training modes are supported:
+
+* **Inline-blank** (default, ``ForgePolicyValueConfig.decoder=False``).
+  Reconstructs a conservative inline-blank legal set from the visible
+  state, maps the observed choice onto the corresponding blank target,
+  and trains :class:`InlineBlankPolicy` per
+  ``docs/text_encoder_inline_blanks_plan.md``.
+* **Decoder** (``ForgePolicyValueConfig.decoder=True``).
+  Renders the decision spec via :func:`render_decision_spec`, translates
+  the observed event into a flat decoder target sequence via
+  :mod:`magic_ai.text_encoder.forge_target_encoding`, and trains the
+  autoregressive grammar decoder with
+  :func:`decoder_cross_entropy_loss` (see
+  ``docs/decoder_grammar_plan.md`` step 10).
+
+The on-disk record schema is currently V1 (no persisted PendingState);
+the decoder loader synthesizes the pending state at load time using the
+same conservative reconstruction as the inline-blank path. A future
+extractor change will bump ``FORMAT_VERSION`` to 2 and persist the
+PendingState + DecoderTarget directly; the loader detects the version
+and skips synthesis when V2 records are available.
 """
 
 from __future__ import annotations
@@ -14,7 +34,7 @@ import gzip
 import hashlib
 import math
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -26,11 +46,28 @@ from torch import Tensor
 from transformers import PreTrainedTokenizerFast
 
 from magic_ai.game_state import GameStateSnapshot, PendingOptionState, PendingState
-from magic_ai.text_encoder.batch import TextEncodedBatch, collate, tokenize_snapshot
+from magic_ai.text_encoder.batch import (
+    TextEncodedBatch,
+    collate,
+    collate_with_specs,
+    tokenize_snapshot,
+)
+from magic_ai.text_encoder.decision_spec import AnchorKind, DecisionSpec, DecisionType
+from magic_ai.text_encoder.forge_target_encoding import (
+    DecoderTarget,
+    pending_decision_type,
+)
+from magic_ai.text_encoder.forge_target_encoding import (
+    translate as translate_observed_to_target,
+)
+from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE, batch_next_mask
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy
 from magic_ai.text_encoder.render import OracleEntry, RenderError, render_snapshot
+from magic_ai.text_encoder.render_spec import DecisionSpecRenderer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, MAX_NUM
 from magic_ai.text_encoder.training import (
+    decoder_cross_entropy_loss,
+    decoder_per_step_accuracy,
     inline_blank_per_blank_accuracy,
     inline_blank_per_blank_loss,
     inline_blank_priority_accuracy,
@@ -40,6 +77,17 @@ from magic_ai.text_encoder.training import (
 
 ChoiceKind = Literal["priority", "attack", "block", "may", "choose"]
 ValueTargetMode = Literal["terminal", "gae", "vtrace"]
+
+# Pending-kind dispatch for the decoder pipeline. Mirrors the keys the
+# extractor emits (`choice.kind`) onto pending-state kinds the renderer
+# understands.
+_CHOICE_KIND_TO_PENDING_KIND: dict[str, str] = {
+    "priority": "priority",
+    "attack": "attackers",
+    "block": "blockers",
+    "may": "may",
+    "choose": "permanent",
+}
 
 
 @dataclass(frozen=True)
@@ -53,13 +101,53 @@ class ForgePolicyValueConfig:
     value_loss_weight: float = 1.0
     policy_loss_weight: float = 1.0
     pad_token_id: int = 0
+    # When True, train the autoregressive grammar decoder (decoder pipeline).
+    # When False, train the legacy inline-blank policy.
+    decoder: bool = False
 
 
 @dataclass(frozen=True)
 class ForgeChoiceBatch:
+    """Inline-blank (V1) batch shape; populated when ``cfg.decoder=False``."""
+
     encoded: TextEncodedBatch
     priority_target_blank: Tensor
     per_blank_target_legal: Tensor
+    value_targets: Tensor
+
+
+@dataclass(frozen=True)
+class ForgeDecoderBatch:
+    """Decoder pipeline batch.
+
+    ``encoded`` carries the combined ``[state, spec]`` token stream and
+    pointer-anchor metadata produced by
+    :func:`magic_ai.text_encoder.batch.collate_with_specs`.
+
+    Decoder-target tensors:
+
+    * ``output_token_ids [B, L]`` int64 — grammar token id per step
+      (PAD on pointer steps; the supervised target is the pointer
+      position, not the vocab id).
+    * ``output_pointer_pos [B, L]`` int64 — absolute encoder position
+      of the chosen anchor on pointer steps (-1 elsewhere).
+    * ``output_is_pointer [B, L]`` bool — True at pointer steps.
+    * ``output_pad_mask [B, L]`` bool — True at valid steps, False at
+      sequence padding.
+    * ``vocab_mask [B, L, V_grammar]`` / ``pointer_mask [B, L, T_enc]``
+      bool — per-step legality masks consulted by the loss.
+    * ``decision_type_per_row [B]`` int64 — for combat exact-match metric.
+    * ``value_targets [B]`` float — same as the inline-blank batch.
+    """
+
+    encoded: TextEncodedBatch
+    output_token_ids: Tensor
+    output_pointer_pos: Tensor
+    output_is_pointer: Tensor
+    output_pad_mask: Tensor
+    vocab_mask: Tensor
+    pointer_mask: Tensor
+    decision_type_per_row: Tensor
     value_targets: Tensor
 
 
@@ -69,6 +157,18 @@ class _PreparedExample:
     priority_target_blank: int
     per_blank_target_legal: list[int]
     value_target: float
+
+
+@dataclass(frozen=True)
+class _PreparedDecoderExample:
+    """Per-row payload for the decoder pipeline."""
+
+    encoded: Any  # TextEncodedExample
+    spec: DecisionSpec
+    target: DecoderTarget
+    value_target: float
+    # subject_index → encoder_position, by anchor kind, for fast pointer lookup.
+    anchor_pos_by_kind: dict[int, list[int]] = field(default_factory=dict)
 
 
 def _stable_eval_bucket(game_id: str, bucket: int) -> int:
@@ -197,6 +297,7 @@ def _priority_actions_and_target(
                     "kind": "activate",
                     "permanent_id": cid,
                     "ability_index": 0,
+                    "card_name": name,
                 },
             )
         )
@@ -224,6 +325,7 @@ def _attack_actions_and_targets(
         if not cid:
             continue
         option_index = len(actions)
+        name = _card_name(card)
         actions.append(
             cast(
                 PendingOptionState,
@@ -232,6 +334,7 @@ def _attack_actions_and_targets(
                     "kind": "attacker",
                     "permanent_id": cid,
                     "card_id": cid,
+                    "card_name": name,
                 },
             )
         )
@@ -262,6 +365,7 @@ def _block_actions_and_targets(
             {"id": _card_id(attacker), "label": _card_name(attacker)} for attacker in attackers
         ]
         option_index = len(actions)
+        name = _card_name(blocker)
         actions.append(
             cast(
                 PendingOptionState,
@@ -270,6 +374,7 @@ def _block_actions_and_targets(
                     "kind": "block",
                     "permanent_id": blocker_id,
                     "card_id": blocker_id,
+                    "card_name": name,
                     "valid_targets": valid_targets,
                 },
             )
@@ -299,11 +404,13 @@ def _may_actions_and_targets(
 def _choose_actions_and_targets(
     observed: dict[str, Any],
 ) -> tuple[list[PendingOptionState], dict[int, int]]:
-    # The Forge logs do not expose the legal alternatives for generic choices.
-    # Keep a single observed placeholder so value training still uses the row
-    # and policy loss has a well-defined, zero-entropy supervised target.
     raw = str(observed.get("raw") or "observed")
-    return [cast(PendingOptionState, {"id": raw, "kind": "choice", "label": raw})], {-1: 0}
+    return [
+        cast(
+            PendingOptionState,
+            {"id": raw, "kind": "permanent", "label": raw, "card_name": raw},
+        )
+    ], {-1: 0}
 
 
 def _actions_and_targets(
@@ -338,13 +445,7 @@ def _with_pending(
     actions: list[PendingOptionState],
 ) -> dict[str, Any]:
     out = dict(snapshot)
-    pending_kind = {
-        "priority": "priority",
-        "attack": "attack",
-        "block": "block",
-        "may": "may",
-        "choose": "mode",
-    }.get(kind, kind)
+    pending_kind = _CHOICE_KIND_TO_PENDING_KIND.get(kind, kind)
     out["pending"] = cast(
         PendingState,
         {
@@ -392,9 +493,6 @@ def _value_target(record: dict[str, Any], cfg: ForgePolicyValueConfig) -> float:
     remaining = max(
         0, int(choice.get("candidate_count") or 1) - int(choice.get("candidate_index") or 0) - 1
     )
-    # With one extracted row per game and no behavior-policy trace, both GAE
-    # and v-trace reduce to a discounted Monte Carlo terminal sign. The runtime
-    # flag exists so callers can preserve the intended target semantics.
     return float(sign * (cfg.gamma**remaining))
 
 
@@ -413,6 +511,9 @@ class ForgeChoiceDataset:
         self.tokenizer = tokenizer
         self.oracle = oracle
         self.token_ids = _render_token_ids(tokenizer)
+        self._spec_renderer: DecisionSpecRenderer | None = (
+            DecisionSpecRenderer(tokenizer) if cfg.decoder else None
+        )
         bucket = 0 if cfg.eval_fraction <= 0 else max(2, int(round(1.0 / cfg.eval_fraction)))
         self.records: list[dict[str, Any]] = []
         for record in _iter_records(cfg.data_path):
@@ -438,6 +539,7 @@ class ForgeChoiceDataset:
             out[kind] = out.get(kind, 0) + 1
         return out
 
+    # ----------------------------------------------------------------- inline
     def _prepare(self, record: dict[str, Any]) -> _PreparedExample | None:
         actions, priority_option_index, per_blank_by_option = _actions_and_targets(
             record, self.oracle
@@ -490,7 +592,81 @@ class ForgeChoiceDataset:
             value_target=_value_target(record, self.cfg),
         )
 
-    def _batch_from_indices(self, indices: Sequence[int]) -> ForgeChoiceBatch:
+    # ----------------------------------------------------------------- decoder
+    def _prepare_decoder(self, record: dict[str, Any]) -> _PreparedDecoderExample | None:
+        if self._spec_renderer is None:
+            raise RuntimeError("decoder pipeline requires DecisionSpecRenderer")
+        actions, _priority_option_index, _ = _actions_and_targets(record, self.oracle)
+        choice = record.get("choice") or {}
+        kind = str(choice.get("kind") or "")
+        observed = cast(dict[str, Any], choice.get("observed") or {})
+        snapshot = cast(dict[str, Any], (record.get("state") or {}).get("snapshot") or {})
+        snapshot = _with_pending(snapshot, kind, actions)
+
+        pending = cast(PendingState, snapshot["pending"])
+        decision_type = pending_decision_type(pending)
+        if decision_type is None:
+            return None
+        target = translate_observed_to_target(pending, observed)
+        if target is None or not target.output_token_ids:
+            return None
+
+        try:
+            rendered = render_snapshot(
+                cast(GameStateSnapshot, snapshot),
+                actions,
+                oracle=self.oracle,
+                chosen_token_id=self.token_ids["<chosen>"],
+                none_token_id=self.token_ids["<none>"],
+                yes_token_id=self.token_ids["<yes>"],
+                no_token_id=self.token_ids["<no>"],
+                mulligan_token_id=self.token_ids["<mulligan>"],
+                keep_token_id=self.token_ids["<keep>"],
+                self_token_id=self.token_ids["<self>"],
+                opp_token_id=self.token_ids["<opp>"],
+                num_token_ids=[self.token_ids[f"<num:{i}>"] for i in range(MAX_NUM)],
+                mana_token_ids=[
+                    self.token_ids[t] for t in ("{W}", "{U}", "{B}", "{R}", "{G}", "{C}")
+                ],
+                card_ref_token_ids=[
+                    self.token_ids[f"<card-ref:{i}>"] for i in range(MAX_CARD_REFS)
+                ],
+            )
+            encoded = tokenize_snapshot(rendered, self.tokenizer)
+            spec = self._spec_renderer.render(
+                cast(GameStateSnapshot, snapshot), card_refs=rendered.card_refs
+            )
+        except RenderError, RuntimeError, KeyError, TypeError, ValueError, NotImplementedError:
+            return None
+
+        # Build per-kind subject_index → encoder_position lookup; the
+        # spec anchors are positioned relative to the spec section start,
+        # so add the row's state-token length here (the same offset the
+        # collator applies). One small dict per row; B is small.
+        state_len = len(encoded.token_ids)
+        anchor_pos_by_kind: dict[int, list[int]] = {}
+        for anchor in spec.anchors:
+            arr = anchor_pos_by_kind.setdefault(int(anchor.kind), [])
+            # anchors of one kind appear in subject_index order in render_spec.
+            while len(arr) <= anchor.subject_index:
+                arr.append(-1)
+            arr[anchor.subject_index] = int(anchor.token_position) + state_len
+
+        return _PreparedDecoderExample(
+            encoded=encoded,
+            spec=spec,
+            target=target,
+            value_target=_value_target(record, self.cfg),
+            anchor_pos_by_kind=anchor_pos_by_kind,
+        )
+
+    # ----------------------------------------------------------------- batching
+    def _batch_from_indices(self, indices: Sequence[int]) -> ForgeChoiceBatch | ForgeDecoderBatch:
+        if self.cfg.decoder:
+            return self._decoder_batch_from_indices(indices)
+        return self._inline_batch_from_indices(indices)
+
+    def _inline_batch_from_indices(self, indices: Sequence[int]) -> ForgeChoiceBatch:
         prepared: list[_PreparedExample] = []
         cursor = 0
         while len(prepared) < len(indices) and cursor < len(indices) * 4:
@@ -524,15 +700,175 @@ class ForgeChoiceDataset:
             value_targets=values,
         )
 
-    def iter_epoch(self, batch_size: int, rng: np.random.Generator) -> Iterator[ForgeChoiceBatch]:
+    def _decoder_batch_from_indices(self, indices: Sequence[int]) -> ForgeDecoderBatch:
+        prepared: list[_PreparedDecoderExample] = []
+        cursor = 0
+        while len(prepared) < len(indices) and cursor < len(indices) * 4:
+            item = self._prepare_decoder(self.records[int(indices[cursor % len(indices)])])
+            cursor += 1
+            if item is not None:
+                prepared.append(item)
+        if not prepared:
+            raise ValueError("no renderable Forge decoder examples in selected batch")
+
+        # Combined-stream collate (state + spec).
+        encoded = collate_with_specs(
+            [p.encoded for p in prepared],
+            [p.spec for p in prepared],
+            pad_id=self.cfg.pad_token_id,
+        )
+
+        batch_size = len(prepared)
+        # Output sequences are typically short (<= ~16 tokens). Pad to
+        # the per-batch max.
+        L = max(len(p.target.output_token_ids) for p in prepared)
+        T_enc = int(encoded.token_ids.shape[1])
+
+        out_tokens = torch.zeros((batch_size, L), dtype=torch.long)
+        out_pointer_pos = torch.full((batch_size, L), 0, dtype=torch.long)
+        out_is_pointer = torch.zeros((batch_size, L), dtype=torch.bool)
+        out_pad_mask = torch.zeros((batch_size, L), dtype=torch.bool)
+        decision_type_per_row = torch.empty((batch_size,), dtype=torch.long)
+        values = torch.empty((batch_size,), dtype=torch.float32)
+
+        # vocab/pointer masks built per row by walking the grammar.
+        vocab_mask = torch.zeros((batch_size, L, GRAMMAR_VOCAB_SIZE), dtype=torch.bool)
+        pointer_mask = torch.zeros((batch_size, L, T_enc), dtype=torch.bool)
+
+        for b, item in enumerate(prepared):
+            decision_type_per_row[b] = int(item.target.decision_type)
+            values[b] = float(item.value_target)
+            tokens = item.target.output_token_ids
+            subjects = item.target.output_pointer_subjects
+            is_ptrs = item.target.output_is_pointer
+            n = len(tokens)
+            out_pad_mask[b, :n] = True
+            for i, (tok, subj, is_ptr) in enumerate(zip(tokens, subjects, is_ptrs, strict=True)):
+                out_tokens[b, i] = int(tok)
+                out_is_pointer[b, i] = bool(is_ptr)
+                if is_ptr:
+                    # Map subject_index to encoder position via the
+                    # appropriate AnchorKind for this grammar step.
+                    kind = _expected_pointer_kind(item.spec, item.target, i)
+                    positions = item.anchor_pos_by_kind.get(int(kind), [])
+                    if 0 <= subj < len(positions) and positions[subj] >= 0:
+                        out_pointer_pos[b, i] = positions[subj]
+                    else:
+                        # Defensive: anchor missing. Mark step invalid.
+                        out_pad_mask[b, i] = False
+
+        # Build per-step legality masks by walking the grammar once per row.
+        # batch_next_mask wants padded prefix arrays — we call it L times.
+        prefix_tokens_np = np.zeros((batch_size, L), dtype=np.int64)
+        prefix_subjects_np = np.full((batch_size, L), -1, dtype=np.int64)
+        prefix_lens_np = np.zeros((batch_size,), dtype=np.int64)
+        for b, item in enumerate(prepared):
+            for i, (tok, subj) in enumerate(
+                zip(item.target.output_token_ids, item.target.output_pointer_subjects, strict=True)
+            ):
+                prefix_tokens_np[b, i] = int(tok)
+                prefix_subjects_np[b, i] = int(subj)
+
+        specs = [p.spec for p in prepared]
+        for step in range(L):
+            v_mask, _ptr_mask_subj = batch_next_mask(
+                specs,
+                prefix_tokens_np,
+                prefix_subjects_np,
+                prefix_lens_np,
+            )
+            vocab_mask[:, step, :] = torch.from_numpy(v_mask)
+            # Translate the per-anchor pointer mask into encoder-position
+            # space via each row's anchor_pos_by_kind. The expected anchor
+            # kind at this step is implied by the grammar.
+            for b, item in enumerate(prepared):
+                if step >= len(item.target.output_token_ids):
+                    continue
+                if not item.target.output_is_pointer[step]:
+                    continue
+                kind = _expected_pointer_kind(item.spec, item.target, step)
+                positions = item.anchor_pos_by_kind.get(int(kind), [])
+                # Spec-side anchors of this kind are all legal at the
+                # subject level; cross-subject constraints (uniqueness,
+                # block legal-edge) live in the grammar mask itself,
+                # which we mirror by walking the grammar above. For the
+                # loss-side mask in encoder-position space we simply
+                # allow all anchors of the expected kind whose position
+                # is set; the actual uniqueness/edge constraint is
+                # already encoded in the supervision target.
+                for pos in positions:
+                    if 0 <= pos < T_enc:
+                        pointer_mask[b, step, pos] = True
+            # advance the prefix lengths.
+            for b, item in enumerate(prepared):
+                if step < len(item.target.output_token_ids):
+                    prefix_lens_np[b] = step + 1
+
+        # Truncate the combined stream if needed.
+        if (
+            self.cfg.max_tokens is not None
+            and int(encoded.token_ids.shape[1]) > self.cfg.max_tokens
+        ):
+            # Truncation invalidates pointer positions beyond the cap;
+            # mark those steps as padding so they don't contribute loss.
+            cap = int(self.cfg.max_tokens)
+            encoded = _truncate_encoded_batch(encoded, max_tokens=cap)
+            beyond = out_pointer_pos >= cap
+            out_pad_mask = out_pad_mask & ~(out_is_pointer & beyond)
+            pointer_mask = pointer_mask[:, :, :cap]
+
+        return ForgeDecoderBatch(
+            encoded=encoded,
+            output_token_ids=out_tokens,
+            output_pointer_pos=out_pointer_pos,
+            output_is_pointer=out_is_pointer,
+            output_pad_mask=out_pad_mask,
+            vocab_mask=vocab_mask,
+            pointer_mask=pointer_mask,
+            decision_type_per_row=decision_type_per_row,
+            value_targets=values,
+        )
+
+    def iter_epoch(
+        self, batch_size: int, rng: np.random.Generator
+    ) -> Iterator[ForgeChoiceBatch | ForgeDecoderBatch]:
         order = rng.permutation(len(self.records))
         end = (len(order) // batch_size) * batch_size
         for off in range(0, end, batch_size):
             yield self._batch_from_indices([int(i) for i in order[off : off + batch_size]])
 
-    def sample_batch(self, batch_size: int, rng: np.random.Generator) -> ForgeChoiceBatch:
+    def sample_batch(
+        self, batch_size: int, rng: np.random.Generator
+    ) -> ForgeChoiceBatch | ForgeDecoderBatch:
         indices = rng.integers(0, len(self.records), size=batch_size)
         return self._batch_from_indices([int(i) for i in indices])
+
+
+def _expected_pointer_kind(
+    spec: DecisionSpec, target: DecoderTarget, step_index: int
+) -> AnchorKind:
+    """Anchor kind expected at ``target.output[step_index]`` (a pointer step).
+
+    Mirrors the per-decision-type grammar in
+    :mod:`magic_ai.text_encoder.grammar`. Used by collate to look up the
+    encoder position for the supervised pointer target.
+    """
+
+    dt = DecisionType(target.decision_type)
+    if dt is DecisionType.PRIORITY:
+        return AnchorKind.LEGAL_ACTION
+    if dt is DecisionType.CHOOSE_TARGETS:
+        return AnchorKind.LEGAL_TARGET
+    if dt is DecisionType.DECLARE_ATTACKERS:
+        # Pattern: OPEN [ATTACK ptr-attacker DEFENDER ptr-defender]+ END
+        # body offset = step_index - 1; mod 4 → 1 = attacker, 3 = defender.
+        body_off = step_index - 1
+        return AnchorKind.LEGAL_ATTACKER if body_off % 4 == 1 else AnchorKind.DEFENDER
+    if dt is DecisionType.DECLARE_BLOCKERS:
+        # Pattern: OPEN [BLOCK ptr-blocker ATTACKER ptr-attacker]+ END
+        body_off = step_index - 1
+        return AnchorKind.LEGAL_BLOCKER if body_off % 4 == 1 else AnchorKind.LEGAL_ATTACKER
+    raise ValueError(f"decision type {dt} has no pointer steps")
 
 
 class ForgePolicyValueTrainer:
@@ -549,7 +885,15 @@ class ForgePolicyValueTrainer:
         self.grad_clip = grad_clip
         self.optimizer = torch.optim.AdamW(policy.parameters(), lr=lr, weight_decay=0.01)
 
-    def step(self, batch: ForgeChoiceBatch, *, compute_stats: bool = True) -> dict[str, float]:
+    # ------------------------------------------------------------------ inline
+    def step(
+        self, batch: ForgeChoiceBatch | ForgeDecoderBatch, *, compute_stats: bool = True
+    ) -> dict[str, float]:
+        if isinstance(batch, ForgeDecoderBatch):
+            return self._decoder_step(batch, compute_stats=compute_stats)
+        return self._inline_step(batch, compute_stats=compute_stats)
+
+    def _inline_step(self, batch: ForgeChoiceBatch, *, compute_stats: bool) -> dict[str, float]:
         self.policy.train()
         self.optimizer.zero_grad(set_to_none=True)
         out, _ = self.policy(batch.encoded, h_in=None, c_in=None)
@@ -613,6 +957,97 @@ class ForgePolicyValueTrainer:
             "grad_norm": float(grad_norm.detach()),
         }
 
+    def _decoder_step(self, batch: ForgeDecoderBatch, *, compute_stats: bool) -> dict[str, float]:
+        self.policy.train()
+        self.optimizer.zero_grad(set_to_none=True)
+        # Run the encoder through the recurrent policy to get value head;
+        # then run the grammar decoder teacher-forced via the underlying
+        # TextPolicy.
+        text_policy = self.policy.text_policy
+        if text_policy.grammar_decoder is None:
+            raise RuntimeError("decoder pipeline requires TextPolicy(use_grammar_decoder=True)")
+        device = next(text_policy.parameters()).device
+        encoded = batch.encoded
+        target_tokens = batch.output_token_ids.to(device)
+        vocab_logits, pointer_logits = text_policy.forward_decoder_teacher_forced(
+            encoded, target_tokens
+        )
+        # Run the value head off the encoder CLS pool from the recurrent
+        # policy too, keeping the value training path stable. The
+        # recurrent policy's forward does pack_batch internally; reuse it
+        # by calling its forward directly.
+        out, _ = self.policy(encoded, h_in=None, c_in=None)
+
+        decoder_loss = decoder_cross_entropy_loss(
+            vocab_logits,
+            pointer_logits,
+            target_tokens,
+            batch.output_pointer_pos.to(device),
+            batch.output_is_pointer.to(device),
+            batch.vocab_mask.to(device),
+            batch.pointer_mask.to(device),
+            batch.output_pad_mask.to(device),
+        )
+        v_loss = value_loss(out.values.float(), batch.value_targets.to(out.values.device))
+        loss = self.cfg.policy_loss_weight * decoder_loss + self.cfg.value_loss_weight * v_loss
+        loss.backward()
+        if self.grad_clip is not None:
+            grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip)
+        else:
+            grad_norm = torch.tensor(0.0, device=loss.device)
+        self.optimizer.step()
+        if not compute_stats:
+            return {}
+        with torch.no_grad():
+            per_step = decoder_per_step_accuracy(
+                vocab_logits,
+                pointer_logits,
+                target_tokens,
+                batch.output_pointer_pos.to(device),
+                batch.output_is_pointer.to(device),
+                batch.vocab_mask.to(device),
+                batch.pointer_mask.to(device),
+                batch.output_pad_mask.to(device),
+            )
+            # Combat full-sequence exact-match: a row is correct if every
+            # supervised step is correct.
+            neg_inf = torch.finfo(vocab_logits.dtype).min
+            v_pred = vocab_logits.masked_fill(~batch.vocab_mask.to(device), neg_inf).argmax(-1)
+            p_pred = pointer_logits.masked_fill(~batch.pointer_mask.to(device), neg_inf).argmax(-1)
+            correct_per_step = torch.where(
+                batch.output_is_pointer.to(device),
+                p_pred == batch.output_pointer_pos.to(device),
+                v_pred == target_tokens,
+            )
+            row_correct = ((~batch.output_pad_mask.to(device)) | correct_per_step).all(dim=-1)
+            combat_kinds = (
+                (batch.decision_type_per_row == int(DecisionType.DECLARE_ATTACKERS))
+                | (batch.decision_type_per_row == int(DecisionType.DECLARE_BLOCKERS))
+            ).to(device)
+            combat_total = int(combat_kinds.sum().item())
+            combat_exact = (
+                float((row_correct & combat_kinds).sum().item()) / combat_total
+                if combat_total > 0
+                else 0.0
+            )
+            pred_sign = torch.sign(out.values.float())
+            target = batch.value_targets.to(out.values.device)
+            non_draw = target.abs() > 1e-6
+            sign_acc = (
+                (pred_sign[non_draw] == torch.sign(target[non_draw])).float().mean()
+                if non_draw.any()
+                else torch.tensor(0.0, device=loss.device)
+            )
+        return {
+            "loss": float(loss.detach()),
+            "policy_loss": float(decoder_loss.detach()),
+            "value_loss": float(v_loss.detach()),
+            "decoder_step_accuracy": float(per_step["accuracy"]),
+            "decoder_combat_exact_match": float(combat_exact),
+            "value_sign_accuracy": float(sign_acc.detach()),
+            "grad_norm": float(grad_norm.detach()),
+        }
+
     @torch.no_grad()
     def evaluate(
         self,
@@ -628,27 +1063,51 @@ class ForgePolicyValueTrainer:
         for _ in range(batches):
             batch = dataset.sample_batch(self.cfg.batch_size, rng)
             batch = _batch_to_device(batch, device)
-            out, _ = self.policy(batch.encoded, h_in=None, c_in=None)
-            if out.blank_logits is None:
-                continue
-            priority_loss = inline_blank_priority_loss(
-                out.blank_logits,
-                batch.encoded.blank_group,
-                batch.encoded.blank_group_kind,
-                batch.encoded.blank_legal_mask,
-                batch.priority_target_blank,
-            )
-            per_blank_loss = inline_blank_per_blank_loss(
-                out.blank_logits,
-                batch.encoded.blank_group_kind,
-                batch.encoded.blank_legal_mask,
-                batch.per_blank_target_legal,
-            )
-            v_loss = value_loss(out.values.float(), batch.value_targets)
-            stats = {
-                "eval_policy_loss": float((priority_loss + per_blank_loss).detach()),
-                "eval_value_loss": float(v_loss.detach()),
-            }
+            if isinstance(batch, ForgeDecoderBatch):
+                text_policy = self.policy.text_policy
+                if text_policy.grammar_decoder is None:
+                    continue
+                vocab_logits, pointer_logits = text_policy.forward_decoder_teacher_forced(
+                    batch.encoded, batch.output_token_ids
+                )
+                out, _ = self.policy(batch.encoded, h_in=None, c_in=None)
+                policy_l = decoder_cross_entropy_loss(
+                    vocab_logits,
+                    pointer_logits,
+                    batch.output_token_ids,
+                    batch.output_pointer_pos,
+                    batch.output_is_pointer,
+                    batch.vocab_mask,
+                    batch.pointer_mask,
+                    batch.output_pad_mask,
+                )
+                v_loss = value_loss(out.values.float(), batch.value_targets)
+                stats = {
+                    "eval_policy_loss": float(policy_l.detach()),
+                    "eval_value_loss": float(v_loss.detach()),
+                }
+            else:
+                out, _ = self.policy(batch.encoded, h_in=None, c_in=None)
+                if out.blank_logits is None:
+                    continue
+                priority_loss = inline_blank_priority_loss(
+                    out.blank_logits,
+                    batch.encoded.blank_group,
+                    batch.encoded.blank_group_kind,
+                    batch.encoded.blank_legal_mask,
+                    batch.priority_target_blank,
+                )
+                per_blank_loss = inline_blank_per_blank_loss(
+                    out.blank_logits,
+                    batch.encoded.blank_group_kind,
+                    batch.encoded.blank_legal_mask,
+                    batch.per_blank_target_legal,
+                )
+                v_loss = value_loss(out.values.float(), batch.value_targets)
+                stats = {
+                    "eval_policy_loss": float((priority_loss + per_blank_loss).detach()),
+                    "eval_value_loss": float(v_loss.detach()),
+                }
             for key, value in stats.items():
                 totals[key] = totals.get(key, 0.0) + value
             count += 1
@@ -673,6 +1132,16 @@ def _encoded_to_device(batch: TextEncodedBatch, device: torch.device) -> TextEnc
         blank_option_index=batch.blank_option_index.to(device),
         blank_legal_ids=batch.blank_legal_ids.to(device),
         blank_legal_mask=batch.blank_legal_mask.to(device),
+        spec_tokens=batch.spec_tokens.to(device),
+        spec_lens=batch.spec_lens.to(device),
+        decision_type=batch.decision_type.to(device),
+        pointer_anchor_positions=batch.pointer_anchor_positions.to(device),
+        pointer_anchor_kinds=batch.pointer_anchor_kinds.to(device),
+        pointer_anchor_subjects=batch.pointer_anchor_subjects.to(device),
+        pointer_anchor_handles=batch.pointer_anchor_handles.to(device),
+        legal_edge_bitmap=(
+            batch.legal_edge_bitmap.to(device) if batch.legal_edge_bitmap is not None else None
+        ),
     )
 
 
@@ -702,10 +1171,32 @@ def _truncate_encoded_batch(batch: TextEncodedBatch, *, max_tokens: int) -> Text
         blank_option_index=batch.blank_option_index,
         blank_legal_ids=batch.blank_legal_ids,
         blank_legal_mask=blank_legal_mask,
+        spec_tokens=batch.spec_tokens,
+        spec_lens=batch.spec_lens,
+        decision_type=batch.decision_type,
+        pointer_anchor_positions=batch.pointer_anchor_positions,
+        pointer_anchor_kinds=batch.pointer_anchor_kinds,
+        pointer_anchor_subjects=batch.pointer_anchor_subjects,
+        pointer_anchor_handles=batch.pointer_anchor_handles,
+        legal_edge_bitmap=batch.legal_edge_bitmap,
     )
 
 
-def _batch_to_device(batch: ForgeChoiceBatch, device: torch.device) -> ForgeChoiceBatch:
+def _batch_to_device(
+    batch: ForgeChoiceBatch | ForgeDecoderBatch, device: torch.device
+) -> ForgeChoiceBatch | ForgeDecoderBatch:
+    if isinstance(batch, ForgeDecoderBatch):
+        return ForgeDecoderBatch(
+            encoded=_encoded_to_device(batch.encoded, device),
+            output_token_ids=batch.output_token_ids.to(device),
+            output_pointer_pos=batch.output_pointer_pos.to(device),
+            output_is_pointer=batch.output_is_pointer.to(device),
+            output_pad_mask=batch.output_pad_mask.to(device),
+            vocab_mask=batch.vocab_mask.to(device),
+            pointer_mask=batch.pointer_mask.to(device),
+            decision_type_per_row=batch.decision_type_per_row.to(device),
+            value_targets=batch.value_targets.to(device),
+        )
     return ForgeChoiceBatch(
         encoded=_encoded_to_device(batch.encoded, device),
         priority_target_blank=batch.priority_target_blank.to(device),
@@ -721,6 +1212,7 @@ def batches_per_epoch(n_examples: int, batch_size: int) -> int:
 __all__ = [
     "ForgeChoiceBatch",
     "ForgeChoiceDataset",
+    "ForgeDecoderBatch",
     "ForgePolicyValueConfig",
     "ForgePolicyValueTrainer",
     "ValueTargetMode",

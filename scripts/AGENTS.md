@@ -19,4 +19,5 @@ Utility scripts for building data pipelines, evaluating card embeddings, pretrai
 - `play_text_rollout.py` — Run smoke-test episodes with RecurrentTextPolicy against the mage engine; can emit priority JSONL traces for the inline-blank BC gate.
 - `pretrain_text_encoder.py` — Smoke-test the text encoder value training loop with synthetic data.
 - `synth_embedding_eval.py` — Evaluate synthetic card embeddings for invariance and analogies under rules-text encoding.
+- `test_forge_target_encoding_smoke.py` — Synthesize one fake decision per pending kind, run them through the V2 decoder-target encoder, and assert grammar legality (no Forge JVM / corpus required).
 - `train.py` — Train PPO/R-NaD self-play policies against mage-go, including the native text IMPALA actor/server/ring/learner path and steady-state benchmark logging.

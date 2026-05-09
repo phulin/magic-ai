@@ -21,6 +21,7 @@ Comprehensive test suite covering text encoding (rendering, tokenization, assemb
 - `test_rnad_nfg.py` — Toy normal-form-game convergence test (matching pennies) validating R-NaD outer-loop algorithm.
 - `test_rnad_trainer.py` — Integration tests for R-NaD trainer-state glue and checkpoint management.
 - `test_sharded_native.py` — Tests for sharded native rollout driver batch concatenation and shard range splitting.
+- `test_forge_target_encoding.py` — Tests for Forge observed-event → decoder-target translators; asserts each translator's output is grammar-legal under `next_mask` for its `DecisionType`.
 - `test_text_actor_critic.py` — Smoke tests for text-encoder actor-critic layout and decision trace inference.
 - `test_text_encoder_batch.py` — Tests for tokenization anchor positions and collation padding/masking.
 - `test_text_encoder_model.py` — Forward/pooling/heads smoke test for text-encoder state and policy models.

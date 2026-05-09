@@ -12,7 +12,8 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 - `native_assembler.py` — Python wrapper for native Go MageEncodeTokensPacked assembler; manages packed token and inline-blank tensor I/O.
 - `native_token_tables.py` — Serialize TokenTables, including inline-blank singletons, into flat buffers and register with Go-side mage lib.
 - `policy.py` — Self-contained text-encoder policy facade; renders inline blanks and returns value plus blank logits. Optional `use_grammar_decoder=True` wires a `GrammarDecoder` and exposes `forward_decoder_teacher_forced` + `encode_snapshots_with_specs` (additive, leaves the inline-blank path unchanged when the flag is off).
-- `policy_value_pretrain.py` — Forge choice-situation dataset and trainer for joint inline-policy/value pretraining from extracted torch or JSONL artifacts.
+- `policy_value_pretrain.py` — Forge choice-situation dataset and trainer for joint policy/value pretraining; supports both the inline-blank path and (with `cfg.decoder=True`) the autoregressive grammar decoder pipeline (decoder CE + decision-spec rendering).
+- `forge_target_encoding.py` — Translate observed Forge events (priority/attack/block/may/choose/mode/X) into flat decoder-target token sequences (`DecoderTarget`) the grammar decoder is asked to reproduce.
 - `recurrent.py` — LSTM history adapter wrapping TextPolicy; carries recurrence through encoder state vector.
 - `render.py` — Deterministic GameStateSnapshot → text renderer; produces custom-token-laced strings plus inline-blank anchor metadata.
 - `render_spec.py` — GameStateSnapshot pending → DecisionSpec renderer for the autoregressive grammar decoder (additive, does not touch inline-blank path).
