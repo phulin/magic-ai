@@ -398,24 +398,11 @@ class TextRolloutActor:
         self._record_timing("actor_record", start)
 
         # Advance the engines via the decoder-action batched cgo entry.
-        # Session A wires ``mage.batch_step_by_decoder_action``; until that
-        # lands we raise so callers fail loudly rather than silently
-        # skipping engine progression.
         start = time.perf_counter()
-        try:
-            import mage  # noqa: PLC0415
+        import mage  # noqa: PLC0415
 
-            step_fn = getattr(mage, "batch_step_by_decoder_action", None)
-        except Exception:  # noqa: BLE001
-            step_fn = None
-        if step_fn is None:
-            raise RuntimeError(
-                "mage.batch_step_by_decoder_action is not available; Session A "
-                "(Go-side decoder action apply + cgo wrapper) must land before "
-                "the IMPALA decoder pipeline can advance engine state."
-            )
         handles = [int(g._id) for g in batch.ready_games]
-        step_fn(
+        mage.batch_step_by_decoder_action(
             handles=handles,
             decision_type=decoder.decision_type,
             output_token_ids=decoder.output_token_ids,
