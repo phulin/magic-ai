@@ -1014,6 +1014,14 @@ class RNaDStats:
     transformed reward. >> 0.5 means the value head is fitting the
     regularization landscape rather than the win/loss landscape."""
 
+    policy_drift_diagnostics_computed: bool = False
+    """Whether sampled-log-ratio / target-lag diagnostics were computed for
+    this update rather than skipped by their cadence gate."""
+
+    v_target_reg_share_computed: bool = False
+    """Whether ``v_target_reg_share`` was computed for this update rather than
+    skipped by its cadence gate."""
+
 
 @dataclass(frozen=True)
 class _TrajLossPieces:

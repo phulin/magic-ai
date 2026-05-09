@@ -3055,12 +3055,7 @@ def rnad_value_metrics(state: RNaDTrainerState | None) -> dict[str, float]:
     if state is None or not state.last_stats:
         return {}
     rs = state.last_stats[0]
-    return {
-        "rnad/sampled_log_ratio_mean": rs.sampled_log_ratio_mean,
-        "rnad/sampled_log_ratio_absmax": rs.sampled_log_ratio_absmax,
-        "rnad/is_bias_up_mean": rs.is_bias_up_mean,
-        "rnad/is_bias_down_mean": rs.is_bias_down_mean,
-        "rnad/v_target_reg_share": rs.v_target_reg_share,
+    metrics = {
         "rnad/q_clip_fraction": rs.q_clip_fraction,
         "rnad/v_hat_mean": rs.v_hat_mean,
         "rnad/transformed_reward_mean": rs.transformed_reward_mean,
@@ -3068,6 +3063,18 @@ def rnad_value_metrics(state: RNaDTrainerState | None) -> dict[str, float]:
         "rnad/outer_iteration": state.outer_iteration,
         "rnad/gradient_step": state.gradient_step,
     }
+    if rs.policy_drift_diagnostics_computed:
+        metrics.update(
+            {
+                "rnad/sampled_log_ratio_mean": rs.sampled_log_ratio_mean,
+                "rnad/sampled_log_ratio_absmax": rs.sampled_log_ratio_absmax,
+                "rnad/is_bias_up_mean": rs.is_bias_up_mean,
+                "rnad/is_bias_down_mean": rs.is_bias_down_mean,
+            }
+        )
+    if rs.v_target_reg_share_computed:
+        metrics["rnad/v_target_reg_share"] = rs.v_target_reg_share
+    return metrics
 
 
 def train_native_batched_envs(

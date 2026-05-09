@@ -15,6 +15,7 @@ from magic_ai.actions import ActionTrace, PolicyStep
 from magic_ai.game_state import GameStateSnapshot, PendingState
 from magic_ai.opponent_pool import OpponentPool, SnapshotSchedule
 from magic_ai.returns import gae_returns
+from magic_ai.rnad import RNaDStats
 from magic_ai.rollout import PPOStats, RolloutStep
 from magic_ai.slot_encoder.game_state import GameStateEncoder
 from magic_ai.slot_encoder.model import PPOPolicy
@@ -47,6 +48,7 @@ from scripts.train import (
     main,
     priority_trace_jsonl_path,
     retrospective_rating_rows,
+    rnad_value_metrics,
     sample_decks,
     sample_text_policy_batch,
     save_checkpoint,
@@ -423,6 +425,80 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(payloads[0]["total_generated_rollout_steps"], 34)
         self.assertEqual(payloads[0]["games"], 8)
         self.assertEqual(payloads[0]["return_mean"], 0.5)
+
+    def test_rnad_value_metrics_skips_cadence_gated_diagnostics(self) -> None:
+        state = Namespace(
+            last_stats=[
+                RNaDStats(
+                    loss=0.5,
+                    critic_loss=1.0,
+                    policy_loss=2.0,
+                    v_hat_mean=3.0,
+                    grad_norm=6.0,
+                    transformed_reward_mean=4.0,
+                    q_clip_fraction=0.25,
+                    sampled_log_ratio_mean=100.0,
+                    sampled_log_ratio_absmax=101.0,
+                    is_bias_up_mean=102.0,
+                    is_bias_down_mean=103.0,
+                    v_target_reg_share=104.0,
+                    policy_drift_diagnostics_computed=False,
+                    v_target_reg_share_computed=False,
+                )
+            ],
+            outer_iteration=5,
+            gradient_step=8,
+        )
+
+        metrics = rnad_value_metrics(cast(Any, state))
+
+        self.assertEqual(metrics["rnad/v_hat_mean"], 3.0)
+        self.assertEqual(metrics["rnad/transformed_reward_mean"], 4.0)
+        self.assertEqual(metrics["rnad/grad_norm"], 6.0)
+        self.assertEqual(metrics["rnad/q_clip_fraction"], 0.25)
+        self.assertEqual(metrics["rnad/outer_iteration"], 5)
+        self.assertEqual(metrics["rnad/gradient_step"], 8)
+        self.assertNotIn("rnad/sampled_log_ratio_mean", metrics)
+        self.assertNotIn("rnad/sampled_log_ratio_absmax", metrics)
+        self.assertNotIn("rnad/is_bias_up_mean", metrics)
+        self.assertNotIn("rnad/is_bias_down_mean", metrics)
+        self.assertNotIn("rnad/v_target_reg_share", metrics)
+
+    def test_rnad_value_metrics_logs_successful_update_stats(self) -> None:
+        state = Namespace(
+            last_stats=[
+                RNaDStats(
+                    loss=0.5,
+                    critic_loss=1.0,
+                    policy_loss=2.0,
+                    v_hat_mean=3.0,
+                    grad_norm=4.0,
+                    transformed_reward_mean=5.0,
+                    sampled_log_ratio_mean=6.0,
+                    sampled_log_ratio_absmax=7.0,
+                    is_bias_up_mean=8.0,
+                    is_bias_down_mean=9.0,
+                    v_target_reg_share=10.0,
+                    policy_drift_diagnostics_computed=True,
+                    v_target_reg_share_computed=True,
+                )
+            ],
+            outer_iteration=7,
+            gradient_step=11,
+        )
+
+        metrics = rnad_value_metrics(cast(Any, state))
+
+        self.assertEqual(metrics["rnad/v_hat_mean"], 3.0)
+        self.assertEqual(metrics["rnad/grad_norm"], 4.0)
+        self.assertEqual(metrics["rnad/transformed_reward_mean"], 5.0)
+        self.assertEqual(metrics["rnad/sampled_log_ratio_mean"], 6.0)
+        self.assertEqual(metrics["rnad/sampled_log_ratio_absmax"], 7.0)
+        self.assertEqual(metrics["rnad/is_bias_up_mean"], 8.0)
+        self.assertEqual(metrics["rnad/is_bias_down_mean"], 9.0)
+        self.assertEqual(metrics["rnad/v_target_reg_share"], 10.0)
+        self.assertEqual(metrics["rnad/outer_iteration"], 7)
+        self.assertEqual(metrics["rnad/gradient_step"], 11)
 
     def test_retrospective_log_schedule_fires_every_five_percent(self) -> None:
         schedule = RetrospectiveLogSchedule.build(episodes := 100)

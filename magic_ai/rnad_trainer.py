@@ -493,6 +493,8 @@ def run_rnad_update(
             is_bias_up_mean=is_bias_up_mean,
             is_bias_down_mean=is_bias_down_mean,
             v_target_reg_share=v_target_reg_share,
+            policy_drift_diagnostics_computed=compute_policy_drift_diagnostics,
+            v_target_reg_share_computed=compute_v_target_reg_share,
         )
         state.last_stats = [aggregate]
         return TrainerStats(
@@ -529,6 +531,8 @@ def run_rnad_update(
         is_bias_up_mean=is_bias_up_mean,
         is_bias_down_mean=is_bias_down_mean,
         v_target_reg_share=v_target_reg_share,
+        policy_drift_diagnostics_computed=compute_policy_drift_diagnostics,
+        v_target_reg_share_computed=compute_v_target_reg_share,
     )
     state.last_stats = [aggregate]
 
