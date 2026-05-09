@@ -43,11 +43,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from magic_ai.actions import (  # noqa: E402
     OPTION_SCALAR_DIM,
     TARGET_SCALAR_DIM,
-    TRACE_KIND_VALUES,
     ActionRequest,
     ActionTrace,
     PolicyStep,
-    action_from_choice_accepted,
 )
 from magic_ai.game_state import (  # noqa: E402
     GAME_INFO_DIM,
@@ -102,68 +100,27 @@ from magic_ai.slot_encoder.native_rollout import (  # noqa: E402
     NativeTextRolloutDriver,
 )
 from magic_ai.text_encoder.actor_critic import (  # noqa: E402
-    NativeTextReplayPayload,
+    NativeTextDecoderBatch,
     TextActorCritic,  # noqa: E402
 )
 
-
-# Inline-blank → grammar-decoder cutover artifacts.
+# Inline-blank → grammar-decoder cutover (Session B):
 #
-# These four helpers were the inline-blank-shaped sampling / staging surface
-# of the native batched IMPALA text rollout (``train_text_native_batched_envs``
-# and its IMPALA actor loop ``run_text_rollouts_actor_loop``). They each
-# encoded inline-blank-specific data shapes that the grammar decoder no
-# longer produces:
+# The IMPALA actor / inference-server pipeline now speaks the decoder wire
+# shape (:class:`NativeTextDecoderBatch`) end-to-end. The four legacy
+# inline-blank stubs that lived here (TextDecisionLayout,
+# build_text_decision_layout, infer_text_trace_kind, _decode_text_action)
+# have been removed:
 #
-# * ``TextDecisionLayout`` / ``build_text_decision_layout`` packed per-blank
-#   (option_idx, target_idx, mask, none-head) tensors per row.
-# * ``infer_text_trace_kind`` mapped a ``PendingState`` to the inline-blank
-#   ``TraceKind`` consumed by the staging buffer's ``trace_kind_id`` column.
-# * ``_decode_text_action`` translated ``selected_choice_cols`` (one column
-#   per blank) back into an engine ``ActionRequest``.
-#
-# The decoder pipeline replaces those with per-row ``DecoderDecisionLayout``
-# objects sampled by ``TextActorCritic.sample_batch`` and decoded via
-# ``decode_decoder_action``. The single-policy in-process rollout
-# (``train_text_envs`` → ``sample_text_policy_batch``) is wired to that path
-# below.
-#
-# The IMPALA actor / inference-server pipeline still routes through Go-side
-# selected_choice_cols and was not migrated in this commit — its native
-# dispatch (``TextInferenceServer`` and ``TextRolloutActor``) needs an
-# end-to-end protocol redesign around decoder layouts. Until that lands,
-# the four stubs raise so callers fail loudly rather than silently producing
-# nonsense actions.
-class TextDecisionLayout:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise NotImplementedError(
-            "TextDecisionLayout is part of the inline-blank IMPALA path; "
-            "the decoder cutover replaced it with DecoderDecisionLayout."
-        )
-
-
-def build_text_decision_layout(*args: Any, **kwargs: Any) -> TextDecisionLayout:  # type: ignore[empty-body]
-    raise NotImplementedError(
-        "build_text_decision_layout was removed in the decoder cutover; "
-        "use DecoderDecisionLayout via TextActorCritic.sample_batch."
-    )
-
-
-def infer_text_trace_kind(*args: Any, **kwargs: Any) -> int:  # type: ignore[empty-body]
-    raise NotImplementedError(
-        "infer_text_trace_kind was removed in the decoder cutover; "
-        "the decoder samples per-row DecisionType, see decode_decoder_action."
-    )
-
-
-def _decode_text_action(*args: Any, **kwargs: Any) -> Any:
-    raise NotImplementedError(
-        "_decode_text_action consumed inline-blank selected_choice_cols; "
-        "the decoder pipeline uses decode_decoder_action(pending, layout) "
-        "from magic_ai.text_encoder.actor_critic."
-    )
-
-
+# * ``TextDecisionLayout`` / ``build_text_decision_layout`` →
+#   :class:`DecoderDecisionLayout` (sampled directly by
+#   :meth:`TextActorCritic.sample_batch`).
+# * ``infer_text_trace_kind`` → :func:`_decision_type_to_trace_kind` defined
+#   later in this module.
+# * ``_decode_text_action`` → engine-side translation in Go via
+#   ``mage.batch_step_by_decoder_action``; transcripts use
+#   :func:`decode_decoder_action` from
+#   :mod:`magic_ai.text_encoder.actor_critic`.
 from magic_ai.text_encoder.card_cache import (  # noqa: E402
     DEFAULT_ORACLE_DB_PATH,
     CardTokenCache,
@@ -429,24 +386,38 @@ class TextTrainingBackend:
     batch_workers: int = 1
 
 
+@dataclass
+class _StagedDecoderRow:
+    """One env-step worth of decoder targets + encoded snapshot.
+
+    Stored Python-side (one per finished env-step) and gathered into the
+    shared :class:`TextReplayBuffer` at episode-commit time. Tensor fields
+    are slices into the actor's reusable scratch and must be cloned before
+    the actor reuses its scratch for the next batch.
+    """
+
+    decoder: NativeTextDecoderBatch  # length-1 row slice (cloned)
+    packed_row: Any  # PackedTextBatch length-1 slice (cloned)
+    perspective_player_idx: int
+    lstm_h_in: torch.Tensor | None  # [layers, 1, hidden] cloned
+    lstm_c_in: torch.Tensor | None
+    ready_event: Any | None = None
+
+
 class NativeTextTrajectoryBuffer:
-    """Fixed-width per-env staging for the native batched IMPALA text rollout.
+    """Per-env staging for the native batched IMPALA text decoder rollout.
 
-    The inline-blank cutover removed the per-blank tensor schema this class
-    was built around (``blank_positions`` / ``blank_kind`` / ``decision_*``
-    rectangles per env-step). The decoder pipeline writes per-row
-    :class:`DecoderDecisionPayload` records via
-    :meth:`TextReplayBuffer.commit_decoder_decision`, so a decoder-shaped
-    replacement would be a much smaller class — but the surrounding native
-    actor / inference-server pipeline (``TextRolloutActor``,
-    ``TextInferenceServer``, the Go-side ``selected_choice_cols`` contract)
-    still speaks inline-blank, so wiring just this one piece would not yield
-    a working pipeline.
+    Each actor stages :class:`_StagedDecoderRow` records here as it processes
+    inference replies. When an env's episode finishes (or hits the step cap),
+    :meth:`append_envs_to_replay_returning_tensor` reserves a window in the
+    shared :class:`TextReplayBuffer`, writes the encoded snapshots, the
+    decoder targets via :meth:`TextReplayBuffer.commit_decoder_decision`, and
+    the IMPALA-side common fields, then seals the reservation.
 
-    Until the IMPALA actor protocol is redesigned around decoder layouts,
-    constructing this raises and the only working text-rollout entry point
-    is the in-process single-env loop driven by
-    :func:`sample_text_policy_batch`.
+    The store is a Python ring per env (one list of length :attr:`max_steps`)
+    rather than a fixed tensor rectangle. Decoder targets are short and
+    variable-width, so a tensor rectangle would over-allocate; the per-step
+    object holds tensor slices already in the right shape.
     """
 
     def __init__(
@@ -457,564 +428,102 @@ class NativeTextTrajectoryBuffer:
         max_steps: int,
         validate: bool = True,
     ) -> None:
-        del replay_buffer, num_envs, max_steps, validate
-        raise NotImplementedError(
-            "NativeTextTrajectoryBuffer staged inline-blank-shaped rollouts; "
-            "the IMPALA actor/inference-server pipeline still speaks the "
-            "inline-blank protocol. Migrate scripts/train.py "
-            "train_text_native_batched_envs and magic_ai/native/inference_server.py "
-            "to the decoder pipeline before re-enabling this entry point."
-        )
+        self._replay_buffer = replay_buffer
+        self.num_envs = int(num_envs)
+        self.max_steps = int(max_steps)
+        self.validate = bool(validate)
+        self.device = replay_buffer.device
         self._lock = threading.Lock()
         self.timing_stats: Any | None = None
-        shape = (self.num_envs, self.max_steps)
-        self.step_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self.step_count_host = [0 for _ in range(self.num_envs)]
-        self._stage_ready_events: list[list[Any | None]] = [
-            [None for _ in range(self.max_steps)] for _ in range(self.num_envs)
-        ]
-        self.token_ids = torch.zeros(*shape, self.max_tokens, dtype=torch.int32, device=self.device)
-        self.seq_lengths = torch.zeros(*shape, dtype=torch.int32, device=self.device)
-        self.seq_lengths_host = [[0 for _ in range(self.max_steps)] for _ in range(self.num_envs)]
-        self.card_ref_positions = torch.full(
-            (*shape, self.max_card_refs), -1, dtype=torch.int32, device=self.device
-        )
-        self.blank_positions = torch.full(
-            (*shape, self.max_blanks_per_row), -1, dtype=torch.int32, device=self.device
-        )
-        self.blank_kind = torch.zeros(
-            *shape, self.max_blanks_per_row, dtype=torch.int32, device=self.device
-        )
-        self.blank_group = torch.full(
-            (*shape, self.max_blanks_per_row), -1, dtype=torch.int32, device=self.device
-        )
-        self.blank_group_kind = torch.zeros(
-            *shape, self.max_blanks_per_row, dtype=torch.int32, device=self.device
-        )
-        self.blank_option_index = torch.full(
-            (*shape, self.max_blanks_per_row), -1, dtype=torch.int32, device=self.device
-        )
-        self.blank_legal_ids = torch.zeros(
-            *shape,
-            self.max_blanks_per_row,
-            self.max_legal_per_blank,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.blank_legal_mask = torch.zeros(
-            *shape,
-            self.max_blanks_per_row,
-            self.max_legal_per_blank,
-            dtype=torch.bool,
-            device=self.device,
-        )
-        self.trace_kind_id = torch.zeros(*shape, dtype=torch.int8, device=self.device)
-        self.decision_count = torch.zeros(*shape, dtype=torch.int16, device=self.device)
-        self.decision_count_host = [
-            [0 for _ in range(self.max_steps)] for _ in range(self.num_envs)
-        ]
-        decision_shape = (*shape, self.max_decision_groups, self.max_cached_choices)
-        self.decision_option_idx = torch.full(
-            decision_shape, -1, dtype=torch.int16, device=self.device
-        )
-        self.decision_target_idx = torch.full_like(self.decision_option_idx, -1)
-        self.decision_mask = torch.zeros(decision_shape, dtype=torch.bool, device=self.device)
-        self.uses_none_head = torch.zeros(
-            *shape, self.max_decision_groups, dtype=torch.bool, device=self.device
-        )
-        self.selected_indices = torch.full(
-            (*shape, self.max_decision_groups), -1, dtype=torch.int16, device=self.device
-        )
-        self.behavior_action_log_prob = torch.zeros(
-            *shape, self.max_decision_groups, dtype=torch.float32, device=self.device
-        )
-        self.may_selected = torch.zeros(*shape, dtype=torch.float32, device=self.device)
-        self.old_log_prob = torch.zeros(*shape, dtype=torch.float32, device=self.device)
-        self.value = torch.zeros(*shape, dtype=torch.float32, device=self.device)
-        self.perspective_player_idx = torch.zeros(*shape, dtype=torch.int8, device=self.device)
-        self.lstm_h_in: torch.Tensor | None = None
-        self.lstm_c_in: torch.Tensor | None = None
-        if self.recurrent_layers > 0:
-            recurrent_shape = (
-                self.num_envs,
-                self.max_steps,
-                self.recurrent_layers,
-                self.recurrent_hidden_dim,
-            )
-            self.lstm_h_in = torch.zeros(recurrent_shape, dtype=torch.float32, device=self.device)
-            self.lstm_c_in = torch.zeros_like(self.lstm_h_in)
-        self.projected_state: torch.Tensor | None = None
-        if self.lstm_proj_hidden > 0:
-            self.projected_state = torch.zeros(
-                self.num_envs,
-                self.max_steps,
-                self.lstm_proj_hidden,
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
+        self._rows: list[list[_StagedDecoderRow]] = [[] for _ in range(self.num_envs)]
+        # Public host mirror for compatibility with the slot-buffer surface.
+        self.step_count_host: list[int] = [0 for _ in range(self.num_envs)]
 
-    def _record_timing(self, name: str, start: float) -> None:
-        timing = self.timing_stats
-        if timing is not None:
-            timing.add(name, time.perf_counter() - start)
-
-    def reset_env(self, env_idx: int) -> None:
-        with self._lock:
-            env_idx = int(env_idx)
-            self.step_count[env_idx] = 0
-            self.step_count_host[env_idx] = 0
-            for step in range(self.max_steps):
-                self._stage_ready_events[env_idx][step] = None
+    # ------------------------------------------------------------------ stage
 
     def stage_batch(
         self,
         env_indices: list[int],
-        payload: NativeTextReplayPayload,
+        decoder_batch: NativeTextDecoderBatch,
+        *,
+        packed_rows: Sequence[Any],
+        perspective_player_indices: Sequence[int],
+        lstm_h_in: torch.Tensor | None = None,
+        lstm_c_in: torch.Tensor | None = None,
         ready_event: Any | None = None,
     ) -> None:
-        with self._lock:
-            if ready_event is not None and self.device.type == "cuda":
-                torch.cuda.current_stream(self.device).wait_event(ready_event)
-            self._stage_batch_locked(env_indices, payload)
+        """Append per-env decoder rows + their encoded snapshots.
 
-    def _stage_batch_locked(
-        self,
-        env_indices: list[int],
-        payload: NativeTextReplayPayload,
-    ) -> None:
-        if not env_indices:
-            return
-        env_t = torch.tensor(env_indices, dtype=torch.long, device=self.device)
-        step_host = [self.step_count_host[int(env_idx)] for env_idx in env_indices]
-        if self.validate and any(step >= self.max_steps for step in step_host):
-            env_idx = next(
-                int(env_idx)
-                for env_idx, step in zip(env_indices, step_host, strict=True)
-                if step >= self.max_steps
-            )
-            raise RuntimeError(f"native text staging buffer is full for env {env_idx}")
-        step_t = torch.tensor(step_host, dtype=torch.long, device=self.device)
-
-        batch_size = len(env_indices)
-        encoded = payload.encoded
-        seq_lengths = encoded.seq_lengths.to(device=self.device)
-        seq_lengths_host = encoded.seq_lengths_host
-        if seq_lengths_host is None:
-            raise ValueError("native text staging requires encoded.seq_lengths_host")
-        if self.validate and max(seq_lengths_host, default=0) > self.max_tokens:
-            raise ValueError("encoded packed row token width exceeds staging max_tokens")
-        row_tokens = torch.zeros(batch_size, self.max_tokens, dtype=torch.int32, device=self.device)
-        row_tokens[
-            encoded.seq_id.to(device=self.device),
-            encoded.pos_in_seq.to(device=self.device),
-        ] = encoded.token_ids.to(device=self.device, dtype=torch.int32)
-        self.token_ids[env_t, step_t] = row_tokens
-        self.seq_lengths[env_t, step_t] = seq_lengths.to(dtype=torch.int32)
-        for env_idx, step, seq_len in zip(env_indices, step_host, seq_lengths_host, strict=True):
-            self.seq_lengths_host[int(env_idx)][step] = int(seq_len)
-
-        base = encoded.state_positions.to(device=self.device, dtype=torch.int32)
-
-        def rebase_positions(pos: torch.Tensor, view_shape: tuple[int, ...]) -> torch.Tensor:
-            pos_dev = pos.to(device=self.device, dtype=torch.int32)
-            valid = pos_dev >= 0
-            shifted = pos_dev - base.view(view_shape)
-            return torch.where(valid, shifted, pos_dev)
-
-        self.card_ref_positions[env_t, step_t] = rebase_positions(
-            encoded.card_ref_positions,
-            (batch_size, 1),
-        )
-        blank_width = min(int(encoded.blank_positions.shape[1]), self.max_blanks_per_row)
-        blank_legal_width = min(int(encoded.blank_legal_ids.shape[2]), self.max_legal_per_blank)
-        self.blank_positions[env_t, step_t].fill_(-1)
-        self.blank_kind[env_t, step_t].zero_()
-        self.blank_group[env_t, step_t].fill_(-1)
-        self.blank_group_kind[env_t, step_t].zero_()
-        self.blank_option_index[env_t, step_t].fill_(-1)
-        self.blank_legal_ids[env_t, step_t].zero_()
-        self.blank_legal_mask[env_t, step_t].zero_()
-        if blank_width > 0:
-            self.blank_positions[env_t, step_t, :blank_width] = rebase_positions(
-                encoded.blank_positions[:, :blank_width],
-                (batch_size, 1),
-            )
-            self.blank_kind[env_t, step_t, :blank_width] = encoded.blank_kind[:, :blank_width].to(
-                device=self.device, dtype=torch.int32
-            )
-            self.blank_group[env_t, step_t, :blank_width] = encoded.blank_group[:, :blank_width].to(
-                device=self.device, dtype=torch.int32
-            )
-            self.blank_group_kind[env_t, step_t, :blank_width] = encoded.blank_group_kind[
-                :, :blank_width
-            ].to(device=self.device, dtype=torch.int32)
-            self.blank_option_index[env_t, step_t, :blank_width] = encoded.blank_option_index[
-                :, :blank_width
-            ].to(device=self.device, dtype=torch.int32)
-            if blank_legal_width > 0:
-                self.blank_legal_ids[env_t, step_t, :blank_width, :blank_legal_width] = (
-                    encoded.blank_legal_ids[:, :blank_width, :blank_legal_width].to(
-                        device=self.device, dtype=torch.int32
-                    )
-                )
-                self.blank_legal_mask[env_t, step_t, :blank_width, :blank_legal_width] = (
-                    encoded.blank_legal_mask[:, :blank_width, :blank_legal_width].to(
-                        device=self.device, dtype=torch.bool
-                    )
-                )
-
-        decision_count = payload.decision_count.to(device=self.device, dtype=torch.int32)
-        decision_count_host = payload.decision_count_host
-        if decision_count_host is None:
-            decision_count_host = tuple(int(x) for x in payload.decision_count.cpu().tolist())
-        stored_count = decision_count.clamp(max=self.max_decision_groups)
-        stored_count_host = tuple(
-            min(int(x), self.max_decision_groups) for x in decision_count_host
-        )
-        self.trace_kind_id[env_t, step_t] = payload.trace_kind_id.to(
-            device=self.device, dtype=torch.int8
-        )
-        self.decision_count[env_t, step_t] = stored_count.to(dtype=torch.int16)
-        for env_idx, step, count in zip(env_indices, step_host, stored_count_host, strict=True):
-            self.decision_count_host[int(env_idx)][step] = int(count)
-        self.decision_option_idx[env_t, step_t].fill_(-1)
-        self.decision_target_idx[env_t, step_t].fill_(-1)
-        self.decision_mask[env_t, step_t].zero_()
-        self.uses_none_head[env_t, step_t].zero_()
-        self.selected_indices[env_t, step_t].fill_(-1)
-        self.behavior_action_log_prob[env_t, step_t].zero_()
-        decision_rows = (
-            int(payload.total_decision_groups)
-            if payload.total_decision_groups is not None
-            else int(payload.decision_option_idx.shape[0])
-        )
-        step_for_group = torch.repeat_interleave(
-            torch.arange(batch_size, device=self.device),
-            decision_count,
-            output_size=decision_rows,
-        )
-        group_starts = torch.cumsum(decision_count, dim=0) - decision_count
-        group_in_step = (
-            torch.arange(decision_rows, device=self.device) - group_starts[step_for_group]
-        )
-        flat_slots = batch_size * self.max_decision_groups
-        dummy_slot = flat_slots
-        valid_group = group_in_step < self.max_decision_groups
-        dest = step_for_group * self.max_decision_groups + group_in_step
-        dest = torch.where(valid_group, dest, dest.new_full((), dummy_slot))
-
-        option_tmp = torch.full(
-            (flat_slots + 1, self.max_cached_choices),
-            -1,
-            dtype=torch.int16,
-            device=self.device,
-        )
-        target_tmp = torch.full_like(option_tmp, -1)
-        mask_tmp = torch.zeros(
-            flat_slots + 1,
-            self.max_cached_choices,
-            dtype=torch.bool,
-            device=self.device,
-        )
-        none_tmp = torch.zeros(flat_slots + 1, dtype=torch.bool, device=self.device)
-        selected_tmp = torch.full((flat_slots + 1,), -1, dtype=torch.int16, device=self.device)
-        behavior_lp_tmp = torch.zeros(flat_slots + 1, dtype=torch.float32, device=self.device)
-        option_tmp[dest] = payload.decision_option_idx.to(device=self.device, dtype=torch.int16)
-        target_tmp[dest] = payload.decision_target_idx.to(device=self.device, dtype=torch.int16)
-        mask_tmp[dest] = payload.decision_mask.to(device=self.device, dtype=torch.bool)
-        none_tmp[dest] = payload.uses_none_head.to(device=self.device, dtype=torch.bool)
-        selected_tmp[dest] = payload.selected_indices.to(device=self.device, dtype=torch.int16)
-        if payload.behavior_action_log_prob is not None:
-            behavior_lp_tmp[dest] = payload.behavior_action_log_prob.to(
-                device=self.device, dtype=torch.float32
-            )
-
-        slot_shape = (batch_size, self.max_decision_groups)
-        self.decision_option_idx[env_t, step_t] = option_tmp[:-1].view(
-            *slot_shape,
-            self.max_cached_choices,
-        )
-        self.decision_target_idx[env_t, step_t] = target_tmp[:-1].view(
-            *slot_shape,
-            self.max_cached_choices,
-        )
-        self.decision_mask[env_t, step_t] = mask_tmp[:-1].view(
-            *slot_shape,
-            self.max_cached_choices,
-        )
-        self.uses_none_head[env_t, step_t] = none_tmp[:-1].view(*slot_shape)
-        self.selected_indices[env_t, step_t] = selected_tmp[:-1].view(*slot_shape)
-        self.behavior_action_log_prob[env_t, step_t] = behavior_lp_tmp[:-1].view(*slot_shape)
-
-        self.may_selected[env_t, step_t] = payload.may_selected.to(
-            device=self.device, dtype=torch.float32
-        )
-        self.old_log_prob[env_t, step_t] = payload.old_log_prob.to(
-            device=self.device, dtype=torch.float32
-        )
-        self.value[env_t, step_t] = payload.value.to(device=self.device, dtype=torch.float32)
-        self.perspective_player_idx[env_t, step_t] = payload.perspective_player_idx.to(
-            device=self.device, dtype=torch.int8
-        )
-        if self.lstm_h_in is not None and self.lstm_c_in is not None:
-            self.lstm_h_in[env_t, step_t] = payload.lstm_h_in.permute(1, 0, 2).to(
-                device=self.device, dtype=torch.float32
-            )
-            self.lstm_c_in[env_t, step_t] = payload.lstm_c_in.permute(1, 0, 2).to(
-                device=self.device, dtype=torch.float32
-            )
-        if self.projected_state is not None and payload.projected_state is not None:
-            self.projected_state[env_t, step_t] = payload.projected_state.to(
-                device=self.device, dtype=torch.bfloat16
-            )
-        ready_event: Any | None = None
-        if self.device.type == "cuda":
-            ready_event = torch.cuda.Event()
-            ready_event.record(torch.cuda.current_stream(self.device))
-        self.step_count[env_t] = step_t + 1
-        for env_idx, step in zip(env_indices, step_host, strict=True):
-            self._stage_ready_events[int(env_idx)][step] = ready_event
-            self.step_count_host[int(env_idx)] = step + 1
-
-    def _append_envs_to_replay_core(
-        self,
-        env_indices: list[int],
-        replay_buffer: TextReplayBuffer,
-        *,
-        seal: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Append finished episodes from the staging buffer to ``replay_buffer``
-        and reset the staging slots. Returns ``(flat_rows, counts_all)``
-        on-device. Host-side mirrors carry the per-env, per-row lengths used
-        to build packed token and decision layouts without rediscovering them
-        through device masks.
+        ``decoder_batch`` is the inference-server reply slice for these envs;
+        ``packed_rows[i]`` is the matching length-1 PackedTextBatch row. All
+        tensor data is cloned so the actor can recycle its scratch. Caller
+        holds responsibility for translating positions into the row-local
+        frame before slicing.
         """
 
-        device = self.device
-        if not env_indices:
-            empty = torch.zeros(0, dtype=torch.long, device=device)
-            return empty, empty
+        n = len(env_indices)
+        if int(len(decoder_batch)) != n:
+            raise ValueError("decoder_batch row count must match env_indices length")
+        if len(packed_rows) != n:
+            raise ValueError("packed_rows length must match env_indices length")
+        if len(perspective_player_indices) != n:
+            raise ValueError("perspective length must match env_indices length")
 
-        start = time.perf_counter()
-        counts_host = [self.step_count_host[int(env_idx)] for env_idx in env_indices]
-        counts_all = torch.tensor(counts_host, dtype=torch.long, device=device)
-        flat_pairs = [
-            (int(env_idx), step)
-            for env_idx, count in zip(env_indices, counts_host, strict=True)
-            for step in range(count)
-        ]
-        if not flat_pairs:
-            env_t_all = torch.tensor(env_indices, dtype=torch.long, device=device)
-            self.step_count[env_t_all] = 0
-            for env_idx in env_indices:
-                env_idx_i = int(env_idx)
-                self.step_count_host[env_idx_i] = 0
-                for step in range(self.max_steps):
-                    self._stage_ready_events[env_idx_i][step] = None
-            return torch.zeros(0, dtype=torch.long, device=device), counts_all
-
-        flat_env_host = [env_idx for env_idx, _step in flat_pairs]
-        flat_step_host = [step for _env_idx, step in flat_pairs]
-        flat_env = torch.tensor(flat_env_host, dtype=torch.long, device=device)
-        flat_step = torch.tensor(flat_step_host, dtype=torch.long, device=device)
-        if self.device.type == "cuda":
-            stream = torch.cuda.current_stream(self.device)
-            for env_idx, step in flat_pairs:
-                event = self._stage_ready_events[env_idx][step]
-                if event is not None:
-                    stream.wait_event(event)
-
-        seq_lengths = self.seq_lengths[flat_env, flat_step]
-        seq_lengths_host = tuple(
-            self.seq_lengths_host[env_idx][step]
-            for env_idx, step in zip(flat_env_host, flat_step_host, strict=True)
-        )
-        row_count = int(seq_lengths.numel())
-        decision_count = self.decision_count[flat_env, flat_step].to(dtype=torch.int32)
-        decision_count_host = tuple(
-            self.decision_count_host[env_idx][step]
-            for env_idx, step in zip(flat_env_host, flat_step_host, strict=True)
-        )
-        total_decision_groups = sum(decision_count_host)
-        self._record_timing("finish_append_build_indices", start)
-
-        start = time.perf_counter()
-        if total_decision_groups:
-            step_for_group = torch.repeat_interleave(
-                torch.arange(row_count, device=self.device),
-                decision_count,
-                output_size=total_decision_groups,
+        # Pre-slice the decoder batch into single-row clones outside the
+        # lock; cloning is cheap-relative-to-replay-write and keeps the
+        # critical section short. Clone individually so each env-step row
+        # is independent of the actor's reusable scratch tensors.
+        per_row: list[NativeTextDecoderBatch] = []
+        for i in range(n):
+            row = decoder_batch[i]
+            per_row.append(
+                NativeTextDecoderBatch(
+                    decision_type=row.decision_type.detach().clone(),
+                    output_token_ids=row.output_token_ids.detach().clone(),
+                    output_pointer_subjects=row.output_pointer_subjects.detach().clone(),
+                    output_is_pointer=row.output_is_pointer.detach().clone(),
+                    output_lens=row.output_lens.detach().clone(),
+                    pointer_anchor_handles=row.pointer_anchor_handles.detach().clone(),
+                    pointer_anchor_count=row.pointer_anchor_count.detach().clone(),
+                    log_probs=row.log_probs.detach().clone(),
+                    value=row.value.detach().clone(),
+                    output_pad_mask=row.output_pad_mask.detach().clone(),
+                )
             )
-            group_starts = torch.cumsum(decision_count, dim=0) - decision_count
-            group_in_step = (
-                torch.arange(total_decision_groups, device=self.device)
-                - group_starts[step_for_group]
-            )
-            option_idx = self.decision_option_idx[flat_env, flat_step][
-                step_for_group, group_in_step
-            ]
-            target_idx = self.decision_target_idx[flat_env, flat_step][
-                step_for_group, group_in_step
-            ]
-            decision_mask = self.decision_mask[flat_env, flat_step][step_for_group, group_in_step]
-            uses_none = self.uses_none_head[flat_env, flat_step][step_for_group, group_in_step]
-            selected_indices = self.selected_indices[flat_env, flat_step][
-                step_for_group, group_in_step
-            ]
-            behavior_action_log_prob = self.behavior_action_log_prob[flat_env, flat_step][
-                step_for_group, group_in_step
-            ]
-        else:
-            option_idx = torch.empty(
-                (0, self.max_cached_choices), dtype=torch.long, device=self.device
-            )
-            target_idx = torch.empty_like(option_idx)
-            decision_mask = torch.empty(
-                (0, self.max_cached_choices), dtype=torch.bool, device=self.device
-            )
-            uses_none = torch.empty(0, dtype=torch.bool, device=self.device)
-            selected_indices = torch.empty(0, dtype=torch.long, device=self.device)
-            behavior_action_log_prob = torch.empty(0, dtype=torch.float32, device=self.device)
-        self._record_timing("finish_append_decision_gather", start)
-
-        start = time.perf_counter()
-        lstm_h = (
-            self.lstm_h_in[flat_env, flat_step].permute(1, 0, 2)
-            if self.lstm_h_in is not None
-            else None
-        )
-        lstm_c = (
-            self.lstm_c_in[flat_env, flat_step].permute(1, 0, 2)
-            if self.lstm_c_in is not None
-            else None
-        )
-        self._record_timing("finish_append_lstm_gather", start)
-
-        start = time.perf_counter()
-        rows = replay_buffer.append_staged_batch(
-            flat_env=flat_env,
-            flat_step=flat_step,
-            token_ids=self.token_ids,
-            seq_lengths=seq_lengths,
-            seq_lengths_host=seq_lengths_host,
-            card_ref_positions=self.card_ref_positions,
-            blank_positions=self.blank_positions,
-            blank_kind=self.blank_kind,
-            blank_group=self.blank_group,
-            blank_group_kind=self.blank_group_kind,
-            blank_option_index=self.blank_option_index,
-            blank_legal_ids=self.blank_legal_ids,
-            blank_legal_mask=self.blank_legal_mask,
-            trace_kind_id=self.trace_kind_id[flat_env, flat_step],
-            decision_count=decision_count,
-            decision_count_host=decision_count_host,
-            total_decision_groups=total_decision_groups,
-            total_stored_decision_groups=total_decision_groups,
-            decision_option_idx=option_idx,
-            decision_target_idx=target_idx,
-            decision_mask=decision_mask,
-            uses_none_head=uses_none,
-            selected_indices=selected_indices,
-            behavior_action_log_prob=behavior_action_log_prob,
-            may_selected=self.may_selected[flat_env, flat_step],
-            old_log_prob=self.old_log_prob[flat_env, flat_step],
-            value=self.value[flat_env, flat_step],
-            perspective_player_idx=self.perspective_player_idx[flat_env, flat_step].to(
-                dtype=torch.long
-            ),
-            lstm_h_in=lstm_h,
-            lstm_c_in=lstm_c,
-            seal=seal,
-        )
-        if replay_buffer.projected_state is not None and self.projected_state is not None:
-            replay_buffer.write_projected_state(rows, self.projected_state[flat_env, flat_step])
-        self._record_timing("finish_append_replay_copy", start)
-
-        # Reset all targeted env slots in one scatter (resetting an already-
-        # empty slot to 0 is a no-op).
-        start = time.perf_counter()
-        env_t_all = torch.tensor(env_indices, dtype=torch.long, device=device)
-        self.step_count[env_t_all] = 0
-        for env_idx, count in zip(env_indices, counts_host, strict=True):
-            env_idx_i = int(env_idx)
-            self.step_count_host[env_idx_i] = 0
-            for step in range(count):
-                self._stage_ready_events[env_idx_i][step] = None
-        self._record_timing("finish_append_reset_slots", start)
-        return rows, counts_all
-
-    def replay_capacity_required(self, env_indices: list[int]) -> tuple[int, int, int]:
-        """Return ``(row_count, token_count, decision_count)`` needed to commit envs.
-
-        Uses host mirrors only, so this is a pure CPU capacity check before
-        launching any copy kernels.
-        """
 
         with self._lock:
-            row_count = 0
-            token_count = 0
-            decision_count = 0
-            for env_idx in env_indices:
-                env_idx_i = int(env_idx)
-                count = self.step_count_host[env_idx_i]
-                row_count += count
-                token_count += sum(self.seq_lengths_host[env_idx_i][:count])
-                decision_count += sum(self.decision_count_host[env_idx_i][:count])
-            return row_count, token_count, decision_count
+            for i, env_idx in enumerate(env_indices):
+                env_i = int(env_idx)
+                if self.validate and len(self._rows[env_i]) >= self.max_steps:
+                    raise RuntimeError(f"native text staging buffer is full for env {env_i}")
+                h_slice = (
+                    lstm_h_in[:, i : i + 1].detach().clone() if lstm_h_in is not None else None
+                )
+                c_slice = (
+                    lstm_c_in[:, i : i + 1].detach().clone() if lstm_c_in is not None else None
+                )
+                self._rows[env_i].append(
+                    _StagedDecoderRow(
+                        decoder=per_row[i],
+                        packed_row=packed_rows[i],
+                        perspective_player_idx=int(perspective_player_indices[i]),
+                        lstm_h_in=h_slice,
+                        lstm_c_in=c_slice,
+                        ready_event=ready_event,
+                    )
+                )
+                self.step_count_host[env_i] = len(self._rows[env_i])
 
-    def can_append_envs_to_replay(
-        self,
-        env_indices: list[int],
-        replay_buffer: TextReplayBuffer,
-    ) -> bool:
-        row_count, token_count, decision_count = self.replay_capacity_required(env_indices)
-        return replay_buffer.can_reserve(
-            row_count=row_count,
-            token_count=token_count,
-            decision_count=decision_count,
-        )
-
-    def try_append_envs_to_replay_returning_tensor(
-        self,
-        env_indices: list[int],
-        replay_buffer: TextReplayBuffer,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if not self.can_append_envs_to_replay(env_indices, replay_buffer):
-            return None
-        return self._append_envs_to_replay_core(env_indices, replay_buffer)
-
-    def append_envs_to_replay(
-        self,
-        env_indices: list[int],
-        replay_buffer: TextReplayBuffer,
-    ) -> list[list[int]]:
+    def reset_env(self, env_idx: int) -> None:
         with self._lock:
-            return self._append_envs_to_replay_locked(env_indices, replay_buffer)
+            env_i = int(env_idx)
+            self._rows[env_i] = []
+            self.step_count_host[env_i] = 0
 
-    def _append_envs_to_replay_locked(
-        self,
-        env_indices: list[int],
-        replay_buffer: TextReplayBuffer,
-    ) -> list[list[int]]:
-        if not env_indices:
-            return []
-        rows, counts_all = self._append_envs_to_replay_core(env_indices, replay_buffer)
-        if rows.numel() == 0:
-            return [[] for _ in env_indices]
-        active_counts = counts_all[counts_all > 0]
-        rows_by_active = [
-            list(chunk)
-            for chunk in torch.split(rows.detach().cpu(), active_counts.detach().cpu().tolist())
-        ]
-        result: list[list[int]] = []
-        active_cursor = 0
-        for count in counts_all.detach().cpu().tolist():
-            if count > 0:
-                result.append([int(row) for row in rows_by_active[active_cursor]])
-                active_cursor += 1
-            else:
-                result.append([])
-        return result
+    def active_step_count(self, env_idx: int) -> int:
+        return self.step_count_host[int(env_idx)]
+
+    # ---------------------------------------------------------------- commit
 
     def append_envs_to_replay_returning_tensor(
         self,
@@ -1023,18 +532,140 @@ class NativeTextTrajectoryBuffer:
         *,
         seal: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Like :meth:`append_envs_to_replay` but returns ``(flat_rows,
-        counts_all)`` on-device, skipping the per-env host conversions
-        (``rows.cpu().tolist()``, ``active_counts.cpu().tolist()``,
-        ``counts_all.cpu().tolist()``) that the list-of-lists API does.
+        """Commit the staged steps for ``env_indices`` into the replay buffer.
+
+        Returns ``(flat_rows, counts_per_env)`` on the buffer's device.
+        After this returns, the staged slots for these envs are cleared.
         """
-        start = time.perf_counter()
-        self._lock.acquire()
-        self._record_timing("finish_append_wait_lock", start)
+
+        del seal  # decoder commit always seals via commit_decoder_decision + commit
+        device = replay_buffer.device
+        with self._lock:
+            counts_host = [len(self._rows[int(e)]) for e in env_indices]
+            counts_t = torch.tensor(counts_host, dtype=torch.long, device=device)
+            total = sum(counts_host)
+            if total == 0:
+                return torch.zeros(0, dtype=torch.long, device=device), counts_t
+            staged: list[_StagedDecoderRow] = []
+            for e in env_indices:
+                staged.extend(self._rows[int(e)])
+                self._rows[int(e)] = []
+                self.step_count_host[int(e)] = 0
+
+        # Build the merged decoder batch (concat across rows).
+        merged_decoder = NativeTextDecoderBatch.concat([row.decoder for row in staged])
+
+        # Translate to DecoderDecisionPayload shape — replay scoring needs
+        # both pointer-position and subject-index. We don't carry encoder
+        # positions here (they were translated to subjects at sample time);
+        # store -1 for output_pointer_pos and the subjects for the new field.
+        l_max = int(merged_decoder.output_token_ids.shape[1])
+        n_max = int(merged_decoder.pointer_anchor_handles.shape[1])
+        zero_pos = torch.full((total, l_max), -1, dtype=torch.int32, device=device)
+        anchor_kinds = torch.full((total, n_max), -1, dtype=torch.int32, device=device)
+        anchor_subjects = torch.arange(n_max, device=device, dtype=torch.int32).expand(total, n_max)
+        # Mask out anchors past pointer_anchor_count.
+        cnt = merged_decoder.pointer_anchor_count.to(device=device, dtype=torch.int32)
+        mask = anchor_subjects < cnt.unsqueeze(-1)
+        anchor_subjects = torch.where(mask, anchor_subjects, torch.full_like(anchor_subjects, -1))
+        anchor_handles = merged_decoder.pointer_anchor_handles.to(device=device, dtype=torch.int32)
+        anchor_handles = torch.where(mask, anchor_handles, torch.full_like(anchor_handles, -1))
+        # Empty legal-edge bitmap; combat decisions need it filled out
+        # by the encoder, but for IMPALA staging we leave a placeholder.
+        legal_edge = torch.zeros((total, 0, 0), dtype=torch.bool, device=device)
+        legal_n = torch.zeros((total,), dtype=torch.int32, device=device)
+        from magic_ai.text_encoder.replay_buffer import DecoderDecisionPayload
+
+        payload = DecoderDecisionPayload(
+            output_token_ids=merged_decoder.output_token_ids.to(device=device, dtype=torch.int32),
+            output_pointer_pos=zero_pos,
+            output_is_pointer=merged_decoder.output_is_pointer.to(device=device, dtype=torch.bool),
+            output_pad_mask=merged_decoder.output_pad_mask.to(device=device, dtype=torch.bool),
+            decision_type=merged_decoder.decision_type.to(device=device, dtype=torch.int32),
+            pointer_anchor_positions=zero_pos[:, :n_max].clone(),
+            pointer_anchor_kinds=anchor_kinds,
+            pointer_anchor_subjects=anchor_subjects,
+            pointer_anchor_handles=anchor_handles,
+            pointer_anchor_count=cnt,
+            legal_edge_bitmap=legal_edge,
+            legal_edge_n_blockers=legal_n,
+            legal_edge_n_attackers=legal_n,
+        )
+
+        # Reserve a window in the replay buffer covering all rows. Tokens
+        # come from the staged packed rows; decisions are stored as zero
+        # (decoder-pipeline rows don't use the inline-blank decision arrays).
+        from magic_ai.text_encoder.batch import PackedTextBatch  # local import
+
+        token_count = sum(int(row.packed_row.token_ids.shape[0]) for row in staged)
+        reservation = replay_buffer.reserve_append(
+            row_count=total,
+            token_count=token_count,
+            decision_count=0,
+        )
         try:
-            return self._append_envs_to_replay_core(env_indices, replay_buffer, seal=seal)
-        finally:
-            self._lock.release()
+            # Write encoded rows + common fields FIRST. The packed-row
+            # helper clears the decoder row as part of its scratch reset
+            # (see ``TextReplayBuffer._write_packed_encoded_row``), so the
+            # decoder commit must come after.
+            row_cursor = int(reservation.row_start)
+            token_cursor = int(reservation.token_start)
+            zeros_int = torch.zeros((1,), dtype=torch.long, device=device)
+            for row in staged:
+                packed = cast(PackedTextBatch, row.packed_row)
+                token_width = int(packed.token_ids.shape[0])
+                replay_buffer._write_packed_encoded_row(
+                    row_cursor, token_cursor, packed, batch_index=0
+                )
+                replay_buffer.core._write_common_row(
+                    row_cursor,
+                    trace_kind_id=int(
+                        _decision_type_to_trace_kind_id(int(row.decoder.decision_type[0].item()))
+                    ),
+                    may_selected=0.0,
+                    old_log_prob=float(row.decoder.log_probs.sum().item()),
+                    value=float(row.decoder.value[0].item()),
+                    perspective_player_idx=int(row.perspective_player_idx),
+                    lstm_h_in=row.lstm_h_in,
+                    lstm_c_in=row.lstm_c_in,
+                )
+                # decision_count = 0 for decoder rows.
+                replay_buffer.core.decision_start[row_cursor] = zeros_int
+                replay_buffer.core.decision_count[row_cursor] = zeros_int
+                row_cursor += 1
+                token_cursor += token_width
+            replay_buffer.commit_decoder_decision(reservation, payload)
+            replay_buffer._mark_append_ready_range(
+                int(reservation.row_start), int(reservation.row_end)
+            )
+            replay_buffer.commit(reservation)
+        except BaseException:
+            # On failure, leave the reservation un-sealed (caller must drop).
+            raise
+
+        rows = torch.arange(
+            int(reservation.row_start),
+            int(reservation.row_end),
+            dtype=torch.long,
+            device=device,
+        )
+        return rows, counts_t
+
+    def append_envs_to_replay(
+        self,
+        env_indices: list[int],
+        replay_buffer: TextReplayBuffer,
+    ) -> list[list[int]]:
+        rows, counts = self.append_envs_to_replay_returning_tensor(env_indices, replay_buffer)
+        if int(rows.numel()) == 0:
+            return [[] for _ in env_indices]
+        offsets = [0]
+        for c in counts.detach().cpu().tolist():
+            offsets.append(offsets[-1] + int(c))
+        rows_h = rows.detach().cpu().tolist()
+        return [
+            [int(r) for r in rows_h[offsets[i] : offsets[i + 1]]] for i in range(len(env_indices))
+        ]
 
     def append_env_to_replay(self, env_idx: int, replay_buffer: TextReplayBuffer) -> list[int]:
         return self.append_envs_to_replay([env_idx], replay_buffer)[0]
@@ -1367,6 +998,14 @@ def _decision_type_to_trace_kind(decision_type: int) -> str:
         DecisionType.CHOOSE_MODE: "choice_index",
         DecisionType.CHOOSE_X: "choice_index",
     }[dt]
+
+
+def _decision_type_to_trace_kind_id(decision_type: int) -> int:
+    """Numeric form of :func:`_decision_type_to_trace_kind` for replay storage."""
+
+    from magic_ai.actions import TRACE_KIND_TO_ID
+
+    return int(TRACE_KIND_TO_ID[cast(Any, _decision_type_to_trace_kind(decision_type))])
 
 
 def _single_token_id(tokenizer: Any, token: str) -> int:
@@ -4243,61 +3882,6 @@ def train_text_envs(
     )
 
 
-def sample_native_text_policy_batch(
-    args: argparse.Namespace,
-    backend: TextTrainingBackend,
-    native_batch: Any,
-    *,
-    env_indices: list[int],
-    perspective_player_indices: list[int],
-    deterministic: bool = False,
-    sampling_policy: TextActorCritic | None = None,
-    text_batch: Any | None = None,
-    packed_text_batch: Any | None = None,
-) -> list[Any]:
-    if packed_text_batch is not None:
-        encoded = None
-    elif text_batch is not None:
-        encoded = text_batch
-    else:
-        raise NativeEncodingError(
-            "native text policy sampling requires packed_text_batch or text_batch; "
-            "the Python render-plan assembler has been removed"
-        )
-
-    # The native encoder writes these directly into pinned CPU scratch — no
-    # device transfer needed, no detach (we're already under no_grad).
-    layouts: list[Any] = []
-    starts = native_batch.decision_start.tolist()
-    counts = native_batch.decision_count.tolist()
-    for row_idx, trace_kind_raw in enumerate(native_batch.trace_kinds):
-        trace_kind = cast(Any, trace_kind_raw)
-        start = int(starts[row_idx])
-        count = int(counts[row_idx])
-        end = start + count
-        pending = cast(PendingState, {"kind": trace_kind, "options": []})
-        layouts.append(
-            TextDecisionLayout(
-                trace_kind=trace_kind,
-                decision_option_idx=native_batch.decision_option_idx[start:end],
-                decision_target_idx=native_batch.decision_target_idx[start:end],
-                decision_mask=native_batch.decision_mask[start:end],
-                uses_none_head=native_batch.uses_none_head[start:end],
-                pending=pending,
-            )
-        )
-
-    actor = sampling_policy if sampling_policy is not None else backend.policy
-    return actor.sample_text_batch(
-        encoded,
-        env_indices=env_indices,
-        perspective_player_indices=perspective_player_indices,
-        layouts=layouts,
-        deterministic=deterministic,
-        packed_batch=packed_text_batch,
-    )
-
-
 def train_text_native_batched_envs(
     args: argparse.Namespace,
     mage: Any,
@@ -5310,38 +4894,17 @@ def train_text_native_batched_envs(
                         env.inference_policy_version = int(policy_version)
                         env.behavior_policy_version = int(policy_version)
                         count = int(policy_batch.decision_counts[row_idx])
-                        selected_for_step = policy_batch.selected_choice_cols[
-                            selected_cursor : selected_cursor + count
-                        ]
                         selected_cursor += count
                         if env.transcript_enabled:
-                            try:
-                                state, pending = _current_transcript_snapshot(env.game)
-                                trace_kind = TRACE_KIND_VALUES[
-                                    int(ready.native_batch.trace_kind_id[row_idx])
-                                ]
-                                if trace_kind == "may":
-                                    action = action_from_choice_accepted(
-                                        bool(policy_batch.may_selected[row_idx])
-                                    )
-                                else:
-                                    _trace, action = _decode_text_action(
-                                        trace_kind,
-                                        pending,
-                                        list(selected_for_step),
-                                    )
-                                env.transcript.append(
-                                    TranscriptAction(
-                                        state=state,
-                                        pending=pending,
-                                        action=copy.deepcopy(action),
-                                    )
-                                )
-                            except Exception as exc:  # noqa: BLE001
-                                disable_transcript(
-                                    env,
-                                    f"{exc} while snapshotting live game for Go text action",
-                                )
+                            # The Go-side text-rollout worker path is not yet
+                            # migrated to the decoder pipeline; the IMPALA
+                            # actor loop (run_text_rollouts_actor_loop) is
+                            # the supported entry point post-Session-B.
+                            raise NotImplementedError(
+                                "Go-side text rollout worker still speaks the "
+                                "inline-blank protocol. Use --num-rollout-actors "
+                                ">= 1 (the IMPALA actor loop) instead."
+                            )
                         env.episode_steps.append(
                             RolloutStep(
                                 perspective_player_idx=int(perspectives[row_idx]),
@@ -5544,7 +5107,6 @@ def train_text_native_batched_envs(
                 refill_request_queue=refill_req_q,
                 refill_response_queue=refill_resp_qs[actor_id],
                 transcript_snapshot=_current_transcript_snapshot,
-                decode_text_action=_decode_text_action,
                 disable_transcript=disable_transcript,
                 append_transcript_action=lambda env, st, pe, ac: env.transcript.append(
                     TranscriptAction(state=st, pending=pe, action=copy.deepcopy(ac))
@@ -6312,44 +5874,17 @@ def train_text_native_batched_envs(
             may_selected = policy_batch.may_selected
             log_probs_cpu = policy_batch.old_log_prob
             values_cpu = policy_batch.value
-            trace_kind_ids = native_batch.trace_kind_id.tolist()
             selected_cursor = 0
             for step_idx, (env, player_idx) in enumerate(
                 zip(ready_envs, ready_players, strict=True)
             ):
                 env.action_count += 1
-                selected_for_step = selected_cols[
-                    selected_cursor : selected_cursor + counts[step_idx]
-                ]
                 selected_cursor += counts[step_idx]
                 if env.transcript_enabled:
-                    try:
-                        transcript_state, transcript_pending = _current_transcript_snapshot(
-                            env.game
-                        )
-                        trace_kind = TRACE_KIND_VALUES[int(trace_kind_ids[step_idx])]
-                        if trace_kind == "may":
-                            transcript_action = action_from_choice_accepted(
-                                bool(may_selected[step_idx])
-                            )
-                        else:
-                            _trace, transcript_action = _decode_text_action(
-                                trace_kind,
-                                transcript_pending,
-                                list(selected_for_step),
-                            )
-                        env.transcript.append(
-                            TranscriptAction(
-                                state=transcript_state,
-                                pending=transcript_pending,
-                                action=copy.deepcopy(transcript_action),
-                            )
-                        )
-                    except Exception as exc:
-                        disable_transcript(
-                            env,
-                            f"{exc} while snapshotting live game for native text action",
-                        )
+                    raise NotImplementedError(
+                        "in-process IMPALA text rollout path was not migrated to "
+                        "the decoder pipeline; use --num-rollout-actors >= 1."
+                    )
                 env.episode_steps.append(
                     RolloutStep(
                         perspective_player_idx=int(player_idx),

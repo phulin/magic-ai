@@ -118,10 +118,12 @@ def main() -> int:
     layout = DecoderDecisionLayout(
         output_token_ids=sample.output_token_ids[0],
         output_pointer_pos=sample.output_pointer_pos[0],
+        output_pointer_subjects=sample.output_pointer_subjects[0],
         output_is_pointer=sample.output_is_pointer[0],
         output_pad_mask=sample.output_pad_mask[0],
         decision_type=int(sample.decision_type[0].item()),
         pointer_anchor_handles=sample.pointer_anchor_handles[0],
+        pointer_anchor_count=int(sample.pointer_anchor_count[0].item()),
     )
     action = decode_decoder_action(pending, layout)  # type: ignore[arg-type]
     chosen = int(action.get("option_index", 0))  # type: ignore[union-attr]

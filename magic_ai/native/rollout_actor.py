@@ -26,15 +26,18 @@ import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import Future
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
 
-from magic_ai.actions import TRACE_KIND_VALUES, action_from_choice_accepted
 from magic_ai.native.inference_server import (
     RolloutTimingStats,
     TextInferenceRequest,
     TextInferenceServer,
+)
+from magic_ai.text_encoder.actor_critic import (
+    DecoderDecisionLayout,
+    decode_decoder_action,
 )
 
 if TYPE_CHECKING:
@@ -126,7 +129,6 @@ class TextRolloutActor:
     refill_request_queue: Queue[RefillRequest]
     refill_response_queue: Queue[Any]
     transcript_snapshot: Callable[..., tuple[Any, Any]]
-    decode_text_action: Callable[..., tuple[Any, Any]]
     disable_transcript: Callable[..., None]
     append_transcript_action: Callable[..., None]
     record_step: Callable[..., None]
@@ -340,55 +342,47 @@ class TextRolloutActor:
         reply = batch.future.result()
         self._record_timing("actor_wait_inference", batch.submitted_at)
         try:
-            if reply.replay_rows is None and self.replay_buffer is not None:
-                start = time.perf_counter()
-                if reply.replay_payload is None:
-                    raise RuntimeError("text inference reply missing replay payload")
-                rows = self.replay_buffer.append_native_payload(
-                    reply.replay_payload,
-                    ready_event=getattr(reply, "ready_event", None),
-                )
-                reply = replace(
-                    reply, replay_rows=[int(row) for row in rows.detach().cpu().tolist()]
-                )
-                self._record_timing("actor_append_replay", start)
-            elif reply.replay_rows is None:
-                start = time.perf_counter()
-                self.staging_buffer.stage_batch(
-                    batch.ready_env_indices,
-                    reply.replay_payload,
-                    ready_event=getattr(reply, "ready_event", None),
-                )
-                self._record_timing("actor_stage", start)
+            start = time.perf_counter()
+            self.staging_buffer.stage_batch(
+                batch.ready_env_indices,
+                reply.decoder_batch,
+                packed_rows=reply.packed_rows,
+                perspective_player_indices=reply.perspective_player_indices,
+                ready_event=getattr(reply, "ready_event", None),
+            )
+            self._record_timing("actor_stage", start)
         finally:
             release_item = getattr(reply, "release_item", None)
             if release_item is not None:
                 release_item()
+
         # Build transcripts + RolloutSteps (CPU-only, actor-local) and then
-        # advance the engine. Transcript work uses host-side scalars from the
-        # reply, so no additional GPU sync is needed.
+        # advance the engine via the decoder-action batched cgo entry.
         start = time.perf_counter()
-        cursor = 0
+        decoder = reply.decoder_batch
+        log_probs_per_row = decoder.log_probs.sum(dim=-1).detach().cpu().tolist()
+        values_host = decoder.value.detach().cpu().tolist()
+        decision_types_host = decoder.decision_type.detach().cpu().tolist()
         for step_idx, (env, player_idx) in enumerate(
             zip(batch.ready_envs, batch.ready_players, strict=True)
         ):
             env.action_count += 1
             env.inference_policy_version = int(getattr(reply, "inference_policy_version", 0))
             env.behavior_policy_version = int(env.inference_policy_version)
-            count = int(reply.decision_counts[step_idx])
-            replay_idx = int(reply.replay_rows[step_idx]) if reply.replay_rows is not None else None
-            selected_for_step = reply.selected_choice_cols[cursor : cursor + count]
-            cursor += count
             if env.transcript_enabled:
                 try:
                     state, pending = self.transcript_snapshot(env.game)
-                    trace_kind = TRACE_KIND_VALUES[int(reply.trace_kind_id[step_idx])]
-                    if trace_kind == "may":
-                        action = action_from_choice_accepted(bool(reply.may_selected[step_idx]))
-                    else:
-                        _trace, action = self.decode_text_action(
-                            trace_kind, pending, list(selected_for_step)
-                        )
+                    layout = DecoderDecisionLayout(
+                        output_token_ids=decoder.output_token_ids[step_idx],
+                        output_pointer_pos=decoder.output_pointer_subjects[step_idx],
+                        output_pointer_subjects=decoder.output_pointer_subjects[step_idx],
+                        output_is_pointer=decoder.output_is_pointer[step_idx],
+                        output_pad_mask=decoder.output_pad_mask[step_idx],
+                        decision_type=int(decision_types_host[step_idx]),
+                        pointer_anchor_handles=decoder.pointer_anchor_handles[step_idx],
+                        pointer_anchor_count=int(decoder.pointer_anchor_count[step_idx].item()),
+                    )
+                    action = decode_decoder_action(pending, layout)
                     self.append_transcript_action(env, state, pending, action)
                 except Exception as exc:  # noqa: BLE001
                     self.disable_transcript(
@@ -397,27 +391,39 @@ class TextRolloutActor:
             self.record_step(
                 env,
                 int(player_idx),
-                float(reply.old_log_prob[step_idx]),
-                float(reply.value[step_idx]),
-                replay_idx,
+                float(log_probs_per_row[step_idx]),
+                float(values_host[step_idx]),
+                None,  # decoder rows commit at episode end via staging buffer
             )
         self._record_timing("actor_record", start)
 
-        # CPU step_by_choice (parallel across actors thanks to GIL release in cgo).
+        # Advance the engines via the decoder-action batched cgo entry.
+        # Session A wires ``mage.batch_step_by_decoder_action``; until that
+        # lands we raise so callers fail loudly rather than silently
+        # skipping engine progression.
         start = time.perf_counter()
-        starts: list[int] = []
-        running = 0
-        for c in reply.decision_counts:
-            starts.append(running)
-            running += int(c)
-        self.rollout_driver.step_by_choice(
-            batch.ready_games,
-            decision_starts=starts,
-            decision_counts=list(reply.decision_counts),
-            selected_choice_cols=list(reply.selected_choice_cols),
-            may_selected=list(reply.may_selected),
-            max_options=self.encode_cfg.max_options,
-            max_targets_per_option=self.encode_cfg.max_targets_per_option,
+        try:
+            import mage  # noqa: PLC0415
+
+            step_fn = getattr(mage, "batch_step_by_decoder_action", None)
+        except Exception:  # noqa: BLE001
+            step_fn = None
+        if step_fn is None:
+            raise RuntimeError(
+                "mage.batch_step_by_decoder_action is not available; Session A "
+                "(Go-side decoder action apply + cgo wrapper) must land before "
+                "the IMPALA decoder pipeline can advance engine state."
+            )
+        handles = [int(g._id) for g in batch.ready_games]
+        step_fn(
+            handles=handles,
+            decision_type=decoder.decision_type,
+            output_token_ids=decoder.output_token_ids,
+            output_pointer_subjects=decoder.output_pointer_subjects,
+            output_is_pointer=decoder.output_is_pointer,
+            output_lens=decoder.output_lens,
+            pointer_anchor_handles=decoder.pointer_anchor_handles,
+            pointer_anchor_count=decoder.pointer_anchor_count,
         )
         self._record_timing("actor_step", start)
         return list(batch.ready_envs)

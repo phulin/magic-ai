@@ -27,7 +27,11 @@ from typing import Any, cast
 import torch
 
 from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
-from magic_ai.text_encoder.actor_critic import NativeTextReplayPayload
+from magic_ai.text_encoder.actor_critic import (
+    NativeTextDecoderBatch,
+    decoder_sample,
+    native_decoder_batch_from_sample,
+)
 from magic_ai.text_encoder.batch import PackedTextBatch
 
 _PROFILE_SAMPLE_COMPONENTS = os.environ.get("MAGIC_AI_PROFILE_SAMPLE_COMPONENTS") == "1"
@@ -66,16 +70,18 @@ class TextInferenceRequest:
 
 @dataclass(frozen=True)
 class TextInferenceReply:
-    """Host-side per-row scalars an actor needs for stepping + transcripts."""
+    """Per-actor inference reply for the decoder-shaped IMPALA pipeline.
 
-    decision_counts: list[int]
-    selected_choice_cols: list[int]  # flat across the request's rows
-    may_selected: list[int]
-    old_log_prob: list[float]
-    value: list[float]
-    trace_kind_id: list[int]
-    replay_payload: NativeTextReplayPayload
-    replay_rows: list[int] | None = None
+    The actor uses ``decoder_batch`` to step its envs via
+    ``mage.batch_step_by_decoder_action`` and to stage decoder targets into
+    the per-actor :class:`NativeTextTrajectoryBuffer`. ``packed_rows`` carries
+    the per-env encoded snapshots needed at episode-commit time for replay
+    scoring.
+    """
+
+    decoder_batch: NativeTextDecoderBatch
+    packed_rows: list[PackedTextBatch]
+    perspective_player_indices: list[int]
     inference_policy_version: int = 0
     ready_event: Any | None = None
     release_item: Any | None = None
@@ -1282,7 +1288,6 @@ class TextInferenceServer:
     def _process(self, items: list[_PendingItem]) -> None:
         start = time.perf_counter()
         self._queue.wait_for_item_copies(items)
-        merged_native = self._queue.native_batch_for(items)
         merged_packed = self._queue.packed_batch_for(items)
         env_indices: list[int] = [i for it in items for i in it.env_indices]
         perspective: list[int] = [p for it in items for p in it.perspective_player_indices]
@@ -1300,132 +1305,93 @@ class TextInferenceServer:
 
         start = time.perf_counter()
         policy_version = 0
-        sample_profile: dict[str, float] | None = (
-            {} if self._timing is not None and _PROFILE_SAMPLE_COMPONENTS else None
-        )
         with torch.no_grad():
             if self._policy_version_manager is not None:
                 with self._policy_version_manager.acquire_inference_policy() as (
                     policy,
                     policy_version,
                 ):
-                    sample = policy.sample_native_tensor_batch(
-                        native_batch=merged_native,
-                        env_indices=env_indices,
-                        perspective_player_indices=perspective,
-                        packed_batch=merged_packed,
-                        deterministic=self._deterministic,
-                        append_replay=False,
-                        return_replay_payload=True,
-                        profile_timings=sample_profile,
-                    )
+                    decoder_batch = self._sample_decoder(policy, merged_packed)
             else:
-                sample = self._policy.sample_native_tensor_batch(
-                    native_batch=merged_native,
-                    env_indices=env_indices,
-                    perspective_player_indices=perspective,
-                    packed_batch=merged_packed,
-                    deterministic=self._deterministic,
-                    append_replay=False,
-                    return_replay_payload=True,
-                    profile_timings=sample_profile,
-                )
+                decoder_batch = self._sample_decoder(self._policy, merged_packed)
         if self._timing is not None:
             self._timing.add("server_sample", time.perf_counter() - start)
-            if sample_profile is not None:
-                for name, elapsed in sample_profile.items():
-                    self._timing.add(f"server_sample_{name}", elapsed)
-        if sample.replay_payload is None:
-            raise RuntimeError("inference server expected a replay payload")
-        ready_event: Any | None = None
-        if sample.replay_payload.value.device.type == "cuda":
-            ready_event = torch.cuda.Event()
-            ready_event.record(torch.cuda.current_stream(sample.replay_payload.value.device))
 
-        # Scatter per-request host-side slices.
+        ready_event: Any | None = None
+        if decoder_batch.value.device.type == "cuda":
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream(decoder_batch.value.device))
+
+        # Scatter per-actor decoder-batch slices and per-row encoded snapshots.
         start = time.perf_counter()
         row_cursor = 0
-        col_cursor = 0
         token_cursor = 0
-        decision_counts = sample.decision_counts
-        sel_cols = sample.selected_choice_cols
-        may_sel = sample.may_selected
-        log_prob = sample.old_log_prob
-        value = sample.value
-        trace_kind_ids = merged_native.trace_kind_id.tolist()
         seq_lengths_host = merged_packed.seq_lengths_host
         if seq_lengths_host is None:
             raise ValueError("merged packed batch missing seq_lengths_host")
         for it in items:
             n = len(it.env_indices)
             row_end = row_cursor + n
-            req_counts = decision_counts[row_cursor:row_end]
-            req_cols_total = sum(req_counts)
-            token_end = token_cursor + sum(int(x) for x in seq_lengths_host[row_cursor:row_end])
-            replay_payload = NativeTextReplayPayload(
-                encoded=_slice_packed_text_batch(
-                    merged_packed,
-                    row_start=row_cursor,
-                    row_end=row_end,
-                    token_start=token_cursor,
-                    token_end=token_end,
-                ),
-                trace_kind_id=sample.replay_payload.trace_kind_id[row_cursor:row_end],
-                decision_count=sample.replay_payload.decision_count[row_cursor:row_end],
-                decision_count_host=tuple(int(x) for x in req_counts),
-                total_decision_groups=req_cols_total,
-                total_stored_decision_groups=req_cols_total,
-                decision_option_idx=sample.replay_payload.decision_option_idx[
-                    col_cursor : col_cursor + req_cols_total
-                ],
-                decision_target_idx=sample.replay_payload.decision_target_idx[
-                    col_cursor : col_cursor + req_cols_total
-                ],
-                decision_mask=sample.replay_payload.decision_mask[
-                    col_cursor : col_cursor + req_cols_total
-                ],
-                uses_none_head=sample.replay_payload.uses_none_head[
-                    col_cursor : col_cursor + req_cols_total
-                ],
-                selected_indices=sample.replay_payload.selected_indices[
-                    col_cursor : col_cursor + req_cols_total
-                ],
-                behavior_action_log_prob=sample.replay_payload.behavior_action_log_prob[
-                    col_cursor : col_cursor + req_cols_total
-                ]
-                if sample.replay_payload.behavior_action_log_prob is not None
-                else None,
-                may_selected=sample.replay_payload.may_selected[row_cursor:row_end],
-                old_log_prob=sample.replay_payload.old_log_prob[row_cursor:row_end],
-                value=sample.replay_payload.value[row_cursor:row_end],
-                perspective_player_idx=sample.replay_payload.perspective_player_idx[
-                    row_cursor:row_end
-                ],
-                lstm_h_in=sample.replay_payload.lstm_h_in[:, row_cursor:row_end],
-                lstm_c_in=sample.replay_payload.lstm_c_in[:, row_cursor:row_end],
-                projected_state=sample.replay_payload.projected_state[row_cursor:row_end]
-                if sample.replay_payload.projected_state is not None
-                else None,
-            )
+            row_lengths = [int(x) for x in seq_lengths_host[row_cursor:row_end]]
+            packed_rows: list[PackedTextBatch] = []
+            tcur = token_cursor
+            for n_tokens in row_lengths:
+                tend = tcur + n_tokens
+                packed_rows.append(
+                    _slice_packed_text_batch(
+                        merged_packed,
+                        row_start=row_cursor + len(packed_rows),
+                        row_end=row_cursor + len(packed_rows) + 1,
+                        token_start=tcur,
+                        token_end=tend,
+                    )
+                )
+                tcur = tend
+            actor_decoder = decoder_batch[row_cursor:row_end]
             reply = TextInferenceReply(
-                decision_counts=list(req_counts),
-                selected_choice_cols=list(sel_cols[col_cursor : col_cursor + req_cols_total]),
-                may_selected=list(may_sel[row_cursor:row_end]),
-                old_log_prob=list(log_prob[row_cursor:row_end]),
-                value=list(value[row_cursor:row_end]),
-                trace_kind_id=list(trace_kind_ids[row_cursor:row_end]),
-                replay_payload=replay_payload,
-                replay_rows=None,
+                decoder_batch=actor_decoder,
+                packed_rows=packed_rows,
+                perspective_player_indices=list(perspective[row_cursor:row_end]),
                 inference_policy_version=int(policy_version),
                 ready_event=ready_event,
                 release_item=lambda item=it: self._queue.finish_items([item]),
             )
             row_cursor = row_end
-            col_cursor += req_cols_total
-            token_cursor = token_end
+            token_cursor += sum(row_lengths)
             it.future.set_result(reply)
         if self._timing is not None:
             self._timing.add("server_scatter", time.perf_counter() - start)
+
+    def _sample_decoder(
+        self, policy: Any, merged_packed: PackedTextBatch
+    ) -> NativeTextDecoderBatch:
+        """Run encode_only + decoder_sample on the merged packed batch."""
+
+        text_policy = policy.policy.text_policy if hasattr(policy, "policy") else policy.text_policy
+        # Build attention mask from packed seq lengths.
+        b = int(merged_packed.seq_lengths.shape[0])
+        encoded_snaps = text_policy.encode_packed_only(merged_packed)
+        encoded = encoded_snaps.encoded
+        device = encoded.device
+        seq_lengths = merged_packed.seq_lengths.to(device=device, dtype=torch.long)
+        t_enc = int(encoded.shape[1])
+        positions = torch.arange(t_enc, device=device).unsqueeze(0).expand(b, -1)
+        attn_mask = positions < seq_lengths.unsqueeze(-1)
+
+        sample = decoder_sample(
+            text_policy,
+            encoded,
+            attn_mask,
+            merged_packed.decision_type.to(device=device, dtype=torch.long),
+            merged_packed.pointer_anchor_positions.to(device=device, dtype=torch.long),
+            merged_packed.pointer_anchor_kinds.to(device=device, dtype=torch.long),
+            merged_packed.pointer_anchor_subjects.to(device=device, dtype=torch.long),
+            merged_packed.pointer_anchor_handles.to(device=device, dtype=torch.long),
+            legal_edge_bitmap=merged_packed.legal_edge_bitmap,
+            greedy=self._deterministic,
+        )
+        value = text_policy.run_heads(encoded_snaps).squeeze(-1)
+        return native_decoder_batch_from_sample(sample, value=value)
 
 
 __all__ = [

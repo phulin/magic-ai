@@ -924,6 +924,11 @@ class TrainPPOTests(unittest.TestCase):
         train_native_text.assert_called_once()
         train_text.assert_not_called()
 
+    @unittest.skip(
+        "IMPALA Session B: in-process IMPALA text rollout was not migrated "
+        "to the decoder pipeline; only --num-rollout-actors >= 1 (the actor "
+        "loop) is supported post-Session-B."
+    )
     def test_native_text_rollout_updates_without_draining_live_games(self) -> None:
         class FakeGame:
             def __init__(self, idx: int) -> None:
