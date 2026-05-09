@@ -871,9 +871,11 @@ class TextActorCritic(nn.Module):
         h_in, c_in = self.lstm_env_state_inputs(env_indices, perspective_player_indices)
         device = self.device
         moved = batch  # caller is expected to have moved the batch already
-        encoded = self.policy.text_policy.encoder(moved)
-        # Update recurrent state through the standard policy forward.
-        _, (h_out, c_out) = self.policy(moved, h_in=h_in, c_in=c_in)
+        # Single encoder forward with history injection + LSTM update;
+        # decoder cross-attn requires the padded [B, T, D] hidden tensor.
+        encoded, h_out, c_out = self.policy.encoder_forward_padded_with_history(
+            moved, h_in=h_in, c_in=c_in
+        )
         self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
 
         attn_mask = moved.attention_mask.to(device=device, dtype=torch.bool)
@@ -1009,7 +1011,18 @@ class TextActorCritic(nn.Module):
         """
         del return_extras
         batch = self._gather_replay_decoder(replay_rows)
-        encoded_snaps = self.policy.text_policy.encode_packed_only(batch.encoded)
+        # Run encoder with the per-row recurrent state recorded at rollout
+        # time so train-time scoring matches sample-time exactly. Replay
+        # storage layout is [B, layers, hidden]; LSTM wants [layers, B, hidden].
+        h_in = (
+            batch.lstm_h_in.permute(1, 0, 2).contiguous() if batch.lstm_h_in is not None else None
+        )
+        c_in = (
+            batch.lstm_c_in.permute(1, 0, 2).contiguous() if batch.lstm_c_in is not None else None
+        )
+        encoded_snaps, _h_out, _c_out = self.policy.encode_with_history(
+            batch.encoded, h_in=h_in, c_in=c_in
+        )
         encoded = encoded_snaps.encoded
         attn_mask = batch.encoded.cu_seqlens.new_zeros(0)  # placeholder; pack_batch path
         # Build the [B, T_enc] attention mask from packed seq lengths.

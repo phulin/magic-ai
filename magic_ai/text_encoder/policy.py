@@ -87,12 +87,16 @@ class TextPolicy(nn.Module):
             decoder_cfg = GrammarDecoderConfig(d_model=cfg.d_model, n_heads=n_heads)
         self.grammar_decoder = GrammarDecoder(decoder_cfg)
 
-    def encode_only(self, batch: TextEncodedBatch) -> EncodedSnapshots:
+    def encode_only(
+        self, batch: TextEncodedBatch, *, hist_emb: Tensor | None = None
+    ) -> EncodedSnapshots:
         packed = pack_batch(batch)
-        return self.encode_packed_only(packed)
+        return self.encode_packed_only(packed, hist_emb=hist_emb)
 
-    def encode_packed_only(self, batch: PackedTextBatch) -> EncodedSnapshots:
-        hidden = self.encoder.forward_packed(batch)
+    def encode_packed_only(
+        self, batch: PackedTextBatch, *, hist_emb: Tensor | None = None
+    ) -> EncodedSnapshots:
+        hidden = self.encoder.forward_packed(batch, hist_emb=hist_emb)
         card_vecs, card_mask = gather_card_vectors_packed(hidden, batch)
         state_vec = gather_state_vector_packed(hidden, batch)
         return EncodedSnapshots(
@@ -107,8 +111,10 @@ class TextPolicy(nn.Module):
         sv = encoded.state_vector if state_vec is None else state_vec
         return self.value_head(sv)
 
-    def forward(self, batch: TextEncodedBatch) -> TextPolicyOutput:
-        encoded = self.encode_only(batch)
+    def forward(
+        self, batch: TextEncodedBatch, *, hist_emb: Tensor | None = None
+    ) -> TextPolicyOutput:
+        encoded = self.encode_only(batch, hist_emb=hist_emb)
         values = self.run_heads(encoded)
         return TextPolicyOutput(
             values=values,
@@ -121,6 +127,8 @@ class TextPolicy(nn.Module):
         self,
         batch: TextEncodedBatch,
         target_tokens: Tensor,
+        *,
+        hist_emb: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Run encoder + grammar decoder in teacher-forced mode.
 
@@ -129,7 +137,7 @@ class TextPolicy(nn.Module):
         ``(vocab_logits [B, L, V_grammar], pointer_logits [B, L, T_enc])``.
         """
 
-        encoded = self.encoder(batch)
+        encoded = self.encoder(batch, hist_emb=hist_emb)
         return self.grammar_decoder.forward_teacher_forced(
             target_tokens,
             encoded,

@@ -461,11 +461,18 @@ class TextStateEncoder(nn.Module):
         elif isinstance(module, RMSNorm):
             nn.init.ones_(module.weight)
 
-    def forward(self, batch: TextEncodedBatch) -> Tensor:
+    def forward(self, batch: TextEncodedBatch, hist_emb: Tensor | None = None) -> Tensor:
         token_ids = batch.token_ids
         attention_mask = batch.attention_mask
         b, t = token_ids.shape
         x = self.tok_emb(token_ids)
+        if hist_emb is not None:
+            # Additive injection at the BOS position (index 0) of each row.
+            # Train-time and sample-time share this same path so the encoder's
+            # hidden states (which the decoder cross-attends to) become
+            # history-conditioned.
+            x = x.clone()
+            x[:, 0] = x[:, 0] + hist_emb.to(dtype=x.dtype)
         key_pad = ~attention_mask.bool()
         # Guard rows whose entire key axis is masked: softmax over an empty
         # set is NaN, which would poison the whole batch. Such rows produce
@@ -523,7 +530,7 @@ class TextStateEncoder(nn.Module):
         x = self.final_norm(x)
         return x
 
-    def forward_packed(self, batch: PackedTextBatch) -> Tensor:
+    def forward_packed(self, batch: PackedTextBatch, hist_emb: Tensor | None = None) -> Tensor:
         """Run the encoder over a packed (varlen) batch.
 
         Returns hidden states of shape ``[T_packed, D]``. Documents are
@@ -536,6 +543,12 @@ class TextStateEncoder(nn.Module):
         token_ids = batch.token_ids  # [T]
         t = token_ids.shape[0]
         x = self.tok_emb(token_ids)  # [T, D] — packed path stays rank-2
+        if hist_emb is not None:
+            # Each cu_seqlens[i] is the offset where doc i begins; the BOS
+            # token is at that position. Vectorized scatter-add of the
+            # per-doc history embedding onto each BOS row.
+            bos_idx = batch.cu_seqlens[:-1].to(device=x.device, dtype=torch.long)
+            x = x.index_add(0, bos_idx, hist_emb.to(dtype=x.dtype))
         pos = batch.pos_in_seq.to(device=x.device)
         rope_cos_g = cast(Tensor, self.rope_cos_global).index_select(0, pos).to(x.dtype)
         rope_sin_g = cast(Tensor, self.rope_sin_global).index_select(0, pos).to(x.dtype)

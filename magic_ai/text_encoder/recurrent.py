@@ -74,6 +74,14 @@ class RecurrentTextPolicy(nn.Module):
         nn.init.normal_(self.out_proj.weight, std=0.02)
         nn.init.zeros_(self.out_proj.bias)
 
+        # History projection: top-layer LSTM hidden -> additive embedding at
+        # each document's BOS position. Zero-initialized so existing
+        # checkpoints behave like the no-hist version at init time and the
+        # encoder learns to use history gradually.
+        self.hist_proj = nn.Linear(cfg.lstm_hidden, d_model)
+        nn.init.zeros_(self.hist_proj.weight)
+        nn.init.zeros_(self.hist_proj.bias)
+
         self.lstm = nn.LSTM(
             input_size=cfg.lstm_hidden,
             hidden_size=cfg.lstm_hidden,
@@ -109,6 +117,88 @@ class RecurrentTextPolicy(nn.Module):
             raise ValueError(f"{name} must have shape {expected}; got {tuple(state.shape)}")
         return squeezed
 
+    def _hist_emb(
+        self,
+        b: int,
+        device: torch.device,
+        h_in: Tensor | None,
+        c_in: Tensor | None = None,
+    ) -> tuple[Tensor | None, Tensor, Tensor]:
+        """Resolve initial (h_in, c_in) and the additive hist embedding.
+
+        Returns ``(hist_emb, h_in, c_in)`` where ``hist_emb`` is ``None`` when
+        ``h_in`` was ``None`` (zero-init: hist_proj of zeros is bias only,
+        which is also zero at construction; we skip the inject entirely so
+        the no-history path is exactly equivalent to a pre-history encoder).
+        """
+        if h_in is None or c_in is None:
+            h_init, c_init = self.init_state(b, device)
+            # hist_proj of zeros is zero (zero-init weight + zero bias), so
+            # skip the inject entirely when there's no carried state.
+            return None, h_init, c_init
+        # Top-layer hidden state drives the history projection.
+        return self.hist_proj(h_in[-1]), h_in, c_in
+
+    def encoder_forward_padded_with_history(
+        self,
+        batch: TextEncodedBatch,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Run the non-packed encoder.forward with hist injection + LSTM update.
+
+        Returns ``(encoded [B, T, D], h_out, c_out)``. Used by sample-time
+        paths whose downstream decoder cross-attn requires a padded
+        rank-3 hidden tensor.
+        """
+        from magic_ai.text_encoder.model import gather_state_vector
+
+        b = int(batch.token_ids.shape[0])
+        device = batch.token_ids.device
+        hist_emb, h_in_eff, c_in_eff = self._hist_emb(b, device, h_in, c_in)
+        encoded = self.text_policy.encoder(batch, hist_emb=hist_emb)
+        state_vec = gather_state_vector(encoded, batch)
+        lstm_input = self.in_proj(state_vec)
+        h_in_eff = h_in_eff.to(device=device, dtype=lstm_input.dtype)
+        c_in_eff = c_in_eff.to(device=device, dtype=lstm_input.dtype)
+        _, (h_out, c_out) = self.lstm(lstm_input.unsqueeze(1), (h_in_eff, c_in_eff))
+        h_out = self._normalize_lstm_final_state(h_out, b, "h_out")
+        c_out = self._normalize_lstm_final_state(c_out, b, "c_out")
+        return encoded, h_out, c_out
+
+    def encode_with_history(
+        self,
+        batch: PackedTextBatch | TextEncodedBatch,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
+    ) -> tuple[EncodedSnapshots, Tensor, Tensor]:
+        """Run encoder with history-conditioning + LSTM update.
+
+        The encoder sees ``h_in`` via the additive HIST embedding at each
+        doc's BOS position; the LSTM is then advanced to ``(h_out, c_out)``
+        for the next env-step. This is the single forward path used by both
+        sample-time (IMPALA / opponent eval / inference server) and
+        train-time (replay scoring inside the trainer).
+        """
+        if isinstance(batch, PackedTextBatch):
+            b = int(batch.seq_lengths.shape[0])
+            device = batch.token_ids.device
+        else:
+            b = int(batch.token_ids.shape[0])
+            device = batch.token_ids.device
+        hist_emb, h_in_eff, c_in_eff = self._hist_emb(b, device, h_in, c_in)
+        if isinstance(batch, PackedTextBatch):
+            encoded = self.text_policy.encode_packed_only(batch, hist_emb=hist_emb)
+        else:
+            encoded = self.text_policy.encode_only(batch, hist_emb=hist_emb)
+        lstm_input = self.in_proj(encoded.state_vector)
+        h_in_eff = h_in_eff.to(device=device, dtype=lstm_input.dtype)
+        c_in_eff = c_in_eff.to(device=device, dtype=lstm_input.dtype)
+        _, (h_out, c_out) = self.lstm(lstm_input.unsqueeze(1), (h_in_eff, c_in_eff))
+        h_out = self._normalize_lstm_final_state(h_out, b, "h_out")
+        c_out = self._normalize_lstm_final_state(c_out, b, "c_out")
+        return encoded, h_out, c_out
+
     def forward(
         self,
         batch: TextEncodedBatch,
@@ -127,9 +217,8 @@ class RecurrentTextPolicy(nn.Module):
         with torch.autocast(
             device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
         ):
-            encoded = self.text_policy.encode_only(batch)
-            return self._forward_encoded(
-                encoded,
+            return self._run(
+                batch,
                 h_in=h_in,
                 c_in=c_in,
                 state_hidden_override=state_hidden_override,
@@ -171,45 +260,47 @@ class RecurrentTextPolicy(nn.Module):
         with torch.autocast(
             device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
         ):
-            encoded = self.text_policy.encode_packed_only(batch)
-            return self._forward_encoded(
-                encoded,
+            return self._run(
+                batch,
                 h_in=h_in,
                 c_in=c_in,
                 state_hidden_override=state_hidden_override,
             )
 
-    def _forward_encoded(
+    def _run(
         self,
-        encoded: EncodedSnapshots,
+        batch: PackedTextBatch | TextEncodedBatch,
         h_in: Tensor | None = None,
         c_in: Tensor | None = None,
         *,
         state_hidden_override: Tensor | None = None,
     ) -> tuple[RecurrentTextPolicyOutput, tuple[Tensor, Tensor]]:
-        b = encoded.state_vector.shape[0]
-        device = encoded.state_vector.device
-        if h_in is None or c_in is None:
-            h_in, c_in = self.init_state(b, device)
-
-        lstm_input: Tensor | None
         if state_hidden_override is not None:
+            # Head-only path: caller provides a precomputed state_hidden and
+            # the LSTM update is skipped. ``state_hidden_override`` must
+            # already be the result of a real LSTM update somewhere upstream
+            # (otherwise the heads see stale state — see :meth:`forward`).
+            if isinstance(batch, PackedTextBatch):
+                encoded = self.text_policy.encode_packed_only(batch, hist_emb=None)
+            else:
+                encoded = self.text_policy.encode_only(batch, hist_emb=None)
+            b = encoded.state_vector.shape[0]
             if state_hidden_override.shape != (b, self.lstm_hidden):
                 raise ValueError(
                     "state_hidden_override must have shape "
                     f"({b}, {self.lstm_hidden}); got {tuple(state_hidden_override.shape)}"
                 )
             state_hidden = state_hidden_override
+            device = encoded.state_vector.device
+            if h_in is None or c_in is None:
+                h_in, c_in = self.init_state(b, device)
             h_out, c_out = h_in, c_in
             lstm_input = None
         else:
+            encoded, h_out, c_out = self.encode_with_history(batch, h_in=h_in, c_in=c_in)
             lstm_input = self.in_proj(encoded.state_vector)
-            h_in = h_in.to(device=device, dtype=lstm_input.dtype)
-            c_in = c_in.to(device=device, dtype=lstm_input.dtype)
-            y, (h_out, c_out) = self.lstm(lstm_input.unsqueeze(1), (h_in, c_in))
-            h_out = self._normalize_lstm_final_state(h_out, b, "h_out")
-            c_out = self._normalize_lstm_final_state(c_out, b, "c_out")
-            state_hidden = y.squeeze(1)
+            # The top LSTM layer's hidden output is what feeds the heads.
+            state_hidden = h_out[-1]
 
         state_for_heads = self.out_proj(state_hidden)
         values = self.text_policy.run_heads(encoded, state_vec=state_for_heads)

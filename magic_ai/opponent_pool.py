@@ -513,7 +513,11 @@ def run_eval_matches(
             packed = nat_outputs.to_packed_text_batch(trim=True, derive_token_metadata=True)
             text_policy = policy.policy.text_policy
             with torch.no_grad():
-                encoded_snaps = text_policy.encode_packed_only(packed)
+                h_in, c_in = policy.lstm_env_state_inputs(slot_indices, players)
+                encoded_snaps, h_out, c_out = policy.policy.encode_with_history(
+                    packed, h_in=h_in, c_in=c_in
+                )
+                policy.scatter_lstm_env_states(slot_indices, players, h_out, c_out)
                 encoded = encoded_snaps.encoded
                 device = encoded.device
                 b = int(packed.seq_lengths.shape[0])

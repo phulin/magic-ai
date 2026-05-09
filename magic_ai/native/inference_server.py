@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, fields
 from queue import Empty
@@ -1311,9 +1312,13 @@ class TextInferenceServer:
                     policy,
                     policy_version,
                 ):
-                    decoder_batch = self._sample_decoder(policy, merged_packed)
+                    decoder_batch = self._sample_decoder(
+                        policy, merged_packed, env_indices, perspective
+                    )
             else:
-                decoder_batch = self._sample_decoder(self._policy, merged_packed)
+                decoder_batch = self._sample_decoder(
+                    self._policy, merged_packed, env_indices, perspective
+                )
         if self._timing is not None:
             self._timing.add("server_sample", time.perf_counter() - start)
 
@@ -1363,14 +1368,34 @@ class TextInferenceServer:
             self._timing.add("server_scatter", time.perf_counter() - start)
 
     def _sample_decoder(
-        self, policy: Any, merged_packed: PackedTextBatch
+        self,
+        policy: Any,
+        merged_packed: PackedTextBatch,
+        env_indices: Sequence[int],
+        perspective_player_indices: Sequence[int],
     ) -> NativeTextDecoderBatch:
-        """Run encode_only + decoder_sample on the merged packed batch."""
+        """Run encode_with_history + decoder_sample on the merged packed batch.
+
+        Per-env LSTM state is fetched from ``self._policy``'s live state,
+        injected into the encoder via the additive HIST embedding, advanced
+        by one step, then scattered back. Train-time and sample-time share
+        the identical encode-with-history path.
+        """
 
         text_policy = policy.policy.text_policy if hasattr(policy, "policy") else policy.text_policy
+        recurrent_policy = policy.policy if hasattr(policy, "policy") else None
         # Build attention mask from packed seq lengths.
         b = int(merged_packed.seq_lengths.shape[0])
-        encoded_snaps = text_policy.encode_packed_only(merged_packed)
+        if recurrent_policy is not None:
+            h_in, c_in = self._policy.lstm_env_state_inputs(env_indices, perspective_player_indices)
+            encoded_snaps, h_out, c_out = recurrent_policy.encode_with_history(
+                merged_packed, h_in=h_in, c_in=c_in
+            )
+            self._policy.scatter_lstm_env_states(
+                env_indices, perspective_player_indices, h_out, c_out
+            )
+        else:
+            encoded_snaps = text_policy.encode_packed_only(merged_packed)
         encoded = encoded_snaps.encoded
         device = encoded.device
         seq_lengths = merged_packed.seq_lengths.to(device=device, dtype=torch.long)
