@@ -31,6 +31,7 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from magic_ai.lstm_recompute import PerPlayerLstmLayout, build_per_player_lstm_layout
 from magic_ai.model_state import is_actor_runtime_state_key
 
 
@@ -1053,6 +1054,20 @@ class _TrajLossPieces:
     v_target_reg_share_count: Tensor | None = None
 
 
+@dataclass(frozen=True)
+class _RNaDBatchLayout:
+    flat_rows: tuple[int, ...]
+    ep_lens: tuple[int, ...]
+    ep_offsets: Tensor
+    perspective: Tensor
+    terminal_reward_p0: Tensor
+    zero_sum: Tensor
+    logp_mu: Tensor
+    own_idx_p0: Tensor
+    own_idx_p1: Tensor
+    lstm_layout: PerPlayerLstmLayout
+
+
 def _maybe_recompute_lstm(policy: Any, replay_rows: list[int]) -> tuple[Tensor, Tensor] | None:
     """Re-run the policy's LSTM scan over a single episode (issue 2).
 
@@ -1907,7 +1922,16 @@ def _batched_trajectory_loss_from_forwards(
     )
 
 
-def _maybe_precompute_replay_forward(policy: Any, episodes: Sequence[Sequence[int]]) -> Any | None:
+def _maybe_precompute_replay_forward(
+    policy: Any,
+    episodes: Sequence[Sequence[int]],
+    *,
+    prepared_batch: Any | None = None,
+    flat_rows: Sequence[int] | None = None,
+    ep_lens: Sequence[int] | None = None,
+    lstm_layout: PerPlayerLstmLayout | None = None,
+    lstm_chunk_size: int | None = None,
+) -> Any | None:
     """Return ``policy.precompute_replay_forward(...)`` when available.
 
     The text-encoder policy fuses the encoder forward with the per-episode
@@ -1920,7 +1944,27 @@ def _maybe_precompute_replay_forward(policy: Any, episodes: Sequence[Sequence[in
     fn = getattr(policy, "precompute_replay_forward", None)
     if fn is None:
         return None
-    return fn([list(ep) for ep in episodes])
+    kwargs: dict[str, Any] = {}
+    if prepared_batch is not None:
+        kwargs["prepared_batch"] = prepared_batch
+    if flat_rows is not None:
+        kwargs["flat_rows_override"] = flat_rows
+    if ep_lens is not None:
+        kwargs["ep_lens_override"] = ep_lens
+    if lstm_layout is not None:
+        kwargs["lstm_layout_override"] = lstm_layout
+    if lstm_chunk_size is not None:
+        kwargs["lstm_chunk_size"] = int(lstm_chunk_size)
+    return fn([list(ep) for ep in episodes], **kwargs)
+
+
+def _maybe_prepare_rnad_replay_batch(policy: Any, flat_rows: Sequence[int]) -> Any | None:
+    """Return a backend-prepared R-NaD replay batch when available."""
+
+    fn = getattr(policy, "prepare_rnad_replay_batch", None)
+    if fn is None:
+        return None
+    return fn(flat_rows)
 
 
 def _maybe_recompute_lstm_h_out_episodes(
@@ -1990,25 +2034,23 @@ def rnad_batched_trajectory_loss(
         raise ValueError("episodes_logp_mu length mismatch")
 
     flat_rows: list[int] = []
-    own_idx_p0: list[int] = []
-    own_idx_p1: list[int] = []
+    ep_lens: list[int] = []
     ep_offsets: list[int] = [0]
+    perspective_host: list[int] = []
     max_ep_len = 0
     for ep, perspectives in zip(episodes_replay_rows, episodes_perspective, strict=True):
         if not ep:
             raise ValueError("each episode must contain at least one row")
         if len(perspectives) != len(ep):
             raise ValueError("episodes_perspective entries must match episode lengths")
-        base = len(flat_rows)
         flat_rows.extend(int(r) for r in ep)
-        for offset, player in enumerate(perspectives):
-            if int(player) == 0:
-                own_idx_p0.append(base + offset)
-            elif int(player) == 1:
-                own_idx_p1.append(base + offset)
-            else:
+        for player in perspectives:
+            player_i = int(player)
+            perspective_host.append(player_i)
+            if player_i not in (0, 1):
                 raise ValueError("episodes_perspective values must be 0 or 1")
         ep_offsets.append(ep_offsets[-1] + len(ep))
+        ep_lens.append(len(ep))
         if len(ep) > max_ep_len:
             max_ep_len = len(ep)
 
@@ -2019,11 +2061,68 @@ def rnad_batched_trajectory_loss(
     #    runs once on the flat batch and is reused by the per-choice forward
     #    below via ``cached=...``; otherwise we fall back to the legacy
     #    ``recompute_lstm_outputs_for_episodes`` + ``hidden_override`` path.
-    online_cache = _maybe_precompute_replay_forward(online, episodes_replay_rows)
+    with torch.profiler.record_function("rnad_batched_trajectory_loss/prepare_replay_batch"):
+        shared_replay_batch = _maybe_prepare_rnad_replay_batch(online, flat_rows)
+
+    with torch.profiler.record_function("rnad_batched_trajectory_loss/device_input_tensors"):
+        batch_perspective = getattr(shared_replay_batch, "perspective_player_idx", None)
+        if isinstance(batch_perspective, Tensor) and int(batch_perspective.shape[0]) == len(
+            flat_rows
+        ):
+            perspective_flat = batch_perspective.to(device=device)
+        else:
+            perspective_flat = torch.tensor(perspective_host, dtype=torch.long, device=device)
+        terminal_reward_p0_t = torch.tensor(
+            [float(r) for r in episodes_terminal_reward_p0], dtype=torch.float32, device=device
+        )
+        zero_sum_t = torch.tensor(
+            [bool(z) for z in episodes_zero_sum], dtype=torch.bool, device=device
+        )
+        ep_offsets_t = torch.tensor(ep_offsets, dtype=torch.long, device=device)
+        own_idx_p0_t = (perspective_flat == 0).nonzero(as_tuple=False).squeeze(-1)
+        own_idx_p1_t = (perspective_flat == 1).nonzero(as_tuple=False).squeeze(-1)
+        lstm_layout = build_per_player_lstm_layout(
+            perspective_flat,
+            episodes_perspective,
+            ep_offsets=ep_offsets_t,
+            chunk_size=config.bptt_chunk_size,
+        )
+        batch_logp_mu = getattr(shared_replay_batch, "old_log_prob", None)
+        logp_mu = (
+            batch_logp_mu.to(device=device)
+            if isinstance(batch_logp_mu, Tensor) and int(batch_logp_mu.shape[0]) == len(flat_rows)
+            else torch.empty(0, dtype=torch.float32, device=device)
+        )
+    layout = _RNaDBatchLayout(
+        flat_rows=tuple(flat_rows),
+        ep_lens=tuple(ep_lens),
+        ep_offsets=ep_offsets_t,
+        perspective=perspective_flat,
+        terminal_reward_p0=terminal_reward_p0_t,
+        zero_sum=zero_sum_t,
+        logp_mu=logp_mu,
+        own_idx_p0=own_idx_p0_t,
+        own_idx_p1=own_idx_p1_t,
+        lstm_layout=lstm_layout,
+    )
+    with torch.profiler.record_function("rnad_batched_trajectory_loss/online_precompute"):
+        online_cache = _maybe_precompute_replay_forward(
+            online,
+            episodes_replay_rows,
+            prepared_batch=shared_replay_batch,
+            flat_rows=flat_rows if shared_replay_batch is not None else None,
+            ep_lens=ep_lens if shared_replay_batch is not None else None,
+            lstm_layout=layout.lstm_layout,
+            lstm_chunk_size=config.bptt_chunk_size,
+        )
     if online_cache is not None:
         online_h_concat: Tensor | None = online_cache.h_concat
+        if shared_replay_batch is None:
+            shared_replay_batch = online_cache.batch
     else:
-        online_h_list = _maybe_recompute_lstm_h_out_episodes(online, episodes_replay_rows)
+        shared_replay_batch = None
+        with torch.profiler.record_function("rnad_batched_trajectory_loss/online_lstm_recompute"):
+            online_h_list = _maybe_recompute_lstm_h_out_episodes(online, episodes_replay_rows)
         online_h_concat = torch.cat(online_h_list, dim=0) if online_h_list is not None else None
 
     online_per_choice = getattr(online, "evaluate_replay_batch_per_choice")  # noqa: B009
@@ -2039,65 +2138,75 @@ def rnad_batched_trajectory_loss(
         return per_choice(list(flat_rows))
 
     # 2) Single per-choice forward per policy across the full batch.
-    lp_online_b, _, v_online_b, pc_online_b = _forward(
-        online_per_choice, online_h_concat, online_cache
-    )
+    with torch.profiler.record_function("rnad_batched_trajectory_loss/online_per_choice"):
+        lp_online_b, _, v_online_b, pc_online_b = _forward(
+            online_per_choice, online_h_concat, online_cache
+        )
     del online_cache, online_h_concat
 
     def _aux_forward(policy: Any, per_choice: Any) -> Any:
-        cache = _maybe_precompute_replay_forward(policy, episodes_replay_rows)
+        with torch.profiler.record_function("rnad_batched_trajectory_loss/aux_precompute"):
+            cache = _maybe_precompute_replay_forward(
+                policy,
+                episodes_replay_rows,
+                prepared_batch=shared_replay_batch,
+                flat_rows=flat_rows if shared_replay_batch is not None else None,
+                ep_lens=ep_lens if shared_replay_batch is not None else None,
+                lstm_layout=layout.lstm_layout,
+                lstm_chunk_size=config.bptt_chunk_size,
+            )
         if cache is None:
-            h_list = _maybe_recompute_lstm_h_out_episodes(policy, episodes_replay_rows)
+            with torch.profiler.record_function("rnad_batched_trajectory_loss/aux_lstm_recompute"):
+                h_list = _maybe_recompute_lstm_h_out_episodes(policy, episodes_replay_rows)
             h_concat = torch.cat(h_list, dim=0) if h_list is not None else None
         else:
             h_concat = cache.h_concat
-        out = _forward(per_choice, h_concat, cache)
+        with torch.profiler.record_function("rnad_batched_trajectory_loss/aux_per_choice"):
+            out = _forward(per_choice, h_concat, cache)
         del cache, h_concat
         return out
 
     with torch.no_grad():
-        lp_tgt_b, _, v_tgt_b, pc_tgt_b = _aux_forward(target, target_per_choice)
-        _, _, _, pc_reg_cur_b = _aux_forward(reg_cur, reg_cur_per_choice)
-        _, _, _, pc_reg_prev_b = _aux_forward(reg_prev, reg_prev_per_choice)
+        with torch.profiler.record_function("rnad_batched_trajectory_loss/target_forward"):
+            lp_tgt_b, _, v_tgt_b, pc_tgt_b = _aux_forward(target, target_per_choice)
+        with torch.profiler.record_function("rnad_batched_trajectory_loss/reg_cur_forward"):
+            _, _, _, pc_reg_cur_b = _aux_forward(reg_cur, reg_cur_per_choice)
+        with torch.profiler.record_function("rnad_batched_trajectory_loss/reg_prev_forward"):
+            _, _, _, pc_reg_prev_b = _aux_forward(reg_prev, reg_prev_per_choice)
 
     # 3) Single batched loss assembly across the whole flat batch.
-    perspective_flat = torch.tensor(
-        [int(p) for ep in episodes_perspective for p in ep],
-        dtype=torch.long,
-        device=device,
-    )
-    terminal_reward_p0_t = torch.tensor(
-        [float(r) for r in episodes_terminal_reward_p0], dtype=torch.float32, device=device
-    )
-    zero_sum_t = torch.tensor([bool(z) for z in episodes_zero_sum], dtype=torch.bool, device=device)
-    target_dtype = v_online_b.dtype
-    logp_mu_flat = torch.cat([t.to(device=device, dtype=target_dtype) for t in episodes_logp_mu])
-    ep_offsets_t = torch.tensor(ep_offsets, dtype=torch.long, device=device)
-    own_idx_p0_t = torch.tensor(own_idx_p0, dtype=torch.long, device=device)
-    own_idx_p1_t = torch.tensor(own_idx_p1, dtype=torch.long, device=device)
+    with torch.profiler.record_function("rnad_batched_trajectory_loss/logp_mu_to_device"):
+        target_dtype = v_online_b.dtype
+        if int(layout.logp_mu.numel()) == len(flat_rows):
+            logp_mu_flat = layout.logp_mu.to(device=device, dtype=target_dtype)
+        else:
+            logp_mu_flat = torch.cat(
+                [t.to(device=device, dtype=target_dtype) for t in episodes_logp_mu]
+            )
 
-    pieces = _batched_trajectory_loss_from_forwards(
-        lp_online=lp_online_b,
-        v_online=v_online_b,
-        pc_online=pc_online_b,
-        lp_tgt_scalar=lp_tgt_b,
-        v_tgt=v_tgt_b,
-        pc_tgt=pc_tgt_b,
-        pc_reg_cur=pc_reg_cur_b,
-        pc_reg_prev=pc_reg_prev_b,
-        perspective=perspective_flat,
-        terminal_reward_p0=terminal_reward_p0_t,
-        zero_sum=zero_sum_t,
-        logp_mu=logp_mu_flat,
-        ep_offsets=ep_offsets_t,
-        own_idx_p0=own_idx_p0_t,
-        own_idx_p1=own_idx_p1_t,
-        max_ep_len=max_ep_len,
-        config=config,
-        alpha=alpha,
-        compute_v_target_reg_share=compute_v_target_reg_share,
-        compute_policy_drift_diagnostics=compute_policy_drift_diagnostics,
-    )
+    with torch.profiler.record_function("rnad_batched_trajectory_loss/batched_loss_assembly"):
+        pieces = _batched_trajectory_loss_from_forwards(
+            lp_online=lp_online_b,
+            v_online=v_online_b,
+            pc_online=pc_online_b,
+            lp_tgt_scalar=lp_tgt_b,
+            v_tgt=v_tgt_b,
+            pc_tgt=pc_tgt_b,
+            pc_reg_cur=pc_reg_cur_b,
+            pc_reg_prev=pc_reg_prev_b,
+            perspective=layout.perspective,
+            terminal_reward_p0=layout.terminal_reward_p0,
+            zero_sum=layout.zero_sum,
+            logp_mu=logp_mu_flat,
+            ep_offsets=layout.ep_offsets,
+            own_idx_p0=layout.own_idx_p0,
+            own_idx_p1=layout.own_idx_p1,
+            max_ep_len=max_ep_len,
+            config=config,
+            alpha=alpha,
+            compute_v_target_reg_share=compute_v_target_reg_share,
+            compute_policy_drift_diagnostics=compute_policy_drift_diagnostics,
+        )
     return [pieces]
 
 

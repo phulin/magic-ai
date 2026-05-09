@@ -30,7 +30,7 @@ from magic_ai.actions import (
     selected_option_id,
 )
 from magic_ai.game_state import PendingState
-from magic_ai.lstm_recompute import lstm_recompute_per_step_h_out_per_player
+from magic_ai.lstm_recompute import PerPlayerLstmLayout, lstm_recompute_per_step_h_out_per_player
 from magic_ai.replay_decisions import (
     ReplayPerChoice,
     ReplayScoringForward,
@@ -707,11 +707,18 @@ class TextActorCritic(nn.Module):
             self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
             mark_profile("lstm_state_out")
 
-            trace_kind_id = native_batch.trace_kind_id.to(self.device)
-            has_may_decision = bool(
-                (native_batch.trace_kind_id[:batch_size] == TRACE_KIND_TO_ID["may"]).any().item()
-            )
-            decision_count = native_batch.decision_count.to(self.device)
+            with torch.profiler.record_function("sample_native_tensor_batch/trace_kind_to_device"):
+                trace_kind_id = native_batch.trace_kind_id.to(self.device)
+            with torch.profiler.record_function("sample_native_tensor_batch/has_may_decision_sync"):
+                has_may_decision = bool(
+                    (native_batch.trace_kind_id[:batch_size] == TRACE_KIND_TO_ID["may"])
+                    .any()
+                    .item()
+                )
+            with torch.profiler.record_function(
+                "sample_native_tensor_batch/decision_count_to_device"
+            ):
+                decision_count = native_batch.decision_count.to(self.device)
             decision_rows = int(native_batch.decision_rows_written)
             max_cached_choices = int(native_batch.decision_mask.shape[1])
             device = output.values.device
@@ -885,85 +892,108 @@ class TextActorCritic(nn.Module):
             mark_profile("decision_may")
             mark_profile("decision_sampling")
 
-        replay_payload = (
-            NativeTextReplayPayload(
-                encoded=replay_encoded,
-                trace_kind_id=trace_kind_id.detach(),
-                decision_count=decision_count.detach(),
-                decision_count_host=tuple(int(x) for x in decision_count.detach().cpu().tolist()),
-                total_decision_groups=decision_rows,
-                total_stored_decision_groups=None,
-                decision_option_idx=option_idx.detach(),
-                decision_target_idx=target_idx.detach(),
-                decision_mask=decision_mask.detach(),
-                uses_none_head=uses_none.detach(),
-                selected_indices=selected.detach(),
-                behavior_action_log_prob=group_log_probs.detach(),
-                may_selected=may_selected_t.detach(),
-                old_log_prob=step_log_probs.detach(),
-                value=output.values.detach(),
-                perspective_player_idx=torch.tensor(
-                    perspective_player_indices, dtype=torch.long, device=self.device
-                ),
-                lstm_h_in=h_in.detach(),
-                lstm_c_in=c_in.detach(),
-                projected_state=output.lstm_input.detach()
-                if output.lstm_input is not None
-                else None,
-            )
-            if return_replay_payload
-            else None
-        )
+        with torch.profiler.record_function("sample_native_tensor_batch/replay_payload"):
+            replay_payload = None
+            if return_replay_payload:
+                with torch.profiler.record_function(
+                    "sample_native_tensor_batch/replay_payload_decision_count_host"
+                ):
+                    decision_count_host = tuple(
+                        int(x) for x in decision_count.detach().cpu().tolist()
+                    )
+                replay_payload = NativeTextReplayPayload(
+                    encoded=replay_encoded,
+                    trace_kind_id=trace_kind_id.detach(),
+                    decision_count=decision_count.detach(),
+                    decision_count_host=decision_count_host,
+                    total_decision_groups=decision_rows,
+                    total_stored_decision_groups=None,
+                    decision_option_idx=option_idx.detach(),
+                    decision_target_idx=target_idx.detach(),
+                    decision_mask=decision_mask.detach(),
+                    uses_none_head=uses_none.detach(),
+                    selected_indices=selected.detach(),
+                    behavior_action_log_prob=group_log_probs.detach(),
+                    may_selected=may_selected_t.detach(),
+                    old_log_prob=step_log_probs.detach(),
+                    value=output.values.detach(),
+                    perspective_player_idx=torch.tensor(
+                        perspective_player_indices, dtype=torch.long, device=self.device
+                    ),
+                    lstm_h_in=h_in.detach(),
+                    lstm_c_in=c_in.detach(),
+                    projected_state=output.lstm_input.detach()
+                    if output.lstm_input is not None
+                    else None,
+                )
         mark_profile("replay_payload")
 
-        if append_replay and self.rollout_buffer is not None:
-            perspective_t = torch.tensor(
-                perspective_player_indices, dtype=torch.long, device=self.device
-            )
-            replay_rows = self.rollout_buffer.append_batch(
-                encoded=replay_encoded,
-                trace_kind_id=trace_kind_id,
-                decision_count=decision_count,
-                decision_count_host=tuple(int(x) for x in decision_count.detach().cpu().tolist()),
-                total_decision_groups=decision_rows,
-                total_stored_decision_groups=None,
-                decision_option_idx=option_idx,
-                decision_target_idx=target_idx,
-                decision_mask=decision_mask,
-                uses_none_head=uses_none,
-                selected_indices=selected,
-                behavior_action_log_prob=group_log_probs.detach(),
-                may_selected=may_selected_t,
-                old_log_prob=step_log_probs.detach(),
-                value=output.values.detach(),
-                perspective_player_idx=perspective_t,
-                lstm_h_in=h_in.detach(),
-                lstm_c_in=c_in.detach(),
-            )
-            if self.rollout_buffer.projected_state is not None and output.lstm_input is not None:
-                self.rollout_buffer.write_projected_state(replay_rows, output.lstm_input.detach())
-        else:
-            replay_rows = torch.full((batch_size,), -1, dtype=torch.long, device=device)
+        with torch.profiler.record_function("sample_native_tensor_batch/append_replay"):
+            if append_replay and self.rollout_buffer is not None:
+                perspective_t = torch.tensor(
+                    perspective_player_indices, dtype=torch.long, device=self.device
+                )
+                with torch.profiler.record_function(
+                    "sample_native_tensor_batch/append_replay_decision_count_host"
+                ):
+                    decision_count_host = tuple(
+                        int(x) for x in decision_count.detach().cpu().tolist()
+                    )
+                with torch.profiler.record_function("sample_native_tensor_batch/append_batch"):
+                    replay_rows = self.rollout_buffer.append_batch(
+                        encoded=replay_encoded,
+                        trace_kind_id=trace_kind_id,
+                        decision_count=decision_count,
+                        decision_count_host=decision_count_host,
+                        total_decision_groups=decision_rows,
+                        total_stored_decision_groups=None,
+                        decision_option_idx=option_idx,
+                        decision_target_idx=target_idx,
+                        decision_mask=decision_mask,
+                        uses_none_head=uses_none,
+                        selected_indices=selected,
+                        behavior_action_log_prob=group_log_probs.detach(),
+                        may_selected=may_selected_t,
+                        old_log_prob=step_log_probs.detach(),
+                        value=output.values.detach(),
+                        perspective_player_idx=perspective_t,
+                        lstm_h_in=h_in.detach(),
+                        lstm_c_in=c_in.detach(),
+                    )
+                if (
+                    self.rollout_buffer.projected_state is not None
+                    and output.lstm_input is not None
+                ):
+                    with torch.profiler.record_function(
+                        "sample_native_tensor_batch/write_projected_state"
+                    ):
+                        self.rollout_buffer.write_projected_state(
+                            replay_rows, output.lstm_input.detach()
+                        )
+            else:
+                replay_rows = torch.full((batch_size,), -1, dtype=torch.long, device=device)
         mark_profile("append_replay")
 
-        host = torch.cat(
-            [
-                decision_count.to(dtype=torch.float32),
-                may_selected_t.to(dtype=torch.float32),
-                step_log_probs.detach(),
-                output.values.detach(),
-                replay_rows.to(dtype=torch.float32),
-                selected.to(dtype=torch.float32),
-            ]
-        ).cpu()
+        with torch.profiler.record_function("sample_native_tensor_batch/host_return_cpu"):
+            host = torch.cat(
+                [
+                    decision_count.to(dtype=torch.float32),
+                    may_selected_t.to(dtype=torch.float32),
+                    step_log_probs.detach(),
+                    output.values.detach(),
+                    replay_rows.to(dtype=torch.float32),
+                    selected.to(dtype=torch.float32),
+                ]
+            ).cpu()
         mark_profile("host_return")
-        b = batch_size
-        decision_counts = host[:b].tolist()
-        may_selected = host[b : 2 * b].tolist()
-        old_log_prob = host[2 * b : 3 * b].tolist()
-        value = host[3 * b : 4 * b].tolist()
-        replay_rows_cpu = host[4 * b : 5 * b].tolist()
-        selected_choice_cols = host[5 * b :].tolist()
+        with torch.profiler.record_function("sample_native_tensor_batch/host_return_tolist"):
+            b = batch_size
+            decision_counts = host[:b].tolist()
+            may_selected = host[b : 2 * b].tolist()
+            old_log_prob = host[2 * b : 3 * b].tolist()
+            value = host[3 * b : 4 * b].tolist()
+            replay_rows_cpu = host[4 * b : 5 * b].tolist()
+            selected_choice_cols = host[5 * b :].tolist()
         return NativeTextSampleBatch(
             decision_counts=[int(x) for x in decision_counts],
             selected_choice_cols=[int(x) for x in selected_choice_cols],
@@ -1199,6 +1229,12 @@ class TextActorCritic(nn.Module):
     def precompute_replay_forward(
         self,
         episodes_replay_rows: Sequence[Sequence[int]],
+        *,
+        prepared_batch: TextReplayBatch | None = None,
+        flat_rows_override: Sequence[int] | None = None,
+        ep_lens_override: Sequence[int] | None = None,
+        lstm_layout_override: PerPlayerLstmLayout | None = None,
+        lstm_chunk_size: int = 200,
     ) -> CachedReplayForward:
         """Run encoder + per-player LSTM recompute for a batch of episodes.
 
@@ -1209,40 +1245,57 @@ class TextActorCritic(nn.Module):
         LSTM so all parameters receive signal from the R-NaD loss.
         """
 
-        if self.rollout_buffer is None:
-            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
-        if not episodes_replay_rows:
+        if not episodes_replay_rows and flat_rows_override is None:
             raise ValueError("episodes_replay_rows must be non-empty")
         flat_rows: list[int] = []
         ep_lens: list[int] = []
-        for ep in episodes_replay_rows:
-            ep_list = [int(r) for r in ep]
-            if not ep_list:
-                raise ValueError("each episode must contain at least one row")
-            flat_rows.extend(ep_list)
-            ep_lens.append(len(ep_list))
-        batch = self.rollout_buffer.gather(flat_rows)
+        if flat_rows_override is None or ep_lens_override is None:
+            for ep in episodes_replay_rows:
+                ep_list = [int(r) for r in ep]
+                if not ep_list:
+                    raise ValueError("each episode must contain at least one row")
+                flat_rows.extend(ep_list)
+                ep_lens.append(len(ep_list))
+        else:
+            flat_rows = [int(r) for r in flat_rows_override]
+            ep_lens = [int(n) for n in ep_lens_override]
+        if not flat_rows:
+            raise ValueError("replay rows must be non-empty")
+        batch = (
+            prepared_batch
+            if prepared_batch is not None
+            else self.prepare_rnad_replay_batch(flat_rows)
+        )
+        if int(batch.trace_kind_id.shape[0]) != len(flat_rows):
+            raise ValueError("prepared_batch row count must match flat_rows")
 
         device_type = batch.encoded.token_ids.device.type
         autocast_enabled = device_type == "cuda"
         with torch.autocast(
             device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
         ):
-            blank_row_mask = (batch.decision_count > 0) | (
-                batch.trace_kind_id == TRACE_KIND_TO_ID["may"]
-            )
-            encoded = self.policy.text_policy.encode_packed_replay_only(
-                batch.encoded,
-                blank_row_mask=blank_row_mask,
-            )
-            state = self.policy.in_proj(encoded.state_vector)
-            perspective = batch.perspective_player_idx.to(device=state.device)
-            h_concat = lstm_recompute_per_step_h_out_per_player(
-                self.policy.lstm,
-                state,
-                perspective,
-                ep_lens,
-            )
+            with torch.profiler.record_function("precompute_replay_forward/blank_row_mask"):
+                blank_row_mask = (batch.decision_count > 0) | (
+                    batch.trace_kind_id == TRACE_KIND_TO_ID["may"]
+                )
+            with torch.profiler.record_function("precompute_replay_forward/encode_packed"):
+                encoded = self.policy.text_policy.encode_packed_replay_only(
+                    batch.encoded,
+                    blank_row_mask=blank_row_mask,
+                )
+            with torch.profiler.record_function("precompute_replay_forward/in_proj"):
+                state = self.policy.in_proj(encoded.state_vector)
+            with torch.profiler.record_function("precompute_replay_forward/perspective_to_device"):
+                perspective = batch.perspective_player_idx.to(device=state.device)
+            with torch.profiler.record_function("precompute_replay_forward/lstm_recompute"):
+                h_concat = lstm_recompute_per_step_h_out_per_player(
+                    self.policy.lstm,
+                    state,
+                    perspective,
+                    ep_lens,
+                    chunk_size=lstm_chunk_size,
+                    layout=lstm_layout_override,
+                )
 
         return CachedReplayForward(
             flat_rows=tuple(flat_rows),
@@ -1250,6 +1303,16 @@ class TextActorCritic(nn.Module):
             encoded=encoded,
             h_concat=h_concat,
         )
+
+    def prepare_rnad_replay_batch(self, flat_rows: Sequence[int]) -> TextReplayBatch:
+        """Gather a flat R-NaD replay batch once for reuse across policy copies."""
+
+        if self.rollout_buffer is None:
+            raise RuntimeError("TextActorCritic.rollout_buffer has not been set")
+        rows = [int(r) for r in flat_rows]
+        if not rows:
+            raise ValueError("flat_rows must be non-empty")
+        return self.rollout_buffer.gather(rows)
 
     @torch.no_grad()
     def refresh_lstm_states(

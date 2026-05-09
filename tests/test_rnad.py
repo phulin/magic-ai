@@ -6,6 +6,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import torch
@@ -1178,6 +1179,81 @@ class FactoredAutoregressiveTests(unittest.TestCase):
             alpha=1.0,
         )
         torch.testing.assert_close(loss_a.pl_sum, loss_b.pl_sum)
+
+    def test_batched_loss_reuses_prepared_replay_batch(self) -> None:
+        from magic_ai.replay_decisions import ReplayPerChoice
+        from magic_ai.rnad import rnad_batched_trajectory_loss
+
+        prepared = object()
+
+        class PreparedStub(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.values = nn.Parameter(torch.zeros(2))
+                self.logits = nn.Parameter(torch.zeros(2, 2))
+                self.prepare_calls = 0
+                self.precompute_batches: list[Any] = []
+
+            def prepare_rnad_replay_batch(self, rows: list[int]) -> object:
+                self.prepare_calls += 1
+                self.assert_rows = list(rows)
+                return prepared
+
+            def precompute_replay_forward(
+                self,
+                episodes_replay_rows: list[list[int]],
+                **kwargs: Any,
+            ) -> Any:
+                del episodes_replay_rows
+                self.precompute_batches.append(kwargs.get("prepared_batch"))
+                return SimpleNamespace(h_concat=None, batch=kwargs.get("prepared_batch"))
+
+            def evaluate_replay_batch_per_choice(self, rows: list[int], **_: Any):  # type: ignore[no-untyped-def]
+                idx = torch.tensor(rows, dtype=torch.long)
+                logits = self.logits[idx]
+                flat_log_probs = torch.log_softmax(logits, dim=-1).reshape(-1)
+                n = int(idx.numel())
+                return (
+                    flat_log_probs.reshape(n, 2)[:, 0],
+                    torch.zeros(n),
+                    self.values[idx],
+                    ReplayPerChoice(
+                        flat_logits=logits.reshape(-1),
+                        flat_log_probs=flat_log_probs,
+                        group_idx=torch.arange(n).repeat_interleave(2),
+                        choice_cols=torch.tensor([0, 1] * n),
+                        is_sampled_flat=torch.tensor([True, False] * n),
+                        may_is_active=torch.zeros(n, dtype=torch.bool),
+                        may_logits_per_step=torch.zeros(n),
+                        may_selected_per_step=torch.zeros(n),
+                        decision_group_id_flat=torch.arange(n).repeat_interleave(2),
+                        step_for_decision_group=torch.arange(n),
+                        behavior_action_log_prob_per_decision_group=torch.full((n,), math.log(0.5)),
+                    ),
+                )
+
+        online = PreparedStub()
+        target = PreparedStub()
+        reg_cur = PreparedStub()
+        reg_prev = PreparedStub()
+        rnad_batched_trajectory_loss(
+            online=cast(Any, online),
+            target=cast(Any, target),
+            reg_cur=cast(Any, reg_cur),
+            reg_prev=cast(Any, reg_prev),
+            episodes_replay_rows=[[0, 1]],
+            episodes_perspective=[[0, 1]],
+            episodes_terminal_reward_p0=[1.0],
+            episodes_zero_sum=[True],
+            episodes_logp_mu=[torch.full((2,), math.log(0.5))],
+            config=RNaDConfig(eta=0.0, neurd_beta=100.0),
+            alpha=1.0,
+        )
+
+        self.assertEqual(online.prepare_calls, 1)
+        self.assertEqual(online.assert_rows, [0, 1])
+        for policy in (online, target, reg_cur, reg_prev):
+            self.assertEqual(policy.precompute_batches, [prepared])
 
 
 class PerPolicyLSTMRecomputeTests(unittest.TestCase):

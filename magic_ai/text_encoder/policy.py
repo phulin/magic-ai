@@ -149,27 +149,34 @@ class TextPolicy(nn.Module):
     ) -> EncodedSnapshots:
         """Run replay scoring encoder outputs without retaining card vectors."""
 
-        hidden = self.encoder.forward_packed(batch)
-        state_vec = gather_state_vector_packed(hidden, batch)
+        with torch.profiler.record_function("encode_packed_replay_only/encoder_forward_packed"):
+            hidden = self.encoder.forward_packed(batch)
+        with torch.profiler.record_function("encode_packed_replay_only/gather_state"):
+            state_vec = gather_state_vector_packed(hidden, batch)
         if blank_row_mask is None:
-            blank_logits = self.inline_blank_policy(
-                hidden,
-                batch.blank_positions,
-                batch.blank_kind,
-                batch.blank_legal_ids,
-                batch.blank_legal_mask,
-            )
-        else:
-            blank_row_mask = blank_row_mask.to(device=hidden.device, dtype=torch.bool)
-            blank_rows = blank_row_mask.nonzero(as_tuple=False).squeeze(-1)
-            blank_logits = hidden.new_full(tuple(batch.blank_legal_ids.shape), float("-inf"))
-            if int(blank_rows.numel()) > 0:
-                blank_logits[blank_rows] = self.inline_blank_policy(
+            with torch.profiler.record_function("encode_packed_replay_only/inline_blank_policy"):
+                blank_logits = self.inline_blank_policy(
                     hidden,
-                    batch.blank_positions[blank_rows],
-                    batch.blank_kind[blank_rows],
-                    batch.blank_legal_ids[blank_rows],
-                    batch.blank_legal_mask[blank_rows],
+                    batch.blank_positions,
+                    batch.blank_kind,
+                    batch.blank_legal_ids,
+                    batch.blank_legal_mask,
+                )
+        else:
+            with torch.profiler.record_function("encode_packed_replay_only/blank_mask_to_device"):
+                blank_row_mask = blank_row_mask.to(device=hidden.device, dtype=torch.bool)
+            with torch.profiler.record_function("encode_packed_replay_only/inline_blank_policy"):
+                blank_logits = self.inline_blank_policy(
+                    hidden,
+                    batch.blank_positions,
+                    batch.blank_kind,
+                    batch.blank_legal_ids,
+                    batch.blank_legal_mask,
+                )
+            with torch.profiler.record_function("encode_packed_replay_only/blank_row_mask"):
+                blank_logits = blank_logits.masked_fill(
+                    ~blank_row_mask[:, None, None],
+                    float("-inf"),
                 )
         return EncodedSnapshots(
             card_vectors=hidden.new_empty((int(batch.seq_lengths.shape[0]), 0, hidden.shape[-1])),

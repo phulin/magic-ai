@@ -32,6 +32,7 @@ so they can be unit-tested and benchmarked without a rollout buffer.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
@@ -39,6 +40,95 @@ from torch import Tensor, nn
 
 LstmRecomputeStrategy = Literal["legacy", "pad", "gather", "packed"]
 STRATEGIES: tuple[LstmRecomputeStrategy, ...] = ("legacy", "pad", "gather", "packed")
+
+
+@dataclass(frozen=True)
+class LstmChunkPlan:
+    """One chunk of active virtual sequences for packed LSTM recompute."""
+
+    chunk_start: int
+    chunk_stop: int
+    active_indices: tuple[int, ...]
+    active_idx: Tensor
+
+
+@dataclass(frozen=True)
+class PerPlayerLstmLayout:
+    """Reusable tensor layout for per-player R-NaD LSTM recompute."""
+
+    sort_idx: Tensor
+    unsort_idx: Tensor
+    sequence_lengths: tuple[int, ...]
+    chunk_size: int
+    chunk_plan: tuple[LstmChunkPlan, ...]
+    total_steps: int
+
+
+def build_per_player_lstm_layout(
+    perspective: Tensor,
+    episodes_perspective: Sequence[Sequence[int]],
+    *,
+    ep_offsets: Tensor | None = None,
+    chunk_size: int = 200,
+) -> PerPlayerLstmLayout:
+    """Build the virtual-sequence sort once for all policy copies.
+
+    Each ``(episode, player)`` pair is one virtual sequence. ``sequence_lengths``
+    stays host-side because ``pack_sequence`` requires Python-sized slices, but
+    it is derived from rollout metadata once instead of by syncing a GPU
+    ``bincount`` inside every policy precompute.
+    """
+
+    if perspective.dim() != 1:
+        raise ValueError("perspective must be 1-D")
+    total_steps = int(perspective.shape[0])
+    ep_lengths = tuple(len(ep) for ep in episodes_perspective)
+    if sum(ep_lengths) != total_steps:
+        raise ValueError("episodes_perspective lengths must sum to perspective length")
+    if any(length <= 0 for length in ep_lengths):
+        raise ValueError("each episode must contain at least one step")
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1 (got {chunk_size})")
+
+    device = perspective.device
+    n_eps = len(ep_lengths)
+    if ep_offsets is None:
+        ep_lengths_t = torch.tensor(ep_lengths, dtype=torch.long, device=device)
+    else:
+        if ep_offsets.dim() != 1 or int(ep_offsets.shape[0]) != n_eps + 1:
+            raise ValueError("ep_offsets must have shape (n_eps + 1,)")
+        ep_lengths_t = ep_offsets[1:] - ep_offsets[:-1]
+    ep_ids = torch.repeat_interleave(
+        torch.arange(n_eps, device=device),
+        ep_lengths_t,
+    )
+    virt_ids = ep_ids * 2 + perspective
+    sort_idx = torch.argsort(virt_ids, stable=True)
+    unsort_idx = torch.argsort(sort_idx)
+
+    counts = [0] * (2 * n_eps)
+    for ep_idx, ep_perspective in enumerate(episodes_perspective):
+        for player in ep_perspective:
+            player_i = int(player)
+            if player_i not in (0, 1):
+                raise ValueError("perspective values must be 0 or 1")
+            counts[2 * ep_idx + player_i] += 1
+    sequence_lengths = tuple(count for count in counts if count > 0)
+    if sum(sequence_lengths) != total_steps:
+        raise ValueError("virtual sequence lengths must sum to perspective length")
+
+    return PerPlayerLstmLayout(
+        sort_idx=sort_idx,
+        unsort_idx=unsort_idx,
+        sequence_lengths=sequence_lengths,
+        chunk_size=int(chunk_size),
+        chunk_plan=_build_lstm_chunk_plan(
+            sequence_lengths,
+            chunk_size=int(chunk_size),
+            device=device,
+        ),
+        total_steps=total_steps,
+    )
 
 
 def _legacy(
@@ -160,12 +250,42 @@ def _slice_history(
     return out
 
 
+def _build_lstm_chunk_plan(
+    lengths: Sequence[int],
+    *,
+    chunk_size: int,
+    device: torch.device,
+) -> tuple[LstmChunkPlan, ...]:
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1 (got {chunk_size})")
+    if not lengths:
+        raise ValueError("lengths must be non-empty")
+    t_max = max(int(length) for length in lengths)
+    chunks: list[LstmChunkPlan] = []
+    for chunk_start in range(0, t_max, chunk_size):
+        chunk_stop = chunk_start + chunk_size
+        active_indices = tuple(i for i, t_i in enumerate(lengths) if int(t_i) > chunk_start)
+        if not active_indices:
+            break
+        active_idx = torch.tensor(active_indices, dtype=torch.long, device=device)
+        chunks.append(
+            LstmChunkPlan(
+                chunk_start=chunk_start,
+                chunk_stop=chunk_stop,
+                active_indices=active_indices,
+                active_idx=active_idx,
+            )
+        )
+    return tuple(chunks)
+
+
 def lstm_recompute_per_step_h_out(
     lstm: nn.LSTM,
     proj_per_episode: Sequence[Tensor],
     *,
     chunk_size: int = 200,
     compiled_lstm: Callable[..., Any] | None = None,
+    chunk_plan: Sequence[LstmChunkPlan] | None = None,
 ) -> list[Tensor]:
     """Chunked-BPTT fused cuDNN recompute returning per-step top-layer h_out.
 
@@ -212,45 +332,69 @@ def lstm_recompute_per_step_h_out(
     device = proj_per_episode[0].device
     dtype = proj_per_episode[0].dtype
     lengths = [int(t.shape[0]) for t in proj_per_episode]
-    t_max = max(lengths)
+    if chunk_plan is None:
+        chunk_plan = _build_lstm_chunk_plan(lengths, chunk_size=chunk_size, device=device)
 
     runner = compiled_lstm if compiled_lstm is not None else lstm
+    if max(lengths) <= chunk_size:
+        with torch.profiler.record_function("lstm_recompute_per_step_h_out/whole_sequence_pack"):
+            packed = nn.utils.rnn.pack_sequence(list(proj_per_episode), enforce_sorted=False)
+            h_in = torch.zeros(lstm.num_layers, n, hidden, dtype=dtype, device=device)
+            c_in = torch.zeros_like(h_in)
+        with torch.profiler.record_function("lstm_recompute_per_step_h_out/whole_sequence_lstm"):
+            out_packed, _state = runner(packed, (h_in, c_in))
+        with torch.profiler.record_function("lstm_recompute_per_step_h_out/whole_sequence_unpack"):
+            if out_packed.data.dtype != dtype:
+                out_packed = nn.utils.rnn.PackedSequence(
+                    out_packed.data.to(dtype=dtype),
+                    out_packed.batch_sizes,
+                    out_packed.sorted_indices,
+                    out_packed.unsorted_indices,
+                )
+            padded, _chunk_lengths = nn.utils.rnn.pad_packed_sequence(
+                out_packed,
+                batch_first=True,
+            )
+            return [padded[i, :length] for i, length in enumerate(lengths)]
+
     h_state = torch.zeros(lstm.num_layers, n, hidden, dtype=dtype, device=device)
     c_state = torch.zeros_like(h_state)
     chunks_per_ep: list[list[Tensor]] = [[] for _ in range(n)]
 
-    for chunk_start in range(0, t_max, chunk_size):
-        chunk_stop = chunk_start + chunk_size
-        active_idx = [i for i, t_i in enumerate(lengths) if t_i > chunk_start]
-        if not active_idx:
-            break
-        chunk_seqs = [
-            proj_per_episode[i][chunk_start : min(chunk_stop, lengths[i])] for i in active_idx
-        ]
-        active_idx_t = torch.tensor(active_idx, dtype=torch.long, device=device)
-        h_in = h_state.index_select(1, active_idx_t).contiguous()
-        c_in = c_state.index_select(1, active_idx_t).contiguous()
-        packed = nn.utils.rnn.pack_sequence(chunk_seqs, enforce_sorted=False)
-        out_packed, (h_out, c_out) = runner(packed, (h_in, c_in))
-        if out_packed.data.dtype != dtype:
-            out_packed = nn.utils.rnn.PackedSequence(
-                out_packed.data.to(dtype=dtype),
-                out_packed.batch_sizes,
-                out_packed.sorted_indices,
-                out_packed.unsorted_indices,
-            )
-        h_out = h_out.to(dtype=dtype)
-        c_out = c_out.to(dtype=dtype)
-        # Detach state crossing the chunk boundary so the next chunk's
-        # backward stops here. Within a chunk, BPTT is full.
-        h_state.index_copy_(1, active_idx_t, h_out.detach().to(dtype=h_state.dtype))
-        c_state.index_copy_(1, active_idx_t, c_out.detach().to(dtype=c_state.dtype))
-        padded, chunk_lengths = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True)
-        for i_local, ep_idx in enumerate(active_idx):
-            t_chunk = int(chunk_lengths[i_local])
-            chunks_per_ep[ep_idx].append(padded[i_local, :t_chunk])
+    for chunk in chunk_plan:
+        with torch.profiler.record_function("lstm_recompute_per_step_h_out/chunk_prepare"):
+            active_idx = chunk.active_indices
+            chunk_seqs = [
+                proj_per_episode[i][chunk.chunk_start : min(chunk.chunk_stop, lengths[i])]
+                for i in active_idx
+            ]
+            h_in = h_state.index_select(1, chunk.active_idx).contiguous()
+            c_in = c_state.index_select(1, chunk.active_idx).contiguous()
+            packed = nn.utils.rnn.pack_sequence(chunk_seqs, enforce_sorted=False)
+        with torch.profiler.record_function("lstm_recompute_per_step_h_out/lstm"):
+            out_packed, (h_out, c_out) = runner(packed, (h_in, c_in))
+        with torch.profiler.record_function("lstm_recompute_per_step_h_out/cast_and_state_write"):
+            if out_packed.data.dtype != dtype:
+                out_packed = nn.utils.rnn.PackedSequence(
+                    out_packed.data.to(dtype=dtype),
+                    out_packed.batch_sizes,
+                    out_packed.sorted_indices,
+                    out_packed.unsorted_indices,
+                )
+            h_out = h_out.to(dtype=dtype)
+            c_out = c_out.to(dtype=dtype)
+            # Detach state crossing the chunk boundary so the next chunk's
+            # backward stops here. Within a chunk, BPTT is full.
+            h_state.index_copy_(1, chunk.active_idx, h_out.detach().to(dtype=h_state.dtype))
+            c_state.index_copy_(1, chunk.active_idx, c_out.detach().to(dtype=c_state.dtype))
+        with torch.profiler.record_function("lstm_recompute_per_step_h_out/pad_and_slice"):
+            padded, chunk_lengths = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True)
+            for i_local, ep_idx in enumerate(active_idx):
+                t_chunk = int(chunk_lengths[i_local])
+                chunks_per_ep[ep_idx].append(padded[i_local, :t_chunk])
 
-    return [parts[0] if len(parts) == 1 else torch.cat(parts, dim=0) for parts in chunks_per_ep]
+    with torch.profiler.record_function("lstm_recompute_per_step_h_out/concat_outputs"):
+        return [parts[0] if len(parts) == 1 else torch.cat(parts, dim=0) for parts in chunks_per_ep]
 
 
 def lstm_recompute_per_step_h_out_per_player(
@@ -261,6 +405,7 @@ def lstm_recompute_per_step_h_out_per_player(
     *,
     chunk_size: int = 200,
     compiled_lstm: Callable[..., Any] | None = None,
+    layout: PerPlayerLstmLayout | None = None,
 ) -> Tensor:
     """Per-player split LSTM recompute returning per-step top-layer h_out.
 
@@ -299,39 +444,54 @@ def lstm_recompute_per_step_h_out_per_player(
     if sum(ep_lengths) != t_total:
         raise ValueError(f"sum(ep_lengths)={sum(ep_lengths)} must equal T_total={t_total}")
 
-    n_eps = len(ep_lengths)
-    device = projected.device
+    if layout is None:
+        with torch.profiler.record_function("lstm_recompute_per_player/build_layout"):
+            layout = build_per_player_lstm_layout(
+                perspective,
+                _episode_perspectives_from_lengths(perspective, ep_lengths),
+            )
+    elif layout.total_steps != t_total:
+        raise ValueError("layout total_steps must match projected length")
+    with torch.profiler.record_function("lstm_recompute_per_player/sort_features"):
+        feats_sorted = projected[layout.sort_idx]  # [T_total, hidden]
 
-    # Episode ID for every flat step: [T_total]
-    ep_ids = torch.repeat_interleave(
-        torch.arange(n_eps, device=device),
-        torch.tensor(ep_lengths, dtype=torch.long, device=device),
-    )
+    with torch.profiler.record_function("lstm_recompute_per_player/split_sequences"):
+        seqs = [
+            s
+            for s in torch.split(feats_sorted, list(layout.sequence_lengths))
+            if int(s.shape[0]) > 0
+        ]
 
-    # Virtual sequence ID: ep_id * 2 + player, values in [0, 2*n_eps)
-    virt_ids = ep_ids * 2 + perspective  # [T_total]
-
-    # Stable sort by virtual ID; within each virtual seq game order is preserved
-    sort_idx = torch.argsort(virt_ids, stable=True)  # [T_total]
-    feats_sorted = projected[sort_idx]  # [T_total, hidden]
-
-    # Per-virtual-sequence lengths; sum == T_total
-    virt_lengths = torch.bincount(virt_ids, minlength=2 * n_eps)  # [2*n_eps]
-
-    # Build list of non-empty per-virtual-sequence tensors for lstm_recompute
-    seqs = [s for s in torch.split(feats_sorted, virt_lengths.tolist()) if s.shape[0] > 0]
-
-    all_h_outs = lstm_recompute_per_step_h_out(
-        lstm,
-        seqs,
-        chunk_size=chunk_size,
-        compiled_lstm=compiled_lstm,
-    )
+    with torch.profiler.record_function("lstm_recompute_per_player/packed_lstm"):
+        all_h_outs = lstm_recompute_per_step_h_out(
+            lstm,
+            seqs,
+            chunk_size=chunk_size,
+            compiled_lstm=compiled_lstm,
+            chunk_plan=layout.chunk_plan if layout.chunk_size == int(chunk_size) else None,
+        )
 
     # Unsort: all_h_cat[j] is the output for sort_idx[j] in the original flat order.
     # Gather via the inverse permutation so the result stays in the autograd graph.
-    all_h_cat = torch.cat(all_h_outs, dim=0)
-    return all_h_cat[torch.argsort(sort_idx)]
+    with torch.profiler.record_function("lstm_recompute_per_player/unsort_output"):
+        all_h_cat = torch.cat(all_h_outs, dim=0)
+        return all_h_cat[layout.unsort_idx]
+
+
+def _episode_perspectives_from_lengths(
+    perspective: Tensor,
+    ep_lengths: Sequence[int],
+) -> list[list[int]]:
+    """Host fallback for callers that have not prebuilt a per-player layout."""
+
+    perspective_h = perspective.detach().cpu().tolist()
+    out: list[list[int]] = []
+    cursor = 0
+    for length in ep_lengths:
+        length_i = int(length)
+        out.append([int(v) for v in perspective_h[cursor : cursor + length_i]])
+        cursor += length_i
+    return out
 
 
 @torch.no_grad()

@@ -237,9 +237,10 @@ def run_rnad_update(
     if not per_episode_replay_rows:
         raise ValueError("no non-empty episodes to update on")
 
-    cl_count_total, pl_count_total = policy.count_active_replay_steps(
-        per_episode_replay_rows,
-    )
+    with torch.profiler.record_function("run_rnad_update/count_active_replay_steps"):
+        cl_count_total, pl_count_total = policy.count_active_replay_steps(
+            per_episode_replay_rows,
+        )
 
     episodes_logp_mu = [torch.tensor(lp, dtype=torch.float32) for lp in per_episode_logp_mu]
 
@@ -268,21 +269,22 @@ def run_rnad_update(
         chunks.append((lo, n_episodes))
 
     def _chunk_pieces(lo: int, hi: int) -> list:
-        return rnad_batched_trajectory_loss(
-            online=policy,
-            target=state.target,
-            reg_cur=state.reg_cur,
-            reg_prev=state.reg_prev,
-            episodes_replay_rows=per_episode_replay_rows[lo:hi],
-            episodes_perspective=per_episode_perspective[lo:hi],
-            episodes_terminal_reward_p0=per_episode_terminal_reward_p0[lo:hi],
-            episodes_zero_sum=per_episode_zero_sum[lo:hi],
-            episodes_logp_mu=episodes_logp_mu[lo:hi],
-            config=state.config,
-            alpha=alpha,
-            compute_v_target_reg_share=compute_v_target_reg_share,
-            compute_policy_drift_diagnostics=compute_policy_drift_diagnostics,
-        )
+        with torch.profiler.record_function("run_rnad_update/chunk_forward_loss"):
+            return rnad_batched_trajectory_loss(
+                online=policy,
+                target=state.target,
+                reg_cur=state.reg_cur,
+                reg_prev=state.reg_prev,
+                episodes_replay_rows=per_episode_replay_rows[lo:hi],
+                episodes_perspective=per_episode_perspective[lo:hi],
+                episodes_terminal_reward_p0=per_episode_terminal_reward_p0[lo:hi],
+                episodes_zero_sum=per_episode_zero_sum[lo:hi],
+                episodes_logp_mu=episodes_logp_mu[lo:hi],
+                config=state.config,
+                alpha=alpha,
+                compute_v_target_reg_share=compute_v_target_reg_share,
+                compute_policy_drift_diagnostics=compute_policy_drift_diagnostics,
+            )
 
     if os.environ.get("RNAD_VERIFY_COUNTS"):
         # Cross-check: rerun under no_grad and confirm the buffer-derived
@@ -310,9 +312,10 @@ def run_rnad_update(
     cl_norm = max(cl_count_total, 1)
     pl_norm = max(pl_count_total, 1)
 
-    optimizer.zero_grad(set_to_none=True)
-    cl_loss_total = 0.0
-    pl_loss_total = 0.0
+    with torch.profiler.record_function("run_rnad_update/optimizer_zero_grad"):
+        optimizer.zero_grad(set_to_none=True)
+    cl_loss_total_t: torch.Tensor | None = None
+    pl_loss_total_t: torch.Tensor | None = None
     n_q_clipped_total: torch.Tensor | None = None
     flat_active_total: torch.Tensor | None = None
     v_hat_sum_total: torch.Tensor | None = None
@@ -330,89 +333,100 @@ def run_rnad_update(
     diag_vshare_count: torch.Tensor | None = None
     for lo, hi in chunks:
         pieces_list = _chunk_pieces(lo, hi)
-        cl_chunk = pieces_list[0].cl_sum.new_zeros(())
-        pl_chunk = pieces_list[0].pl_sum.new_zeros(())
-        for pieces in pieces_list:
-            cl_chunk = cl_chunk + pieces.cl_sum
-            pl_chunk = pl_chunk + pieces.pl_sum
-            n_q_clipped_total = (
-                pieces.n_q_clipped
-                if n_q_clipped_total is None
-                else n_q_clipped_total + pieces.n_q_clipped
+        with torch.profiler.record_function("run_rnad_update/chunk_accumulate_pieces"):
+            cl_chunk = pieces_list[0].cl_sum.new_zeros(())
+            pl_chunk = pieces_list[0].pl_sum.new_zeros(())
+            for pieces in pieces_list:
+                cl_chunk = cl_chunk + pieces.cl_sum
+                pl_chunk = pl_chunk + pieces.pl_sum
+                n_q_clipped_total = (
+                    pieces.n_q_clipped
+                    if n_q_clipped_total is None
+                    else n_q_clipped_total + pieces.n_q_clipped
+                )
+                flat_active_total = (
+                    pieces.pl_count
+                    if flat_active_total is None
+                    else flat_active_total + pieces.pl_count
+                )
+                v_hat_sum_total = (
+                    pieces.v_hat_sum
+                    if v_hat_sum_total is None
+                    else v_hat_sum_total + pieces.v_hat_sum
+                )
+                transformed_sum_total = (
+                    pieces.transformed_sum
+                    if transformed_sum_total is None
+                    else transformed_sum_total + pieces.transformed_sum
+                )
+                transformed_count_total += pieces.transformed_count
+                n_pieces += 1
+                if pieces.sampled_log_ratio_sum is not None:
+                    diag_lr_sum = (
+                        pieces.sampled_log_ratio_sum
+                        if diag_lr_sum is None
+                        else diag_lr_sum + pieces.sampled_log_ratio_sum
+                    )
+                diag_lr_count += pieces.sampled_log_ratio_count
+                if pieces.sampled_log_ratio_absmax is not None:
+                    diag_lr_absmax = (
+                        pieces.sampled_log_ratio_absmax
+                        if diag_lr_absmax is None
+                        else torch.maximum(diag_lr_absmax, pieces.sampled_log_ratio_absmax)
+                    )
+                if pieces.is_bias_up_sum is not None:
+                    diag_isup_sum = (
+                        pieces.is_bias_up_sum
+                        if diag_isup_sum is None
+                        else diag_isup_sum + pieces.is_bias_up_sum
+                    )
+                if pieces.is_bias_up_count is not None:
+                    diag_isup_count = (
+                        pieces.is_bias_up_count
+                        if diag_isup_count is None
+                        else diag_isup_count + pieces.is_bias_up_count
+                    )
+                if pieces.is_bias_down_sum is not None:
+                    diag_isdn_sum = (
+                        pieces.is_bias_down_sum
+                        if diag_isdn_sum is None
+                        else diag_isdn_sum + pieces.is_bias_down_sum
+                    )
+                if pieces.is_bias_down_count is not None:
+                    diag_isdn_count = (
+                        pieces.is_bias_down_count
+                        if diag_isdn_count is None
+                        else diag_isdn_count + pieces.is_bias_down_count
+                    )
+                if pieces.v_target_reg_share_sum is not None:
+                    diag_vshare_sum = (
+                        pieces.v_target_reg_share_sum
+                        if diag_vshare_sum is None
+                        else diag_vshare_sum + pieces.v_target_reg_share_sum
+                    )
+                if pieces.v_target_reg_share_count is not None:
+                    diag_vshare_count = (
+                        pieces.v_target_reg_share_count
+                        if diag_vshare_count is None
+                        else diag_vshare_count + pieces.v_target_reg_share_count
+                    )
+            cl_part = cl_chunk / cl_norm
+            pl_part = pl_chunk / pl_norm
+        with torch.profiler.record_function("run_rnad_update/chunk_backward"):
+            (cl_part + pl_part).backward()
+        with torch.profiler.record_function("run_rnad_update/chunk_loss_accumulate"):
+            cl_detached = cl_part.detach()
+            pl_detached = pl_part.detach()
+            cl_loss_total_t = (
+                cl_detached if cl_loss_total_t is None else cl_loss_total_t + cl_detached
             )
-            flat_active_total = (
-                pieces.pl_count
-                if flat_active_total is None
-                else flat_active_total + pieces.pl_count
+            pl_loss_total_t = (
+                pl_detached if pl_loss_total_t is None else pl_loss_total_t + pl_detached
             )
-            v_hat_sum_total = (
-                pieces.v_hat_sum if v_hat_sum_total is None else v_hat_sum_total + pieces.v_hat_sum
-            )
-            transformed_sum_total = (
-                pieces.transformed_sum
-                if transformed_sum_total is None
-                else transformed_sum_total + pieces.transformed_sum
-            )
-            transformed_count_total += pieces.transformed_count
-            n_pieces += 1
-            if pieces.sampled_log_ratio_sum is not None:
-                diag_lr_sum = (
-                    pieces.sampled_log_ratio_sum
-                    if diag_lr_sum is None
-                    else diag_lr_sum + pieces.sampled_log_ratio_sum
-                )
-            diag_lr_count += pieces.sampled_log_ratio_count
-            if pieces.sampled_log_ratio_absmax is not None:
-                diag_lr_absmax = (
-                    pieces.sampled_log_ratio_absmax
-                    if diag_lr_absmax is None
-                    else torch.maximum(diag_lr_absmax, pieces.sampled_log_ratio_absmax)
-                )
-            if pieces.is_bias_up_sum is not None:
-                diag_isup_sum = (
-                    pieces.is_bias_up_sum
-                    if diag_isup_sum is None
-                    else diag_isup_sum + pieces.is_bias_up_sum
-                )
-            if pieces.is_bias_up_count is not None:
-                diag_isup_count = (
-                    pieces.is_bias_up_count
-                    if diag_isup_count is None
-                    else diag_isup_count + pieces.is_bias_up_count
-                )
-            if pieces.is_bias_down_sum is not None:
-                diag_isdn_sum = (
-                    pieces.is_bias_down_sum
-                    if diag_isdn_sum is None
-                    else diag_isdn_sum + pieces.is_bias_down_sum
-                )
-            if pieces.is_bias_down_count is not None:
-                diag_isdn_count = (
-                    pieces.is_bias_down_count
-                    if diag_isdn_count is None
-                    else diag_isdn_count + pieces.is_bias_down_count
-                )
-            if pieces.v_target_reg_share_sum is not None:
-                diag_vshare_sum = (
-                    pieces.v_target_reg_share_sum
-                    if diag_vshare_sum is None
-                    else diag_vshare_sum + pieces.v_target_reg_share_sum
-                )
-            if pieces.v_target_reg_share_count is not None:
-                diag_vshare_count = (
-                    pieces.v_target_reg_share_count
-                    if diag_vshare_count is None
-                    else diag_vshare_count + pieces.v_target_reg_share_count
-                )
-        cl_part = cl_chunk / cl_norm
-        pl_part = pl_chunk / pl_norm
-        (cl_part + pl_part).backward()
-        cl_loss_total += float(cl_part.detach())
-        pl_loss_total += float(pl_part.detach())
 
     trainable = [p for p in policy.parameters() if p.requires_grad]
-    grad_norm = float(nn.utils.clip_grad_norm_(trainable, max_norm=state.config.grad_clip))
-    loss_total = cl_loss_total + pl_loss_total
+    with torch.profiler.record_function("run_rnad_update/clip_grad_norm"):
+        grad_norm = float(nn.utils.clip_grad_norm_(trainable, max_norm=state.config.grad_clip))
     zero = torch.zeros((), dtype=torch.float32)
     stats_tensors = [
         n_q_clipped_total if n_q_clipped_total is not None else zero,
@@ -427,22 +441,31 @@ def run_rnad_update(
         diag_isdn_count if diag_isdn_count is not None else zero,
         diag_vshare_sum if diag_vshare_sum is not None else zero,
         diag_vshare_count if diag_vshare_count is not None else zero,
+        cl_loss_total_t if cl_loss_total_t is not None else zero,
+        pl_loss_total_t if pl_loss_total_t is not None else zero,
     ]
-    stats_h = torch.stack([t.detach().to(device="cpu", dtype=torch.float32) for t in stats_tensors])
-    (
-        n_q_clipped_h,
-        flat_active_h,
-        v_hat_sum_h,
-        transformed_sum_h,
-        diag_lr_sum_h,
-        diag_lr_absmax_h,
-        diag_isup_sum_h,
-        diag_isup_count_h,
-        diag_isdn_sum_h,
-        diag_isdn_count_h,
-        diag_vshare_sum_h,
-        diag_vshare_count_h,
-    ) = [float(x) for x in stats_h.tolist()]
+    with torch.profiler.record_function("run_rnad_update/stats_tensor_cpu"):
+        stats_h = torch.stack(
+            [t.detach().to(device="cpu", dtype=torch.float32) for t in stats_tensors]
+        )
+    with torch.profiler.record_function("run_rnad_update/stats_tolist"):
+        (
+            n_q_clipped_h,
+            flat_active_h,
+            v_hat_sum_h,
+            transformed_sum_h,
+            diag_lr_sum_h,
+            diag_lr_absmax_h,
+            diag_isup_sum_h,
+            diag_isup_count_h,
+            diag_isdn_sum_h,
+            diag_isdn_count_h,
+            diag_vshare_sum_h,
+            diag_vshare_count_h,
+            cl_loss_total_h,
+            pl_loss_total_h,
+        ) = [float(x) for x in stats_h.tolist()]
+    loss_total = cl_loss_total_h + pl_loss_total_h
     v_hat_mean = v_hat_sum_h / max(transformed_count_total, 1)
     transformed_mean = transformed_sum_h / max(transformed_count_total, 1)
     q_clip_fraction = n_q_clipped_h / flat_active_h if flat_active_h > 0 else 0.0
@@ -454,13 +477,13 @@ def run_rnad_update(
         optimizer.zero_grad(set_to_none=True)
         print(
             f"[rnad] non-finite update skipped: loss={loss_total:.4g} "
-            f"grad_norm={grad_norm:.4g} cl={cl_loss_total:.4g} pl={pl_loss_total:.4g}",
+            f"grad_norm={grad_norm:.4g} cl={cl_loss_total_h:.4g} pl={pl_loss_total_h:.4g}",
             flush=True,
         )
         aggregate = RNaDStats(
             loss=loss_total,
-            critic_loss=cl_loss_total,
-            policy_loss=pl_loss_total,
+            critic_loss=cl_loss_total_h,
+            policy_loss=pl_loss_total_h,
             v_hat_mean=v_hat_mean,
             grad_norm=grad_norm,
             transformed_reward_mean=transformed_mean,
@@ -480,21 +503,23 @@ def run_rnad_update(
             approx_kl=0.0,
             clip_fraction=0.0,
         )
-    optimizer.step()
-    polyak_update_(
-        cast(nn.Module, state.target),
-        cast(nn.Module, policy),
-        gamma=state.config.target_ema_gamma,
-    )
+    with torch.profiler.record_function("run_rnad_update/optimizer_step"):
+        optimizer.step()
+    with torch.profiler.record_function("run_rnad_update/polyak_update"):
+        polyak_update_(
+            cast(nn.Module, state.target),
+            cast(nn.Module, policy),
+            gamma=state.config.target_ema_gamma,
+        )
 
     state.gradient_step += 1
     if state.gradient_step >= current_delta_m:
         _advance_outer_iteration(state)
 
     aggregate = RNaDStats(
-        loss=cl_loss_total + pl_loss_total,
-        critic_loss=cl_loss_total,
-        policy_loss=pl_loss_total,
+        loss=loss_total,
+        critic_loss=cl_loss_total_h,
+        policy_loss=pl_loss_total_h,
         v_hat_mean=v_hat_mean,
         grad_norm=grad_norm,
         transformed_reward_mean=transformed_mean,
