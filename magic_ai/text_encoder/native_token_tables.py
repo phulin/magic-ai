@@ -126,8 +126,13 @@ def _i64_ptr(ffi: Any, t: torch.Tensor) -> Any:
     return ffi.cast("int64_t *", t.data_ptr())
 
 
-def register_native_token_tables(tables: TokenTables) -> None:
+def register_native_token_tables(tables: TokenTables, *, tokenizer: Any) -> None:
     """Pack ``tables`` into flat tensors and register them with the mage lib.
+
+    Also registers the decision-spec tag-id table for the decoder grammar
+    emitter — that table reads its ids out of ``tokenizer`` and must stay in
+    lockstep with the closed-vocabulary ``tables`` that drive the encoder
+    side, so we wire both registrations through the same entry point.
 
     Replaces any prior registration. The packed tensors are held on a
     module-global so they outlive the native side's borrowed pointers.
@@ -314,6 +319,14 @@ def register_native_token_tables(tables: TokenTables) -> None:
     # Replace prior registration only after the call succeeded so a failed
     # re-registration leaves the lib in a known-good state.
     _active_registration = packed
+
+    # Register the decision-spec tag-id table next so the decoder-grammar
+    # emitter on the Go side has the ``<spec-*>`` / ``<dt-*>`` ids resolved.
+    from magic_ai.text_encoder.native_decision_spec import (
+        register_decision_spec_token_table,
+    )
+
+    register_decision_spec_token_table(tokenizer)
 
 
 # Lookup-kind tags for MageTokenTableLookup (mirror the Go-side switch).
