@@ -43,7 +43,13 @@ from magic_ai.game_state import (
     PendingOptionState,
     PendingState,
 )
+from magic_ai.text_encoder.actor_critic import (
+    DecoderDecisionLayout,
+    decode_decoder_action,
+    decoder_sample,
+)
 from magic_ai.text_encoder.card_cache import CardTokenCache
+from magic_ai.text_encoder.policy import TextPolicy
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy
 from magic_ai.text_encoder.render import OracleEntry
 
@@ -268,16 +274,75 @@ class TextRolloutWorker:
         legal_options: Sequence[PendingOptionState],
         state: _PlayerLSTM,
         perspective_player_idx: int,
-    ) -> tuple[int, int | None, _PlayerLSTM] | None:
-        """Run policy for one priority step. Returns (opt_idx, tgt_idx, new_state) or None.
+    ) -> tuple[ActionRequest, _PlayerLSTM, DecoderDecisionLayout] | None:
+        """Run the encoder + LSTM + grammar decoder for one priority step.
 
-        ``None`` means the legacy single-env policy path should punt to the
-        deterministic fallback action.
+        Returns ``(engine_action, new_state, layout)`` so the caller can both
+        send the engine action and record the decoded layout. ``None`` means
+        the policy refused to score this snapshot and the caller should fall
+        back to a deterministic default.
         """
 
-        del game, snapshot, legal_options, state, perspective_player_idx
-        logger.warning("legacy text rollout scoring is disabled after inline-blank migration")
-        return None
+        del legal_options, perspective_player_idx
+        text_policy: TextPolicy = self.policy.text_policy
+        if text_policy.grammar_decoder is None:
+            logger.warning("text rollout requires text_policy.grammar_decoder")
+            return None
+        try:
+            batch = TextPolicy.encode_snapshots([snapshot], self.oracle, self.tokenizer)
+        except Exception as exc:
+            logger.warning("encode_snapshots failed: %s", exc)
+            return None
+        device = self.device
+        token_ids = batch.token_ids.to(device=device, dtype=torch.long)
+        attn_mask = batch.attention_mask.to(device=device, dtype=torch.long)
+        moved = type(batch)(
+            token_ids=token_ids,
+            attention_mask=attn_mask,
+            card_ref_positions=batch.card_ref_positions.to(device=device, dtype=torch.long),
+            seq_lengths=batch.seq_lengths.to(device=device, dtype=torch.long),
+            spec_tokens=batch.spec_tokens.to(device=device),
+            spec_lens=batch.spec_lens.to(device=device),
+            decision_type=batch.decision_type.to(device=device, dtype=torch.long),
+            pointer_anchor_positions=batch.pointer_anchor_positions.to(device=device),
+            pointer_anchor_kinds=batch.pointer_anchor_kinds.to(device=device),
+            pointer_anchor_subjects=batch.pointer_anchor_subjects.to(device=device),
+            pointer_anchor_handles=batch.pointer_anchor_handles.to(device=device),
+            legal_edge_bitmap=(
+                batch.legal_edge_bitmap.to(device=device)
+                if batch.legal_edge_bitmap is not None
+                else None
+            ),
+        )
+        h_in = state.h.to(device=device)
+        c_in = state.c.to(device=device)
+        with torch.no_grad():
+            encoded = text_policy.encoder(moved)
+            _, (h_out, c_out) = self.policy(moved, h_in=h_in, c_in=c_in)
+            sample = decoder_sample(
+                text_policy,
+                encoded,
+                moved.attention_mask.to(dtype=torch.bool),
+                moved.decision_type.to(dtype=torch.long),
+                moved.pointer_anchor_positions.to(dtype=torch.long),
+                moved.pointer_anchor_kinds.to(dtype=torch.long),
+                moved.pointer_anchor_subjects.to(dtype=torch.long),
+                moved.pointer_anchor_handles.to(dtype=torch.long),
+                legal_edge_bitmap=moved.legal_edge_bitmap,
+                greedy=self.sampling_temperature <= 0.0,
+                temperature=max(self.sampling_temperature, 1e-6),
+            )
+        layout = DecoderDecisionLayout(
+            output_token_ids=sample.output_token_ids[0],
+            output_pointer_pos=sample.output_pointer_pos[0],
+            output_is_pointer=sample.output_is_pointer[0],
+            output_pad_mask=sample.output_pad_mask[0],
+            decision_type=int(sample.decision_type[0].item()),
+            pointer_anchor_handles=sample.pointer_anchor_handles[0],
+        )
+        pending = cast(PendingState, game.pending or game.legal() or {})
+        action = decode_decoder_action(pending, layout)
+        return action, _PlayerLSTM(h=h_out, c=c_out), layout
 
     # --- public API -------------------------------------------------------
 
@@ -347,11 +412,17 @@ class TextRolloutWorker:
                     continue
 
                 pending_kind = pending.get("kind", "") or ""
-                # We only run the policy on priority decisions; other kinds use
-                # a deterministic default. Keeps the smoke harness simple and
-                # avoids feeding the renderer non-priority pendings it does
-                # not have grammar for.
-                if pending_kind != "priority":
+                # The decoder handles every grammar-supported decision type
+                # (priority, attackers, blockers, may, choose-targets/mode/X).
+                # Anything else falls through to the deterministic default
+                # path so we don't feed the renderer pendings it has no
+                # grammar for.
+                if pending_kind not in (
+                    "priority",
+                    "attackers",
+                    "blockers",
+                    "may",
+                ):
                     action = _default_action_for(pending)
                     try:
                         game.step(dict(action))
@@ -368,31 +439,21 @@ class TextRolloutWorker:
                 scored = self._score_step(game, snapshot, options, state, player_idx)
                 if scored is None:
                     action = _default_action_for(pending)
-                    chosen_opt, chosen_tgt = -1, None
+                    chosen_opt: int = 0
                 else:
-                    chosen_opt, chosen_tgt, new_state = scored
+                    action, new_state, _layout = scored
                     states[player_idx] = new_state
-                    action = _translate_action(pending, chosen_opt, chosen_tgt)
-
-                # Sanity: action's option must round-trip through the
-                # candidate list (priority only). We already mapped via
-                # build_priority_candidates so this is essentially asserting
-                # 0 <= chosen_opt < len(options).
-                if chosen_opt >= 0:
-                    if not (0 <= chosen_opt < len(options)):
-                        logger.warning(
-                            "chosen option idx %d out of range (n=%d); using default",
-                            chosen_opt,
-                            len(options),
-                        )
-                        action = _default_action_for(pending)
+                    # We don't currently round-trip the chosen option index
+                    # back from the engine action; record 0 as a placeholder
+                    # since downstream consumers ignore it for non-priority.
+                    chosen_opt = 0
 
                 episode.steps.append(
                     TextRolloutStep(
                         snapshot=snapshot,
                         legal_options=options,
-                        chosen_option_idx=int(chosen_opt) if chosen_opt >= 0 else 0,
-                        chosen_target_idx=chosen_tgt,
+                        chosen_option_idx=int(chosen_opt),
+                        chosen_target_idx=None,
                         reward=0.0,
                         perspective_player_idx=player_idx,
                     )
@@ -402,10 +463,9 @@ class TextRolloutWorker:
                     game.step(dict(action))
                 except Exception as exc:
                     logger.warning(
-                        "game.step failed (kind=%s opt=%d tgt=%s): %s; aborting",
+                        "game.step failed (kind=%s opt=%d): %s; aborting",
                         pending_kind,
                         chosen_opt,
-                        chosen_tgt,
                         exc,
                     )
                     break
