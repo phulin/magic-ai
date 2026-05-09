@@ -182,11 +182,27 @@ def _train_one_pipeline(
             step += 1
     print(f"[{label}] train time {time.time() - t0:.1f}s")
 
-    # Eval
+    # Eval — bucket by decision_type and report per-bucket accuracy on the
+    # *supervised pointer step* only (apples-to-apples across pipelines):
+    #
+    # * Inline path: priority_target_blank gives the chosen anchor; we only
+    #   score that pick (per-blank target accuracy is a separate metric not
+    #   reported here — it's a different question).
+    # * Decoder path: decoder targets contain forced control tokens (OPEN/END)
+    #   whose mask reduces to a single legal id, so they're 100% by
+    #   construction. Honest comparison restricts to is_pointer_step==True.
     policy.eval()
     eval_rng = np.random.default_rng(args.seed + 999)
-    correct = 0
-    total = 0
+    # Per-bucket {kind: (correct, total)}
+    bucket: dict[str, list[int]] = {}
+
+    def _bump(kind: str, c: int, t: int) -> None:
+        if t == 0:
+            return
+        cur = bucket.setdefault(kind, [0, 0])
+        cur[0] += c
+        cur[1] += t
+
     with torch.no_grad():
         for _ in range(args.eval_batches):
             host_batch = eval_ds.sample_batch(args.batch_size, eval_rng)
@@ -198,17 +214,20 @@ def _train_one_pipeline(
                     vocab_logits, pointer_logits = text_policy.forward_decoder_teacher_forced(
                         dec_batch.encoded, dec_batch.output_token_ids
                     )
-                    neg_inf = torch.finfo(vocab_logits.dtype).min
-                    v_pred = vocab_logits.masked_fill(~dec_batch.vocab_mask, neg_inf).argmax(-1)
+                    neg_inf = torch.finfo(pointer_logits.dtype).min
                     p_pred = pointer_logits.masked_fill(~dec_batch.pointer_mask, neg_inf).argmax(-1)
-                    correct_per_step = torch.where(
-                        dec_batch.output_is_pointer,
-                        p_pred == dec_batch.output_pointer_pos,
-                        v_pred == dec_batch.output_token_ids,
+                    pointer_correct = (p_pred == dec_batch.output_pointer_pos) & (
+                        dec_batch.output_is_pointer & dec_batch.output_pad_mask
                     )
-                    valid = dec_batch.output_pad_mask
-                    correct += int((correct_per_step & valid).sum().item())
-                    total += int(valid.sum().item())
+                    pointer_valid = dec_batch.output_is_pointer & dec_batch.output_pad_mask
+                    # Sum per-row (pointer correctness can be multi-step,
+                    # treat each pointer step as one supervised question)
+                    dt = dec_batch.decision_type_per_row
+                    for dt_val in torch.unique(dt).tolist():
+                        rows = dt == int(dt_val)
+                        c = int(pointer_correct[rows].sum().item())
+                        t = int(pointer_valid[rows].sum().item())
+                        _bump(_decision_type_name(int(dt_val)), c, t)
                 else:
                     inl_batch = cast(ForgeChoiceBatch, batch)
                     out, _ = policy(inl_batch.encoded, h_in=None, c_in=None)
@@ -220,14 +239,46 @@ def _train_one_pipeline(
                     )
                     pri_pred = masked_scores.argmax(dim=-1)
                     pri_target = inl_batch.priority_target_blank.to(pri_pred.device)
-                    pri_correct = (pri_pred == pri_target).float()
                     valid_pri = pri_target >= 0
-                    correct += int((pri_correct[valid_pri]).sum().item())
-                    total += int(valid_pri.sum().item())
+                    pri_correct = (pri_pred == pri_target) & valid_pri
+                    # Inline only supervises priority anchors; everything goes
+                    # into the priority bucket.
+                    _bump(
+                        "priority",
+                        int(pri_correct.sum().item()),
+                        int(valid_pri.sum().item()),
+                    )
 
-    final_acc = correct / max(total, 1)
-    print(f"[{label}] eval per-step accuracy = {final_acc:.4f} (correct {correct}/{total})")
-    return {"accuracy": final_acc, "correct": correct, "total": total}
+    overall_correct = sum(c for c, _ in bucket.values())
+    overall_total = sum(t for _, t in bucket.values())
+    overall_acc = overall_correct / max(overall_total, 1)
+    print(f"[{label}] eval — supervised pointer steps only:")
+    for kind in sorted(bucket):
+        c, t = bucket[kind]
+        print(f"           {kind:20s} {c / t:.4f}  ({c}/{t})")
+    print(f"           {'OVERALL':20s} {overall_acc:.4f}  ({overall_correct}/{overall_total})")
+    return {
+        "accuracy": overall_acc,
+        "correct": overall_correct,
+        "total": overall_total,
+        **{f"acc_{k}": (c / t if t else 0.0) for k, (c, t) in bucket.items()},
+        **{f"n_{k}": t for k, (c, t) in bucket.items()},
+    }
+
+
+_DECISION_TYPE_NAMES = {
+    0: "priority",
+    1: "declare_attackers",
+    2: "declare_blockers",
+    3: "choose_targets",
+    4: "may",
+    5: "choose_mode",
+    6: "choose_x",
+}
+
+
+def _decision_type_name(dt_val: int) -> str:
+    return _DECISION_TYPE_NAMES.get(dt_val, f"unknown({dt_val})")
 
 
 class _NullCtx:
@@ -306,8 +357,25 @@ def main() -> int:
         )
 
     print("\n=========================== PARITY SUMMARY ===========================")
-    for pipeline, r in results.items():
-        print(f"  {pipeline:8s} accuracy={r['accuracy']:.4f}  ({r['correct']}/{r['total']})")
+    print("(Per-decision-type accuracy on the supervised pointer step.)")
+    all_kinds = sorted({k[4:] for r in results.values() for k in r if k.startswith("acc_")})
+    print(f"  {'kind':20s}  " + "  ".join(f"{p:>10s}" for p in results))
+    for kind in all_kinds:
+        row = [
+            f"  {kind:20s}",
+        ]
+        for p in results:
+            acc = results[p].get(f"acc_{kind}")
+            n = results[p].get(f"n_{kind}", 0)
+            row.append(
+                f"  {acc:>5.3f} (n={int(n) if isinstance(n, (int, float)) else n})"
+                if acc is not None
+                else "  -        "
+            )
+        print("".join(row))
+    print(
+        f"  {'OVERALL':20s}  " + "  ".join(f"  {r['accuracy']:>5.3f}    " for r in results.values())
+    )
     if "inline" in results and "decoder" in results:
         delta = results["decoder"]["accuracy"] - results["inline"]["accuracy"]
         print(f"  delta(decoder - inline) = {delta:+.4f} ({delta * 100:+.2f}pp)")
