@@ -387,6 +387,61 @@ NUM_TOKENS: tuple[str, ...] = tuple(num_token(k) for k in range(MAX_NUM))
 
 INLINE_BLANK_TOKENS: tuple[str, ...] = CHOOSE_KIND_TOKENS + BLANK_ANSWER_TOKENS + NUM_TOKENS
 
+# ---------------------------------------------------------------------------
+# Decision-spec tokens (see docs/decoder_grammar_plan.md).
+#
+# Encoder-side tokens for the spec section the renderer appends to state
+# text. The decoder's grammar vocabulary (<DECLARE_ATTACKERS>, <ATTACK>,
+# <BLOCK>, <END>, …) is *not* registered here — it lives only on the
+# decoder side.
+#
+# Inline-blank tokens above remain registered while the inline path is
+# still in service. They will be removed in migration step 12 once the
+# decoder is the only policy path.
+# ---------------------------------------------------------------------------
+
+MAX_STACK_REFS = 16
+
+
+def stack_ref_token(k: int) -> str:
+    if not 0 <= k < MAX_STACK_REFS:
+        raise ValueError(f"stack-ref index {k} out of range [0, {MAX_STACK_REFS})")
+    return f"<stack-ref:{k}>"
+
+
+SPEC_STRUCTURAL_TOKENS: tuple[str, ...] = (
+    "<spec-open>",
+    "<spec-close>",
+    "<decision-type>",
+    "<legal-attacker>",
+    "<legal-blocker>",
+    "<legal-target>",
+    "<legal-action>",
+    "<for-action>",
+    "<max-value>",
+    "</max-value>",
+    "<player-ref:0>",
+    "<player-ref:1>",
+)
+
+# Decision-type-name tokens. Prefixed with `<dt-` to disambiguate from the
+# pre-existing `<choose-mode>` / `<choose-may>` inline-blank kind tokens.
+DECISION_TYPE_NAME_TOKENS: tuple[str, ...] = (
+    "<dt-priority>",
+    "<dt-declare-attackers>",
+    "<dt-declare-blockers>",
+    "<dt-choose-targets>",
+    "<dt-may>",
+    "<dt-choose-mode>",
+    "<dt-choose-x>",
+)
+
+STACK_REF_TOKENS: tuple[str, ...] = tuple(stack_ref_token(k) for k in range(MAX_STACK_REFS))
+
+DECISION_SPEC_TOKENS: tuple[str, ...] = (
+    SPEC_STRUCTURAL_TOKENS + DECISION_TYPE_NAME_TOKENS + STACK_REF_TOKENS
+)
+
 # Union of every custom token, ordered (structural, status, mana, loyalty,
 # card-ref, dict-entry). The build script feeds this whole tuple to
 # ``add_special_tokens`` so each entry is guaranteed a single id and is
@@ -405,6 +460,7 @@ ALL_CUSTOM_TOKENS: tuple[str, ...] = (
     + SCALAR_WRAPPER_TOKENS
     + POOL_MANA_TOKENS
     + INLINE_BLANK_TOKENS
+    + DECISION_SPEC_TOKENS
 )
 
 

@@ -15,6 +15,7 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 - `policy_value_pretrain.py` — Forge choice-situation dataset and trainer for joint inline-policy/value pretraining from extracted torch or JSONL artifacts.
 - `recurrent.py` — LSTM history adapter wrapping TextPolicy; carries recurrence through encoder state vector.
 - `render.py` — Deterministic GameStateSnapshot → text renderer; produces custom-token-laced strings plus inline-blank anchor metadata.
+- `render_spec.py` — GameStateSnapshot pending → DecisionSpec renderer for the autoregressive grammar decoder (additive, does not touch inline-blank path).
 - `replay_buffer.py` — Single global concurrent ring for encoded text snapshots, inline blank metadata, episode/policy-version metadata, completed-window claims, and GPU-side PPO return building.
 - `replay_triton.py` — Optional CUDA/Triton kernels for packed replay-buffer batch append writes, gather packing, and position rebasing.
 - `rollout.py` — End-to-end Python Magic game player using text encoder and RecurrentTextPolicy.
@@ -22,3 +23,6 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 - `tokenizer.py` — ModernBERT BPE tokenizer augmented with custom mana/card-ref/status/structural tokens.
 - `training.py` — Value/inline-blank loss helpers plus TextEncoderTrainer.
 - `inline_blanks.py` — Stable inline-blank group-kind enums shared by renderer, batches, training losses, and policy sampling.
+- `decision_spec.py` — Decoder-pipeline types: `DecisionType`/`AnchorKind` enums, `DecisionSpec` dataclass, and pointer-anchor helpers.
+- `grammar.py` — Per-decision-type grammar state machines (`next_mask`, `batch_next_mask`) and the decoder's small `GrammarVocab` enum.
+- `decoder.py` — Autoregressive `GrammarDecoder`: causal transformer with cross-attention to encoder context, vocab + pointer heads, KV-cached `step` API, and `combined_sample` helper.
