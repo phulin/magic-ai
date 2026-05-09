@@ -42,14 +42,8 @@ class OpponentPool:
     entries: list[OpponentEntry] = field(default_factory=list)
 
     def add_snapshot(self, path: Path, tag: str, *, snapshot_games: int = 0) -> OpponentEntry:
-        # Use the previous checkpoint's mean as a temporal prior, but reset
-        # uncertainty because each checkpoint is a separate fixed player.
         env = cast(Any, self.env)
-        if self.entries:
-            prev = self.entries[-1].rating
-            seed_rating = env.create_rating(mu=prev.mu)
-        else:
-            seed_rating = env.create_rating()
+        seed_rating = env.create_rating()
         entry = OpponentEntry(
             path=path, tag=tag, rating=seed_rating, snapshot_games=int(snapshot_games)
         )

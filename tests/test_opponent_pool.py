@@ -6,6 +6,7 @@ import torch.nn as nn
 import trueskill
 from magic_ai.opponent_pool import (
     OpponentEntry,
+    OpponentPool,
     _disable_text_replay_capture,
     load_opponent_weights,
     opponent_policy_state_dict,
@@ -39,6 +40,17 @@ def _text_policy() -> TextActorCritic:
         lstm_layers=1,
     )
     return TextActorCritic(cfg)
+
+
+def test_add_snapshot_uses_default_trueskill_prior_for_each_snapshot() -> None:
+    pool = OpponentPool()
+    first = pool.add_snapshot(Path("snapshot_g000100_p010.0.pt"), "g000100_p010.0")
+    first.rating = pool.env.create_rating(mu=31.0, sigma=5.0)
+
+    second = pool.add_snapshot(Path("snapshot_g000200_p020.0.pt"), "g000200_p020.0")
+
+    assert second.rating.mu == 25.0
+    assert second.rating.sigma == 25.0 / 3.0
 
 
 def test_opponent_state_dict_excludes_runtime_lstm_buffers() -> None:

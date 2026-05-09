@@ -1556,8 +1556,8 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(pool.entries[1].tag, "g000200_p020.0")
         self.assertEqual(pool.entries[0].rating.mu, 31.0)
         self.assertEqual(pool.entries[0].n_games, 9)
-        # New snapshot seeds from the previous entry's mean, but not confidence.
-        self.assertAlmostEqual(pool.entries[1].rating.mu, 31.0)
+        # New snapshots seed from the default TrueSkill prior.
+        self.assertAlmostEqual(pool.entries[1].rating.mu, 25.0)
         self.assertAlmostEqual(pool.entries[1].rating.sigma, 25.0 / 3.0)
 
     def test_prune_pool_to_schedule_keeps_entries_closest_to_new_thresholds(self) -> None:
