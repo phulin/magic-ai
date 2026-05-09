@@ -30,6 +30,7 @@ from magic_ai.text_encoder.decision_spec import (
     DecisionSpec,
     DecisionType,
     PointerAnchor,
+    blocker_attacker_order,
 )
 
 # Pending-kind → decision-type dispatch.
@@ -168,16 +169,10 @@ class DecisionSpecRenderer:
                 tokens.append(v.player_ref[player_idx])
 
         elif decision_type is DecisionType.DECLARE_BLOCKERS:
-            # Build the attacker list as the union of attackers across all
-            # blocker options' valid_targets, in stable first-seen order.
-            attacker_order: list[str] = []
-            attacker_index: dict[str, int] = {}
-            for option in options:
-                for target in option.get("valid_targets") or []:
-                    aid = target["id"]
-                    if aid not in attacker_index:
-                        attacker_index[aid] = len(attacker_order)
-                        attacker_order.append(aid)
+            # Canonical attacker order shared with forge_target_encoding via
+            # decision_spec.blocker_attacker_order.
+            attacker_order = blocker_attacker_order(options)
+            attacker_index = {aid: i for i, aid in enumerate(attacker_order)}
 
             # Emit one <legal-blocker> per blocker option.
             for opt_idx in range(len(options)):
@@ -214,7 +209,7 @@ class DecisionSpecRenderer:
             bitmap = np.zeros((n_blockers, n_attackers), dtype=np.bool_)
             for blocker_idx, option in enumerate(options):
                 for target in option.get("valid_targets") or []:
-                    bitmap[blocker_idx, attacker_index[target["id"]]] = True
+                    bitmap[blocker_idx, attacker_index[str(target["id"])]] = True
             legal_edge_bitmap = bitmap
 
         elif decision_type is DecisionType.CHOOSE_TARGETS:

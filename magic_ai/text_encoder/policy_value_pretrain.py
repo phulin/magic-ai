@@ -254,7 +254,9 @@ class ForgeChoiceDataset:
         T_enc = int(encoded.token_ids.shape[1])
 
         out_tokens = torch.zeros((batch_size, L), dtype=torch.long)
-        out_pointer_pos = torch.full((batch_size, L), 0, dtype=torch.long)
+        # Sentinel -1 for unfilled pointer targets: CE/gather will fail loud
+        # if pad_mask has a hole that lets a padded slot reach the loss.
+        out_pointer_pos = torch.full((batch_size, L), -1, dtype=torch.long)
         out_is_pointer = torch.zeros((batch_size, L), dtype=torch.bool)
         out_pad_mask = torch.zeros((batch_size, L), dtype=torch.bool)
         decision_type_per_row = torch.empty((batch_size,), dtype=torch.long)

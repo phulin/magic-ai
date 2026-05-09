@@ -362,8 +362,6 @@ class ShardedNativeBatchEncoder:
                     max_options=max_options,
                     max_targets=max_targets,
                     max_card_refs=max_card_refs,
-                    max_blanks=64,
-                    max_legal_per_blank=64,
                 )
                 self._packed_token_outputs_spec = (
                     capacity,
@@ -403,8 +401,6 @@ class ShardedNativeBatchEncoder:
                 max_options=max_options,
                 max_targets=max_targets,
                 max_card_refs=max_card_refs,
-                max_blanks=64,
-                max_legal_per_blank=64,
             )
             self._packed_token_outputs_spec = (
                 capacity,
@@ -431,8 +427,6 @@ class ShardedNativeBatchEncoder:
                     max_options=max_options,
                     max_targets=max_targets,
                     max_card_refs=max_card_refs,
-                    max_blanks=64,
-                    max_legal_per_blank=64,
                 )
                 current_spec = (capacity, max_tokens, max_options, max_targets, max_card_refs)
                 self._packed_token_shard_outputs[idx] = current

@@ -1119,6 +1119,22 @@ class TextActorCritic(nn.Module):
         idx = replay_rows.to(device=self.rollout_buffer.device, dtype=torch.long)
         return self.rollout_buffer.core.old_log_prob[idx], self.rollout_buffer.core.value[idx]
 
+    def compute_spr_loss(
+        self,
+        step_indices: Tensor,
+        *,
+        extras: Any | None = None,
+    ) -> Tensor:
+        """SPR is not used by the decoder pipeline; only invoked when
+        ``spr_enabled`` is True, which it never is here."""
+
+        del step_indices, extras
+        raise RuntimeError("TextActorCritic does not implement SPR; spr_enabled stays False")
+
+    def update_spr_target(self, decay: float | None = None) -> None:
+        del decay
+        raise RuntimeError("TextActorCritic does not implement SPR; spr_enabled stays False")
+
     def recompute_lstm_states_for_episode(
         self,
         replay_rows: list[int],

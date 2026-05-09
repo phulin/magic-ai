@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import cast
 
 import torch
 from torch import Tensor
@@ -31,6 +32,12 @@ from transformers import PreTrainedTokenizerFast
 from magic_ai.text_encoder.decision_spec import AnchorKind, DecisionSpec, DecisionType
 from magic_ai.text_encoder.render import RenderedSnapshot
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
+
+# Sentinel default for dataclass fields that __post_init__ always populates.
+# Typing as ``Tensor`` (rather than ``Tensor | None``) keeps callers and
+# downstream consumers free of None-guards; the runtime None is replaced
+# before the first user-visible read.
+_UNSET_TENSOR: Tensor = cast(Tensor, None)
 
 _CARD_REF_RE = re.compile(r"^<card-ref:(\d+)>$")
 
@@ -57,15 +64,16 @@ class TextEncodedBatch:
     attention_mask: Tensor  # [B, T] int64
     card_ref_positions: Tensor  # [B, MAX_CARD_REFS] int64, -1 = absent
     seq_lengths: Tensor  # [B] int64
-    # Decision-spec fields are optional; rows that batch state-only snapshots
-    # (e.g. for MLM pretraining) leave these empty.
-    spec_tokens: Tensor | None = None  # [B, T_spec_max] int32, 0 = pad
-    spec_lens: Tensor | None = None  # [B] int32
-    decision_type: Tensor | None = None  # [B] int32 (DecisionType enum, -1 = no pending)
-    pointer_anchor_positions: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
-    pointer_anchor_kinds: Tensor | None = None  # [B, N_anchors_max] int32 (AnchorKind), -1 = pad
-    pointer_anchor_subjects: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
-    pointer_anchor_handles: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
+    # Decision-spec fields are optional inputs (state-only batches like MLM
+    # pretraining leave them unset); ``__post_init__`` always materializes
+    # them, so consumers see ``Tensor`` not ``Tensor | None``.
+    spec_tokens: Tensor = _UNSET_TENSOR  # [B, T_spec_max] int32, 0 = pad
+    spec_lens: Tensor = _UNSET_TENSOR  # [B] int32
+    decision_type: Tensor = _UNSET_TENSOR  # [B] int32 (DecisionType enum, -1 = no pending)
+    pointer_anchor_positions: Tensor = _UNSET_TENSOR  # [B, N_anchors_max] int32, -1 = pad
+    pointer_anchor_kinds: Tensor = _UNSET_TENSOR  # [B, N_anchors_max] int32 (AnchorKind), -1 = pad
+    pointer_anchor_subjects: Tensor = _UNSET_TENSOR  # [B, N_anchors_max] int32, -1 = pad
+    pointer_anchor_handles: Tensor = _UNSET_TENSOR  # [B, N_anchors_max] int32, -1 = pad
     # ``[B, N_blockers_max, N_attackers_max]`` bool. ``None`` when no row in
     # the batch has DECLARE_BLOCKERS legal-edge data.
     legal_edge_bitmap: Tensor | None = None
@@ -107,12 +115,12 @@ class PackedTextBatch:
 
     state_positions: Tensor  # [B] int32, packed-offset of each row's first token
     card_ref_positions: Tensor  # [B, MAX_CARD_REFS] int32, -1 = absent
-    spec_lens: Tensor | None = None  # [B] int32
-    decision_type: Tensor | None = None  # [B] int32
-    pointer_anchor_positions: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
-    pointer_anchor_kinds: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
-    pointer_anchor_subjects: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
-    pointer_anchor_handles: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
+    spec_lens: Tensor = _UNSET_TENSOR  # [B] int32
+    decision_type: Tensor = _UNSET_TENSOR  # [B] int32
+    pointer_anchor_positions: Tensor = _UNSET_TENSOR  # [B, N_anchors_max] int32, -1 = pad
+    pointer_anchor_kinds: Tensor = _UNSET_TENSOR  # [B, N_anchors_max] int32, -1 = pad
+    pointer_anchor_subjects: Tensor = _UNSET_TENSOR  # [B, N_anchors_max] int32, -1 = pad
+    pointer_anchor_handles: Tensor = _UNSET_TENSOR  # [B, N_anchors_max] int32, -1 = pad
     legal_edge_bitmap: Tensor | None = None
     total_tokens: int | None = None
     seq_lengths_host: tuple[int, ...] | None = None

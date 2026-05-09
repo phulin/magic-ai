@@ -113,9 +113,9 @@ def encode_card_batch(
     examples = []
     for name in card_names:
         snap = make_single_card_snapshot(name)
-        rendered = render_snapshot(snap, actions=[], oracle=oracle)
+        rendered = render_snapshot(snap, oracle=oracle)
         examples.append(tokenize_snapshot(rendered, tokenizer))
-    batch = collate(examples, pad_id=pad_id)
+    batch = collate(examples, [None] * len(examples), pad_id=pad_id)
 
     batch_on_device = type(batch)(
         token_ids=batch.token_ids.to(device),

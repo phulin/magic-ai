@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from magic_ai.game_state import PendingOptionState, PendingState
-from magic_ai.text_encoder.decision_spec import DecisionType
+from magic_ai.text_encoder.decision_spec import DecisionType, blocker_attacker_order
 from magic_ai.text_encoder.grammar import GrammarVocab, bpe_digit_str_to_grammar_ids
 
 
@@ -239,16 +239,9 @@ def _blocker_assignments(
     if not assignments:
         return None
 
-    # Build the same attacker order as render_spec: union of valid_targets
-    # in first-seen order across blocker options.
-    attacker_index: dict[str, int] = {}
-    attacker_full_ids_in_order: list[str] = []
-    for option in options:
-        for target in option.get("valid_targets") or []:
-            aid = str(target["id"])
-            if aid not in attacker_index:
-                attacker_index[aid] = len(attacker_index)
-                attacker_full_ids_in_order.append(aid)
+    # Canonical attacker order shared with render_spec via
+    # decision_spec.blocker_attacker_order.
+    attacker_full_ids_in_order = blocker_attacker_order(options)
 
     pairs: list[tuple[int, int]] = []
     for assignment in assignments:

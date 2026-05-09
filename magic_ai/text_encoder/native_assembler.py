@@ -422,6 +422,14 @@ def encode_tokens_packed(
         raise NativeEncodingError(message)
     outputs.batch_handle = int(handle_out[0])
     outputs.spec_overflow[0] = int(spec_out.spec_overflow)
+    if int(spec_out.spec_overflow) != 0:
+        from magic_ai.slot_encoder.native_encoder import NativeEncodingError
+
+        raise NativeEncodingError(
+            f"MageEncodeDecisionSpec spec_overflow={int(spec_out.spec_overflow)}: "
+            f"per-row spec exceeded T_spec_max={int(outputs.spec_tokens.shape[1])} "
+            f"or N_anchors_max={int(outputs.pointer_anchor_positions.shape[1])}"
+        )
 
     decision_rows_written = int(result.decision_rows_written)
     batch = encoder._slice_batch_buffers(buffers, batch_size)

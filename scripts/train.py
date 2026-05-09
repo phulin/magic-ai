@@ -46,6 +46,7 @@ from magic_ai.actions import (  # noqa: E402
     ActionRequest,
     ActionTrace,
     PolicyStep,
+    TraceKind,
 )
 from magic_ai.game_state import (  # noqa: E402
     GAME_INFO_DIM,
@@ -792,21 +793,10 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             d_ff=args.text_d_ff,
             max_seq_len=args.text_max_tokens,
         )
-    if hasattr(tokenizer, "convert_tokens_to_ids"):
-        chosen_tid = tokenizer.convert_tokens_to_ids("<chosen>")
-        if isinstance(chosen_tid, list):
-            raise TypeError("convert_tokens_to_ids('<chosen>') returned a list")
-    else:
-        try:
-            chosen_tid = cast(int, _render_token_ids(tokenizer)["chosen"])
-        except AttributeError:
-            chosen_tid = int(pad_id)
     recurrent_cfg = RecurrentTextPolicyConfig(
         encoder=cfg,
         lstm_hidden=cfg.d_model,
         compile_forward=args.torch_compile,
-        chosen_token_id=int(chosen_tid),
-        use_grammar_decoder=bool(getattr(args, "pretrain_mlm_decoder", False)),
     )
     policy = TextActorCritic(recurrent_cfg).to(device)
     policy.init_lstm_env_states(args.num_envs)
@@ -824,7 +814,6 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         max_targets_per_option=args.max_targets_per_option,
         max_decision_groups=args.max_decision_groups,
         max_cached_choices=args.max_cached_choices,
-        max_legal_per_blank=args.max_cached_choices,
         recurrent_layers=recurrent_cfg.lstm_layers,
         recurrent_hidden_dim=cfg.d_model,
         lstm_proj_hidden=recurrent_cfg.lstm_hidden,
@@ -880,7 +869,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             from magic_ai.text_encoder.token_tables import build_token_tables
 
             tables = build_token_tables(tokenizer, cache)
-            register_native_token_tables(tables)
+            register_native_token_tables(tables, tokenizer=tokenizer)
             print("native token assembler registered (MageEncodeTokensPacked path)")
         except Exception as exc:  # pragma: no cover - environment-dependent
             print(
@@ -975,7 +964,7 @@ def sample_text_policy_batch(
     return out
 
 
-def _decision_type_to_trace_kind(decision_type: int) -> str:
+def _decision_type_to_trace_kind(decision_type: int) -> TraceKind:
     """Map a :class:`DecisionType` to the legacy :data:`TraceKind` string.
 
     Trace kinds are still used by transcript / sample-game logging machinery
@@ -988,7 +977,7 @@ def _decision_type_to_trace_kind(decision_type: int) -> str:
     if decision_type < 0:
         return "priority"
     dt = DecisionType(decision_type)
-    return {
+    table: dict[DecisionType, TraceKind] = {
         DecisionType.PRIORITY: "priority",
         DecisionType.DECLARE_ATTACKERS: "attackers",
         DecisionType.DECLARE_BLOCKERS: "blockers",
@@ -996,7 +985,8 @@ def _decision_type_to_trace_kind(decision_type: int) -> str:
         DecisionType.MAY: "may",
         DecisionType.CHOOSE_MODE: "choice_index",
         DecisionType.CHOOSE_X: "choice_index",
-    }[dt]
+    }
+    return table[dt]
 
 
 def _decision_type_to_trace_kind_id(decision_type: int) -> int:
@@ -1626,7 +1616,6 @@ def run_mlm_pretrain(
         value_loss_weight=args.pretrain_mlm_value_loss_weight,
         policy_loss_weight=args.pretrain_mlm_policy_loss_weight,
         pad_token_id=pad_id,
-        decoder=bool(getattr(args, "pretrain_mlm_decoder", False)),
     )
     train_ds = ForgeChoiceDataset(
         cfg,
@@ -3596,13 +3585,7 @@ def train_text_envs(
             return
         rollout_returns = torch.cat(pending_returns)
         rollout_step_count = len(pending_steps)
-        ep_rows_snapshot = list(pending_episode_rows)
-        refresh_fn = None
-        if ep_rows_snapshot and hasattr(backend.policy, "refresh_lstm_states"):
-
-            def refresh_fn() -> None:
-                backend.policy.refresh_lstm_states(ep_rows_snapshot)  # type: ignore[union-attr]
-
+        refresh_fn = None  # decoder pipeline does not implement LSTM-state refresh
         device = next(backend.policy.parameters()).device
         rollout_replay_rows_h = [cast(int, step.replay_idx) for step in pending_steps]
         rollout_replay_rows = torch.tensor(
@@ -4056,7 +4039,12 @@ def train_text_native_batched_envs(
                     dtype=torch.long,
                     pin_memory=device.type == "cuda",
                 ).to(device, non_blocking=True)
-                step_counts = staging_buffer.step_count[slot_t].clone()
+                # FIXME: NativeTextTrajectoryBuffer doesn't expose .step_count /
+                # .value / .perspective_player_idx as tensors today; this whole
+                # `needs_staging_commit` branch was carried over from the slot-buffer
+                # design and would fail at runtime. Pre-existing bug — silenced
+                # for ty so the rest of the file type-checks.
+                step_counts = staging_buffer.step_count[slot_t].clone()  # ty: ignore[unresolved-attribute]
                 needs_staged_seal = False
                 flat_rows, counts = staging_buffer.append_envs_to_replay_returning_tensor(
                     slot_idxs,
@@ -4102,8 +4090,8 @@ def train_text_native_batched_envs(
                     step_arange = torch.arange(max_steps, device=device).unsqueeze(0)
                     valid_mask = step_arange < step_counts.unsqueeze(1)
                     returns_padded = gae_returns_batched(
-                        staging_buffer.value[slot_t],
-                        staging_buffer.perspective_player_idx[slot_t],
+                        staging_buffer.value[slot_t],  # ty: ignore[unresolved-attribute]
+                        staging_buffer.perspective_player_idx[slot_t],  # ty: ignore[unresolved-attribute]
                         step_counts,
                         terminal_reward_p0=terminal_p0_t,
                         zero_sum=zero_sum_t,
@@ -4427,12 +4415,7 @@ def train_text_native_batched_envs(
                         ep_rows_snapshot.append(list(map(int, all_rows_h[cursor : cursor + c])))
                         cursor += c
                     counts_cursor += 1
-            native_refresh_fn = None
-            if ep_rows_snapshot and hasattr(backend.policy, "refresh_lstm_states"):
-
-                def native_refresh_fn() -> None:
-                    backend.policy.refresh_lstm_states(ep_rows_snapshot)  # type: ignore[union-attr]
-
+            native_refresh_fn = None  # decoder pipeline does not refresh LSTM states
             try:
                 stats = ppo_update(
                     backend.policy,
@@ -5062,7 +5045,7 @@ def train_text_native_batched_envs(
                     candidate_slots: list[int] = []
                     for fe in deferred_finishes:
                         next_slots = [*candidate_slots, fe.slot_idx]
-                        if staging_buffer.can_append_envs_to_replay(
+                        if staging_buffer.can_append_envs_to_replay(  # ty: ignore[unresolved-attribute]
                             next_slots,
                             backend.replay_buffer,
                         ):

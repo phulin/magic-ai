@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import torch
 import torch.nn as nn
 from torch import Tensor
 from transformers import PreTrainedTokenizerFast
@@ -141,7 +142,7 @@ class TextPolicy(nn.Module):
         return self.grammar_decoder.forward_teacher_forced(
             target_tokens,
             encoded,
-            batch.attention_mask.to(dtype=bool),
+            batch.attention_mask.to(dtype=torch.bool),
         )
 
     @staticmethod

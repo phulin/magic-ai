@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import torch  # noqa: E402
+from magic_ai.game_state import PendingState  # noqa: E402
 from magic_ai.text_encoder.actor_critic import (  # noqa: E402
     DecoderDecisionLayout,
     decode_decoder_action,
@@ -114,7 +115,7 @@ def main() -> int:
     options = [{"kind": "pass"}] + [
         {"kind": "play_land", "card_id": f"c{i}"} for i in range(n_actions - 1)
     ]
-    pending = cast("dict[str, object]", {"kind": "priority", "player_idx": 0, "options": options})
+    pending = cast("PendingState", {"kind": "priority", "player_idx": 0, "options": options})
     layout = DecoderDecisionLayout(
         output_token_ids=sample.output_token_ids[0],
         output_pointer_pos=sample.output_pointer_pos[0],

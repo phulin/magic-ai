@@ -14,11 +14,35 @@ will eventually emit the same shape directly.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 
 import numpy as np
+
+from magic_ai.game_state import PendingOptionState
+
+
+def blocker_attacker_order(options: Iterable[PendingOptionState]) -> list[str]:
+    """Canonical attacker order for ``DECLARE_BLOCKERS``: union of
+    ``valid_targets`` across blocker options in stable first-seen order.
+
+    Single source of truth shared by ``render_spec`` (which lays out
+    LEGAL_ATTACKER anchors and the legal-edge bitmap columns) and
+    ``forge_target_encoding`` (which translates observed assignments
+    into pointer subject indices). Keep these aligned by calling here
+    rather than reimplementing the loop.
+    """
+
+    attacker_index: dict[str, int] = {}
+    order: list[str] = []
+    for option in options:
+        for target in option.get("valid_targets") or []:
+            aid = str(target["id"])
+            if aid not in attacker_index:
+                attacker_index[aid] = len(order)
+                order.append(aid)
+    return order
 
 
 class DecisionType(IntEnum):
