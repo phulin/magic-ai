@@ -309,6 +309,107 @@ def inline_blank_per_blank_accuracy(
 
 
 # ---------------------------------------------------------------------------
+# Grammar-decoder loss (decoder-pipeline path; see docs/decoder_grammar_plan.md).
+# ---------------------------------------------------------------------------
+
+
+def decoder_cross_entropy_loss(
+    vocab_logits: Tensor,
+    pointer_logits: Tensor,
+    target_tokens: Tensor,
+    target_pointer_pos: Tensor,
+    is_pointer_step: Tensor,
+    vocab_mask: Tensor,
+    pointer_mask: Tensor,
+    pad_mask: Tensor,
+) -> Tensor:
+    """Teacher-forced CE over the autoregressive decoder output.
+
+    ``vocab_logits`` ``[B, L, V_grammar]`` and ``pointer_logits``
+    ``[B, L, T_enc]`` come from
+    :meth:`TextPolicy.forward_decoder_teacher_forced`. ``target_tokens``
+    ``[B, L]`` holds the ground-truth grammar token ids; for pointer steps
+    the token id is ignored and ``target_pointer_pos`` ``[B, L]`` (encoder
+    position of the chosen anchor) is the supervised target instead.
+
+    ``is_pointer_step`` ``[B, L]`` selects which steps score the pointer
+    head (True) vs. the vocab head (False). ``vocab_mask`` ``[B, L, V]``
+    and ``pointer_mask`` ``[B, L, T_enc]`` are the per-step legality
+    masks (illegal positions are zeroed in the softmax via -inf).
+    ``pad_mask`` ``[B, L]`` is True for valid positions, False for
+    sequence padding.
+
+    Vectorized — no loops over (B, L). Reshapes once, applies the mask
+    in one broadcast, and uses a single ``F.cross_entropy`` call per
+    head with a ``-inf`` fill on illegal columns.
+    """
+
+    B, L, V = vocab_logits.shape
+    T_enc = pointer_logits.shape[-1]
+
+    neg_inf = torch.finfo(vocab_logits.dtype).min
+    vocab_logits_masked = vocab_logits.masked_fill(~vocab_mask, neg_inf)
+    pointer_logits_masked = pointer_logits.masked_fill(~pointer_mask, neg_inf)
+
+    valid = pad_mask.reshape(-1)
+    vocab_step = (~is_pointer_step) & pad_mask
+    pointer_step = is_pointer_step & pad_mask
+
+    vocab_flat = vocab_logits_masked.reshape(B * L, V)
+    pointer_flat = pointer_logits_masked.reshape(B * L, T_enc)
+    vocab_target = target_tokens.reshape(-1).to(torch.long)
+    pointer_target = target_pointer_pos.reshape(-1).to(torch.long)
+
+    vocab_sel = vocab_step.reshape(-1)
+    pointer_sel = pointer_step.reshape(-1)
+
+    losses = []
+    if vocab_sel.any():
+        losses.append(
+            F.cross_entropy(vocab_flat[vocab_sel], vocab_target[vocab_sel], reduction="sum")
+        )
+    if pointer_sel.any():
+        losses.append(
+            F.cross_entropy(pointer_flat[pointer_sel], pointer_target[pointer_sel], reduction="sum")
+        )
+    if not losses:
+        return vocab_logits.new_zeros(())
+    n_valid = valid.sum().clamp_min(1)
+    return torch.stack(losses).sum() / n_valid
+
+
+def decoder_per_step_accuracy(
+    vocab_logits: Tensor,
+    pointer_logits: Tensor,
+    target_tokens: Tensor,
+    target_pointer_pos: Tensor,
+    is_pointer_step: Tensor,
+    vocab_mask: Tensor,
+    pointer_mask: Tensor,
+    pad_mask: Tensor,
+) -> dict[str, float | int]:
+    """Per-step argmax accuracy over the masked logits.
+
+    Returns dict ``{accuracy, correct, total}`` aggregated over all valid
+    (non-pad) steps in the batch. Vectorized.
+    """
+
+    neg_inf = torch.finfo(vocab_logits.dtype).min
+    vocab_pred = vocab_logits.masked_fill(~vocab_mask, neg_inf).argmax(dim=-1)
+    pointer_pred = pointer_logits.masked_fill(~pointer_mask, neg_inf).argmax(dim=-1)
+
+    correct_per_step = torch.where(
+        is_pointer_step,
+        pointer_pred == target_pointer_pos.to(torch.long),
+        vocab_pred == target_tokens.to(torch.long),
+    )
+    valid = pad_mask
+    correct = int((correct_per_step & valid).sum().item())
+    total = int(valid.sum().item())
+    return {"accuracy": correct / total if total else 0.0, "correct": correct, "total": total}
+
+
+# ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
 
@@ -358,6 +459,8 @@ class TextEncoderTrainer:
 
 __all__ = [
     "TextEncoderTrainer",
+    "decoder_cross_entropy_loss",
+    "decoder_per_step_accuracy",
     "inline_blank_per_blank_accuracy",
     "inline_blank_per_blank_loss",
     "inline_blank_priority_accuracy",
