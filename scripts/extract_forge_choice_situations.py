@@ -106,6 +106,29 @@ def _iter_zip_jsonl(zip_path: Path) -> Iterator[tuple[str, list[dict[str, Any]]]
             yield name, rows
 
 
+def _iter_dir_jsonl(dir_path: Path) -> Iterator[tuple[str, list[dict[str, Any]]]]:
+    for path in sorted(dir_path.glob("*.jsonl.gz")):
+        rows: list[dict[str, Any]] = []
+        with gzip.open(path, "rb") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                row = _loads(line)
+                record = row.get("record")
+                if record == "META" or (
+                    record == "EVENT" and isinstance(row.get("snapshot"), dict)
+                ):
+                    rows.append(row)
+        yield path.name, rows
+
+
+def _iter_jsonl(input_path: Path) -> Iterator[tuple[str, list[dict[str, Any]]]]:
+    if input_path.is_dir():
+        yield from _iter_dir_jsonl(input_path)
+    else:
+        yield from _iter_zip_jsonl(input_path)
+
+
 def _meta_from_rows(rows: Sequence[dict[str, Any]]) -> _GameMeta | None:
     for row in rows:
         if row.get("record") != "META":
@@ -202,6 +225,60 @@ def _step(raw: str | None) -> str:
         "CLEANUP": "Cleanup",
     }
     return mapping.get(raw.upper(), raw)
+
+
+_FORGE_KIND_TO_OPTION_KIND: dict[str, str] = {
+    "PLAY_LAND": "play",
+    "CAST_SPELL": "cast",
+    "ACTIVATE": "activate",
+    "ACTIVATE_MANA": "activate",
+}
+
+
+def _priority_pending_from_playable_actions(
+    raw_snapshot: dict[str, Any], perspective_id: str
+) -> dict[str, Any] | None:
+    """Build a ``PendingState``-shaped dict for priority decisions.
+
+    Forge logs each event with ``snapshot.playableActions``: a list of
+    {abilityId, controllerId, sourceId, sourceName, kind, cost, ...} dicts
+    for the player whose priority it is. We map those to
+    ``PendingOptionState`` entries so the V2 decoder-target translator can
+    score the observed pick.
+    """
+
+    actions = raw_snapshot.get("playableActions") or []
+    priority_id = str(raw_snapshot.get("priorityPlayerId") or "")
+    perspective_idx = 0 if perspective_id and priority_id == perspective_id else 0
+    options: list[dict[str, Any]] = []
+    for i, act in enumerate(actions):
+        if not isinstance(act, dict):
+            continue
+        forge_kind = str(act.get("kind") or "")
+        opt_kind = _FORGE_KIND_TO_OPTION_KIND.get(forge_kind)
+        if opt_kind is None:
+            continue
+        ability_id = str(act.get("abilityId") or "")
+        source_id = str(act.get("sourceId") or "")
+        source_name = str(act.get("sourceName") or "")
+        options.append(
+            {
+                "id": ability_id or f"opt:{i}",
+                "kind": opt_kind,
+                "card_id": source_id,
+                "card_name": source_name,
+                "permanent_id": source_id,
+                "label": str(act.get("description") or source_name),
+                "mana_cost": str(act.get("cost") or ""),
+            }
+        )
+    # Always include a pass option — it's grammar-legal for every priority window.
+    options.append({"id": "pass", "kind": "pass", "label": "Pass priority"})
+    return {
+        "kind": "priority",
+        "player_idx": perspective_idx,
+        "options": options,
+    }
 
 
 def _normalize_snapshot(raw: dict[str, Any], perspective_id: str) -> dict[str, Any]:
@@ -324,12 +401,38 @@ def _block_label(description: str) -> dict[str, Any] | None:
     return {"raw": description, "actor_name": actor, "assignments": parsed}
 
 
+_STACK_PUSH_NAME_RE = re.compile(r"^STACK_PUSH\s+(?P<name>.+?)\s+by\s+(?P<player>.+?)$")
+_LOG_PUTS_BF_RE = re.compile(
+    r"^(?P<player>.+?) puts (?P<name>.+?) \[[^\]]+\] from hand onto the Battlefield"
+)
+
+
 def _priority_label(description: str, event_type: str) -> dict[str, Any] | None:
     lower = description.lower()
+    # Legacy zip format: "PlayerA played Plains", "PlayerB cast Lightning Bolt"
     if event_type == "STACK_PUSH" and (" cast " in lower or " activated " in lower):
         return {"raw": description, "event_type": event_type}
     if " played " in lower:
         return {"raw": description, "event_type": event_type}
+    # Newer Forge log format: STACK_PUSH "STACK_PUSH <CardName> by <Player>",
+    # land plays: LOG "PlayerA puts Plains [c00] from hand onto the Battlefield".
+    m = _STACK_PUSH_NAME_RE.match(description)
+    if m is not None:
+        return {
+            "raw": description,
+            "event_type": event_type,
+            "card_name": m.group("name"),
+            "player_name": m.group("player"),
+        }
+    m = _LOG_PUTS_BF_RE.match(description)
+    if m is not None:
+        return {
+            "raw": description,
+            "event_type": event_type,
+            "card_name": m.group("name"),
+            "player_name": m.group("player"),
+            "is_land_play": True,
+        }
     return None
 
 
@@ -411,6 +514,10 @@ def _make_candidate(
 ) -> _ChoiceCandidate | None:
     source_snapshot = source.get("snapshot") or {}
     normalized = _normalize_snapshot(source_snapshot, perspective_id)
+    if kind == "priority":
+        pending = _priority_pending_from_playable_actions(source_snapshot, perspective_id)
+        if pending is not None:
+            normalized["pending"] = pending
     return _ChoiceCandidate(
         kind=kind,
         game_id=game_id,
@@ -828,7 +935,7 @@ def extract(args: argparse.Namespace) -> dict[str, int]:
         else None
     )
     try:
-        for member, rows in _iter_zip_jsonl(args.zip):
+        for member, rows in _iter_jsonl(args.zip):
             if args.limit_games is not None and stats["games_seen"] >= args.limit_games:
                 break
             meta = _meta_from_rows(rows)

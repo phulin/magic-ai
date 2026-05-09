@@ -2,6 +2,76 @@
 
 Tracking implementation of `docs/decoder_grammar_plan.md`.
 
+## Cutover status (2026-05-09)
+
+Phases 1–7 of the inline-blank → grammar-decoder cutover are landed on
+`decoder-cutover`. The Forge BC pretraining path, the Python rollout
+(`magic_ai/text_encoder/rollout.py`), the in-process train.py text-encoder
+path (`sample_text_policy_batch`), the actor-critic sampler/scorer, and the
+replay buffer all run on the decoder pipeline. Verification:
+
+- `pytest -x -q` → 313 passed, 1 skipped, 2 xfailed
+- `scripts/smoke_decoder_train.py` → smoke OK (sample + teacher-forced loss + grad)
+- `scripts/decoder_bc_parity.py` (V2 corpus, 30 steps) → priority accuracy 1.000
+- `mage-go go test ./cmd/pylib/...` → ok
+
+### What still uses inline blanks
+
+The native batched IMPALA actor pipeline
+(`train_text_native_batched_envs` → `run_text_rollouts_actor_loop`,
+`magic_ai/native/inference_server.py`, `magic_ai/native/rollout_actor.py`,
+the Go-side selected_choice_cols protocol, `NativeTextTrajectoryBuffer`)
+still expects inline-blank shapes. The four legacy stubs in
+`scripts/train.py` (`build_text_decision_layout`, `infer_text_trace_kind`,
+`_decode_text_action`, `NativeTextTrajectoryBuffer.__init__`) raise loudly
+on construction with a pointer to the decoder-shaped replacements.
+
+To re-enable that high-throughput path the following needs an end-to-end
+protocol redesign — none of the work is done:
+
+- `TextInferenceServer` request/response contract: replace
+  `selected_choice_cols`/`may_selected` with per-row decoder layouts
+  (output_token_ids, output_pointer_pos, output_is_pointer, output_pad_mask,
+  decision_type, pointer_anchor_handles).
+- `TextRolloutActor`: receive the decoder layout, call
+  `decode_decoder_action(pending, layout)`, drive the engine via
+  `step_by_choice` accordingly (Go-side `step_by_choice` may need a
+  per-decision-type dispatch since it currently expects flat
+  selected_choice_cols).
+- `NativeTextTrajectoryBuffer`: ring-buffer of `DecoderDecisionPayload`
+  records (one per env-step) instead of the inline-blank rectangles;
+  `commit_decoder_decision` already exists on the replay buffer.
+
+The single-policy in-process loop (`train_text_envs`) covers all current
+tested paths and is wired correctly; the IMPALA path is parked.
+
+### Forge BC corpus V2
+
+`scripts/extract_forge_choice_situations.py` previously wrote V1 records
+without `pending` state; the V2 decoder-target translator therefore had
+nothing to translate. The extractor now:
+
+- Accepts a `--zip` argument that may be either a zipfile or a directory
+  of `*.jsonl.gz` shards (Forge writes loose dirs in newer batches).
+- Builds a `pending` dict from `snapshot.playableActions` for priority
+  candidates, mapping Forge `kind` (`PLAY_LAND`/`CAST_SPELL`/`ACTIVATE`/
+  `ACTIVATE_MANA`) to the engine's `play`/`cast`/`activate` option kinds.
+- Recognizes the new Forge log description formats
+  (`STACK_PUSH <name> by <player>`, `<player> puts <name> [id] from hand
+  onto the Battlefield`) in addition to the legacy
+  `played`/`cast`/`activated` strings.
+
+`forge_target_encoding.translate_priority` now matches by structured
+`(card_name, is_land_play)` from the observed-event dict when present.
+
+The V2 corpus extracted from `data/games/` (1000 games) yields 4000 records
+with ~83% priority translation rate. Attack and block extraction is not yet
+ported to the new Forge log format — those translators expect
+`PlayerA assigned X to attack PlayerB` / `PlayerA blocked X with Y` log
+lines, but the current logs use `PlayerA attacks PlayerB with N creatures`
+followed by per-creature `Attacker:` / `Blocker:` lines. Re-porting
+`_attack_label` / `_block_label` is the next bounded follow-up.
+
 ## Done
 
 | Step | Description | Where |

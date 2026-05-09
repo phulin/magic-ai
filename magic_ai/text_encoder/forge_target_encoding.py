@@ -106,6 +106,19 @@ def _option_index_for_priority(
     is_activate = " activated " in lower
     is_pass = "pass" in lower and not (is_play or is_cast or is_activate)
 
+    # Newer Forge log format: extractor structured the parse into observed
+    # ("card_name", "is_land_play") so we don't have to re-regex here.
+    obs_card_name = observed.get("card_name")
+    if obs_card_name:
+        is_land_play = bool(observed.get("is_land_play"))
+        # STACK_PUSH events cover both spell casts and ability activations;
+        # match by card_name + a permissive kind (cast OR activate when the
+        # event_type is STACK_PUSH; play when it's a hand→bf log line).
+        candidate_kinds: tuple[str, ...] = ("play",) if is_land_play else ("cast", "activate")
+        for i, option in enumerate(options):
+            if option.get("card_name") == obs_card_name and option.get("kind") in candidate_kinds:
+                return i
+
     for i, option in enumerate(options):
         kind = option.get("kind") or ""
         name = option.get("card_name") or option.get("label") or ""
