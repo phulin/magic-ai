@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn as nn
@@ -28,6 +28,9 @@ from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.policy import EncodedSnapshots, TextPolicy
 
+if TYPE_CHECKING:
+    from magic_ai.text_encoder.decoder import GrammarDecoderConfig
+
 
 @dataclass
 class RecurrentTextPolicyConfig:
@@ -36,6 +39,8 @@ class RecurrentTextPolicyConfig:
     lstm_layers: int = 1
     compile_forward: bool = True
     chosen_token_id: int | None = None
+    use_grammar_decoder: bool = False
+    grammar_decoder_cfg: GrammarDecoderConfig | None = None
 
 
 @dataclass
@@ -54,7 +59,11 @@ class RecurrentTextPolicy(nn.Module):
     def __init__(self, cfg: RecurrentTextPolicyConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        self.text_policy = TextPolicy(cfg.encoder)
+        self.text_policy = TextPolicy(
+            cfg.encoder,
+            use_grammar_decoder=cfg.use_grammar_decoder,
+            decoder_cfg=cfg.grammar_decoder_cfg,
+        )
 
         d_model = cfg.encoder.d_model
         self.d_model = d_model

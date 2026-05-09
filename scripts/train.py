@@ -1107,6 +1107,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         lstm_hidden=cfg.d_model,
         compile_forward=args.torch_compile,
         chosen_token_id=int(chosen_tid),
+        use_grammar_decoder=bool(getattr(args, "pretrain_mlm_decoder", False)),
     )
     policy = TextActorCritic(recurrent_cfg).to(device)
     policy.init_lstm_env_states(args.num_envs)

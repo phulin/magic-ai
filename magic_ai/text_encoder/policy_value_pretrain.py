@@ -770,12 +770,21 @@ class ForgeChoiceDataset:
                 prefix_subjects_np[b, i] = int(subj)
 
         specs = [p.spec for p in prepared]
+        # Per-row cap on prefix length: for rows whose sequence is shorter
+        # than L, batch_next_mask must not be queried past the sequence end
+        # (the per-decision grammars raise on prefix_len > max). Cap at
+        # len(target)-1 so the mask is the legal mask for the last emitted
+        # token; the loss ignores those steps via out_pad_mask anyway.
+        per_row_max_prefix = np.array(
+            [max(0, len(p.target.output_token_ids) - 1) for p in prepared], dtype=np.int64
+        )
         for step in range(L):
+            safe_prefix_lens = np.minimum(prefix_lens_np, per_row_max_prefix)
             v_mask, _ptr_mask_subj = batch_next_mask(
                 specs,
                 prefix_tokens_np,
                 prefix_subjects_np,
-                prefix_lens_np,
+                safe_prefix_lens,
             )
             vocab_mask[:, step, :] = torch.from_numpy(v_mask)
             # Translate the per-anchor pointer mask into encoder-position
