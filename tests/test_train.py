@@ -52,6 +52,7 @@ from scripts.train import (
     sample_decks,
     sample_text_policy_batch,
     save_checkpoint,
+    token_length_percentile_metrics,
     train_selected_backend,
     train_text_envs,
     validate_args,
@@ -425,6 +426,41 @@ class TrainPPOTests(unittest.TestCase):
         self.assertEqual(payloads[0]["total_generated_rollout_steps"], 34)
         self.assertEqual(payloads[0]["games"], 8)
         self.assertEqual(payloads[0]["return_mean"], 0.5)
+
+    def test_log_ppo_stats_includes_token_metrics(self) -> None:
+        stats = PPOStats(
+            loss=1.0,
+            policy_loss=2.0,
+            value_loss=3.0,
+            entropy=4.0,
+            approx_kl=5.0,
+            clip_fraction=6.0,
+            spr_loss=7.0,
+        )
+        payloads: list[dict[str, object]] = []
+
+        log_ppo_stats(
+            stats,
+            games=8,
+            steps=13,
+            total_rollout_steps=21,
+            total_generated_rollout_steps=34,
+            token_metrics={"tokens_per_encoded_state/p50": 128.0},
+            log_fn=payloads.append,
+            run_active=True,
+        )
+
+        self.assertEqual(payloads[0]["tokens_per_encoded_state/p50"], 128.0)
+
+    def test_token_length_percentile_metrics(self) -> None:
+        row_token_length = [10, 30, 20, 40]
+        rows = [0, 2, 1, 3]
+
+        metrics = token_length_percentile_metrics(row_token_length, rows)
+
+        self.assertEqual(metrics["tokens_per_encoded_state/p25"], 17.5)
+        self.assertEqual(metrics["tokens_per_encoded_state/p50"], 25.0)
+        self.assertEqual(metrics["tokens_per_encoded_state/p75"], 32.5)
 
     def test_rnad_value_metrics_skips_cadence_gated_diagnostics(self) -> None:
         state = Namespace(
@@ -996,6 +1032,7 @@ class TrainPPOTests(unittest.TestCase):
         class FakeReplayBuffer:
             def __init__(self) -> None:
                 self.reset_calls = 0
+                self.row_token_length_host = [8]
 
             def reset(self) -> None:
                 self.reset_calls += 1
@@ -1314,6 +1351,7 @@ class TrainPPOTests(unittest.TestCase):
         class FakeReplayBuffer:
             def __init__(self) -> None:
                 self.reset_calls = 0
+                self.row_token_length_host = [8] * 8
 
             def reset(self) -> None:
                 self.reset_calls += 1

@@ -321,6 +321,8 @@ def run_rnad_update(
     v_hat_sum_total: torch.Tensor | None = None
     transformed_sum_total: torch.Tensor | None = None
     transformed_count_total = 0
+    entropy_sum_total: torch.Tensor | None = None
+    entropy_count_total: torch.Tensor | None = None
     n_pieces = 0
     diag_lr_sum: torch.Tensor | None = None
     diag_lr_count = 0
@@ -358,6 +360,16 @@ def run_rnad_update(
                     pieces.transformed_sum
                     if transformed_sum_total is None
                     else transformed_sum_total + pieces.transformed_sum
+                )
+                entropy_sum_total = (
+                    pieces.entropy_sum
+                    if entropy_sum_total is None
+                    else entropy_sum_total + pieces.entropy_sum
+                )
+                entropy_count_total = (
+                    pieces.entropy_count
+                    if entropy_count_total is None
+                    else entropy_count_total + pieces.entropy_count
                 )
                 transformed_count_total += pieces.transformed_count
                 n_pieces += 1
@@ -433,6 +445,8 @@ def run_rnad_update(
         flat_active_total if flat_active_total is not None else zero,
         v_hat_sum_total if v_hat_sum_total is not None else zero,
         transformed_sum_total if transformed_sum_total is not None else zero,
+        entropy_sum_total if entropy_sum_total is not None else zero,
+        entropy_count_total if entropy_count_total is not None else zero,
         diag_lr_sum if diag_lr_sum is not None else zero,
         diag_lr_absmax if diag_lr_absmax is not None else zero,
         diag_isup_sum if diag_isup_sum is not None else zero,
@@ -454,6 +468,8 @@ def run_rnad_update(
             flat_active_h,
             v_hat_sum_h,
             transformed_sum_h,
+            entropy_sum_h,
+            entropy_count_h,
             diag_lr_sum_h,
             diag_lr_absmax_h,
             diag_isup_sum_h,
@@ -468,6 +484,7 @@ def run_rnad_update(
     loss_total = cl_loss_total_h + pl_loss_total_h
     v_hat_mean = v_hat_sum_h / max(transformed_count_total, 1)
     transformed_mean = transformed_sum_h / max(transformed_count_total, 1)
+    entropy_mean = entropy_sum_h / max(entropy_count_h, 1.0)
     q_clip_fraction = n_q_clipped_h / flat_active_h if flat_active_h > 0 else 0.0
     sampled_log_ratio_mean = diag_lr_sum_h / diag_lr_count if diag_lr_count > 0 else 0.0
     is_bias_up_mean = diag_isup_sum_h / diag_isup_count_h if diag_isup_count_h > 0 else 0.0
@@ -487,6 +504,7 @@ def run_rnad_update(
             v_hat_mean=v_hat_mean,
             grad_norm=grad_norm,
             transformed_reward_mean=transformed_mean,
+            entropy=entropy_mean,
             q_clip_fraction=q_clip_fraction,
             sampled_log_ratio_mean=sampled_log_ratio_mean,
             sampled_log_ratio_absmax=diag_lr_absmax_h,
@@ -501,7 +519,7 @@ def run_rnad_update(
             loss=aggregate.loss,
             policy_loss=aggregate.policy_loss,
             value_loss=aggregate.critic_loss,
-            entropy=0.0,
+            entropy=aggregate.entropy,
             approx_kl=0.0,
             clip_fraction=0.0,
         )
@@ -525,6 +543,7 @@ def run_rnad_update(
         v_hat_mean=v_hat_mean,
         grad_norm=grad_norm,
         transformed_reward_mean=transformed_mean,
+        entropy=entropy_mean,
         q_clip_fraction=q_clip_fraction,
         sampled_log_ratio_mean=sampled_log_ratio_mean,
         sampled_log_ratio_absmax=diag_lr_absmax_h,
@@ -540,7 +559,7 @@ def run_rnad_update(
         loss=aggregate.loss,
         policy_loss=aggregate.policy_loss,
         value_loss=aggregate.critic_loss,
-        entropy=0.0,
+        entropy=aggregate.entropy,
         approx_kl=0.0,
         clip_fraction=q_clip_fraction,
         spr_loss=0.0,

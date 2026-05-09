@@ -16,7 +16,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -2854,6 +2854,7 @@ def log_ppo_stats(
     total_generated_rollout_steps: int,
     win_stats: WinFractionStats | None = None,
     value_metrics: dict[str, float] | None = None,
+    token_metrics: dict[str, float] | None = None,
     log_fn: Callable[[dict[str, Any]], None] | None = None,
     run_active: bool | None = None,
 ) -> None:
@@ -2878,8 +2879,33 @@ def log_ppo_stats(
         payload.update(win_stats.as_wandb_metrics())
     if value_metrics is not None:
         payload.update(value_metrics)
+    if token_metrics is not None:
+        payload.update(token_metrics)
     logger = wandb.log if log_fn is None else log_fn
     logger(payload)
+
+
+def token_length_percentile_metrics(
+    row_token_length_host: list[int],
+    rows: Sequence[int],
+) -> dict[str, float]:
+    """Summarize encoded text state lengths for rollout rows."""
+    if not rows:
+        return {}
+    lengths = torch.tensor(
+        [row_token_length_host[int(row)] for row in rows],
+        dtype=torch.float32,
+        device="cpu",
+    )
+    if lengths.numel() == 0:
+        return {}
+    quantiles = torch.tensor((0.25, 0.50, 0.75), dtype=torch.float32)
+    p25, p50, p75 = torch.quantile(lengths, quantiles).tolist()
+    return {
+        "tokens_per_encoded_state/p25": float(p25),
+        "tokens_per_encoded_state/p50": float(p50),
+        "tokens_per_encoded_state/p75": float(p75),
+    }
 
 
 def _snapshot_games_from_tag(tag: str) -> int | None:
@@ -3827,8 +3853,9 @@ def train_text_envs(
                 backend.policy.refresh_lstm_states(ep_rows_snapshot)  # type: ignore[union-attr]
 
         device = next(backend.policy.parameters()).device
+        rollout_replay_rows_h = [cast(int, step.replay_idx) for step in pending_steps]
         rollout_replay_rows = torch.tensor(
-            [cast(int, step.replay_idx) for step in pending_steps],
+            rollout_replay_rows_h,
             dtype=torch.long,
             device=device,
         )
@@ -3877,6 +3904,14 @@ def train_text_envs(
             value_metrics=rollout_value_metrics(
                 torch.tensor([step.value for step in pending_steps], dtype=torch.float32),
                 rollout_returns,
+            ),
+            token_metrics=(
+                token_length_percentile_metrics(
+                    backend.replay_buffer.row_token_length_host,
+                    rollout_replay_rows_h,
+                )
+                if rollout_replay_rows_h
+                else None
             ),
             log_fn=tracked_wandb_log,
             run_active=True,
@@ -4169,6 +4204,7 @@ def train_text_native_batched_envs(
     total_wandb_logs = restored_state.total_wandb_logs
 
     pending_replay_rows: list[torch.Tensor] = []
+    pending_replay_rows_host: list[int] = []
     pending_returns: list[torch.Tensor] = []
     pending_step_count: int = 0
     # Guards read-modify-write of pending_step_count between the driver thread
@@ -4354,6 +4390,7 @@ def train_text_native_batched_envs(
                     )
                 )
                 pending_replay_rows.append(flat_rows)
+                pending_replay_rows_host.extend(itertools.chain.from_iterable(per_env_rows_h))
                 if rnad_state is None:
                     terminal_p0_t = torch.tensor(
                         terminal_p0_h,
@@ -4499,6 +4536,7 @@ def train_text_native_batched_envs(
         flat_rows_chunks: list[torch.Tensor] | None = None,
         episode_step_counts: list[torch.Tensor] | None = None,
         step_count: int | None = None,
+        replay_rows_host: Sequence[int] = (),
         completed_games_snapshot: int | None = None,
         win_stats_snapshot: WinFractionStats | None = None,
         reset_replay: bool = True,
@@ -4509,6 +4547,7 @@ def train_text_native_batched_envs(
         if update_step_count == 0:
             return
         update_rows = pending_replay_rows if replay_rows_chunks is None else replay_rows_chunks
+        update_rows_host = pending_replay_rows_host if not replay_rows_host else replay_rows_host
         update_episodes = pending_episodes if episodes is None else episodes
         update_flat_rows = (
             pending_flat_rows_chunks if flat_rows_chunks is None else flat_rows_chunks
@@ -4780,11 +4819,20 @@ def train_text_native_batched_envs(
             total_generated_rollout_steps=total_generated_rollout_steps,
             win_stats=log_win_stats,
             value_metrics=value_metrics,
+            token_metrics=(
+                token_length_percentile_metrics(
+                    backend.replay_buffer.row_token_length_host,
+                    update_rows_host,
+                )
+                if update_rows_host
+                else None
+            ),
             log_fn=tracked_wandb_log,
             run_active=True,
         )
         if replay_rows_chunks is None and replay_rows_tensor is None:
             pending_replay_rows.clear()
+            pending_replay_rows_host.clear()
             pending_returns.clear()
             pending_episodes.clear()
             pending_flat_rows_chunks.clear()
@@ -4946,6 +4994,7 @@ def train_text_native_batched_envs(
                     replay_rows_tensor=window.rows,
                     returns_tensor=returns,
                     step_count=steps,
+                    replay_rows_host=range(window.row_start, window.row_end),
                     completed_games_snapshot=int(completed_games),
                     win_stats_snapshot=replace(win_stats),
                     reset_replay=False,
@@ -4955,6 +5004,7 @@ def train_text_native_batched_envs(
                     final=final,
                     replay_rows_tensor=window.rows,
                     step_count=steps,
+                    replay_rows_host=range(window.row_start, window.row_end),
                     completed_games_snapshot=int(completed_games),
                     win_stats_snapshot=replace(win_stats),
                     reset_replay=False,
@@ -5537,6 +5587,7 @@ def train_text_native_batched_envs(
                                 replay_rows_tensor=window.rows,
                                 returns_tensor=returns,
                                 step_count=steps,
+                                replay_rows_host=range(window.row_start, window.row_end),
                                 completed_games_snapshot=int(completed_games),
                                 win_stats_snapshot=replace(win_stats),
                                 reset_replay=False,
@@ -5546,6 +5597,7 @@ def train_text_native_batched_envs(
                                 final=draining,
                                 replay_rows_tensor=window.rows,
                                 step_count=steps,
+                                replay_rows_host=range(window.row_start, window.row_end),
                                 completed_games_snapshot=int(completed_games),
                                 win_stats_snapshot=replace(win_stats),
                                 reset_replay=False,

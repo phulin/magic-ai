@@ -977,6 +977,7 @@ class RNaDStats:
     v_hat_mean: float
     grad_norm: float
     transformed_reward_mean: float
+    entropy: float = 0.0
     q_clip_fraction: float = 0.0
     """Fraction of per-action Q values clipped by ``[-neurd_clip, +neurd_clip]``
     in the per-choice NeuRD loss this update. Tracked because — under issue 6 —
@@ -1048,6 +1049,8 @@ class _TrajLossPieces:
     v_hat_sum: Tensor
     transformed_sum: Tensor
     transformed_count: int
+    entropy_sum: Tensor
+    entropy_count: Tensor
     # Diagnostics (issue: within-inner-loop policy degradation). All are sums
     # / maxes paired with their counts so the trainer can aggregate across
     # episodes without weighting bias.
@@ -1257,6 +1260,7 @@ def rnad_trajectory_loss(
 def _trajectory_loss_from_forwards(
     *,
     lp_online: Tensor,
+    entropy_online: Tensor,
     v_online: Tensor,
     pc_online: Any,
     lp_tgt_scalar: Tensor,
@@ -1567,6 +1571,8 @@ def _trajectory_loss_from_forwards(
         v_hat_sum=v_online.new_tensor(sum(v_hat_means)),
         transformed_sum=v_online.new_tensor(sum(transformed_means)),
         transformed_count=max(len(v_hat_means), 1),
+        entropy_sum=entropy_online.detach().to(dtype=dtype).sum(),
+        entropy_count=torch.tensor(t_len, dtype=torch.long, device=device),
         sampled_log_ratio_sum=v_online.new_tensor(sampled_log_ratio_sum_t),
         sampled_log_ratio_absmax=v_online.new_tensor(sampled_log_ratio_absmax_t),
         sampled_log_ratio_count=sampled_log_ratio_count_t,
@@ -1582,6 +1588,7 @@ def _trajectory_loss_from_forwards(
 def _batched_trajectory_loss_from_forwards(
     *,
     lp_online: Tensor,
+    entropy_online: Tensor,
     v_online: Tensor,
     pc_online: Any,
     lp_tgt_scalar: Tensor,
@@ -1918,6 +1925,8 @@ def _batched_trajectory_loss_from_forwards(
         v_hat_sum=v_hat_sum,
         transformed_sum=transformed_sum,
         transformed_count=max(2 * T_total, 1),
+        entropy_sum=entropy_online.detach().to(dtype=dtype).sum(),
+        entropy_count=torch.tensor(T_total, dtype=torch.long, device=device),
         sampled_log_ratio_sum=sampled_log_ratio_sum_t,
         sampled_log_ratio_absmax=sampled_log_ratio_absmax_t,
         sampled_log_ratio_count=T_total if compute_policy_drift_diagnostics else 0,
@@ -2147,7 +2156,7 @@ def rnad_batched_trajectory_loss(
 
     # 2) Single per-choice forward per policy across the full batch.
     with torch.profiler.record_function("rnad_batched_trajectory_loss/online_per_choice"):
-        lp_online_b, _, v_online_b, pc_online_b = _forward(
+        lp_online_b, entropy_online_b, v_online_b, pc_online_b = _forward(
             online_per_choice, online_h_concat, online_cache
         )
     del online_cache, online_h_concat
@@ -2195,6 +2204,7 @@ def rnad_batched_trajectory_loss(
     with torch.profiler.record_function("rnad_batched_trajectory_loss/batched_loss_assembly"):
         pieces = _batched_trajectory_loss_from_forwards(
             lp_online=lp_online_b,
+            entropy_online=entropy_online_b,
             v_online=v_online_b,
             pc_online=pc_online_b,
             lp_tgt_scalar=lp_tgt_b,
@@ -2282,6 +2292,10 @@ def rnad_update_trajectory(
             [
                 pieces.v_hat_sum.detach().to(dtype=torch.float32),
                 pieces.transformed_sum.detach().to(dtype=torch.float32),
+                (
+                    pieces.entropy_sum.detach().to(dtype=torch.float32)
+                    / pieces.entropy_count.clamp_min(1).to(dtype=torch.float32)
+                ),
             ]
         )
         .cpu()
@@ -2295,6 +2309,7 @@ def rnad_update_trajectory(
         v_hat_mean=float(stats_h[0]) / stats_denom,
         grad_norm=grad_norm,
         transformed_reward_mean=float(stats_h[1]) / stats_denom,
+        entropy=float(stats_h[2]),
     )
 
 

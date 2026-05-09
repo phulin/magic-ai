@@ -1801,6 +1801,7 @@ class TextActorCriticTests(unittest.TestCase):
         self.assertTrue(math.isfinite(stats.loss))
         self.assertTrue(math.isfinite(stats.policy_loss))
         self.assertTrue(math.isfinite(stats.value_loss))
+        self.assertTrue(math.isfinite(stats.entropy))
 
     def test_count_active_replay_steps(self) -> None:
         model = _model()

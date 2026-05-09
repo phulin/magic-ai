@@ -647,6 +647,7 @@ class RNaDUpdateTrajectoryTests(unittest.TestCase):
         self.assertTrue(math.isfinite(stats.critic_loss))
         self.assertTrue(math.isfinite(stats.policy_loss))
         self.assertTrue(math.isfinite(stats.grad_norm))
+        self.assertTrue(math.isfinite(stats.entropy))
 
     def test_critic_moves_toward_terminal_reward_in_on_policy(self) -> None:
         # With on-policy data, zero reg entropy bonus (theta == reg), and a
