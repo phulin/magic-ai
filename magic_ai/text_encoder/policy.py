@@ -30,6 +30,7 @@ from magic_ai.text_encoder.batch import (
     pack_batch,
     tokenize_snapshot,
 )
+from magic_ai.text_encoder.decoder import GrammarDecoder, GrammarDecoderConfig
 from magic_ai.text_encoder.mlm import MLMHead
 from magic_ai.text_encoder.model import (
     InlineBlankPolicy,
@@ -40,7 +41,8 @@ from magic_ai.text_encoder.model import (
     gather_state_vector_packed,
     initialize_text_state_encoder_from_hf,
 )
-from magic_ai.text_encoder.render import OracleEntry, render_snapshot
+from magic_ai.text_encoder.render import OracleEntry, RenderedSnapshot, render_snapshot
+from magic_ai.text_encoder.render_spec import DecisionSpecRenderer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, MAX_NUM
 
 
@@ -90,7 +92,13 @@ class TextPolicyOutput:
 class TextPolicy(nn.Module):
     """Encoder + three heads, callable on a :class:`TextEncodedBatch`."""
 
-    def __init__(self, cfg: TextEncoderConfig) -> None:
+    def __init__(
+        self,
+        cfg: TextEncoderConfig,
+        *,
+        use_grammar_decoder: bool = False,
+        decoder_cfg: GrammarDecoderConfig | None = None,
+    ) -> None:
         super().__init__()
         self.cfg = cfg
         self.encoder = TextStateEncoder(cfg)
@@ -104,6 +112,12 @@ class TextPolicy(nn.Module):
             self.mlm_head.layer_norm,
             num_kinds=cfg.vocab_size,
         )
+        self.use_grammar_decoder = use_grammar_decoder
+        self.grammar_decoder: GrammarDecoder | None = None
+        if use_grammar_decoder:
+            self.grammar_decoder = GrammarDecoder(
+                decoder_cfg or GrammarDecoderConfig(d_model=cfg.d_model)
+            )
 
     def encode_only(self, batch: TextEncodedBatch) -> EncodedSnapshots:
         """Run the encoder + pool ops; return raw vectors without head logits.
@@ -216,6 +230,76 @@ class TextPolicy(nn.Module):
             blank_legal_mask=batch.blank_legal_mask,
         )
 
+    def forward_decoder_teacher_forced(
+        self,
+        batch: TextEncodedBatch,
+        target_tokens: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Run encoder + grammar decoder in teacher-forced mode.
+
+        ``batch.token_ids`` should already be the combined ``[state, spec]``
+        stream produced by :func:`collate_with_specs`. Returns
+        ``(vocab_logits [B, L, V_grammar], pointer_logits [B, L, T_enc])``.
+        """
+
+        if self.grammar_decoder is None:
+            raise RuntimeError("TextPolicy was constructed with use_grammar_decoder=False")
+        encoded = self.encoder(batch)
+        return self.grammar_decoder.forward_teacher_forced(
+            target_tokens,
+            encoded,
+            batch.attention_mask.to(dtype=torch.bool),
+        )
+
+    @staticmethod
+    def encode_snapshots_with_specs(
+        snapshots: Sequence[GameStateSnapshot],
+        actions_per_snapshot: Sequence[Sequence[PendingOptionState] | None] | None,
+        oracle: dict[str, OracleEntry] | None,
+        tokenizer: PreTrainedTokenizerFast,
+    ) -> TextEncodedBatch:
+        """Render -> tokenize -> render-spec -> collate with combined streams.
+
+        Snapshots without a pending decision (or with a kind that is deferred
+        post-v1) get a ``None`` spec and ``decision_type = -1``.
+        """
+
+        if len(snapshots) == 0:
+            raise ValueError("encode_snapshots_with_specs() requires at least one snapshot")
+        if actions_per_snapshot is not None and len(actions_per_snapshot) != len(snapshots):
+            raise ValueError(
+                "actions_per_snapshot length must match snapshots length "
+                f"({len(actions_per_snapshot)} vs {len(snapshots)})"
+            )
+        from magic_ai.text_encoder.batch import collate_with_specs as _collate
+        from magic_ai.text_encoder.batch import tokenize_snapshot as _tokenize
+        from magic_ai.text_encoder.decision_spec import DecisionSpec
+
+        rendered_list = _render_snapshots_with_token_ids(
+            snapshots,
+            actions_per_snapshot,
+            oracle=oracle,
+            tokenizer=tokenizer,
+        )
+        spec_renderer = DecisionSpecRenderer(tokenizer)
+        examples = []
+        specs: list[DecisionSpec | None] = []
+        for snap, rendered in zip(snapshots, rendered_list, strict=True):
+            examples.append(_tokenize(rendered, tokenizer))
+            pending = snap.get("pending")
+            if pending is None:
+                specs.append(None)
+                continue
+            try:
+                spec = spec_renderer.render(snap, card_refs=rendered.card_refs)
+            except NotImplementedError, ValueError:
+                spec = None
+            specs.append(spec)
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            raise ValueError("tokenizer has no pad_token_id; cannot collate")
+        return _collate(examples, specs, pad_id=int(pad_id))
+
     @staticmethod
     def encode_snapshots(
         snapshots: Sequence[GameStateSnapshot],
@@ -225,87 +309,78 @@ class TextPolicy(nn.Module):
         *,
         chosen_token_id: int | None = None,
     ) -> TextEncodedBatch:
-        """Render -> tokenize -> collate convenience.
+        """Render -> tokenize -> collate convenience (inline-blank path)."""
 
-        ``actions_per_snapshot`` may be ``None`` (in which case each snapshot's
-        own ``pending.options`` is used) or a sequence aligned with
-        ``snapshots`` whose entries can each be ``None`` to defer to the
-        snapshot's pending options.
-        """
+        rendered_list = _render_snapshots_with_token_ids(
+            snapshots,
+            actions_per_snapshot,
+            oracle=oracle,
+            tokenizer=tokenizer,
+            chosen_token_id=chosen_token_id,
+        )
+        examples = [tokenize_snapshot(r, tokenizer) for r in rendered_list]
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            raise ValueError("tokenizer has no pad_token_id; cannot collate")
+        return collate(examples, pad_id=int(pad_id))
 
-        if len(snapshots) == 0:
-            raise ValueError("encode_snapshots() requires at least one snapshot")
 
-        if actions_per_snapshot is None:
-            action_lists: list[Sequence[PendingOptionState] | None] = [None] * len(snapshots)
-        else:
-            if len(actions_per_snapshot) != len(snapshots):
-                raise ValueError(
-                    "actions_per_snapshot length must match snapshots length "
-                    f"({len(actions_per_snapshot)} vs {len(snapshots)})"
-                )
-            action_lists = list(actions_per_snapshot)
+def _resolve_single_token(tokenizer: PreTrainedTokenizerFast, token: str) -> int:
+    tid = tokenizer.convert_tokens_to_ids(token)
+    if isinstance(tid, list):
+        raise TypeError(f"convert_tokens_to_ids({token!r}) returned a list")
+    return int(tid)
 
-        examples = []
-        none_token_id: int | None = None
-        yes_token_id: int | None = None
-        no_token_id: int | None = None
-        num_token_ids: list[int] | None = None
-        mana_token_ids: list[int] | None = None
-        card_ref_token_ids: list[int] | None = None
-        if chosen_token_id is None:
-            tid = tokenizer.convert_tokens_to_ids("<chosen>")
-            if isinstance(tid, list):
-                raise TypeError("convert_tokens_to_ids('<chosen>') returned a list")
-            chosen_token_id = int(tid)
-        none_tid = tokenizer.convert_tokens_to_ids("<none>")
-        if isinstance(none_tid, list):
-            raise TypeError("convert_tokens_to_ids('<none>') returned a list")
-        none_token_id = int(none_tid)
-        yes_tid = tokenizer.convert_tokens_to_ids("<yes>")
-        if isinstance(yes_tid, list):
-            raise TypeError("convert_tokens_to_ids('<yes>') returned a list")
-        yes_token_id = int(yes_tid)
-        no_tid = tokenizer.convert_tokens_to_ids("<no>")
-        if isinstance(no_tid, list):
-            raise TypeError("convert_tokens_to_ids('<no>') returned a list")
-        no_token_id = int(no_tid)
-        mulligan_tid = tokenizer.convert_tokens_to_ids("<mulligan>")
-        if isinstance(mulligan_tid, list):
-            raise TypeError("convert_tokens_to_ids('<mulligan>') returned a list")
-        mulligan_token_id = int(mulligan_tid)
-        keep_tid = tokenizer.convert_tokens_to_ids("<keep>")
-        if isinstance(keep_tid, list):
-            raise TypeError("convert_tokens_to_ids('<keep>') returned a list")
-        keep_token_id = int(keep_tid)
-        self_tid = tokenizer.convert_tokens_to_ids("<self>")
-        if isinstance(self_tid, list):
-            raise TypeError("convert_tokens_to_ids('<self>') returned a list")
-        self_token_id = int(self_tid)
-        opp_tid = tokenizer.convert_tokens_to_ids("<opp>")
-        if isinstance(opp_tid, list):
-            raise TypeError("convert_tokens_to_ids('<opp>') returned a list")
-        opp_token_id = int(opp_tid)
-        num_token_ids = []
-        for k in range(MAX_NUM):
-            tid = tokenizer.convert_tokens_to_ids(f"<num:{k}>")
-            if isinstance(tid, list):
-                raise TypeError(f"convert_tokens_to_ids('<num:{k}>') returned a list")
-            num_token_ids.append(int(tid))
-        mana_token_ids = []
-        for symbol in ("W", "U", "B", "R", "G", "C"):
-            tid = tokenizer.convert_tokens_to_ids(f"<mana:{symbol}>")
-            if isinstance(tid, list):
-                raise TypeError(f"convert_tokens_to_ids('<mana:{symbol}>') returned a list")
-            mana_token_ids.append(int(tid))
-        card_ref_token_ids = []
-        for k in range(MAX_CARD_REFS):
-            tid = tokenizer.convert_tokens_to_ids(f"<card-ref:{k}>")
-            if isinstance(tid, list):
-                raise TypeError(f"convert_tokens_to_ids('<card-ref:{k}>') returned a list")
-            card_ref_token_ids.append(int(tid))
-        for snap, actions in zip(snapshots, action_lists, strict=True):
-            rendered = render_snapshot(
+
+def _render_snapshots_with_token_ids(
+    snapshots: Sequence[GameStateSnapshot],
+    actions_per_snapshot: Sequence[Sequence[PendingOptionState] | None] | None,
+    *,
+    oracle: dict[str, OracleEntry] | None,
+    tokenizer: PreTrainedTokenizerFast,
+    chosen_token_id: int | None = None,
+) -> list[RenderedSnapshot]:
+    """Render every snapshot with all special-token ids plumbed through.
+
+    Shared by :meth:`TextPolicy.encode_snapshots` (inline-blank path) and
+    :meth:`TextPolicy.encode_snapshots_with_specs` (decoder path) so both
+    pipelines see identical state-text rendering. Resolves the token-id
+    table once and reuses it across snapshots.
+    """
+
+    if len(snapshots) == 0:
+        raise ValueError("encode_snapshots() requires at least one snapshot")
+    if actions_per_snapshot is None:
+        action_lists: list[Sequence[PendingOptionState] | None] = [None] * len(snapshots)
+    else:
+        if len(actions_per_snapshot) != len(snapshots):
+            raise ValueError(
+                "actions_per_snapshot length must match snapshots length "
+                f"({len(actions_per_snapshot)} vs {len(snapshots)})"
+            )
+        action_lists = list(actions_per_snapshot)
+
+    if chosen_token_id is None:
+        chosen_token_id = _resolve_single_token(tokenizer, "<chosen>")
+    none_token_id = _resolve_single_token(tokenizer, "<none>")
+    yes_token_id = _resolve_single_token(tokenizer, "<yes>")
+    no_token_id = _resolve_single_token(tokenizer, "<no>")
+    mulligan_token_id = _resolve_single_token(tokenizer, "<mulligan>")
+    keep_token_id = _resolve_single_token(tokenizer, "<keep>")
+    self_token_id = _resolve_single_token(tokenizer, "<self>")
+    opp_token_id = _resolve_single_token(tokenizer, "<opp>")
+    num_token_ids = [_resolve_single_token(tokenizer, f"<num:{k}>") for k in range(MAX_NUM)]
+    mana_token_ids = [
+        _resolve_single_token(tokenizer, f"<mana:{s}>") for s in ("W", "U", "B", "R", "G", "C")
+    ]
+    card_ref_token_ids = [
+        _resolve_single_token(tokenizer, f"<card-ref:{k}>") for k in range(MAX_CARD_REFS)
+    ]
+
+    rendered_list: list[RenderedSnapshot] = []
+    for snap, actions in zip(snapshots, action_lists, strict=True):
+        rendered_list.append(
+            render_snapshot(
                 snap,
                 actions,
                 oracle=oracle,
@@ -321,12 +396,8 @@ class TextPolicy(nn.Module):
                 mana_token_ids=mana_token_ids,
                 card_ref_token_ids=card_ref_token_ids,
             )
-            examples.append(tokenize_snapshot(rendered, tokenizer))
-
-        pad_id = tokenizer.pad_token_id
-        if pad_id is None:
-            raise ValueError("tokenizer has no pad_token_id; cannot collate")
-        return collate(examples, pad_id=int(pad_id))
+        )
+    return rendered_list
 
 
 def build_text_policy(

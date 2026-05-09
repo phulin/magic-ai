@@ -5,13 +5,13 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 ## Files
 - `__init__.py` — Package exports for the tokenizer API.
 - `actor_critic.py` — Training-facing actor-critic wrapper bridging policy outputs to action supervision.
-- `batch.py` — Tokenize snapshots and collate into padded batches with card-ref positions and inline-blank metadata.
+- `batch.py` — Tokenize snapshots and collate into padded batches with card-ref positions, inline-blank metadata, and (additive) decision-spec tokens, pointer anchors, and legal-edge bitmaps for the grammar decoder via `collate_with_specs`.
 - `card_cache.py` — Pre-tokenized card-body cache (Name/Type/P/T/oracle) keyed by engine card-row IDs.
 - `mlm.py` — Masked-LM pretraining: uint16 .bin token-stream dataset, BERT-style masking, tied LM head, MLMTrainer.
 - `model.py` — ModernBERT encoder trunk with card/state gather pools, value head, and inline-blank legal-token scoring.
 - `native_assembler.py` — Python wrapper for native Go MageEncodeTokensPacked assembler; manages packed token and inline-blank tensor I/O.
 - `native_token_tables.py` — Serialize TokenTables, including inline-blank singletons, into flat buffers and register with Go-side mage lib.
-- `policy.py` — Self-contained text-encoder policy facade; renders inline blanks and returns value plus blank logits.
+- `policy.py` — Self-contained text-encoder policy facade; renders inline blanks and returns value plus blank logits. Optional `use_grammar_decoder=True` wires a `GrammarDecoder` and exposes `forward_decoder_teacher_forced` + `encode_snapshots_with_specs` (additive, leaves the inline-blank path unchanged when the flag is off).
 - `policy_value_pretrain.py` — Forge choice-situation dataset and trainer for joint inline-policy/value pretraining from extracted torch or JSONL artifacts.
 - `recurrent.py` — LSTM history adapter wrapping TextPolicy; carries recurrence through encoder state vector.
 - `render.py` — Deterministic GameStateSnapshot → text renderer; produces custom-token-laced strings plus inline-blank anchor metadata.

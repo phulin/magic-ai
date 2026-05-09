@@ -30,6 +30,7 @@ import torch
 from torch import Tensor
 from transformers import PreTrainedTokenizerFast
 
+from magic_ai.text_encoder.decision_spec import AnchorKind, DecisionSpec, DecisionType
 from magic_ai.text_encoder.render import RenderedSnapshot
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
@@ -100,6 +101,33 @@ class TextEncodedBatch:
     blank_legal_mask: Tensor = field(  # [B, K, V_max] bool
         default_factory=lambda: torch.zeros((0, 0, 0), dtype=torch.bool)
     )
+    # Decoder-pipeline fields (additive). Populated by ``collate_with_specs``;
+    # the inline-blank path leaves them as the empty defaults below so existing
+    # callers and tests remain unaffected.
+    spec_tokens: Tensor = field(  # [B, T_spec_max] int32, 0 = pad
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    spec_lens: Tensor = field(  # [B] int32
+        default_factory=lambda: torch.zeros((0,), dtype=torch.int32)
+    )
+    decision_type: Tensor = field(  # [B] int32 (DecisionType enum value, -1 = no pending)
+        default_factory=lambda: torch.zeros((0,), dtype=torch.int32)
+    )
+    pointer_anchor_positions: Tensor = field(  # [B, N_anchors_max] int32, -1 = pad
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    pointer_anchor_kinds: Tensor = field(  # [B, N_anchors_max] int32 (AnchorKind), -1 = pad
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    pointer_anchor_subjects: Tensor = field(  # [B, N_anchors_max] int32, -1 = pad
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    pointer_anchor_handles: Tensor = field(  # [B, N_anchors_max] int32, -1 = pad
+        default_factory=lambda: torch.zeros((0, 0), dtype=torch.int32)
+    )
+    # ``[B, N_blockers_max, N_attackers_max]`` bool. ``None`` when no row in
+    # the batch has DECLARE_BLOCKERS legal-edge data.
+    legal_edge_bitmap: Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.seq_lengths_host is None and self.seq_lengths.device.type == "cpu":
@@ -395,6 +423,157 @@ def tokenize_snapshot(
 # ---------------------------------------------------------------------------
 # Collate
 # ---------------------------------------------------------------------------
+
+
+def collate_with_specs(
+    examples: Sequence[TextEncodedExample],
+    specs: Sequence[DecisionSpec | None],
+    pad_id: int,
+) -> TextEncodedBatch:
+    """Collate examples while concatenating per-row decision-spec tokens.
+
+    Each row's combined token stream is ``state_tokens || spec_tokens``; the
+    encoder consumes the combined stream so the trunk sees both the rendered
+    state and the spec section in one forward pass. Pointer-anchor positions
+    (which the renderer records relative to the spec section's start) are
+    shifted by the row's state-token length so they index into the combined
+    stream.
+
+    Rows with ``specs[i] is None`` contribute no spec tokens and decision_type
+    ``-1`` — useful when batching state-only snapshots alongside decision
+    snapshots in the same batch.
+    """
+
+    if len(examples) != len(specs):
+        raise ValueError(f"examples / specs length mismatch: {len(examples)} vs {len(specs)}")
+    if len(examples) == 0:
+        raise ValueError("collate_with_specs() requires at least one example")
+
+    batch_size = len(examples)
+    state_lens = [len(ex.token_ids) for ex in examples]
+    spec_lens = [len(s.spec_tokens) if s is not None else 0 for s in specs]
+    seq_lengths = [state_lens[i] + spec_lens[i] for i in range(batch_size)]
+    max_t = max(seq_lengths)
+    max_t_spec = max(spec_lens) if spec_lens else 0
+    n_anchors = [len(s.anchors) if s is not None else 0 for s in specs]
+    max_n_anchors = max(n_anchors) if n_anchors else 0
+    max_blanks = max((len(ex.blank_positions) for ex in examples), default=0)
+    max_legal = max(
+        (len(legal) for ex in examples for legal in ex.blank_legal_ids),
+        default=0,
+    )
+
+    token_ids = torch.full((batch_size, max_t), pad_id, dtype=torch.int64)
+    attention_mask = torch.zeros((batch_size, max_t), dtype=torch.int64)
+    card_ref_positions = torch.full((batch_size, MAX_CARD_REFS), -1, dtype=torch.int64)
+
+    blank_positions = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
+    blank_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
+    blank_group = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
+    blank_group_kind = torch.zeros((batch_size, max_blanks), dtype=torch.int32)
+    blank_option_index = torch.full((batch_size, max_blanks), -1, dtype=torch.int32)
+    blank_legal_ids = torch.zeros((batch_size, max_blanks, max_legal), dtype=torch.int32)
+    blank_legal_mask = torch.zeros((batch_size, max_blanks, max_legal), dtype=torch.bool)
+
+    spec_tokens = torch.zeros((batch_size, max_t_spec), dtype=torch.int32)
+    decision_type_t = torch.full((batch_size,), -1, dtype=torch.int32)
+    pointer_positions = torch.full((batch_size, max_n_anchors), -1, dtype=torch.int32)
+    pointer_kinds = torch.full((batch_size, max_n_anchors), -1, dtype=torch.int32)
+    pointer_subjects = torch.full((batch_size, max_n_anchors), -1, dtype=torch.int32)
+    pointer_handles = torch.full((batch_size, max_n_anchors), -1, dtype=torch.int32)
+
+    # Legal-edge bitmap sizing — only emit the tensor when at least one row
+    # carries a DECLARE_BLOCKERS bitmap.
+    max_blockers = 0
+    max_attackers = 0
+    has_edges = False
+    for s in specs:
+        if s is None or s.legal_edge_bitmap is None:
+            continue
+        has_edges = True
+        rows, cols = s.legal_edge_bitmap.shape
+        if rows > max_blockers:
+            max_blockers = rows
+        if cols > max_attackers:
+            max_attackers = cols
+    legal_edge_bitmap: Tensor | None = (
+        torch.zeros((batch_size, max_blockers, max_attackers), dtype=torch.bool)
+        if has_edges
+        else None
+    )
+
+    for b, ex in enumerate(examples):
+        t_state = state_lens[b]
+        t_spec = spec_lens[b]
+        t_total = t_state + t_spec
+        token_ids[b, :t_state] = torch.as_tensor(ex.token_ids, dtype=torch.int64)
+        attention_mask[b, :t_total] = 1
+        spec = specs[b]
+        if spec is not None and t_spec > 0:
+            spec_int32 = torch.as_tensor(spec.spec_tokens, dtype=torch.int32)
+            token_ids[b, t_state:t_total] = spec_int32.to(torch.int64)
+            spec_tokens[b, :t_spec] = spec_int32
+
+        for k, pos in ex.card_ref_positions.items():
+            if 0 <= k < MAX_CARD_REFS:
+                card_ref_positions[b, k] = int(pos)
+
+        for k_idx, pos in enumerate(ex.blank_positions):
+            blank_positions[b, k_idx] = int(pos)
+            blank_kind[b, k_idx] = int(ex.blank_kind_ids[k_idx])
+            blank_group[b, k_idx] = int(ex.blank_group_ids[k_idx])
+            blank_group_kind[b, k_idx] = int(ex.blank_group_kinds[k_idx])
+            blank_option_index[b, k_idx] = int(ex.blank_option_indices[k_idx])
+            for v_idx, tid in enumerate(ex.blank_legal_ids[k_idx]):
+                blank_legal_ids[b, k_idx, v_idx] = int(tid)
+                blank_legal_mask[b, k_idx, v_idx] = True
+
+        if spec is None:
+            continue
+        decision_type_t[b] = int(spec.decision_type)
+        for a_idx, anchor in enumerate(spec.anchors):
+            # Anchor positions are renderer-recorded relative to the spec
+            # section's start (offset 0 = first spec token); shift by the
+            # row's state-token length to index into the combined stream.
+            pointer_positions[b, a_idx] = int(anchor.token_position) + t_state
+            pointer_kinds[b, a_idx] = int(anchor.kind)
+            pointer_subjects[b, a_idx] = int(anchor.subject_index)
+            pointer_handles[b, a_idx] = int(anchor.handle)
+        if legal_edge_bitmap is not None and spec.legal_edge_bitmap is not None:
+            rows, cols = spec.legal_edge_bitmap.shape
+            legal_edge_bitmap[b, :rows, :cols] = torch.from_numpy(spec.legal_edge_bitmap)
+
+    seq_lens_t = torch.as_tensor(seq_lengths, dtype=torch.int64)
+    spec_lens_t = torch.as_tensor(spec_lens, dtype=torch.int32)
+
+    return TextEncodedBatch(
+        token_ids=token_ids,
+        attention_mask=attention_mask,
+        card_ref_positions=card_ref_positions,
+        seq_lengths=seq_lens_t,
+        total_tokens=sum(seq_lengths),
+        seq_lengths_host=tuple(seq_lengths),
+        blank_positions=blank_positions,
+        blank_kind=blank_kind,
+        blank_group=blank_group,
+        blank_group_kind=blank_group_kind,
+        blank_option_index=blank_option_index,
+        blank_legal_ids=blank_legal_ids,
+        blank_legal_mask=blank_legal_mask,
+        spec_tokens=spec_tokens,
+        spec_lens=spec_lens_t,
+        decision_type=decision_type_t,
+        pointer_anchor_positions=pointer_positions,
+        pointer_anchor_kinds=pointer_kinds,
+        pointer_anchor_subjects=pointer_subjects,
+        pointer_anchor_handles=pointer_handles,
+        legal_edge_bitmap=legal_edge_bitmap,
+    )
+
+
+# Re-export AnchorKind / DecisionType for callers that already import from
+# this module — avoids a second import line at the call site.
+_ = (AnchorKind, DecisionType)
 
 
 def collate(examples: Sequence[TextEncodedExample], pad_id: int) -> TextEncodedBatch:
