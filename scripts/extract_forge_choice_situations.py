@@ -1,4 +1,4 @@
-"""Extract one reloadable choice-training situation per Forge game archive.
+"""Extract reloadable choice-training situations from a Forge game archive.
 
 The Forge JSONL logs do not currently carry `snapshot.playableActions`, so this
 extractor stores a self-contained pre-choice snapshot, rendered token ids, the
@@ -8,7 +8,9 @@ stored observed choice onto its policy target while choosing the value target
 construction (terminal sign, discounted return, PPO/GAE-style target, etc.) at
 runtime.
 
-Output format: gzip-compressed JSONL, one object per selected game.
+Output format defaults to a directory of sharded PyTorch ``part-*.pt`` files.
+Gzip JSONL is still available for inspection/debugging by choosing a
+``.jsonl.gz`` output path. By default, two situations are selected per game.
 """
 
 from __future__ import annotations
@@ -16,7 +18,6 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
-import json
 import re
 import sys
 import zipfile
@@ -24,6 +25,9 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
+
+import orjson
+import torch
 
 # Allow direct invocation as ``uv run python scripts/extract_forge_choice_situations.py``.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -37,6 +41,7 @@ from magic_ai.text_encoder.tokenizer import (
 )
 
 ChoiceKind = Literal["priority", "attack", "block", "may", "choose"]
+OutputFormat = Literal["torch_shards", "jsonl.gz"]
 
 FORMAT_VERSION = 1
 DEFAULT_KIND_PRIORITY: tuple[ChoiceKind, ...] = ("may", "block", "attack", "choose", "priority")
@@ -75,13 +80,31 @@ class _GameMeta:
     extras: dict[str, Any]
 
 
+def _loads(line: bytes) -> dict[str, Any]:
+    return cast(dict[str, Any], orjson.loads(line))
+
+
+def _dumps_text(value: Any) -> str:
+    return orjson.dumps(value, option=orjson.OPT_SORT_KEYS).decode("utf-8")
+
+
 def _iter_zip_jsonl(zip_path: Path) -> Iterator[tuple[str, list[dict[str, Any]]]]:
     with zipfile.ZipFile(zip_path) as zf:
         for name in sorted(zf.namelist()):
             if not name.endswith(".jsonl.gz"):
                 continue
-            with gzip.open(zf.open(name), "rt", encoding="utf-8") as fh:
-                yield name, [json.loads(line) for line in fh if line.strip()]
+            rows: list[dict[str, Any]] = []
+            with gzip.open(zf.open(name), "rb") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    row = _loads(line)
+                    record = row.get("record")
+                    if record == "META" or (
+                        record == "EVENT" and isinstance(row.get("snapshot"), dict)
+                    ):
+                        rows.append(row)
+            yield name, rows
 
 
 def _meta_from_rows(rows: Sequence[dict[str, Any]]) -> _GameMeta | None:
@@ -579,6 +602,20 @@ def _stable_choice(candidates: Sequence[_ChoiceCandidate]) -> _ChoiceCandidate:
     return candidates[idx]
 
 
+def _stable_choices(candidates: Sequence[_ChoiceCandidate], count: int) -> list[_ChoiceCandidate]:
+    if count <= 0:
+        return []
+    if count >= len(candidates):
+        return list(candidates)
+    return sorted(
+        candidates,
+        key=lambda c: hashlib.blake2b(
+            f"{c.game_id}:{c.candidate_index}".encode(),
+            digest_size=8,
+        ).digest(),
+    )[:count]
+
+
 def _priority_choice(
     candidates: Sequence[_ChoiceCandidate],
     kind_priority: Sequence[ChoiceKind],
@@ -591,6 +628,35 @@ def _priority_choice(
         if bucket:
             return bucket[0]
     return candidates[0]
+
+
+def _priority_choices(
+    candidates: Sequence[_ChoiceCandidate],
+    kind_priority: Sequence[ChoiceKind],
+    count: int,
+) -> list[_ChoiceCandidate]:
+    if count <= 0:
+        return []
+    by_kind: dict[ChoiceKind, list[_ChoiceCandidate]] = {kind: [] for kind in CHOICE_KINDS}
+    for candidate in candidates:
+        by_kind[candidate.kind].append(candidate)
+    selected: list[_ChoiceCandidate] = []
+    seen: set[int] = set()
+    for kind in kind_priority:
+        for candidate in by_kind.get(kind) or []:
+            if candidate.candidate_index in seen:
+                continue
+            selected.append(candidate)
+            seen.add(candidate.candidate_index)
+            if len(selected) >= count:
+                return selected
+    for candidate in candidates:
+        if candidate.candidate_index in seen:
+            continue
+        selected.append(candidate)
+        if len(selected) >= count:
+            break
+    return selected
 
 
 def _terminal_sign(winner_id: str | None, perspective_id: str) -> float:
@@ -682,22 +748,101 @@ def _token_ids_by_name(tokenizer: Any) -> dict[str, int]:
     return out
 
 
+def _output_format(path: Path) -> OutputFormat:
+    name = path.name
+    if name.endswith(".jsonl.gz"):
+        return "jsonl.gz"
+    return "torch_shards"
+
+
+class _TorchShardWriter:
+    def __init__(self, out_dir: Path, *, shard_size: int, overwrite: bool) -> None:
+        if shard_size <= 0:
+            raise ValueError("--shard-size must be positive")
+        self.out_dir = out_dir
+        self.shard_size = int(shard_size)
+        self.shard_index = 0
+        self.records: list[dict[str, Any]] = []
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        existing = [*self.out_dir.glob("part-*.pt"), self.out_dir / "manifest.json"]
+        existing = [path for path in existing if path.exists()]
+        if existing and not overwrite:
+            raise FileExistsError(
+                f"{self.out_dir} already contains extracted shards; pass --overwrite to replace"
+            )
+        if overwrite:
+            for path in existing:
+                path.unlink()
+
+    def write(self, record: dict[str, Any]) -> None:
+        self.records.append(record)
+        if len(self.records) >= self.shard_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.records:
+            return
+        path = self.out_dir / f"part-{self.shard_index:05d}.pt"
+        tmp_path = path.with_name(f"{path.name}.tmp")
+        torch.save(
+            {
+                "format": "forge_choice_situations_torch_shard",
+                "format_version": FORMAT_VERSION,
+                "shard_index": self.shard_index,
+                "records": self.records,
+            },
+            tmp_path,
+        )
+        tmp_path.replace(path)
+        self.shard_index += 1
+        self.records = []
+
+    def close(self, stats: dict[str, int]) -> None:
+        self.flush()
+        manifest = {
+            "format": "forge_choice_situations_manifest",
+            "format_version": FORMAT_VERSION,
+            "shards": self.shard_index,
+            "shard_size": self.shard_size,
+            "stats": stats,
+        }
+        manifest_path = self.out_dir / "manifest.json"
+        tmp_path = manifest_path.with_name(f"{manifest_path.name}.tmp")
+        tmp_path.write_bytes(
+            orjson.dumps(manifest, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS)
+        )
+        tmp_path.replace(manifest_path)
+
+
 def extract(args: argparse.Namespace) -> dict[str, int]:
     tokenizer = load_tokenizer(args.tokenizer_dir)
     oracle = load_oracle_text(args.oracle_path)
     token_ids_by_name = _token_ids_by_name(tokenizer)
     enabled_kinds = _parse_kinds(args.kinds)
     kind_priority = _parse_kind_priority(args.kind_priority)
+    out_format = _output_format(args.out)
     stats = {
         "games_seen": 0,
         "games_written": 0,
+        "records_written": 0,
         "games_without_candidates": 0,
         "candidates_seen": 0,
     }
     kind_counts = {kind: 0 for kind in CHOICE_KINDS}
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(args.out, "wt", encoding="utf-8", compresslevel=args.compresslevel) as out:
+    if out_format == "jsonl.gz":
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+    shard_writer = (
+        _TorchShardWriter(args.out, shard_size=args.shard_size, overwrite=args.overwrite)
+        if out_format == "torch_shards"
+        else None
+    )
+    jsonl_out = (
+        gzip.open(args.out, "wb", compresslevel=args.compresslevel)
+        if out_format == "jsonl.gz"
+        else None
+    )
+    try:
         for member, rows in _iter_zip_jsonl(args.zip):
             if args.limit_games is not None and stats["games_seen"] >= args.limit_games:
                 break
@@ -715,28 +860,43 @@ def extract(args: argparse.Namespace) -> dict[str, int]:
             if not candidates:
                 stats["games_without_candidates"] += 1
                 continue
-            selected = (
-                _stable_choice(candidates)
+            selected_candidates = (
+                _stable_choices(candidates, args.choices_per_game)
                 if args.selection == "hash"
-                else _priority_choice(candidates, kind_priority)
+                else _priority_choices(candidates, kind_priority, args.choices_per_game)
             )
-            selected = _materialize_tokens(
-                selected,
-                tokenizer=tokenizer,
-                oracle=oracle,
-                token_ids_by_name=token_ids_by_name,
-            )
-            if selected is None:
+            materialized = 0
+            for selected_candidate in selected_candidates:
+                selected = _materialize_tokens(
+                    selected_candidate,
+                    tokenizer=tokenizer,
+                    oracle=oracle,
+                    token_ids_by_name=token_ids_by_name,
+                )
+                if selected is None:
+                    continue
+                kind_counts[selected.kind] += 1
+                record = _record(selected, meta, total_candidates=len(candidates))
+                if shard_writer is not None:
+                    shard_writer.write(record)
+                elif jsonl_out is not None:
+                    jsonl_out.write(orjson.dumps(record))
+                    jsonl_out.write(b"\n")
+                stats["records_written"] += 1
+                materialized += 1
+            if materialized == 0:
                 stats["games_without_candidates"] += 1
                 continue
-            kind_counts[selected.kind] += 1
-            out.write(json.dumps(_record(selected, meta, total_candidates=len(candidates))))
-            out.write("\n")
             stats["games_written"] += 1
             if args.progress_every > 0 and stats["games_seen"] % args.progress_every == 0:
-                print(json.dumps(stats, sort_keys=True), file=sys.stderr, flush=True)
+                print(_dumps_text(stats), file=sys.stderr, flush=True)
+    finally:
+        if jsonl_out is not None:
+            jsonl_out.close()
 
     stats.update({f"written_{kind}": count for kind, count in kind_counts.items()})
+    if shard_writer is not None:
+        shard_writer.close(stats)
     return stats
 
 
@@ -751,8 +911,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out",
         type=Path,
-        default=Path("data/forge_choice_situations.jsonl.gz"),
-        help="Output gzip JSONL path.",
+        default=Path("data/forge_choice_situations"),
+        help="Output directory for sharded part-*.pt files, or .jsonl.gz for debug JSONL.",
+    )
+    parser.add_argument("--shard-size", type=int, default=4096)
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace existing part-*.pt shards and manifest.json under --out",
     )
     parser.add_argument("--tokenizer-dir", type=Path, default=Path("data/text_encoder_tokenizer"))
     parser.add_argument(
@@ -767,7 +933,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--selection",
         choices=("hash", "priority"),
         default="hash",
-        help="How to select one situation when a game has multiple candidates.",
+        help="How to select situations when a game has multiple candidates.",
+    )
+    parser.add_argument(
+        "--choices-per-game",
+        type=int,
+        default=2,
+        help="maximum selected situations to write per game",
     )
     parser.add_argument(
         "--kind-priority",
@@ -789,7 +961,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     stats = extract(args)
-    print(json.dumps(stats, indent=2, sort_keys=True))
+    print(orjson.dumps(stats, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS).decode("utf-8"))
 
 
 if __name__ == "__main__":

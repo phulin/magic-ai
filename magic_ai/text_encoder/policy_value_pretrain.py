@@ -1,18 +1,17 @@
 """Policy + value pretraining on extracted Forge choice situations.
 
-Consumes the gzip JSONL artifact produced by
-``scripts/extract_forge_choice_situations.py``. Each record stores a pre-choice
-snapshot, the action text Forge actually took, and the terminal outcome. This
-loader reconstructs a conservative inline-blank legal set from the visible
-state, maps the observed choice onto the corresponding blank target, and
-trains both the inline policy scorer and value head.
+Consumes the sharded torch or gzip JSONL artifact produced by
+``scripts/extract_forge_choice_situations.py``. Each record stores a
+pre-choice snapshot, the action text Forge actually took, and the terminal
+outcome. This loader reconstructs a conservative inline-blank legal set from
+the visible state, maps the observed choice onto the corresponding blank
+target, and trains both the inline policy scorer and value head.
 """
 
 from __future__ import annotations
 
 import gzip
 import hashlib
-import json
 import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -20,6 +19,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import numpy as np
+import orjson
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -46,6 +46,7 @@ ValueTargetMode = Literal["terminal", "gae", "vtrace"]
 class ForgePolicyValueConfig:
     data_path: Path
     batch_size: int
+    max_tokens: int | None = None
     eval_fraction: float = 0.05
     gamma: float = 1.0
     value_target_mode: ValueTargetMode = "terminal"
@@ -76,14 +77,25 @@ def _stable_eval_bucket(game_id: str, bucket: int) -> int:
 
 
 def _iter_records(path: Path) -> Iterator[dict[str, Any]]:
-    paths = sorted(path.rglob("*.jsonl.gz")) if path.is_dir() else [path]
+    paths = (
+        sorted([*path.rglob("*.pt"), *path.rglob("*.pth"), *path.rglob("*.jsonl.gz")])
+        if path.is_dir()
+        else [path]
+    )
     for item in paths:
+        if item.suffix in (".pt", ".pth"):
+            payload = torch.load(item, map_location="cpu", weights_only=False)
+            records = payload.get("records") if isinstance(payload, dict) else payload
+            if not isinstance(records, list):
+                raise ValueError(f"torch choice artifact {item} does not contain a records list")
+            yield from cast(list[dict[str, Any]], records)
+            continue
         opener = gzip.open if item.suffix == ".gz" else open
         with opener(item, "rt", encoding="utf-8") as fh:
             for line in fh:
                 stripped = line.strip()
                 if stripped:
-                    yield json.loads(stripped)
+                    yield cast(dict[str, Any], orjson.loads(stripped))
 
 
 def _card_name(card: dict[str, Any]) -> str:
@@ -489,6 +501,11 @@ class ForgeChoiceDataset:
         if not prepared:
             raise ValueError("no renderable Forge choice examples in selected batch")
         encoded = collate([p.encoded for p in prepared], self.cfg.pad_token_id)
+        if (
+            self.cfg.max_tokens is not None
+            and int(encoded.token_ids.shape[1]) > self.cfg.max_tokens
+        ):
+            encoded = _truncate_encoded_batch(encoded, max_tokens=self.cfg.max_tokens)
         batch_size = len(prepared)
         max_blanks = int(encoded.blank_positions.shape[1])
         per_blank = torch.full((batch_size, max_blanks), -1, dtype=torch.long)
@@ -656,6 +673,35 @@ def _encoded_to_device(batch: TextEncodedBatch, device: torch.device) -> TextEnc
         blank_option_index=batch.blank_option_index.to(device),
         blank_legal_ids=batch.blank_legal_ids.to(device),
         blank_legal_mask=batch.blank_legal_mask.to(device),
+    )
+
+
+def _truncate_encoded_batch(batch: TextEncodedBatch, *, max_tokens: int) -> TextEncodedBatch:
+    seq_lengths = batch.seq_lengths.clamp(max=max_tokens)
+    attention_mask = batch.attention_mask[:, :max_tokens].clone()
+    for row, seq_len in enumerate(seq_lengths.tolist()):
+        attention_mask[row, int(seq_len) :] = 0
+    card_ref_positions = batch.card_ref_positions.clone()
+    card_ref_positions[card_ref_positions >= max_tokens] = -1
+    blank_positions = batch.blank_positions.clone()
+    blank_positions[blank_positions >= max_tokens] = -1
+    blank_legal_mask = batch.blank_legal_mask.clone()
+    if blank_positions.numel() > 0:
+        blank_legal_mask = blank_legal_mask & (blank_positions.unsqueeze(-1) >= 0)
+    return TextEncodedBatch(
+        token_ids=batch.token_ids[:, :max_tokens].contiguous(),
+        attention_mask=attention_mask,
+        card_ref_positions=card_ref_positions,
+        seq_lengths=seq_lengths,
+        total_tokens=int(seq_lengths.sum().item()),
+        seq_lengths_host=tuple(int(v) for v in seq_lengths.tolist()),
+        blank_positions=blank_positions,
+        blank_kind=batch.blank_kind,
+        blank_group=batch.blank_group,
+        blank_group_kind=batch.blank_group_kind,
+        blank_option_index=batch.blank_option_index,
+        blank_legal_ids=batch.blank_legal_ids,
+        blank_legal_mask=blank_legal_mask,
     )
 
 

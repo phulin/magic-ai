@@ -1869,6 +1869,7 @@ def run_mlm_pretrain(
     cfg = ForgePolicyValueConfig(
         data_path=args.pretrain_mlm_dir,
         batch_size=args.pretrain_mlm_batch_size,
+        max_tokens=args.text_max_tokens,
         eval_fraction=args.pretrain_mlm_eval_fraction,
         gamma=args.gamma,
         value_target_mode=args.pretrain_mlm_value_target,
@@ -2440,8 +2441,9 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="if set, run joint policy/value pretraining over the Forge choice "
-        "JSONL/JSONL.GZ artifact produced by scripts/extract_forge_choice_situations.py "
-        "before starting RL training. Historical flag name retained. Requires --encoder text.",
+        "sharded torch snapshot directory or JSONL.GZ artifact produced by "
+        "scripts/extract_forge_choice_situations.py before starting RL training. "
+        "Historical flag name retained. Requires --encoder text.",
     )
     parser.add_argument(
         "--pretrain-mlm-epochs",

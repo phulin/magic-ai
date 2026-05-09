@@ -12,7 +12,7 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 - `native_assembler.py` — Python wrapper for native Go MageEncodeTokensPacked assembler; manages packed token and inline-blank tensor I/O.
 - `native_token_tables.py` — Serialize TokenTables, including inline-blank singletons, into flat buffers and register with Go-side mage lib.
 - `policy.py` — Self-contained text-encoder policy facade; renders inline blanks and returns value plus blank logits.
-- `policy_value_pretrain.py` — Forge choice-situation dataset and trainer for joint inline-policy/value pretraining from extracted choice JSONL artifacts.
+- `policy_value_pretrain.py` — Forge choice-situation dataset and trainer for joint inline-policy/value pretraining from extracted torch or JSONL artifacts.
 - `recurrent.py` — LSTM history adapter wrapping TextPolicy; carries recurrence through encoder state vector.
 - `render.py` — Deterministic GameStateSnapshot → text renderer; produces custom-token-laced strings plus inline-blank anchor metadata.
 - `replay_buffer.py` — Single global concurrent ring for encoded text snapshots, inline blank metadata, episode/policy-version metadata, completed-window claims, and GPU-side PPO return building.
