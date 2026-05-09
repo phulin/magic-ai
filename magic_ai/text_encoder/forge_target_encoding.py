@@ -158,17 +158,44 @@ def translate_priority(pending: PendingState, observed: dict[str, Any]) -> Decod
 def _attacker_subject_indices(
     options: list[PendingOptionState], observed: dict[str, Any]
 ) -> list[int] | None:
-    """Pick attacker subject indices from the observed attack-event text."""
+    """Pick attacker subject indices from the structured observed event.
 
-    text = str(observed.get("attackers_text") or "")
-    if not text:
-        return None
-    chosen: list[int] = []
-    for i, option in enumerate(options):
-        name = option.get("card_name") or option.get("label") or ""
-        if name and name in text:
-            chosen.append(i)
-    return chosen if chosen else None
+    The Forge extractor emits ``observed["attackers"] = [{"name", "id_prefix"}, ...]``
+    where ``id_prefix`` is the 3-char hex prefix of the permanent's UUID
+    (matching the ``[<id3>]`` rendering used by Forge's combat log).
+    Each chosen attacker must map to exactly one option whose
+    ``permanent_id`` starts with the prefix; ambiguous or missing matches
+    drop the row.
+    """
+
+    raw_attackers = observed.get("attackers") or []
+    if not raw_attackers:
+        # Legacy event-text fallback (kept for any older corpus that
+        # still carries ``attackers_text``).
+        text = str(observed.get("attackers_text") or "")
+        if not text:
+            return None
+        chosen: list[int] = []
+        for i, option in enumerate(options):
+            name = option.get("card_name") or option.get("label") or ""
+            if name and name in text:
+                chosen.append(i)
+        return chosen or None
+
+    chosen = []
+    for atk in raw_attackers:
+        prefix = str(atk.get("id_prefix") or "")
+        if not prefix:
+            return None
+        matches = [
+            i
+            for i, option in enumerate(options)
+            if str(option.get("permanent_id") or "").startswith(prefix)
+        ]
+        if len(matches) != 1:
+            return None
+        chosen.append(matches[0])
+    return chosen or None
 
 
 def translate_attackers(pending: PendingState, observed: dict[str, Any]) -> DecoderTarget | None:
@@ -215,36 +242,72 @@ def _blocker_assignments(
     # Build the same attacker order as render_spec: union of valid_targets
     # in first-seen order across blocker options.
     attacker_index: dict[str, int] = {}
-    attacker_names_in_order: list[str] = []
+    attacker_full_ids_in_order: list[str] = []
     for option in options:
         for target in option.get("valid_targets") or []:
-            aid = target["id"]
+            aid = str(target["id"])
             if aid not in attacker_index:
-                idx = len(attacker_index)
-                attacker_index[aid] = idx
-                # Pull a display name to match against the raw log text.
-                attacker_names_in_order.append(str(target.get("label") or ""))
+                attacker_index[aid] = len(attacker_index)
+                attacker_full_ids_in_order.append(aid)
 
     pairs: list[tuple[int, int]] = []
     for assignment in assignments:
+        # New-format assignment: {attacker_id_prefix, blocker_id_prefix, ...}.
+        # Legacy-format assignment carried {kind, blockers_text, attacker_text}
+        # — kept for back-compat with older corpora.
+        atk_prefix = str(assignment.get("attacker_id_prefix") or "")
+        blk_prefix = str(assignment.get("blocker_id_prefix") or "")
+        if atk_prefix and blk_prefix:
+            atk_matches = [
+                i for i, fid in enumerate(attacker_full_ids_in_order) if fid.startswith(atk_prefix)
+            ]
+            if len(atk_matches) != 1:
+                return None
+            blk_matches = [
+                opt_idx
+                for opt_idx, option in enumerate(options)
+                if str(option.get("permanent_id") or "").startswith(blk_prefix)
+            ]
+            if len(blk_matches) != 1:
+                return None
+            pairs.append((blk_matches[0], atk_matches[0]))
+            continue
+
         if assignment.get("kind") != "block":
             continue
         blockers_text = str(assignment.get("blockers_text") or "")
         attacker_text = str(assignment.get("attacker_text") or "")
-        # Find the attacker by label match.
         attacker_subject = -1
-        for atk_idx, label in enumerate(attacker_names_in_order):
+        for atk_idx, fid in enumerate(attacker_full_ids_in_order):
+            # Legacy fallback uses label substring match — kept on the
+            # full-id loop because we no longer track names separately.
+            label = next(
+                (
+                    str(t.get("label") or "")
+                    for option in options
+                    for t in option.get("valid_targets") or []
+                    if str(t.get("id") or "") == fid
+                ),
+                "",
+            )
             if label and label in attacker_text:
                 attacker_subject = atk_idx
                 break
         if attacker_subject < 0:
             return None
-        # Find the blocker option(s) whose card name appears in blockers_text.
         for opt_idx, option in enumerate(options):
             name = option.get("card_name") or option.get("label") or ""
             if name and name in blockers_text:
                 pairs.append((opt_idx, attacker_subject))
-    return pairs if pairs else None
+    if not pairs:
+        return None
+    # Grammar requires each blocker subject to appear at most once.
+    seen: set[int] = set()
+    for blk, _ in pairs:
+        if blk in seen:
+            return None
+        seen.add(blk)
+    return pairs
 
 
 def translate_blockers(pending: PendingState, observed: dict[str, Any]) -> DecoderTarget | None:

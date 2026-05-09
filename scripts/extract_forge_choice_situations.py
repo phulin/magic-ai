@@ -46,11 +46,16 @@ FORMAT_VERSION = 2
 DEFAULT_KIND_PRIORITY: tuple[ChoiceKind, ...] = ("may", "block", "attack", "choose", "priority")
 CHOICE_KINDS: tuple[ChoiceKind, ...] = ("priority", "attack", "block", "may", "choose")
 
-_ASSIGNED_ATTACK_RE = re.compile(
-    r"^(?P<player>.+?) assigned (?P<objects>.+?) to attack (?P<target>.+?)\.$"
+_ATTACKS_HEADER_RE = re.compile(
+    r"^(?P<attacker_player>.+?) attacks (?P<defender_player>.+?) with (?P<count>\d+) creatures?$"
 )
-_DID_NOT_BLOCK_RE = re.compile(r"^(?P<player>.+?) didn't block (?P<attacker>.+?)\.$")
-_BLOCKED_RE = re.compile(r"^(?P<player>.+?) blocked (?P<attacker>.+?) with (?P<blockers>.+?)\.$")
+# Single attacker line emitted during DECLARE_BLOCKERS step:
+#   "Attacker: <name> [<id3>] (<P>/<T>) unblocked"
+#   "Attacker: <name> [<id3>] (<P>/<T>) blocked by <name> [<id3>] (<P>/<T>) ..."
+_ATTACKER_LINE_RE = re.compile(
+    r"^Attacker:\s+(?P<name>.+?)\s+\[(?P<id>[0-9a-f]+)\]\s+\((?P<pt>[^)]+)\)\s+(?P<rest>.+)$"
+)
+_BLOCKER_TOKEN_RE = re.compile(r"(?P<name>.+?)\s+\[(?P<id>[0-9a-f]+)\]\s+\((?P<pt>[^)]+)\)")
 _PLAYER_PREFIX_RE = re.compile(r"^(?P<player>Player[A-Z0-9_ -]+)")
 
 
@@ -281,6 +286,104 @@ def _priority_pending_from_playable_actions(
     }
 
 
+def _attackers_pending_from_state(
+    raw_snapshot: dict[str, Any], perspective_id: str
+) -> dict[str, Any] | None:
+    """Build a ``pending`` dict for a DECLARE_ATTACKERS decision.
+
+    Candidate attackers are battlefield permanents controlled by the
+    perspective player whose ``power > 0`` (creature-ish). The renderer
+    treats every option as a legal attacker; the BC translator just
+    needs the chosen attackers to be present in the option list.
+    """
+
+    options: list[dict[str, Any]] = []
+    for card in raw_snapshot.get("battlefield") or []:
+        if not isinstance(card, dict):
+            continue
+        if str(card.get("controllerId") or "") != perspective_id:
+            continue
+        try:
+            power = int(card.get("power") or 0)
+        except TypeError, ValueError:
+            power = 0
+        if power <= 0:
+            continue
+        options.append(
+            {
+                "id": str(card.get("id") or ""),
+                "kind": "attacker",
+                "card_id": str(card.get("id") or ""),
+                "card_name": str(card.get("name") or ""),
+                "permanent_id": str(card.get("id") or ""),
+                "label": str(card.get("name") or ""),
+            }
+        )
+    if not options:
+        return None
+    return {"kind": "attackers", "player_idx": 0, "options": options}
+
+
+def _blockers_pending_from_state(
+    raw_snapshot: dict[str, Any],
+    perspective_id: str,
+    attacker_ids: Sequence[str],
+) -> dict[str, Any] | None:
+    """Build a ``pending`` dict for a DECLARE_BLOCKERS decision.
+
+    Each blocker option is a perspective-controlled creature whose
+    ``valid_targets`` list is the set of attacking permanents (full UUIDs
+    so the translator can match by 3-char prefix). The renderer derives
+    the LEGAL_ATTACKER anchor order from the union of ``valid_targets``
+    in first-seen blocker-option order; we use the same attacker order
+    by attaching the same list to every blocker.
+    """
+
+    bf = raw_snapshot.get("battlefield") or []
+
+    # Resolve full attacker UUIDs and labels from the battlefield.
+    attacker_targets: list[dict[str, str]] = []
+    for prefix in attacker_ids:
+        for card in bf:
+            if not isinstance(card, dict):
+                continue
+            cid = str(card.get("id") or "")
+            if cid.startswith(prefix):
+                attacker_targets.append({"id": cid, "label": str(card.get("name") or "")})
+                break
+    if not attacker_targets:
+        return None
+
+    options: list[dict[str, Any]] = []
+    for card in bf:
+        if not isinstance(card, dict):
+            continue
+        if str(card.get("controllerId") or "") != perspective_id:
+            continue
+        try:
+            power = int(card.get("power") or 0)
+        except TypeError, ValueError:
+            power = 0
+        if power <= 0:
+            continue
+        if bool(card.get("tapped")):
+            continue
+        options.append(
+            {
+                "id": str(card.get("id") or ""),
+                "kind": "block",
+                "card_id": str(card.get("id") or ""),
+                "card_name": str(card.get("name") or ""),
+                "permanent_id": str(card.get("id") or ""),
+                "label": str(card.get("name") or ""),
+                "valid_targets": list(attacker_targets),
+            }
+        )
+    if not options:
+        return None
+    return {"kind": "blockers", "player_idx": 0, "options": options}
+
+
 def _normalize_snapshot(raw: dict[str, Any], perspective_id: str) -> dict[str, Any]:
     players = [_player(p) for p in raw.get("players") or []]
     battlefield_by_player: dict[str, list[dict[str, Any]]] = {str(p["ID"]): [] for p in players}
@@ -345,60 +448,122 @@ def _event_rows(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return [r for r in rows if r.get("record") == "EVENT" and isinstance(r.get("snapshot"), dict)]
 
 
-def _next_non_priority(rows: Sequence[dict[str, Any]], start: int) -> dict[str, Any] | None:
-    for row in rows[start + 1 :]:
-        if row.get("type") == "PRIORITY":
-            continue
-        desc = str(row.get("description") or "")
-        if not desc:
-            continue
-        return row
-    return None
+def _parse_attacks_header(description: str) -> dict[str, str] | None:
+    """Match ``"<player> attacks <defender> with N creatures"``.
 
+    The new Forge log format announces an attack with a single header
+    line during the ``DECLARE_ATTACKERS`` step; per-attacker detail rows
+    follow during ``DECLARE_BLOCKERS``.
+    """
 
-def _attack_label(description: str) -> dict[str, Any] | None:
-    match = _ASSIGNED_ATTACK_RE.match(description)
+    match = _ATTACKS_HEADER_RE.match(description)
     if match is None:
         return None
     return {
-        "raw": description,
-        "actor_name": match.group("player"),
-        "attackers_text": match.group("objects"),
-        "defender_text": match.group("target"),
+        "attacker_player": match.group("attacker_player"),
+        "defender_player": match.group("defender_player"),
+        "count": match.group("count"),
     }
 
 
-def _block_label(description: str) -> dict[str, Any] | None:
-    parts = [part.strip() for part in description.splitlines() if part.strip()]
-    parsed: list[dict[str, Any]] = []
-    actor = ""
-    for part in parts:
-        no_block = _DID_NOT_BLOCK_RE.match(part)
-        if no_block is not None:
-            actor = actor or no_block.group("player")
-            parsed.append(
-                {
-                    "kind": "no_block",
-                    "actor_name": no_block.group("player"),
-                    "attacker_text": no_block.group("attacker"),
-                    "blockers_text": "",
-                }
-            )
-            continue
-        blocked = _BLOCKED_RE.match(part)
-        if blocked is not None:
-            actor = actor or blocked.group("player")
-            parsed.append(
-                {
-                    "kind": "block",
-                    "actor_name": blocked.group("player"),
-                    "attacker_text": blocked.group("attacker"),
-                    "blockers_text": blocked.group("blockers"),
-                }
-            )
-    if not parsed:
+def _parse_attacker_line(description: str) -> dict[str, Any] | None:
+    """Match an ``Attacker: <name> [<id3>] (<P>/<T>) <rest>`` log line.
+
+    ``rest`` is either ``"unblocked"`` or
+    ``"blocked by <name> [<id3>] (<P>/<T>) ..."`` (one or more blocker
+    triples concatenated).
+    """
+
+    match = _ATTACKER_LINE_RE.match(description)
+    if match is None:
         return None
-    return {"raw": description, "actor_name": actor, "assignments": parsed}
+    rest = match.group("rest")
+    blockers: list[dict[str, str]] = []
+    if rest != "unblocked" and rest.startswith("blocked by "):
+        for blk in _BLOCKER_TOKEN_RE.finditer(rest[len("blocked by ") :]):
+            blockers.append({"name": blk.group("name"), "id_prefix": blk.group("id")})
+    return {
+        "name": match.group("name"),
+        "id_prefix": match.group("id"),
+        "blockers": blockers,
+    }
+
+
+def _attack_observed(
+    rows: Sequence[dict[str, Any]],
+    header_idx: int,
+    header: dict[str, str],
+) -> dict[str, Any]:
+    """Walk forward from the attack-header to gather per-attacker rows."""
+
+    attackers: list[dict[str, str]] = []
+    for row in rows[header_idx + 1 :]:
+        snap = row.get("snapshot") or {}
+        step = str(snap.get("step") or "")
+        if step not in ("DECLARE_ATTACKERS", "DECLARE_BLOCKERS"):
+            break
+        if str(row.get("type") or "") != "LOG":
+            continue
+        desc = str(row.get("description") or "")
+        if desc.startswith("Attacker:"):
+            parsed = _parse_attacker_line(desc)
+            if parsed is not None:
+                attackers.append({"name": parsed["name"], "id_prefix": parsed["id_prefix"]})
+                if len(attackers) >= int(header["count"]):
+                    break
+    return {
+        "raw": f"{header['attacker_player']} attacks {header['defender_player']} "
+        f"with {header['count']} creatures",
+        "actor_name": header["attacker_player"],
+        "defender_name": header["defender_player"],
+        "attackers": attackers,
+    }
+
+
+def _block_observed(
+    rows: Sequence[dict[str, Any]],
+    header_idx: int,
+    header: dict[str, str],
+) -> dict[str, Any] | None:
+    """Walk forward to collect ``Attacker: ... blocked by ...`` rows."""
+
+    assignments: list[dict[str, Any]] = []
+    seen_attackers: list[dict[str, str]] = []
+    for row in rows[header_idx + 1 :]:
+        snap = row.get("snapshot") or {}
+        step = str(snap.get("step") or "")
+        if step not in ("DECLARE_ATTACKERS", "DECLARE_BLOCKERS"):
+            break
+        if str(row.get("type") or "") != "LOG":
+            continue
+        desc = str(row.get("description") or "")
+        if not desc.startswith("Attacker:"):
+            continue
+        parsed = _parse_attacker_line(desc)
+        if parsed is None:
+            continue
+        seen_attackers.append({"name": parsed["name"], "id_prefix": parsed["id_prefix"]})
+        for blk in parsed["blockers"]:
+            assignments.append(
+                {
+                    "attacker_name": parsed["name"],
+                    "attacker_id_prefix": parsed["id_prefix"],
+                    "blocker_name": blk["name"],
+                    "blocker_id_prefix": blk["id_prefix"],
+                }
+            )
+        if len(seen_attackers) >= int(header["count"]):
+            break
+    if not assignments:
+        return None
+    return {
+        "raw": f"{header['attacker_player']} attacks {header['defender_player']} "
+        f"with {header['count']} creatures (blockers declared)",
+        "actor_name": header["defender_player"],
+        "attacker_player": header["attacker_player"],
+        "attackers": seen_attackers,
+        "assignments": assignments,
+    }
 
 
 _STACK_PUSH_NAME_RE = re.compile(r"^STACK_PUSH\s+(?P<name>.+?)\s+by\s+(?P<player>.+?)$")
@@ -518,6 +683,30 @@ def _make_candidate(
         pending = _priority_pending_from_playable_actions(source_snapshot, perspective_id)
         if pending is not None:
             normalized["pending"] = pending
+    elif kind == "attack":
+        attacker_ids = [a["id_prefix"] for a in observed.get("attackers") or []]
+        if not attacker_ids:
+            return None
+        pending = _attackers_pending_from_state(source_snapshot, perspective_id)
+        if pending is None:
+            return None
+        # Drop if any chosen attacker is not present in the option list.
+        opt_ids = [str(o.get("permanent_id") or "") for o in pending["options"]]
+        if not all(any(oid.startswith(p) for oid in opt_ids) for p in attacker_ids):
+            return None
+        normalized["pending"] = pending
+    elif kind == "block":
+        attacker_ids = [a["id_prefix"] for a in observed.get("attackers") or []]
+        pending = _blockers_pending_from_state(source_snapshot, perspective_id, attacker_ids)
+        if pending is None:
+            return None
+        # Verify every block-assignment's blocker UUID is in options.
+        opt_ids = [str(o.get("permanent_id") or "") for o in pending["options"]]
+        for assignment in observed.get("assignments") or []:
+            blk_prefix = str(assignment.get("blocker_id_prefix") or "")
+            if not any(oid.startswith(blk_prefix) for oid in opt_ids):
+                return None
+        normalized["pending"] = pending
     return _ChoiceCandidate(
         kind=kind,
         game_id=game_id,
@@ -601,45 +790,57 @@ def _extract_candidates(
                 if made is not None:
                     candidates.append(made)
 
-        if row_type == "LOG" and "Declare Attackers Step" in desc:
-            target = _next_non_priority(events, idx)
-            if target is not None and "attack" in enabled_kinds:
-                label = _attack_label(str(target.get("description") or ""))
-                if label is not None:
-                    actor_id = _player_id_by_name(snapshot, str(label.get("actor_name") or ""))
-                    made = _make_candidate(
-                        kind="attack",
-                        archive_member=archive_member,
-                        game_id=meta.game_id,
-                        source=row,
-                        target=target,
-                        perspective_id=actor_id or str(snapshot.get("activePlayerId") or ""),
-                        perspective_name=str(label.get("actor_name") or ""),
-                        observed=label,
-                    )
-                    if made is not None:
-                        candidates.append(made)
-
-        if row_type == "LOG" and "Declare Blockers Step" in desc:
-            target = _next_non_priority(events, idx)
-            if target is not None and "block" in enabled_kinds:
-                label = _block_label(str(target.get("description") or ""))
-                if label is not None:
-                    actor_id = _player_id_by_name(snapshot, str(label.get("actor_name") or ""))
-                    if not actor_id:
-                        actor_id = _opponent_id(snapshot, str(snapshot.get("activePlayerId") or ""))
-                    made = _make_candidate(
-                        kind="block",
-                        archive_member=archive_member,
-                        game_id=meta.game_id,
-                        source=row,
-                        target=target,
-                        perspective_id=actor_id,
-                        perspective_name=str(label.get("actor_name") or ""),
-                        observed=label,
-                    )
-                    if made is not None:
-                        candidates.append(made)
+        if row_type == "LOG":
+            header = _parse_attacks_header(desc)
+            if header is not None:
+                if "attack" in enabled_kinds:
+                    observed = _attack_observed(events, idx, header)
+                    if observed["attackers"]:
+                        actor_id = _player_id_by_name(snapshot, header["attacker_player"])
+                        made = _make_candidate(
+                            kind="attack",
+                            archive_member=archive_member,
+                            game_id=meta.game_id,
+                            source=row,
+                            target=row,
+                            perspective_id=actor_id or str(snapshot.get("activePlayerId") or ""),
+                            perspective_name=header["attacker_player"],
+                            observed=observed,
+                        )
+                        if made is not None:
+                            candidates.append(made)
+                if "block" in enabled_kinds:
+                    block_observed = _block_observed(events, idx, header)
+                    if block_observed is not None:
+                        defender_name = header["defender_player"]
+                        actor_id = _player_id_by_name(snapshot, defender_name)
+                        if not actor_id:
+                            actor_id = _opponent_id(
+                                snapshot, str(snapshot.get("activePlayerId") or "")
+                            )
+                        # Find the snapshot at the first Attacker: row (step
+                        # DECLARE_BLOCKERS) so candidate blocker filtering
+                        # reflects the post-declare-attackers board.
+                        block_source = row
+                        for jrow in events[idx + 1 :]:
+                            if str(jrow.get("type") or "") != "LOG":
+                                continue
+                            jdesc = str(jrow.get("description") or "")
+                            if jdesc.startswith("Attacker:"):
+                                block_source = jrow
+                                break
+                        made = _make_candidate(
+                            kind="block",
+                            archive_member=archive_member,
+                            game_id=meta.game_id,
+                            source=block_source,
+                            target=block_source,
+                            perspective_id=actor_id,
+                            perspective_name=defender_name,
+                            observed=block_observed,
+                        )
+                        if made is not None:
+                            candidates.append(made)
 
         if "may" in enabled_kinds:
             label = _may_label(events, idx)

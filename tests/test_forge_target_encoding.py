@@ -171,6 +171,69 @@ def test_attackers_translates_two_attackers() -> None:
     _assert_grammar_legal(spec, target)
 
 
+def test_attackers_translates_new_format_by_id_prefix() -> None:
+    """Real-Forge-log format: observed carries [{name, id_prefix}, ...]."""
+
+    options = [
+        _opt(
+            id="3c792cf2-befb-4440-a7d7-f3a26a680b61",
+            kind="attacker",
+            card_name="Forest",
+            permanent_id="3c792cf2-befb-4440-a7d7-f3a26a680b61",
+        ),
+        _opt(
+            id="bc148f21-3f0b-4ea5-8624-cfba2554d608",
+            kind="attacker",
+            card_name="Forest",
+            permanent_id="bc148f21-3f0b-4ea5-8624-cfba2554d608",
+        ),
+        _opt(
+            id="acd1075b-c185-45dd-9f86-48b21d4e1ee8",
+            kind="attacker",
+            card_name="Plains",
+            permanent_id="acd1075b-c185-45dd-9f86-48b21d4e1ee8",
+        ),
+    ]
+    pending = _pending("attackers", options)
+    observed = {
+        "raw": "PlayerA attacks PlayerB with 2 creatures",
+        "actor_name": "PlayerA",
+        "defender_name": "PlayerB",
+        "attackers": [
+            {"name": "Forest", "id_prefix": "bc1"},
+            {"name": "Forest", "id_prefix": "3c7"},
+        ],
+    }
+    target = translate_attackers(pending, observed)
+    assert target is not None
+    # Tokens: OPEN, ATTACK, ptr, DEFENDER, ptr, ATTACK, ptr, DEFENDER, ptr, END
+    # Subject indices reflect the order observed: option 1 then option 0.
+    assert target.output_pointer_subjects[2] == 1  # first ATTACK ptr
+    assert target.output_pointer_subjects[6] == 0  # second ATTACK ptr
+    spec = DecisionSpec(
+        decision_type=DecisionType.DECLARE_ATTACKERS,
+        anchors=(
+            [
+                PointerAnchor(
+                    kind=AnchorKind.LEGAL_ATTACKER,
+                    token_position=10 + i,
+                    subject_index=i,
+                )
+                for i in range(len(options))
+            ]
+            + [
+                PointerAnchor(
+                    kind=AnchorKind.DEFENDER,
+                    token_position=20 + i,
+                    subject_index=i,
+                )
+                for i in range(2)
+            ]
+        ),
+    )
+    _assert_grammar_legal(spec, target)
+
+
 # --------------------------------------------------------------------------- #
 # DECLARE_BLOCKERS                                                            #
 # --------------------------------------------------------------------------- #
@@ -209,6 +272,74 @@ def test_blockers_translates_one_block() -> None:
     assert target.decision_type == int(DecisionType.DECLARE_BLOCKERS)
     assert target.output_token_ids[0] == int(GrammarVocab.DECLARE_BLOCKERS_OPEN)
     assert target.output_token_ids[-1] == int(GrammarVocab.END)
+
+    bitmap = np.ones((2, 1), dtype=np.bool_)
+    spec = DecisionSpec(
+        decision_type=DecisionType.DECLARE_BLOCKERS,
+        anchors=(
+            [
+                PointerAnchor(
+                    kind=AnchorKind.LEGAL_BLOCKER,
+                    token_position=10 + i,
+                    subject_index=i,
+                )
+                for i in range(2)
+            ]
+            + [
+                PointerAnchor(
+                    kind=AnchorKind.LEGAL_ATTACKER,
+                    token_position=30,
+                    subject_index=0,
+                )
+            ]
+        ),
+        legal_edge_bitmap=bitmap,
+    )
+    _assert_grammar_legal(spec, target)
+
+
+def test_blockers_translates_new_format_by_id_prefix() -> None:
+    """Real-Forge-log format: observed carries assignments with id prefixes."""
+
+    attacker_id = "c828901c-42b5-4359-baa2-b6f6f7ae183f"  # Craw Wurm [c82]
+    blocker_id = "df484445-d419-4485-a2f3-f8b2e2892dd5"  # Djinn Token [df4]
+    other_blocker_id = "aaaa1234-0000-0000-0000-000000000000"
+    options = [
+        _opt(
+            id=blocker_id,
+            kind="block",
+            card_name="Djinn Token",
+            permanent_id=blocker_id,
+            valid_targets=[{"id": attacker_id, "label": "Craw Wurm"}],
+        ),
+        _opt(
+            id=other_blocker_id,
+            kind="block",
+            card_name="Wall of Stone",
+            permanent_id=other_blocker_id,
+            valid_targets=[{"id": attacker_id, "label": "Craw Wurm"}],
+        ),
+    ]
+    pending = _pending("blockers", options)
+    observed = {
+        "raw": "PlayerA attacks PlayerB with 1 creature (blockers declared)",
+        "actor_name": "PlayerB",
+        "attacker_player": "PlayerA",
+        "attackers": [{"name": "Craw Wurm", "id_prefix": "c82"}],
+        "assignments": [
+            {
+                "attacker_name": "Craw Wurm",
+                "attacker_id_prefix": "c82",
+                "blocker_name": "Djinn Token",
+                "blocker_id_prefix": "df4",
+            }
+        ],
+    }
+    target = translate_blockers(pending, observed)
+    assert target is not None
+    # OPEN, BLOCK, ptr_blk=0, ATTACKER, ptr_atk=0, END
+    assert target.output_pointer_subjects[2] == 0  # blocker subject = option 0
+    assert target.output_pointer_subjects[4] == 0  # attacker subject = first attacker
 
     bitmap = np.ones((2, 1), dtype=np.bool_)
     spec = DecisionSpec(
