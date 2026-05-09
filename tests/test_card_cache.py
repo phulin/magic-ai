@@ -237,7 +237,7 @@ def test_cached_tokens_match_snapshot_render(
     """
 
     name = "Lightning Bolt"
-    rendered = render_snapshot(_single_card_snapshot(name), [], oracle=oracle)
+    rendered = render_snapshot(_single_card_snapshot(name), oracle=oracle)
     # Hand has no status flags for an instant -> the inline body == cache body.
     from magic_ai.text_encoder.render import render_card_body
 
@@ -306,7 +306,7 @@ def test_cached_tokens_match_snapshot_render_multi_face(
     assert "<mana-cost>{1}{B}</mana-cost>" in body_text
     assert "<mana-cost>{7}{B}{R}</mana-cost>" in body_text
 
-    rendered = render_snapshot(_single_card_snapshot(name), [], oracle=multi_oracle)
+    rendered = render_snapshot(_single_card_snapshot(name), oracle=multi_oracle)
     assert body_text in rendered.text
 
     # Row 1 == only real card in this single-name cache.

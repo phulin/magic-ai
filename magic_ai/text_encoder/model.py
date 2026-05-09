@@ -760,59 +760,6 @@ def gather_state_vector_packed(hidden: Tensor, batch: PackedTextBatch) -> Tensor
     return hidden.index_select(0, batch.state_positions)
 
 
-class InlineBlankPolicy(nn.Module):
-    """Score each inline blank against its legal token-id candidates.
-
-    This reuses the tied input embedding matrix as the output vocabulary
-    projection, but only gathers the legal rows for each blank instead of
-    materializing a full-vocabulary logits tensor.
-    """
-
-    def __init__(
-        self,
-        embed: nn.Embedding,
-        decoder_dense: nn.Linear,
-        decoder_norm: nn.Module,
-        *,
-        num_kinds: int,
-    ) -> None:
-        super().__init__()
-        self.embed = embed
-        self.decoder_dense = decoder_dense
-        self.decoder_norm = decoder_norm
-        self.kind_temperature = nn.Embedding(num_kinds, 1)
-        nn.init.ones_(self.kind_temperature.weight)
-
-    def forward(
-        self,
-        hidden: Tensor,
-        blank_positions: Tensor,
-        blank_kind: Tensor,
-        blank_legal_ids: Tensor,
-        blank_legal_mask: Tensor,
-    ) -> Tensor:
-        positions = blank_positions.to(device=hidden.device)
-        if hidden.dim() == 3:
-            blank_h, _ = _gather_at(hidden, positions)
-        elif hidden.dim() == 2:
-            blank_h, _ = _gather_packed(hidden, positions)
-        else:
-            raise ValueError(f"hidden must be rank 2 or 3, got shape {tuple(hidden.shape)}")
-
-        blank_h = self.decoder_norm(F.gelu(self.decoder_dense(blank_h)))
-        legal_ids = blank_legal_ids.to(device=hidden.device)
-        legal_mask = blank_legal_mask.to(device=hidden.device, dtype=torch.bool)
-        legal_emb = self.embed(legal_ids)
-        logits = (legal_emb * blank_h.unsqueeze(-2)).sum(dim=-1)
-
-        safe_kind = blank_kind.to(device=hidden.device).clamp(
-            min=0, max=self.kind_temperature.num_embeddings - 1
-        )
-        temp = self.kind_temperature(safe_kind).squeeze(-1).unsqueeze(-1).to(logits.dtype)
-        logits = logits * temp
-        return logits.masked_fill(~legal_mask, float("-inf"))
-
-
 class _MLP(nn.Module):
     def __init__(self, in_dim: int, hidden: int, out_dim: int) -> None:
         super().__init__()
@@ -839,7 +786,6 @@ class ValueHead(nn.Module):
 __all__ = [
     "TextEncoderConfig",
     "TextStateEncoder",
-    "InlineBlankPolicy",
     "ValueHead",
     "DEFAULT_HF_ENCODER_MODEL",
     "gather_card_vectors",

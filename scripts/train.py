@@ -45,6 +45,8 @@ from magic_ai.actions import (  # noqa: E402
     TARGET_SCALAR_DIM,
     TRACE_KIND_VALUES,
     ActionRequest,
+    ActionTrace,
+    PolicyStep,
     action_from_choice_accepted,
 )
 from magic_ai.game_state import (  # noqa: E402
@@ -102,12 +104,66 @@ from magic_ai.slot_encoder.native_rollout import (  # noqa: E402
 from magic_ai.text_encoder.actor_critic import (  # noqa: E402
     NativeTextReplayPayload,
     TextActorCritic,  # noqa: E402
-    TextDecisionLayout,
-    _decode_text_action,
-    build_text_decision_layout,
-    infer_text_trace_kind,
 )
-from magic_ai.text_encoder.batch import collate, tokenize_snapshot  # noqa: E402
+
+
+# Inline-blank → grammar-decoder cutover artifacts.
+#
+# These four helpers were the inline-blank-shaped sampling / staging surface
+# of the native batched IMPALA text rollout (``train_text_native_batched_envs``
+# and its IMPALA actor loop ``run_text_rollouts_actor_loop``). They each
+# encoded inline-blank-specific data shapes that the grammar decoder no
+# longer produces:
+#
+# * ``TextDecisionLayout`` / ``build_text_decision_layout`` packed per-blank
+#   (option_idx, target_idx, mask, none-head) tensors per row.
+# * ``infer_text_trace_kind`` mapped a ``PendingState`` to the inline-blank
+#   ``TraceKind`` consumed by the staging buffer's ``trace_kind_id`` column.
+# * ``_decode_text_action`` translated ``selected_choice_cols`` (one column
+#   per blank) back into an engine ``ActionRequest``.
+#
+# The decoder pipeline replaces those with per-row ``DecoderDecisionLayout``
+# objects sampled by ``TextActorCritic.sample_batch`` and decoded via
+# ``decode_decoder_action``. The single-policy in-process rollout
+# (``train_text_envs`` → ``sample_text_policy_batch``) is wired to that path
+# below.
+#
+# The IMPALA actor / inference-server pipeline still routes through Go-side
+# selected_choice_cols and was not migrated in this commit — its native
+# dispatch (``TextInferenceServer`` and ``TextRolloutActor``) needs an
+# end-to-end protocol redesign around decoder layouts. Until that lands,
+# the four stubs raise so callers fail loudly rather than silently producing
+# nonsense actions.
+class TextDecisionLayout:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise NotImplementedError(
+            "TextDecisionLayout is part of the inline-blank IMPALA path; "
+            "the decoder cutover replaced it with DecoderDecisionLayout."
+        )
+
+
+def build_text_decision_layout(*args: Any, **kwargs: Any) -> TextDecisionLayout:  # type: ignore[empty-body]
+    raise NotImplementedError(
+        "build_text_decision_layout was removed in the decoder cutover; "
+        "use DecoderDecisionLayout via TextActorCritic.sample_batch."
+    )
+
+
+def infer_text_trace_kind(*args: Any, **kwargs: Any) -> int:  # type: ignore[empty-body]
+    raise NotImplementedError(
+        "infer_text_trace_kind was removed in the decoder cutover; "
+        "the decoder samples per-row DecisionType, see decode_decoder_action."
+    )
+
+
+def _decode_text_action(*args: Any, **kwargs: Any) -> Any:
+    raise NotImplementedError(
+        "_decode_text_action consumed inline-blank selected_choice_cols; "
+        "the decoder pipeline uses decode_decoder_action(pending, layout) "
+        "from magic_ai.text_encoder.actor_critic."
+    )
+
+
 from magic_ai.text_encoder.card_cache import (  # noqa: E402
     DEFAULT_ORACLE_DB_PATH,
     CardTokenCache,
@@ -131,16 +187,21 @@ from magic_ai.text_encoder.policy_value_pretrain import (  # noqa: E402
     batches_per_epoch,
 )
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig  # noqa: E402
-from magic_ai.text_encoder.render import OracleEntry, render_snapshot  # noqa: E402
+from magic_ai.text_encoder.render import OracleEntry  # noqa: E402
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer  # noqa: E402
 from magic_ai.text_encoder.tokenizer import (  # noqa: E402
     MAX_CARD_REFS,
-    MAX_NUM,
     MODERNBERT_REPO,
     MODERNBERT_REVISION,
     TOKENIZER_DIR,
     load_tokenizer,
 )
+
+# Inline-blank pipeline used a fixed ``<num:k>`` token table; the decoder
+# pipeline emits digits via the grammar so MAX_NUM is no longer a tokenizer
+# constant. Keep a local upper bound for the few legacy rollout helpers in
+# this script that haven't been ported to the decoder yet.
+MAX_NUM = 64
 
 DEFAULT_DECK = {
     "name": "bolt-mountain",
@@ -369,7 +430,24 @@ class TextTrainingBackend:
 
 
 class NativeTextTrajectoryBuffer:
-    """Fixed-width per-env staging for native text rollouts before replay commit."""
+    """Fixed-width per-env staging for the native batched IMPALA text rollout.
+
+    The inline-blank cutover removed the per-blank tensor schema this class
+    was built around (``blank_positions`` / ``blank_kind`` / ``decision_*``
+    rectangles per env-step). The decoder pipeline writes per-row
+    :class:`DecoderDecisionPayload` records via
+    :meth:`TextReplayBuffer.commit_decoder_decision`, so a decoder-shaped
+    replacement would be a much smaller class — but the surrounding native
+    actor / inference-server pipeline (``TextRolloutActor``,
+    ``TextInferenceServer``, the Go-side ``selected_choice_cols`` contract)
+    still speaks inline-blank, so wiring just this one piece would not yield
+    a working pipeline.
+
+    Until the IMPALA actor protocol is redesigned around decoder layouts,
+    constructing this raises and the only working text-rollout entry point
+    is the in-process single-env loop driven by
+    :func:`sample_text_policy_batch`.
+    """
 
     def __init__(
         self,
@@ -379,23 +457,14 @@ class NativeTextTrajectoryBuffer:
         max_steps: int,
         validate: bool = True,
     ) -> None:
-        self.num_envs = int(num_envs)
-        self.max_steps = int(max_steps)
-        self.validate = bool(validate)
-        self.device = replay_buffer.device
-        self.max_tokens = replay_buffer.max_tokens
-        self.max_options = replay_buffer.max_options
-        self.max_targets_per_option = replay_buffer.max_targets_per_option
-        self.max_blanks_per_row = replay_buffer.max_blanks_per_row
-        self.max_legal_per_blank = replay_buffer.max_legal_per_blank
-        self.max_decision_groups = replay_buffer.max_decision_groups
-        self.max_cached_choices = replay_buffer.max_cached_choices
-        self.max_card_refs = replay_buffer.max_card_refs
-        self.max_blanks_per_row = replay_buffer.max_blanks_per_row
-        self.max_legal_per_blank = replay_buffer.max_legal_per_blank
-        self.recurrent_layers = replay_buffer.recurrent_layers
-        self.recurrent_hidden_dim = replay_buffer.recurrent_hidden_dim
-        self.lstm_proj_hidden = replay_buffer.lstm_proj_hidden
+        del replay_buffer, num_envs, max_steps, validate
+        raise NotImplementedError(
+            "NativeTextTrajectoryBuffer staged inline-blank-shaped rollouts; "
+            "the IMPALA actor/inference-server pipeline still speaks the "
+            "inline-blank protocol. Migrate scripts/train.py "
+            "train_text_native_batched_envs and magic_ai/native/inference_server.py "
+            "to the decoder pipeline before re-enabling this entry point."
+        )
         self._lock = threading.Lock()
         self.timing_stats: Any | None = None
         shape = (self.num_envs, self.max_steps)
@@ -1201,61 +1270,103 @@ def sample_text_policy_batch(
     env_indices: list[int],
     perspective_player_indices: list[int],
     deterministic: bool = False,
-) -> list[Any]:
-    """Render/tokenize text batches and sample policy actions with replay rows."""
+) -> list[PolicyStep]:
+    """Encode snapshots, sample one decoder action per row, return PolicyStep list.
+
+    Cutover note: the inline-blank tokens (``<chosen>`` / ``<yes>`` / ``<num:k>``
+    …) are gone; the renderer is now decision-agnostic and the grammar decoder
+    samples per-row token sequences. We translate each sampled sequence into
+    an :class:`ActionRequest` via ``decode_decoder_action``.
+    """
+
+    from magic_ai.text_encoder.actor_critic import (
+        decode_decoder_action,
+    )
+    from magic_ai.text_encoder.policy import TextPolicy
 
     n = len(snapshots)
     if n == 0:
         return []
     if len(pendings) != n or len(env_indices) != n or len(perspective_player_indices) != n:
         raise ValueError("snapshots, pendings, env_indices, and players differ")
-    examples = []
-    layouts = []
-    max_cached_choices = backend.replay_buffer.max_cached_choices
-    render_token_ids = _render_token_ids(backend.tokenizer)
-    for snapshot, pending in zip(snapshots, pendings, strict=True):
-        options = list(pending.get("options", []) or [])
-        rendered = render_snapshot(
-            snapshot,
-            options,
-            oracle=backend.oracle,
-            chosen_token_id=cast(int, render_token_ids["chosen"]),
-            none_token_id=cast(int, render_token_ids["none"]),
-            yes_token_id=cast(int, render_token_ids["yes"]),
-            no_token_id=cast(int, render_token_ids["no"]),
-            mulligan_token_id=cast(int, render_token_ids["mulligan"]),
-            keep_token_id=cast(int, render_token_ids["keep"]),
-            self_token_id=cast(int, render_token_ids["self"]),
-            opp_token_id=cast(int, render_token_ids["opp"]),
-            num_token_ids=cast(list[int], render_token_ids["num"]),
-            mana_token_ids=cast(list[int], render_token_ids["mana"]),
-            card_ref_token_ids=cast(list[int], render_token_ids["card_ref"]),
-        )
-        examples.append(tokenize_snapshot(rendered, backend.tokenizer))
-        trace_kind = infer_text_trace_kind(pending)
-        layouts.append(
-            build_text_decision_layout(
-                trace_kind,
-                pending,
-                max_options=args.max_options,
-                max_targets_per_option=args.max_targets_per_option,
-                max_cached_choices=max_cached_choices,
-            )
-        )
 
-    pad_id = backend.tokenizer.pad_token_id
-    if pad_id is None:
-        raise ValueError("text tokenizer must define pad_token_id")
-    encoded = collate(examples, pad_id=int(pad_id))
+    encoded = TextPolicy.encode_snapshots(snapshots, backend.oracle, backend.tokenizer)
     if int(encoded.token_ids.shape[1]) > int(args.text_max_tokens):
         encoded = _truncate_text_batch(encoded, max_tokens=int(args.text_max_tokens))
-    return backend.policy.sample_text_batch(
-        encoded,
-        env_indices=env_indices,
-        perspective_player_indices=perspective_player_indices,
-        layouts=layouts,
-        deterministic=deterministic,
+
+    device = backend.policy.device
+    moved = type(encoded)(
+        token_ids=encoded.token_ids.to(device=device, dtype=torch.long),
+        attention_mask=encoded.attention_mask.to(device=device, dtype=torch.long),
+        card_ref_positions=encoded.card_ref_positions.to(device=device, dtype=torch.long),
+        seq_lengths=encoded.seq_lengths.to(device=device, dtype=torch.long),
+        spec_tokens=encoded.spec_tokens.to(device=device),
+        spec_lens=encoded.spec_lens.to(device=device),
+        decision_type=encoded.decision_type.to(device=device, dtype=torch.long),
+        pointer_anchor_positions=encoded.pointer_anchor_positions.to(device=device),
+        pointer_anchor_kinds=encoded.pointer_anchor_kinds.to(device=device),
+        pointer_anchor_subjects=encoded.pointer_anchor_subjects.to(device=device),
+        pointer_anchor_handles=encoded.pointer_anchor_handles.to(device=device),
+        legal_edge_bitmap=(
+            encoded.legal_edge_bitmap.to(device=device)
+            if encoded.legal_edge_bitmap is not None
+            else None
+        ),
     )
+
+    with torch.no_grad():
+        sample = backend.policy.sample_batch(
+            moved,
+            env_indices=env_indices,
+            perspective_player_indices=perspective_player_indices,
+            deterministic=deterministic,
+        )
+
+    out: list[PolicyStep] = []
+    for i, (pending, layout) in enumerate(zip(pendings, sample.decoded, strict=True)):
+        action = decode_decoder_action(pending, layout)
+        # Sum the per-step log probs over valid (pre-PAD) tokens for the row.
+        per_step = sample.log_probs[i]
+        pad = layout.output_pad_mask.to(device=per_step.device)
+        log_prob = (per_step * pad.to(dtype=per_step.dtype)).sum().detach().cpu()
+        trace = ActionTrace(
+            kind=_decision_type_to_trace_kind(int(layout.decision_type)),
+        )
+        out.append(
+            PolicyStep(
+                action=action,
+                trace=trace,
+                log_prob=log_prob,
+                value=torch.zeros((), dtype=torch.float32),
+                entropy=torch.zeros((), dtype=torch.float32),
+                replay_idx=None,
+            )
+        )
+    return out
+
+
+def _decision_type_to_trace_kind(decision_type: int) -> str:
+    """Map a :class:`DecisionType` to the legacy :data:`TraceKind` string.
+
+    Trace kinds are still used by transcript / sample-game logging machinery
+    that predates the decoder cutover; we keep the surface stable and route
+    decoder decisions to the closest legacy bucket.
+    """
+
+    from magic_ai.text_encoder.decision_spec import DecisionType
+
+    if decision_type < 0:
+        return "priority"
+    dt = DecisionType(decision_type)
+    return {
+        DecisionType.PRIORITY: "priority",
+        DecisionType.DECLARE_ATTACKERS: "attackers",
+        DecisionType.DECLARE_BLOCKERS: "blockers",
+        DecisionType.CHOOSE_TARGETS: "choice_index",
+        DecisionType.MAY: "may",
+        DecisionType.CHOOSE_MODE: "choice_index",
+        DecisionType.CHOOSE_X: "choice_index",
+    }[dt]
 
 
 def _single_token_id(tokenizer: Any, token: str) -> int:

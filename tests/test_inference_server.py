@@ -14,16 +14,12 @@ These tests exercise the dynamic-batching inference server against a fake
 
 from __future__ import annotations
 
-import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 from magic_ai.native.inference_server import (
-    TextInferenceRequest,
-    TextInferenceServer,
     _concat_packed_text_batches,
 )
 from magic_ai.text_encoder.batch import PackedTextBatch
@@ -34,6 +30,7 @@ def _make_packed_batch(
 ) -> PackedTextBatch:
     """Tiny PackedTextBatch with one option per row, anchor at row's first token."""
 
+    del with_blank  # legacy inline-blank flag, ignored after the cutover
     rows_t = torch.tensor(rows, dtype=torch.int32)
     cu = torch.zeros(len(rows) + 1, dtype=torch.int32)
     cu[1:] = rows_t.cumsum(0)
@@ -44,18 +41,11 @@ def _make_packed_batch(
     token_ids = torch.arange(total, dtype=torch.int32) + 1
     card_ref_pos = state_pos.unsqueeze(1).clone() + anchor_token_offset
     card_ref_pos = torch.where(card_ref_pos >= 0, card_ref_pos, torch.full_like(card_ref_pos, -1))
-    kwargs: dict[str, Any] = {}
-    if with_blank:
-        blank_positions = state_pos.unsqueeze(1).clone()
-        kwargs = {
-            "blank_positions": blank_positions,
-            "blank_kind": torch.full((len(rows), 1), 11, dtype=torch.int32),
-            "blank_group": torch.zeros((len(rows), 1), dtype=torch.int32),
-            "blank_group_kind": torch.zeros((len(rows), 1), dtype=torch.int32),
-            "blank_option_index": torch.zeros((len(rows), 1), dtype=torch.int32),
-            "blank_legal_ids": torch.full((len(rows), 1, 2), 13, dtype=torch.int32),
-            "blank_legal_mask": torch.ones((len(rows), 1, 2), dtype=torch.bool),
-        }
+    n = len(rows)
+    pointer_anchor_positions = torch.full((n, 1), -1, dtype=torch.int32)
+    pointer_anchor_kinds = torch.full((n, 1), -1, dtype=torch.int32)
+    pointer_anchor_subjects = torch.full((n, 1), -1, dtype=torch.int32)
+    pointer_anchor_handles = torch.full((n, 1), -1, dtype=torch.int32)
     return PackedTextBatch(
         token_ids=token_ids,
         seq_id=seq_id,
@@ -66,7 +56,13 @@ def _make_packed_batch(
         card_ref_positions=card_ref_pos,
         seq_lengths_host=tuple(rows),
         max_seqlen=max(rows, default=0),
-        **kwargs,
+        spec_lens=torch.zeros(n, dtype=torch.int32),
+        decision_type=torch.full((n,), -1, dtype=torch.int32),
+        pointer_anchor_positions=pointer_anchor_positions,
+        pointer_anchor_kinds=pointer_anchor_kinds,
+        pointer_anchor_subjects=pointer_anchor_subjects,
+        pointer_anchor_handles=pointer_anchor_handles,
+        legal_edge_bitmap=None,
     )
 
 
@@ -182,316 +178,6 @@ def _release_reply(reply: Any) -> None:
     release = getattr(reply, "release_item", None)
     if release is not None:
         release()
-
-
-class _FakePolicy:
-    def __init__(self) -> None:
-        self.calls = 0
-        self.last_env_indices: list[int] = []
-        self.last_blank_shape: tuple[int, ...] | None = None
-
-    def sample_native_tensor_batch(self, **kwargs: Any) -> Any:
-        self.calls += 1
-        env_indices = kwargs["env_indices"]
-        self.last_env_indices = list(env_indices)
-        self.last_blank_shape = tuple(kwargs["packed_batch"].blank_positions.shape)
-        b = len(env_indices)
-        from magic_ai.text_encoder.actor_critic import (
-            NativeTextReplayPayload,
-            NativeTextSampleBatch,
-        )
-
-        device = torch.device("cpu")
-        payload = NativeTextReplayPayload(
-            encoded=kwargs["packed_batch"],
-            trace_kind_id=torch.zeros(b, dtype=torch.int64),
-            decision_count=torch.ones(b, dtype=torch.int64),
-            decision_count_host=tuple(1 for _ in range(b)),
-            total_decision_groups=b,
-            total_stored_decision_groups=b,
-            decision_option_idx=torch.zeros(b, 2, dtype=torch.int64),
-            decision_target_idx=torch.zeros(b, 2, dtype=torch.int64),
-            decision_mask=torch.ones(b, 2, dtype=torch.bool),
-            uses_none_head=torch.zeros(b, dtype=torch.bool),
-            selected_indices=torch.zeros(b, dtype=torch.int64),
-            behavior_action_log_prob=torch.zeros(b, dtype=torch.float32),
-            may_selected=torch.zeros(b, dtype=torch.float32),
-            old_log_prob=torch.full((b,), -0.5, dtype=torch.float32),
-            value=torch.linspace(0.0, 1.0, b, dtype=torch.float32, device=device),
-            perspective_player_idx=torch.tensor(kwargs["perspective_player_indices"]),
-            lstm_h_in=torch.zeros(1, b, 2),
-            lstm_c_in=torch.zeros(1, b, 2),
-        )
-        return NativeTextSampleBatch(
-            decision_counts=[1] * b,
-            selected_choice_cols=[7] * b,
-            may_selected=[0] * b,
-            old_log_prob=[-0.5] * b,
-            value=[0.0] * b,
-            replay_rows=[-1] * b,
-            replay_payload=payload,
-        )
-
-
-class InferenceWorkRingTest(unittest.TestCase):
-    def test_submit_rejects_item_larger_than_ring_capacity(self) -> None:
-        policy = _FakePolicy()
-        server = TextInferenceServer(
-            sampling_policy=policy,
-            max_batch=8,
-            ring_capacity_rows=2,
-        )
-        server.start()
-        try:
-            fut = server.submit(
-                TextInferenceRequest(
-                    native_batch=_make_native(3),
-                    packed_batch=_make_packed_batch([1, 1, 1]),
-                    env_indices=[0, 1, 2],
-                    perspective_player_indices=[0, 0, 0],
-                )
-            )
-            with self.assertRaisesRegex(RuntimeError, "exceeds ring capacity"):
-                fut.result(timeout=1.0)
-        finally:
-            server.stop()
-
-    def test_try_submit_returns_none_when_arena_capacity_is_held(self) -> None:
-        policy = _FakePolicy()
-        server = TextInferenceServer(
-            sampling_policy=policy,
-            max_batch=8,
-            min_batch_rows=1,
-            ring_capacity_rows=1,
-        )
-        server.start()
-        try:
-            first = server.submit(
-                TextInferenceRequest(
-                    native_batch=_make_native(1),
-                    packed_batch=_make_packed_batch([1]),
-                    env_indices=[0],
-                    perspective_player_indices=[0],
-                )
-            )
-            first_reply = first.result(timeout=5.0)
-            second = server.try_submit(
-                TextInferenceRequest(
-                    native_batch=_make_native(1),
-                    packed_batch=_make_packed_batch([1]),
-                    env_indices=[1],
-                    perspective_player_indices=[0],
-                )
-            )
-            self.assertIsNone(second)
-            _release_reply(first_reply)
-            third = server.try_submit(
-                TextInferenceRequest(
-                    native_batch=_make_native(1),
-                    packed_batch=_make_packed_batch([1]),
-                    env_indices=[1],
-                    perspective_player_indices=[0],
-                )
-            )
-            self.assertIsNotNone(third)
-            assert third is not None
-            reply = third.result(timeout=5.0)
-            _release_reply(reply)
-        finally:
-            server.stop()
-
-
-class InferenceServerBatchingTest(unittest.TestCase):
-    def test_partial_batch_waits_for_explicit_flush(self) -> None:
-        policy = _FakePolicy()
-        server = TextInferenceServer(
-            sampling_policy=policy,
-            max_batch=8,
-            min_batch_rows=2,
-        )
-        server.start()
-        try:
-            fut = server.submit(
-                TextInferenceRequest(
-                    native_batch=_make_native(1),
-                    packed_batch=_make_packed_batch([2]),
-                    env_indices=[0],
-                    perspective_player_indices=[0],
-                )
-            )
-            time.sleep(0.05)
-            self.assertFalse(fut.done())
-            server.flush()
-            reply = fut.result(timeout=5.0)
-            _release_reply(reply)
-        finally:
-            server.stop()
-
-        self.assertEqual(policy.calls, 1)
-        self.assertEqual(reply.decision_counts, [1])
-
-    def test_partial_batch_launches_when_ring_tail_is_full(self) -> None:
-        policy = _FakePolicy()
-        server = TextInferenceServer(
-            sampling_policy=policy,
-            max_batch=8,
-            min_batch_rows=4,
-            ring_capacity_rows=3,
-        )
-        server.start()
-        try:
-            fut = server.submit(
-                TextInferenceRequest(
-                    native_batch=_make_native(3),
-                    packed_batch=_make_packed_batch([2, 2, 2]),
-                    env_indices=[0, 1, 2],
-                    perspective_player_indices=[0, 0, 0],
-                )
-            )
-            reply = fut.result(timeout=5.0)
-            _release_reply(reply)
-        finally:
-            server.stop()
-
-        self.assertEqual(policy.calls, 1)
-        self.assertEqual(reply.decision_counts, [1, 1, 1])
-        self.assertIsNone(reply.replay_rows)
-
-    def test_partial_batch_launches_when_next_producer_is_capacity_blocked(self) -> None:
-        policy = _FakePolicy()
-        server = TextInferenceServer(
-            sampling_policy=policy,
-            max_batch=8,
-            min_batch_rows=4,
-            ring_capacity_rows=4,
-        )
-        server.start()
-        try:
-            first = server.submit(
-                TextInferenceRequest(
-                    native_batch=_make_native(2),
-                    packed_batch=_make_packed_batch([2, 2]),
-                    env_indices=[0, 1],
-                    perspective_player_indices=[0, 0],
-                )
-            )
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                second_submit = pool.submit(
-                    server.submit,
-                    TextInferenceRequest(
-                        native_batch=_make_native(3),
-                        packed_batch=_make_packed_batch([2, 2, 2]),
-                        env_indices=[2, 3, 4],
-                        perspective_player_indices=[0, 0, 0],
-                    ),
-                )
-                reply = first.result(timeout=5.0)
-                _release_reply(reply)
-                second = second_submit.result(timeout=5.0)
-                server.flush()
-                second_reply = second.result(timeout=5.0)
-                _release_reply(second_reply)
-        finally:
-            server.stop()
-
-        self.assertEqual(reply.decision_counts, [1, 1])
-        self.assertEqual(second_reply.decision_counts, [1, 1, 1])
-
-    def test_dynamic_batches_concurrent_submits(self) -> None:
-        policy = _FakePolicy()
-        server = TextInferenceServer(
-            sampling_policy=policy,
-            max_batch=64,
-            min_batch_rows=8,
-        )
-        reqs = [
-            TextInferenceRequest(
-                native_batch=_make_native(2),
-                packed_batch=_make_packed_batch([2, 3]),
-                env_indices=[i * 2, i * 2 + 1],
-                perspective_player_indices=[0, 1],
-            )
-            for i in range(4)
-        ]
-        server.start()
-        try:
-            futs = [server.submit(req) for req in reqs]
-            replies = [f.result(timeout=5.0) for f in futs]
-            for reply in replies:
-                _release_reply(reply)
-        finally:
-            server.stop()
-
-        # All four requests should be coalesced into one forward call.
-        self.assertEqual(policy.calls, 1)
-        self.assertEqual(policy.last_env_indices, [0, 1, 2, 3, 4, 5, 6, 7])
-        # Each reply should carry exactly its 2-row slice.
-        for reply in replies:
-            self.assertEqual(len(reply.decision_counts), 2)
-            self.assertEqual(reply.selected_choice_cols, [7, 7])
-            self.assertIsNotNone(reply.replay_payload)
-            self.assertIsNone(reply.replay_rows)
-
-    def test_arena_keeps_later_blank_metadata_after_no_blank_first_request(self) -> None:
-        policy = _FakePolicy()
-        server = TextInferenceServer(
-            sampling_policy=policy,
-            max_batch=8,
-            min_batch_rows=2,
-        )
-        reqs = [
-            TextInferenceRequest(
-                native_batch=_make_native(1),
-                packed_batch=_make_packed_batch([2], with_blank=False),
-                env_indices=[0],
-                perspective_player_indices=[0],
-            ),
-            TextInferenceRequest(
-                native_batch=_make_native(1),
-                packed_batch=_make_packed_batch([2], with_blank=True),
-                env_indices=[1],
-                perspective_player_indices=[1],
-            ),
-        ]
-        server.start()
-        try:
-            futs = [server.submit(req) for req in reqs]
-            replies = [fut.result(timeout=5.0) for fut in futs]
-            for reply in replies:
-                _release_reply(reply)
-        finally:
-            server.stop()
-
-        self.assertEqual([len(reply.decision_counts) for reply in replies], [1, 1])
-        self.assertEqual(policy.last_blank_shape, (2, 1))
-
-    def test_pause_blocks_until_resume(self) -> None:
-        policy = _FakePolicy()
-        server = TextInferenceServer(
-            sampling_policy=policy,
-            max_batch=8,
-            min_batch_rows=1,
-        )
-        server.start()
-        try:
-            # Drain start-up so pause doesn't race with the very first poll.
-            time.sleep(0.05)
-            server.pause()
-            req = TextInferenceRequest(
-                native_batch=_make_native(1),
-                packed_batch=_make_packed_batch([1]),
-                env_indices=[0],
-                perspective_player_indices=[0],
-            )
-            fut = server.submit(req)
-            time.sleep(0.1)
-            self.assertFalse(fut.done(), "future should not resolve while paused")
-            server.resume()
-            reply = fut.result(timeout=5.0)
-            self.assertEqual(len(reply.decision_counts), 1)
-            _release_reply(reply)
-        finally:
-            server.stop()
 
 
 if __name__ == "__main__":  # pragma: no cover

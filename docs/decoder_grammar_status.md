@@ -2,6 +2,76 @@
 
 Tracking implementation of `docs/decoder_grammar_plan.md`.
 
+## Cutover status (2026-05-09)
+
+Phases 1–7 of the inline-blank → grammar-decoder cutover are landed on
+`decoder-cutover`. The Forge BC pretraining path, the Python rollout
+(`magic_ai/text_encoder/rollout.py`), the in-process train.py text-encoder
+path (`sample_text_policy_batch`), the actor-critic sampler/scorer, and the
+replay buffer all run on the decoder pipeline. Verification:
+
+- `pytest -x -q` → 313 passed, 1 skipped, 2 xfailed
+- `scripts/smoke_decoder_train.py` → smoke OK (sample + teacher-forced loss + grad)
+- `scripts/decoder_bc_parity.py` (V2 corpus, 30 steps) → priority accuracy 1.000
+- `mage-go go test ./cmd/pylib/...` → ok
+
+### What still uses inline blanks
+
+The native batched IMPALA actor pipeline
+(`train_text_native_batched_envs` → `run_text_rollouts_actor_loop`,
+`magic_ai/native/inference_server.py`, `magic_ai/native/rollout_actor.py`,
+the Go-side selected_choice_cols protocol, `NativeTextTrajectoryBuffer`)
+still expects inline-blank shapes. The four legacy stubs in
+`scripts/train.py` (`build_text_decision_layout`, `infer_text_trace_kind`,
+`_decode_text_action`, `NativeTextTrajectoryBuffer.__init__`) raise loudly
+on construction with a pointer to the decoder-shaped replacements.
+
+To re-enable that high-throughput path the following needs an end-to-end
+protocol redesign — none of the work is done:
+
+- `TextInferenceServer` request/response contract: replace
+  `selected_choice_cols`/`may_selected` with per-row decoder layouts
+  (output_token_ids, output_pointer_pos, output_is_pointer, output_pad_mask,
+  decision_type, pointer_anchor_handles).
+- `TextRolloutActor`: receive the decoder layout, call
+  `decode_decoder_action(pending, layout)`, drive the engine via
+  `step_by_choice` accordingly (Go-side `step_by_choice` may need a
+  per-decision-type dispatch since it currently expects flat
+  selected_choice_cols).
+- `NativeTextTrajectoryBuffer`: ring-buffer of `DecoderDecisionPayload`
+  records (one per env-step) instead of the inline-blank rectangles;
+  `commit_decoder_decision` already exists on the replay buffer.
+
+The single-policy in-process loop (`train_text_envs`) covers all current
+tested paths and is wired correctly; the IMPALA path is parked.
+
+### Forge BC corpus V2
+
+`scripts/extract_forge_choice_situations.py` previously wrote V1 records
+without `pending` state; the V2 decoder-target translator therefore had
+nothing to translate. The extractor now:
+
+- Accepts a `--zip` argument that may be either a zipfile or a directory
+  of `*.jsonl.gz` shards (Forge writes loose dirs in newer batches).
+- Builds a `pending` dict from `snapshot.playableActions` for priority
+  candidates, mapping Forge `kind` (`PLAY_LAND`/`CAST_SPELL`/`ACTIVATE`/
+  `ACTIVATE_MANA`) to the engine's `play`/`cast`/`activate` option kinds.
+- Recognizes the new Forge log description formats
+  (`STACK_PUSH <name> by <player>`, `<player> puts <name> [id] from hand
+  onto the Battlefield`) in addition to the legacy
+  `played`/`cast`/`activated` strings.
+
+`forge_target_encoding.translate_priority` now matches by structured
+`(card_name, is_land_play)` from the observed-event dict when present.
+
+The V2 corpus extracted from `data/games/` (1000 games) yields 4000 records
+with ~83% priority translation rate. Attack and block extraction is not yet
+ported to the new Forge log format — those translators expect
+`PlayerA assigned X to attack PlayerB` / `PlayerA blocked X with Y` log
+lines, but the current logs use `PlayerA attacks PlayerB with N creatures`
+followed by per-creature `Attacker:` / `Blocker:` lines. Re-porting
+`_attack_label` / `_block_label` is the next bounded follow-up.
+
 ## Done
 
 | Step | Description | Where |
@@ -141,3 +211,81 @@ mage-go/cmd/pylib/mage/__init__.py            (Python wrapper)
 ```
 
 Plus 35 Python + 16 Go test files.
+
+## Phase 7 (final cutover)
+
+Branch `decoder-cutover` at HEAD now passes:
+
+- `cd /home/user/mage-go && go test ./cmd/pylib/...` → ok (cached).
+- `uv run pytest -x -q` → **313 passed, 1 skipped, 2 xfailed, 20 subtests passed**.
+- `uv run scripts/smoke_decoder_train.py` → exits 0, emits `smoke OK`
+  after sampling a legal action and confirming gradients flow through
+  the grammar decoder on CUDA (`teacher-forced loss=8.1436`).
+- `uv run scripts/decoder_bc_parity.py …` → does **not** run on the
+  available `data/forge_choice_situations` corpus: the on-disk records
+  are V1 (`format_version=1`), but Phase 6 dropped the V1 synthesizer
+  in `policy_value_pretrain.py` and now requires V2 (PendingState +
+  DecoderTarget persisted). The dataset must be re-extracted with
+  `scripts/extract_forge_choice_situations.py` before this verification
+  command will produce numbers. Pre-existing gap from Phase 6, not
+  introduced by Phase 7.
+
+### Phase 7 deltas
+
+- `magic_ai/text_encoder/actor_critic.py::TextActorCritic` gained the
+  polymorphic R-NaD / PPO surface so the trainers can drive the text
+  pipeline without branching on backend kind:
+  `precompute_replay_forward`, `count_active_replay_steps`,
+  `evaluate_replay_batch`, `evaluate_replay_batch_per_choice`,
+  `write_ppo_targets`, `gather_ppo_targets`,
+  `gather_replay_old_log_prob_value`,
+  `recompute_lstm_states_for_episode`,
+  `recompute_lstm_outputs_for_episodes`. The decoder collapses each
+  step to a single decision row, so the slot's per-decision-group
+  per-choice axis collapses too: every replay row contributes one
+  log-π / one entropy / one value, packed into the existing
+  `ReplayPerChoice` container so R-NaD's NeuRD assembly runs unchanged.
+- `magic_ai/opponent_pool.py::_disable_text_replay_capture` now
+  actually swaps the policy's `rollout_buffer` for the duration of the
+  context (was a no-op stub).
+- `tests/test_train.py` — five inline-blank-shaped skipped tests
+  deleted (each constructed obsolete blank-group / decision-group /
+  payload tensors that no longer exist on the buffer); the rest of the
+  file (47 tests, including `test_train_text_envs_single_game_rollout_smoke`)
+  passes.
+- `tests/test_inference_server.py` — `InferenceWorkRingTest` and
+  `InferenceServerBatchingTest` (and their `_FakePolicy` helper)
+  deleted; both classes posted `NativeTextSampleBatch(decision_counts=,
+  selected_choice_cols=, may_selected=, …)` against the now-removed
+  inline-blank shape. `ConcatPackedBatchTest` (which is shape-neutral)
+  remains and passes.
+- `scripts/smoke_decoder_train.py` (new) — end-to-end CUDA smoke
+  exercising sampling → action decoding → teacher-forced replay →
+  `loss.backward()` → optimizer step.
+
+### Known follow-ups (not in scope of this branch)
+
+- `scripts/train.py` text-encoder rollout (`NativeTextTrajectoryBuffer`,
+  `_decode_text_action`, `infer_text_trace_kind`,
+  `build_text_decision_layout`) still has Phase 6 `NotImplementedError`
+  placeholders — they fail loudly only when the live text-encoder
+  rollout is invoked (every code path through them is currently
+  mocked out by the test suite or driven by the slot encoder). The
+  decoder-shaped reimplementation will delete `MAX_NUM`, the
+  staging buffer's blank-* tensors, and the legacy
+  `_decode_text_action` helper, and replace them with one call into
+  `actor_critic.sample_batch` + `decode_decoder_action` per env step.
+- Re-extract `data/forge_choice_situations` with V2 records so
+  `scripts/decoder_bc_parity.py` can run again as the live regression.
+- Wire the native `mage.decision_mask_next` callback into
+  `decoder_sample` to remove the per-step CPU mask + host sync
+  (currently the Python `batch_next_mask` is the bottleneck on small
+  batches).
+
+### Cumulative cutover stats (phases 1-7, vs `main`)
+
+```
+43 files changed, 2272 insertions(+), 12314 deletions(-)
+```
+
+Net **-10 042 LoC**.

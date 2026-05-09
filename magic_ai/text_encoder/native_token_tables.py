@@ -104,26 +104,6 @@ class _Packed:
     card_name_tokens: torch.Tensor
     card_name_offsets: torch.Tensor
     dict_entry_ids: torch.Tensor
-    # Inline-blank single-id buffers (Step 1/3 of
-    # docs/text_encoder_inline_blanks_plan.md). Passed through to Go so
-    # native render-plan assembly can emit and score inline blanks.
-    num_ids: torch.Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.int32))
-    choose_target_id: int = 0
-    choose_block_id: int = 0
-    choose_damage_order_id: int = 0
-    choose_mode_id: int = 0
-    choose_may_id: int = 0
-    choose_x_digit_id: int = 0
-    choose_mana_source_id: int = 0
-    choose_play_id: int = 0
-    use_ability_id: int = 0
-    chosen_id: int = 0
-    yes_id: int = 0
-    no_id: int = 0
-    none_id: int = 0
-    x_end_id: int = 0
-    mulligan_id: int = 0
-    keep_id: int = 0
     struct: Any = field(default=None)
 
 
@@ -146,8 +126,13 @@ def _i64_ptr(ffi: Any, t: torch.Tensor) -> Any:
     return ffi.cast("int64_t *", t.data_ptr())
 
 
-def register_native_token_tables(tables: TokenTables) -> None:
+def register_native_token_tables(tables: TokenTables, *, tokenizer: Any) -> None:
     """Pack ``tables`` into flat tensors and register them with the mage lib.
+
+    Also registers the decision-spec tag-id table for the decoder grammar
+    emitter — that table reads its ids out of ``tokenizer`` and must stay in
+    lockstep with the closed-vocabulary ``tables`` that drive the encoder
+    side, so we wire both registrations through the same entry point.
 
     Replaces any prior registration. The packed tensors are held on a
     module-global so they outlive the native side's borrowed pointers.
@@ -228,8 +213,6 @@ def register_native_token_tables(tables: TokenTables) -> None:
     card_body_tokens, card_body_offsets = _pack_int64_offsets([list(b) for b in tables.card_body])
     card_name_tokens, card_name_offsets = _pack_int64_offsets([list(n) for n in tables.card_name])
     dict_entry_ids = torch.as_tensor(tables.dict_entry, dtype=torch.int32)
-    # Inline-blank buffers.
-    num_ids = torch.as_tensor(tables.num_ids, dtype=torch.int32)
 
     packed = _Packed(
         structural_tokens=structural_tokens,
@@ -259,23 +242,6 @@ def register_native_token_tables(tables: TokenTables) -> None:
         card_name_tokens=card_name_tokens,
         card_name_offsets=card_name_offsets,
         dict_entry_ids=dict_entry_ids,
-        num_ids=num_ids,
-        choose_target_id=tables.choose_target_id,
-        choose_block_id=tables.choose_block_id,
-        choose_damage_order_id=tables.choose_damage_order_id,
-        choose_mode_id=tables.choose_mode_id,
-        choose_may_id=tables.choose_may_id,
-        choose_x_digit_id=tables.choose_x_digit_id,
-        choose_mana_source_id=tables.choose_mana_source_id,
-        choose_play_id=tables.choose_play_id,
-        use_ability_id=tables.use_ability_id,
-        chosen_id=tables.chosen_id,
-        yes_id=tables.yes_id,
-        no_id=tables.no_id,
-        none_id=tables.none_id,
-        x_end_id=tables.x_end_id,
-        mulligan_id=tables.mulligan_id,
-        keep_id=tables.keep_id,
     )
 
     struct = ffi.new(
@@ -342,24 +308,6 @@ def register_native_token_tables(tables: TokenTables) -> None:
             "stack_close_id": tables.stack_close_id,
             "command_open_id": tables.command_open_id,
             "command_close_id": tables.command_close_id,
-            "choose_target_id": tables.choose_target_id,
-            "choose_block_id": tables.choose_block_id,
-            "choose_damage_order_id": tables.choose_damage_order_id,
-            "choose_mode_id": tables.choose_mode_id,
-            "choose_may_id": tables.choose_may_id,
-            "choose_x_digit_id": tables.choose_x_digit_id,
-            "choose_mana_source_id": tables.choose_mana_source_id,
-            "choose_play_id": tables.choose_play_id,
-            "use_ability_id": tables.use_ability_id,
-            "chosen_id": tables.chosen_id,
-            "yes_id": tables.yes_id,
-            "no_id": tables.no_id,
-            "none_id": tables.none_id,
-            "x_end_id": tables.x_end_id,
-            "mulligan_id": tables.mulligan_id,
-            "keep_id": tables.keep_id,
-            "num_count": num_ids.numel(),
-            "num_ids": _i32_ptr(ffi, num_ids),
         },
     )
     packed.struct = struct
@@ -371,6 +319,14 @@ def register_native_token_tables(tables: TokenTables) -> None:
     # Replace prior registration only after the call succeeded so a failed
     # re-registration leaves the lib in a known-good state.
     _active_registration = packed
+
+    # Register the decision-spec tag-id table next so the decoder-grammar
+    # emitter on the Go side has the ``<spec-*>`` / ``<dt-*>`` ids resolved.
+    from magic_ai.text_encoder.native_decision_spec import (
+        register_decision_spec_token_table,
+    )
+
+    register_decision_spec_token_table(tokenizer)
 
 
 # Lookup-kind tags for MageTokenTableLookup (mirror the Go-side switch).

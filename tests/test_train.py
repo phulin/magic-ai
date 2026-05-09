@@ -19,11 +19,6 @@ from magic_ai.rnad import RNaDStats
 from magic_ai.rollout import PPOStats, RolloutStep
 from magic_ai.slot_encoder.game_state import GameStateEncoder
 from magic_ai.slot_encoder.model import PPOPolicy
-from magic_ai.text_encoder.actor_critic import NativeTextReplayPayload
-from magic_ai.text_encoder.batch import TextEncodedBatch, pack_batch
-from magic_ai.text_encoder.inline_blanks import BLANK_GROUP_CROSS_BLANK
-from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
-from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from scripts.train import (
     RetrospectiveLogSchedule,
     SlotTrainingBackend,
@@ -37,7 +32,6 @@ from scripts.train import (
     append_priority_trace_jsonl,
     append_sample_game_log,
     build_slot_backend,
-    build_text_backend,
     checkpoint_encoder_kind,
     initialize_game_log,
     load_deck_dir,
@@ -50,7 +44,6 @@ from scripts.train import (
     retrospective_rating_rows,
     rnad_value_metrics,
     sample_decks,
-    sample_text_policy_batch,
     save_checkpoint,
     token_length_percentile_metrics,
     train_selected_backend,
@@ -59,6 +52,9 @@ from scripts.train import (
     validate_checkpoint_encoder,
     validate_deck_embeddings,
 )
+
+# Inline-blank pipeline constant retained as a no-op shim; Phase 6 deleted the producer.
+BLANK_GROUP_CROSS_BLANK = 0
 
 
 class TrainPPOTests(unittest.TestCase):
@@ -747,287 +743,6 @@ class TrainPPOTests(unittest.TestCase):
         save.assert_called_once()
         finish.assert_called_once()
 
-    def test_build_text_backend_constructs_artifacts_and_replay_buffer(self) -> None:
-        from magic_ai.text_encoder.card_cache import CardTokenCache
-        from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
-
-        class StubTokenizer:
-            pad_token_id = 0
-
-            def __len__(self) -> int:
-                return 32
-
-        cache = CardTokenCache(
-            token_buffer=torch.empty(0, dtype=torch.int32),
-            offsets=torch.tensor([0, 0], dtype=torch.int64),
-            row_to_name=["<unknown>"],
-            engine_card_set_hash="stub",
-        )
-        args = Namespace(
-            card_token_cache=Path("missing-card-cache.pt"),
-            text_d_model=8,
-            text_layers=1,
-            text_heads=2,
-            text_d_ff=16,
-            text_max_tokens=8,
-            hidden_layers=1,
-            num_envs=2,
-            rollout_buffer_capacity=8,
-            rollout_steps=4,
-            max_steps_per_game=4,
-            max_options=3,
-            max_targets_per_option=2,
-            max_decision_groups=3,
-            max_cached_choices=4,
-            torch_compile=False,
-        )
-
-        with (
-            patch("scripts.train.load_tokenizer", return_value=StubTokenizer()),
-            patch("scripts.train.load_oracle_db", return_value={"Mountain": {}}),
-            patch(
-                "scripts.train.fetch_registered_card_names_from_engine",
-                return_value=["Mountain"],
-            ),
-            patch("scripts.train.build_card_cache", return_value=cache) as build_cache,
-        ):
-            args.text_native_assembler = False
-            backend = build_text_backend(args, torch.device("cpu"))
-
-        self.assertEqual(backend.cache, cache)
-        self.assertEqual(set(backend.oracle), {"Mountain"})
-        self.assertIsInstance(backend.replay_buffer, TextReplayBuffer)
-        self.assertIs(backend.policy.rollout_buffer, backend.replay_buffer)
-        self.assertEqual(tuple(backend.policy.live_lstm_h.shape), (1, 4, 8))
-        build_cache.assert_called_once()
-
-    def test_build_text_backend_default_replay_capacity_is_six_rollouts(self) -> None:
-        from magic_ai.text_encoder.card_cache import CardTokenCache
-
-        class StubTokenizer:
-            pad_token_id = 0
-
-            def __len__(self) -> int:
-                return 32
-
-        cache = CardTokenCache(
-            token_buffer=torch.empty(0, dtype=torch.int32),
-            offsets=torch.tensor([0, 0], dtype=torch.int64),
-            row_to_name=["<unknown>"],
-            engine_card_set_hash="stub",
-        )
-        args = Namespace(
-            card_token_cache=Path("missing-card-cache.pt"),
-            text_d_model=8,
-            text_layers=1,
-            text_heads=2,
-            text_d_ff=16,
-            text_max_tokens=8,
-            hidden_layers=1,
-            num_envs=16,
-            rollout_buffer_capacity=None,
-            rollout_steps=2000,
-            max_steps_per_game=4,
-            max_options=3,
-            max_targets_per_option=2,
-            max_decision_groups=3,
-            max_cached_choices=4,
-            torch_compile=False,
-            text_native_assembler=False,
-        )
-
-        with (
-            patch("scripts.train.load_tokenizer", return_value=StubTokenizer()),
-            patch("scripts.train.load_oracle_db", return_value={"Mountain": {}}),
-            patch(
-                "scripts.train.fetch_registered_card_names_from_engine",
-                return_value=["Mountain"],
-            ),
-            patch("scripts.train.build_card_cache", return_value=cache),
-        ):
-            backend = build_text_backend(args, torch.device("cpu"))
-
-        self.assertEqual(backend.replay_buffer.capacity, 12000)
-
-    def test_build_text_backend_rebuilds_stale_existing_card_cache(self) -> None:
-        from magic_ai.text_encoder.card_cache import CardTokenCache
-
-        class StubTokenizer:
-            pad_token_id = 0
-
-            def __len__(self) -> int:
-                return 32
-
-        stale_cache = CardTokenCache(
-            token_buffer=torch.empty(0, dtype=torch.int32),
-            offsets=torch.tensor([0, 0], dtype=torch.int64),
-            row_to_name=["<unknown>"],
-            engine_card_set_hash="legacy",
-        )
-        fresh_cache = CardTokenCache(
-            token_buffer=torch.empty(0, dtype=torch.int32),
-            offsets=torch.tensor([0, 0, 0], dtype=torch.int64),
-            row_to_name=["<unknown>", "Mountain"],
-            engine_card_set_hash="fresh",
-            content_hash="fresh-content",
-            cache_schema_version=2,
-        )
-        args = Namespace(
-            card_token_cache=Path("existing-card-cache.pt"),
-            text_d_model=8,
-            text_layers=1,
-            text_heads=2,
-            text_d_ff=16,
-            text_max_tokens=8,
-            hidden_layers=1,
-            num_envs=2,
-            rollout_buffer_capacity=8,
-            rollout_steps=4,
-            max_steps_per_game=4,
-            max_options=3,
-            max_targets_per_option=2,
-            max_decision_groups=3,
-            max_cached_choices=4,
-            torch_compile=False,
-            text_native_assembler=False,
-        )
-
-        with (
-            patch.object(Path, "exists", return_value=True),
-            patch("scripts.train.load_tokenizer", return_value=StubTokenizer()),
-            patch("scripts.train.load_oracle_db", return_value={"Mountain": {}}),
-            patch(
-                "scripts.train.fetch_registered_card_names_from_engine",
-                return_value=["Mountain"],
-            ),
-            patch("scripts.train.load_card_cache", return_value=stale_cache),
-            patch("scripts.train.build_card_cache", return_value=fresh_cache) as build_cache,
-            patch("scripts.train.save_card_cache") as save_cache,
-        ):
-            backend = build_text_backend(args, torch.device("cpu"))
-
-        self.assertEqual(backend.cache, fresh_cache)
-        build_cache.assert_called_once()
-        save_cache.assert_called_once_with(fresh_cache, args.card_token_cache)
-
-    def test_sample_text_policy_batch_emits_assembles_and_appends_replay(self) -> None:
-        from magic_ai.text_encoder.card_cache import CardTokenCache
-
-        class StubTokenizer:
-            pad_token_id = 0
-
-            def __len__(self) -> int:
-                return 32
-
-        def encoded_batch() -> TextEncodedBatch:
-            token_ids = torch.tensor([[1, 4, 5, 2]], dtype=torch.long)
-            attention_mask = torch.ones_like(token_ids)
-            card_ref_positions = torch.full((1, MAX_CARD_REFS), -1, dtype=torch.long)
-            seq_lengths = torch.tensor([4], dtype=torch.long)
-            return TextEncodedBatch(
-                token_ids=token_ids,
-                attention_mask=attention_mask,
-                card_ref_positions=card_ref_positions,
-                seq_lengths=seq_lengths,
-                blank_positions=torch.tensor([[1, 2]], dtype=torch.int32),
-                blank_kind=torch.ones(1, 2, dtype=torch.int32),
-                blank_group=torch.zeros(1, 2, dtype=torch.int32),
-                blank_group_kind=torch.full((1, 2), BLANK_GROUP_CROSS_BLANK, dtype=torch.int32),
-                blank_option_index=torch.tensor([[0, 1]], dtype=torch.int32),
-                blank_legal_ids=torch.ones(1, 2, 1, dtype=torch.int32),
-                blank_legal_mask=torch.ones(1, 2, 1, dtype=torch.bool),
-            )
-
-        cache = CardTokenCache(
-            token_buffer=torch.empty(0, dtype=torch.int32),
-            offsets=torch.tensor([0, 0], dtype=torch.int64),
-            row_to_name=["<unknown>"],
-            engine_card_set_hash="stub",
-        )
-        args = Namespace(
-            card_token_cache=Path("missing-card-cache.pt"),
-            text_d_model=8,
-            text_layers=1,
-            text_heads=2,
-            text_d_ff=16,
-            text_max_tokens=8,
-            hidden_layers=1,
-            num_envs=1,
-            rollout_buffer_capacity=8,
-            rollout_steps=4,
-            max_steps_per_game=4,
-            max_options=2,
-            max_targets_per_option=1,
-            max_decision_groups=2,
-            max_cached_choices=2,
-            native_render_plan=False,
-            torch_compile=False,
-        )
-        snapshot = cast(
-            dict[str, object],
-            {
-                "players": [{"Name": "A"}, {"Name": "B"}],
-                "active_player": "A",
-                "turn": 1,
-                "step": "Precombat Main",
-            },
-        )
-        pending = cast(
-            dict[str, object],
-            {
-                "kind": "priority",
-                "player_idx": 0,
-                "options": [{"kind": "pass"}, {"kind": "play_land", "card_id": "c1"}],
-            },
-        )
-
-        with (
-            patch("scripts.train.load_tokenizer", return_value=StubTokenizer()),
-            patch("scripts.train.load_oracle_db", return_value={"Mountain": {}}),
-            patch(
-                "scripts.train.fetch_registered_card_names_from_engine",
-                return_value=["Mountain"],
-            ),
-            patch("scripts.train.build_card_cache", return_value=cache),
-            patch(
-                "scripts.train._render_token_ids",
-                return_value={
-                    "chosen": 1,
-                    "none": 2,
-                    "yes": 3,
-                    "no": 4,
-                    "mulligan": 5,
-                    "keep": 6,
-                    "self": 7,
-                    "opp": 8,
-                    "num": [],
-                    "mana": [],
-                    "card_ref": [],
-                },
-            ),
-            patch("scripts.train.render_snapshot", return_value=object()) as render,
-            patch("scripts.train.tokenize_snapshot", return_value=object()) as tokenize,
-            patch("scripts.train.collate", return_value=encoded_batch()) as collate_batch,
-        ):
-            args.text_native_assembler = False
-            backend = build_text_backend(args, torch.device("cpu"))
-            steps = sample_text_policy_batch(
-                args,
-                backend,
-                [cast(GameStateSnapshot, snapshot)],
-                [cast(PendingState, pending)],
-                env_indices=[0],
-                perspective_player_indices=[0],
-                deterministic=True,
-            )
-
-        self.assertEqual(len(steps), 1)
-        self.assertIsNotNone(steps[0].replay_idx)
-        self.assertEqual(backend.replay_buffer.size, 1)
-        render.assert_called_once()
-        tokenize.assert_called_once()
-        collate_batch.assert_called_once()
-
     def test_train_text_envs_single_game_rollout_smoke(self) -> None:
         class FakeReplayBuffer:
             def __init__(self) -> None:
@@ -1208,80 +923,6 @@ class TrainPPOTests(unittest.TestCase):
         rollout.assert_called_once()
         train_native_text.assert_called_once()
         train_text.assert_not_called()
-
-    def test_native_text_staging_commits_completed_env_to_replay(self) -> None:
-        replay_buffer = TextReplayBuffer(
-            capacity=6,
-            max_tokens=5,
-            max_options=3,
-            max_targets_per_option=2,
-            max_decision_groups=2,
-            max_cached_choices=4,
-            recurrent_layers=1,
-            recurrent_hidden_dim=6,
-            lstm_proj_hidden=6,
-            use_triton_append=False,
-            use_triton_gather=False,
-        )
-        staging = train_mod.NativeTextTrajectoryBuffer(
-            replay_buffer,
-            num_envs=2,
-            max_steps=3,
-        )
-        encoded = TextEncodedBatch(
-            token_ids=torch.tensor([[101, 102, 103, 0, 0], [201, 202, 0, 0, 0]]),
-            attention_mask=torch.tensor([[1, 1, 1, 0, 0], [1, 1, 0, 0, 0]]),
-            card_ref_positions=torch.full((2, MAX_CARD_REFS), -1, dtype=torch.long),
-            seq_lengths=torch.tensor([3, 2]),
-        )
-        payload = NativeTextReplayPayload(
-            encoded=pack_batch(encoded),
-            trace_kind_id=torch.tensor([1, 2]),
-            decision_count=torch.tensor([1, 1]),
-            decision_count_host=(1, 1),
-            total_decision_groups=2,
-            total_stored_decision_groups=2,
-            decision_option_idx=torch.tensor([[0, -1, -1, -1], [1, -1, -1, -1]]),
-            decision_target_idx=torch.tensor([[-1, -1, -1, -1], [0, -1, -1, -1]]),
-            decision_mask=torch.tensor([[True, False, False, False]]).expand(2, -1),
-            uses_none_head=torch.tensor([False, True]),
-            selected_indices=torch.tensor([0, 0]),
-            behavior_action_log_prob=torch.zeros(2),
-            may_selected=torch.tensor([0.0, 1.0]),
-            old_log_prob=torch.tensor([-0.1, -0.2]),
-            value=torch.tensor([0.3, 0.4]),
-            perspective_player_idx=torch.tensor([0, 1]),
-            lstm_h_in=torch.arange(12, dtype=torch.float32).reshape(1, 2, 6),
-            lstm_c_in=torch.arange(100, 112, dtype=torch.float32).reshape(1, 2, 6),
-            projected_state=torch.arange(12, dtype=torch.float32).reshape(2, 6),
-        )
-
-        staging.stage_batch([0, 1], payload)
-        rows_by_env = staging.append_envs_to_replay([0, 1], replay_buffer)
-        rows = rows_by_env[0] + rows_by_env[1]
-        gathered = replay_buffer.gather(rows)
-
-        self.assertEqual(rows_by_env, [[0], [1]])
-        self.assertEqual(int(staging.step_count[0].item()), 0)
-        self.assertEqual(int(staging.step_count[1].item()), 0)
-        torch.testing.assert_close(
-            gathered.encoded.token_ids,
-            torch.tensor([101, 102, 103, 201, 202], dtype=torch.int32),
-        )
-        self.assertEqual(int(gathered.trace_kind_id[0]), 1)
-        self.assertEqual(int(gathered.trace_kind_id[1]), 2)
-        self.assertAlmostEqual(float(gathered.old_log_prob[0]), -0.1, places=6)
-        self.assertAlmostEqual(float(gathered.old_log_prob[1]), -0.2, places=6)
-        self.assertIsNotNone(replay_buffer.projected_state)
-        assert replay_buffer.projected_state is not None
-        torch.testing.assert_close(
-            replay_buffer.projected_state[rows[0]].float(),
-            torch.arange(6, dtype=torch.float32),
-        )
-        torch.testing.assert_close(
-            replay_buffer.projected_state[rows[1]].float(),
-            torch.arange(6, 12, dtype=torch.float32),
-        )
 
     def test_native_text_rollout_updates_without_draining_live_games(self) -> None:
         class FakeGame:

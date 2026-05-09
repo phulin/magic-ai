@@ -18,7 +18,7 @@ from enum import IntEnum
 from transformers import PreTrainedTokenizerFast
 
 from magic_ai.text_encoder.card_cache import CardTokenCache
-from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, MAX_NUM
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 
 # ---------------------------------------------------------------------------
 # Closed vocabulary constants mirrored by mage-go.
@@ -188,30 +188,6 @@ class TokenTables:
     command_open_id: int = 0
     command_close_id: int = 0
 
-    # Inline-blank specials (Step 1 of text_encoder_inline_blanks_plan.md).
-    # Single-id ``<choose-*>`` blank-kind markers, ``<chosen>`` scoring
-    # token, ``<yes>``/``<no>``/``<none>`` / ``<x-end>`` answer tokens, and
-    # the ``<num:k>`` small-integer answer vocab. ``<pass>`` is reused from
-    # the priority-anchor vocab and is not redeclared here. Default-init to
-    # 0 so existing call sites that don't fill these still construct.
-    choose_target_id: int = 0
-    choose_block_id: int = 0
-    choose_damage_order_id: int = 0
-    choose_mode_id: int = 0
-    choose_may_id: int = 0
-    choose_x_digit_id: int = 0
-    choose_mana_source_id: int = 0
-    choose_play_id: int = 0
-    use_ability_id: int = 0
-    chosen_id: int = 0
-    yes_id: int = 0
-    no_id: int = 0
-    none_id: int = 0
-    x_end_id: int = 0
-    mulligan_id: int = 0
-    keep_id: int = 0
-    num_ids: list[int] = field(default_factory=list)
-
     structural: dict[Frag, list[int]] = field(default_factory=dict)
     zone_open: dict[tuple[int, int], list[int]] = field(default_factory=dict)
     zone_close: dict[tuple[int, int], list[int]] = field(default_factory=dict)
@@ -296,23 +272,6 @@ def build_token_tables(
         stack_close_id=_single(tokenizer, "</stack>"),
         command_open_id=_single(tokenizer, "<command>"),
         command_close_id=_single(tokenizer, "</command>"),
-        choose_target_id=_single(tokenizer, "<choose-target>"),
-        choose_block_id=_single(tokenizer, "<choose-block>"),
-        choose_damage_order_id=_single(tokenizer, "<choose-damage-order>"),
-        choose_mode_id=_single(tokenizer, "<choose-mode>"),
-        choose_may_id=_single(tokenizer, "<choose-may>"),
-        choose_x_digit_id=_single(tokenizer, "<choose-x-digit>"),
-        choose_mana_source_id=_single(tokenizer, "<choose-mana-source>"),
-        choose_play_id=_single(tokenizer, "<choose-play>"),
-        use_ability_id=_single(tokenizer, "<use-ability>"),
-        chosen_id=_single(tokenizer, "<chosen>"),
-        yes_id=_single(tokenizer, "<yes>"),
-        no_id=_single(tokenizer, "<no>"),
-        none_id=_single(tokenizer, "<none>"),
-        x_end_id=_single(tokenizer, "<x-end>"),
-        mulligan_id=_single(tokenizer, "<mulligan>"),
-        keep_id=_single(tokenizer, "<keep>"),
-        num_ids=[_single(tokenizer, f"<num:{k}>") for k in range(MAX_NUM)],
     )
 
     # Static structural fragments.

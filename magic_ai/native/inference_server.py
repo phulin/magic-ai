@@ -190,15 +190,14 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
             out_parts.append(torch.where(valid, t + int(off), t))
         return torch.cat(out_parts, dim=0)
 
-    max_blanks = max((int(b.blank_positions.shape[1]) for b in batches), default=0)
-    max_legal = max((int(b.blank_legal_ids.shape[2]) for b in batches), default=0)
+    max_anchors = max((int(b.pointer_anchor_positions.shape[1]) for b in batches), default=0)
 
-    def _pad_blank_2d(name: str, *, fill: int = 0, shift: bool = False) -> torch.Tensor:
+    def _pad_anchor_2d(name: str, *, fill: int = -1, shift: bool = False) -> torch.Tensor:
         parts: list[torch.Tensor] = []
         for b, off in zip(batches, token_offsets.tolist(), strict=True):
             t = cast(torch.Tensor, getattr(b, name)).to(torch.int32)
             rows = int(t.shape[0])
-            out = torch.full((rows, max_blanks), fill, dtype=torch.int32, device=t.device)
+            out = torch.full((rows, max_anchors), fill, dtype=torch.int32, device=t.device)
             cols = int(t.shape[1])
             if cols > 0:
                 src = t[:, :cols]
@@ -209,18 +208,28 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
             parts.append(out)
         return torch.cat(parts, dim=0)
 
-    def _pad_blank_legal(name: str, *, dtype: torch.dtype) -> torch.Tensor:
+    legal_edge_bitmap: torch.Tensor | None = None
+    if any(b.legal_edge_bitmap is not None for b in batches):
+        max_blockers = max(
+            (int(b.legal_edge_bitmap.shape[1]) for b in batches if b.legal_edge_bitmap is not None),
+            default=0,
+        )
+        max_attackers = max(
+            (int(b.legal_edge_bitmap.shape[2]) for b in batches if b.legal_edge_bitmap is not None),
+            default=0,
+        )
         parts: list[torch.Tensor] = []
         for b in batches:
-            t = cast(torch.Tensor, getattr(b, name)).to(dtype)
-            rows = int(t.shape[0])
-            out = torch.zeros((rows, max_blanks, max_legal), dtype=dtype, device=t.device)
-            k = int(t.shape[1])
-            v = int(t.shape[2])
-            if k > 0 and v > 0:
-                out[:, :k, :v] = t
+            rows = int(b.seq_lengths.shape[0])
+            device = b.seq_lengths.device
+            out = torch.zeros((rows, max_blockers, max_attackers), dtype=torch.bool, device=device)
+            if b.legal_edge_bitmap is not None:
+                bk = int(b.legal_edge_bitmap.shape[1])
+                ak = int(b.legal_edge_bitmap.shape[2])
+                if bk > 0 and ak > 0:
+                    out[:, :bk, :ak] = b.legal_edge_bitmap
             parts.append(out)
-        return torch.cat(parts, dim=0)
+        legal_edge_bitmap = torch.cat(parts, dim=0)
 
     return PackedTextBatch(
         token_ids=token_ids,
@@ -232,13 +241,13 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
         card_ref_positions=_shift_anchor("card_ref_positions"),
         total_tokens=int(token_ids.shape[0]),
         seq_lengths_host=seq_lengths_host,
-        blank_positions=_pad_blank_2d("blank_positions", fill=-1, shift=True),
-        blank_kind=_pad_blank_2d("blank_kind"),
-        blank_group=_pad_blank_2d("blank_group", fill=-1),
-        blank_group_kind=_pad_blank_2d("blank_group_kind"),
-        blank_option_index=_pad_blank_2d("blank_option_index", fill=-1),
-        blank_legal_ids=_pad_blank_legal("blank_legal_ids", dtype=torch.int32),
-        blank_legal_mask=_pad_blank_legal("blank_legal_mask", dtype=torch.bool),
+        spec_lens=torch.cat([b.spec_lens.to(torch.int32) for b in batches], dim=0),
+        decision_type=torch.cat([b.decision_type.to(torch.int32) for b in batches], dim=0),
+        pointer_anchor_positions=_pad_anchor_2d("pointer_anchor_positions", shift=True),
+        pointer_anchor_kinds=_pad_anchor_2d("pointer_anchor_kinds"),
+        pointer_anchor_subjects=_pad_anchor_2d("pointer_anchor_subjects"),
+        pointer_anchor_handles=_pad_anchor_2d("pointer_anchor_handles"),
+        legal_edge_bitmap=legal_edge_bitmap,
         max_seqlen=max(seq_lengths_host, default=0),
     )
 
@@ -281,16 +290,20 @@ def _slice_packed_text_batch(
         ),
         total_tokens=total_tokens,
         seq_lengths_host=seq_lengths_host,
-        blank_positions=_shift_packed_positions(
-            batch.blank_positions[row_start:row_end],
+        spec_lens=batch.spec_lens[row_start:row_end],
+        decision_type=batch.decision_type[row_start:row_end],
+        pointer_anchor_positions=_shift_packed_positions(
+            batch.pointer_anchor_positions[row_start:row_end],
             token_start,
         ),
-        blank_kind=batch.blank_kind[row_start:row_end],
-        blank_group=batch.blank_group[row_start:row_end],
-        blank_group_kind=batch.blank_group_kind[row_start:row_end],
-        blank_option_index=batch.blank_option_index[row_start:row_end],
-        blank_legal_ids=batch.blank_legal_ids[row_start:row_end],
-        blank_legal_mask=batch.blank_legal_mask[row_start:row_end],
+        pointer_anchor_kinds=batch.pointer_anchor_kinds[row_start:row_end],
+        pointer_anchor_subjects=batch.pointer_anchor_subjects[row_start:row_end],
+        pointer_anchor_handles=batch.pointer_anchor_handles[row_start:row_end],
+        legal_edge_bitmap=(
+            batch.legal_edge_bitmap[row_start:row_end]
+            if batch.legal_edge_bitmap is not None
+            else None
+        ),
         max_seqlen=max(seq_lengths_host, default=0) if seq_lengths_host is not None else None,
     )
 
@@ -461,8 +474,8 @@ class _InferenceWorkRing:
                 env_indices=list(request.env_indices),
                 perspective_player_indices=list(request.perspective_player_indices),
                 seq_lengths_host=seq_lengths_host,
-                blank_cols=int(packed.blank_positions.shape[1]),
-                legal_cols=int(packed.blank_legal_ids.shape[2]),
+                blank_cols=int(packed.pointer_anchor_positions.shape[1]),
+                legal_cols=0,
                 copy_event=copy_event,
             )
             self._pending_publish[publish_seq] = item
@@ -678,13 +691,13 @@ class _InferenceWorkRing:
             card_ref_positions=self._packed_arena["card_ref_positions"],
             total_tokens=self._token_cursor,
             seq_lengths_host=seq_lengths_host,
-            blank_positions=self._packed_arena["blank_positions"],
-            blank_kind=self._packed_arena["blank_kind"],
-            blank_group=self._packed_arena["blank_group"],
-            blank_group_kind=self._packed_arena["blank_group_kind"],
-            blank_option_index=self._packed_arena["blank_option_index"],
-            blank_legal_ids=self._packed_arena["blank_legal_ids"],
-            blank_legal_mask=self._packed_arena["blank_legal_mask"],
+            spec_lens=self._packed_arena["spec_lens"],
+            decision_type=self._packed_arena["decision_type"],
+            pointer_anchor_positions=self._packed_arena["pointer_anchor_positions"],
+            pointer_anchor_kinds=self._packed_arena["pointer_anchor_kinds"],
+            pointer_anchor_subjects=self._packed_arena["pointer_anchor_subjects"],
+            pointer_anchor_handles=self._packed_arena["pointer_anchor_handles"],
+            legal_edge_bitmap=None,
         )
         sliced = _slice_packed_text_batch(
             arena_batch,
@@ -695,15 +708,11 @@ class _InferenceWorkRing:
         )
         sliced.seq_lengths_host = seq_lengths_host
         sliced.max_seqlen = max(seq_lengths_host, default=0)
-        blank_cols = max((item.blank_cols for item in items), default=0)
-        legal_cols = max((item.legal_cols for item in items), default=0) if blank_cols > 0 else 0
-        sliced.blank_positions = sliced.blank_positions[:, :blank_cols]
-        sliced.blank_kind = sliced.blank_kind[:, :blank_cols]
-        sliced.blank_group = sliced.blank_group[:, :blank_cols]
-        sliced.blank_group_kind = sliced.blank_group_kind[:, :blank_cols]
-        sliced.blank_option_index = sliced.blank_option_index[:, :blank_cols]
-        sliced.blank_legal_ids = sliced.blank_legal_ids[:, :blank_cols, :legal_cols]
-        sliced.blank_legal_mask = sliced.blank_legal_mask[:, :blank_cols, :legal_cols]
+        anchor_cols = max((item.blank_cols for item in items), default=0)
+        sliced.pointer_anchor_positions = sliced.pointer_anchor_positions[:, :anchor_cols]
+        sliced.pointer_anchor_kinds = sliced.pointer_anchor_kinds[:, :anchor_cols]
+        sliced.pointer_anchor_subjects = sliced.pointer_anchor_subjects[:, :anchor_cols]
+        sliced.pointer_anchor_handles = sliced.pointer_anchor_handles[:, :anchor_cols]
         return sliced
 
     def wait_for_item_copies(self, items: list[_PendingItem]) -> None:
@@ -802,8 +811,7 @@ class _InferenceWorkRing:
                         device=self.arena_device,
                     )
         if self._packed_arena is None:
-            blank_capacity = max(64, int(packed.blank_positions.shape[1]))
-            legal_capacity = max(64, int(packed.blank_legal_ids.shape[2]))
+            anchor_capacity = max(64, int(packed.pointer_anchor_positions.shape[1]))
             self._packed_arena = {
                 "token_ids": _arena_empty(
                     self.token_capacity,
@@ -841,48 +849,38 @@ class _InferenceWorkRing:
                     dtype=torch.int32,
                     device=self.arena_device,
                 ),
-                "blank_positions": _arena_empty(
+                "spec_lens": _arena_empty(
                     self.capacity_rows,
-                    blank_capacity,
                     dtype=torch.int32,
                     device=self.arena_device,
                 ),
-                "blank_kind": _arena_empty(
+                "decision_type": _arena_empty(
                     self.capacity_rows,
-                    blank_capacity,
                     dtype=torch.int32,
                     device=self.arena_device,
                 ),
-                "blank_group": _arena_empty(
+                "pointer_anchor_positions": _arena_empty(
                     self.capacity_rows,
-                    blank_capacity,
+                    anchor_capacity,
                     dtype=torch.int32,
                     device=self.arena_device,
                 ),
-                "blank_group_kind": _arena_empty(
+                "pointer_anchor_kinds": _arena_empty(
                     self.capacity_rows,
-                    blank_capacity,
+                    anchor_capacity,
                     dtype=torch.int32,
                     device=self.arena_device,
                 ),
-                "blank_option_index": _arena_empty(
+                "pointer_anchor_subjects": _arena_empty(
                     self.capacity_rows,
-                    blank_capacity,
+                    anchor_capacity,
                     dtype=torch.int32,
                     device=self.arena_device,
                 ),
-                "blank_legal_ids": _arena_empty(
+                "pointer_anchor_handles": _arena_empty(
                     self.capacity_rows,
-                    blank_capacity,
-                    legal_capacity,
+                    anchor_capacity,
                     dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "blank_legal_mask": _arena_empty(
-                    self.capacity_rows,
-                    blank_capacity,
-                    legal_capacity,
-                    dtype=torch.bool,
                     device=self.arena_device,
                 ),
             }
@@ -935,9 +933,11 @@ class _InferenceWorkRing:
             torch.where(src_refs >= 0, src_refs + int(token_start), src_refs)
         )
 
+        packed_arena["spec_lens"][row_start:row_end].copy_(packed.spec_lens.to(torch.int32))
+        packed_arena["decision_type"][row_start:row_end].copy_(packed.decision_type.to(torch.int32))
         self._copy_blank_2d(
-            name="blank_positions",
-            src=packed.blank_positions.to(torch.int32),
+            name="pointer_anchor_positions",
+            src=packed.pointer_anchor_positions.to(torch.int32),
             packed_arena=packed_arena,
             row_start=row_start,
             row_end=row_end,
@@ -945,50 +945,28 @@ class _InferenceWorkRing:
             token_start=token_start,
         )
         self._copy_blank_2d(
-            name="blank_kind",
-            src=packed.blank_kind.to(torch.int32),
-            packed_arena=packed_arena,
-            row_start=row_start,
-            row_end=row_end,
-            fill=0,
-        )
-        self._copy_blank_2d(
-            name="blank_group",
-            src=packed.blank_group.to(torch.int32),
+            name="pointer_anchor_kinds",
+            src=packed.pointer_anchor_kinds.to(torch.int32),
             packed_arena=packed_arena,
             row_start=row_start,
             row_end=row_end,
             fill=-1,
         )
         self._copy_blank_2d(
-            name="blank_group_kind",
-            src=packed.blank_group_kind.to(torch.int32),
-            packed_arena=packed_arena,
-            row_start=row_start,
-            row_end=row_end,
-            fill=0,
-        )
-        self._copy_blank_2d(
-            name="blank_option_index",
-            src=packed.blank_option_index.to(torch.int32),
+            name="pointer_anchor_subjects",
+            src=packed.pointer_anchor_subjects.to(torch.int32),
             packed_arena=packed_arena,
             row_start=row_start,
             row_end=row_end,
             fill=-1,
         )
-        self._copy_blank_3d(
-            name="blank_legal_ids",
-            src=packed.blank_legal_ids.to(torch.int32),
+        self._copy_blank_2d(
+            name="pointer_anchor_handles",
+            src=packed.pointer_anchor_handles.to(torch.int32),
             packed_arena=packed_arena,
             row_start=row_start,
             row_end=row_end,
-        )
-        self._copy_blank_3d(
-            name="blank_legal_mask",
-            src=packed.blank_legal_mask.bool(),
-            packed_arena=packed_arena,
-            row_start=row_start,
-            row_end=row_end,
+            fill=-1,
         )
 
     def _copy_blank_2d(

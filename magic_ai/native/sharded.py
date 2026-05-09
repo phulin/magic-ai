@@ -141,18 +141,31 @@ def _merge_packed_outputs(
             _add_token_offset(shard.card_ref_positions[:shard_n], token_cursor)
         )
         output.token_overflow[batch_cursor:next_batch].copy_(shard.token_overflow[:shard_n])
-        output.blank_positions[batch_cursor:next_batch].copy_(
-            _add_token_offset(shard.blank_positions[:shard_n], token_cursor)
+        output.spec_tokens[batch_cursor:next_batch].copy_(shard.spec_tokens[:shard_n])
+        output.spec_lens[batch_cursor:next_batch].copy_(shard.spec_lens[:shard_n])
+        output.decision_type[batch_cursor:next_batch].copy_(shard.decision_type[:shard_n])
+        output.pointer_anchor_positions[batch_cursor:next_batch].copy_(
+            _add_token_offset(shard.pointer_anchor_positions[:shard_n], token_cursor)
         )
-        output.blank_kind[batch_cursor:next_batch].copy_(shard.blank_kind[:shard_n])
-        output.blank_group[batch_cursor:next_batch].copy_(shard.blank_group[:shard_n])
-        output.blank_group_kind[batch_cursor:next_batch].copy_(shard.blank_group_kind[:shard_n])
-        output.blank_option_index[batch_cursor:next_batch].copy_(shard.blank_option_index[:shard_n])
-        output.blank_legal_ids[batch_cursor:next_batch].copy_(shard.blank_legal_ids[:shard_n])
-        output.blank_legal_mask[batch_cursor:next_batch].copy_(shard.blank_legal_mask[:shard_n])
-        output.blank_overflow[batch_cursor:next_batch].copy_(shard.blank_overflow[:shard_n])
-        output.blank_count[batch_cursor:next_batch].copy_(shard.blank_count[:shard_n])
-        output.blank_legal_count[batch_cursor:next_batch].copy_(shard.blank_legal_count[:shard_n])
+        output.pointer_anchor_kinds[batch_cursor:next_batch].copy_(
+            shard.pointer_anchor_kinds[:shard_n]
+        )
+        output.pointer_anchor_subjects[batch_cursor:next_batch].copy_(
+            shard.pointer_anchor_subjects[:shard_n]
+        )
+        output.pointer_anchor_handles[batch_cursor:next_batch].copy_(
+            shard.pointer_anchor_handles[:shard_n]
+        )
+        output.pointer_anchor_counts[batch_cursor:next_batch].copy_(
+            shard.pointer_anchor_counts[:shard_n]
+        )
+        output.legal_edge_bitmap[batch_cursor:next_batch].copy_(shard.legal_edge_bitmap[:shard_n])
+        output.legal_edge_n_blockers[batch_cursor:next_batch].copy_(
+            shard.legal_edge_n_blockers[:shard_n]
+        )
+        output.legal_edge_n_attackers[batch_cursor:next_batch].copy_(
+            shard.legal_edge_n_attackers[:shard_n]
+        )
 
         batch_cursor = next_batch
         token_cursor = next_token

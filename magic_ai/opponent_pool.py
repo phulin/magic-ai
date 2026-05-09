@@ -325,10 +325,23 @@ def load_opponent_weights(
 
 @contextmanager
 def _disable_text_replay_capture(*policies: Any) -> Iterator[None]:
-    """Temporarily run text policies in inference mode without replay writes."""
+    """Temporarily run text policies in inference mode without replay writes.
 
-    del policies
-    yield
+    Saves and clears each policy's ``rollout_buffer`` attribute so calls into
+    the policy during evaluation don't write into the training replay buffer.
+    Restores the original buffers on exit (including on exception).
+    """
+
+    saved: list[tuple[Any, Any]] = []
+    for policy in policies:
+        if hasattr(policy, "rollout_buffer"):
+            saved.append((policy, policy.rollout_buffer))
+            policy.rollout_buffer = None
+    try:
+        yield
+    finally:
+        for policy, prev in saved:
+            policy.rollout_buffer = prev
 
 
 def distribute_games_by_recency(

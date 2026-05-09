@@ -336,6 +336,13 @@ def combined_sample(
     neg_inf = float("-inf")
     vocab_l = vocab_logits.masked_fill(~vocab_mask, neg_inf) / temperature
     pointer_l = pointer_logits.masked_fill(~pointer_mask, neg_inf) / temperature
+    # Rows where no head is legal (e.g. vocab on a pointer step) get a uniform
+    # zero-logit dummy distribution so Categorical.sample doesn't blow up; the
+    # caller selects the right column via ``is_pointer_step``.
+    vocab_dummy = (~vocab_mask.any(dim=-1, keepdim=True)).expand_as(vocab_l)
+    pointer_dummy = (~pointer_mask.any(dim=-1, keepdim=True)).expand_as(pointer_l)
+    vocab_l = torch.where(vocab_dummy, torch.zeros_like(vocab_l), vocab_l)
+    pointer_l = torch.where(pointer_dummy, torch.zeros_like(pointer_l), pointer_l)
     if greedy:
         sampled_vocab = vocab_l.argmax(dim=-1)
         sampled_pointer = pointer_l.argmax(dim=-1)
