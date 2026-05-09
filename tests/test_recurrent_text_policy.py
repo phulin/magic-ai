@@ -154,6 +154,5 @@ def test_forward_packed_bypasses_compiled_callable_during_fx_trace(monkeypatch) 
 
     out, _ = policy.forward_packed(packed)
 
-    assert out.blank_logits is not None
-    assert out.blank_logits.shape == packed.blank_legal_mask.shape
+    # Inline-blank head was removed in Phase 6; only verify the value head fires.
     assert torch.isfinite(out.values).all()

@@ -158,16 +158,17 @@ class _PackedOutputs:
     state_positions: torch.Tensor
     card_ref_positions: torch.Tensor
     token_overflow: torch.Tensor
-    blank_positions: torch.Tensor
-    blank_kind: torch.Tensor
-    blank_group: torch.Tensor
-    blank_group_kind: torch.Tensor
-    blank_option_index: torch.Tensor
-    blank_legal_ids: torch.Tensor
-    blank_legal_mask: torch.Tensor
-    blank_overflow: torch.Tensor
-    blank_count: torch.Tensor
-    blank_legal_count: torch.Tensor
+    spec_tokens: torch.Tensor
+    spec_lens: torch.Tensor
+    decision_type: torch.Tensor
+    pointer_anchor_positions: torch.Tensor
+    pointer_anchor_kinds: torch.Tensor
+    pointer_anchor_subjects: torch.Tensor
+    pointer_anchor_handles: torch.Tensor
+    pointer_anchor_counts: torch.Tensor
+    legal_edge_bitmap: torch.Tensor
+    legal_edge_n_blockers: torch.Tensor
+    legal_edge_n_attackers: torch.Tensor
     active_batch_size: int
 
 
@@ -181,16 +182,17 @@ def _packed_outputs(batch_size: int, max_tokens: int = 8) -> _PackedOutputs:
         state_positions=torch.zeros(batch_size, dtype=torch.int32),
         card_ref_positions=torch.full((batch_size, 4), -1, dtype=torch.int32),
         token_overflow=torch.zeros(batch_size, dtype=torch.int32),
-        blank_positions=torch.full((batch_size, 3), -1, dtype=torch.int32),
-        blank_kind=torch.zeros((batch_size, 3), dtype=torch.int32),
-        blank_group=torch.full((batch_size, 3), -1, dtype=torch.int32),
-        blank_group_kind=torch.zeros((batch_size, 3), dtype=torch.int32),
-        blank_option_index=torch.full((batch_size, 3), -1, dtype=torch.int32),
-        blank_legal_ids=torch.zeros((batch_size, 3, 4), dtype=torch.int32),
-        blank_legal_mask=torch.zeros((batch_size, 3, 4), dtype=torch.uint8),
-        blank_overflow=torch.zeros(batch_size, dtype=torch.int32),
-        blank_count=torch.zeros(batch_size, dtype=torch.int32),
-        blank_legal_count=torch.zeros((batch_size, 3), dtype=torch.int32),
+        spec_tokens=torch.zeros((batch_size, 8), dtype=torch.int32),
+        spec_lens=torch.zeros(batch_size, dtype=torch.int32),
+        decision_type=torch.full((batch_size,), -1, dtype=torch.int32),
+        pointer_anchor_positions=torch.full((batch_size, 3), -1, dtype=torch.int32),
+        pointer_anchor_kinds=torch.full((batch_size, 3), -1, dtype=torch.int32),
+        pointer_anchor_subjects=torch.zeros((batch_size, 3), dtype=torch.int32),
+        pointer_anchor_handles=torch.full((batch_size, 3), -1, dtype=torch.int32),
+        pointer_anchor_counts=torch.zeros(batch_size, dtype=torch.int32),
+        legal_edge_bitmap=torch.zeros((batch_size, 4, 4), dtype=torch.uint8),
+        legal_edge_n_blockers=torch.zeros(batch_size, dtype=torch.int32),
+        legal_edge_n_attackers=torch.zeros(batch_size, dtype=torch.int32),
         active_batch_size=batch_size,
     )
 
@@ -205,18 +207,13 @@ class MergePackedOutputsTests(unittest.TestCase):
         a.seq_lengths[:] = torch.tensor([2, 3], dtype=torch.int32)
         a.state_positions[:] = torch.tensor([0, 2], dtype=torch.int32)
         a.card_ref_positions[:, :2] = torch.tensor([[0, -1], [2, 4]], dtype=torch.int32)
-        a.blank_positions[:, :2] = torch.tensor([[1, -1], [2, 4]], dtype=torch.int32)
-        a.blank_kind[:, :2] = torch.tensor([[101, 0], [102, 103]], dtype=torch.int32)
-        a.blank_group[:, :2] = torch.tensor([[0, -1], [1, 1]], dtype=torch.int32)
-        a.blank_group_kind[:, :2] = torch.tensor([[1, 0], [2, 2]], dtype=torch.int32)
-        a.blank_legal_ids[:, :2, :2] = torch.tensor(
-            [[[11, 12], [0, 0]], [[21, 22], [31, 32]]], dtype=torch.int32
-        )
-        a.blank_legal_mask[:, :2, :2] = torch.tensor(
-            [[[1, 1], [0, 0]], [[1, 1], [1, 1]]], dtype=torch.uint8
-        )
-        a.blank_count[:] = torch.tensor([1, 2], dtype=torch.int32)
-        a.blank_legal_count[:, :2] = torch.tensor([[2, 0], [2, 2]], dtype=torch.int32)
+        a.pointer_anchor_positions[:, :2] = torch.tensor([[1, -1], [2, 4]], dtype=torch.int32)
+        a.pointer_anchor_kinds[:, :2] = torch.tensor([[101, -1], [102, 103]], dtype=torch.int32)
+        a.pointer_anchor_handles[:, :2] = torch.tensor([[0, -1], [1, 1]], dtype=torch.int32)
+        a.pointer_anchor_subjects[:, :2] = torch.tensor([[1, 0], [2, 2]], dtype=torch.int32)
+        a.spec_lens[:] = torch.tensor([2, 4], dtype=torch.int32)
+        a.decision_type[:] = torch.tensor([0, 1], dtype=torch.int32)
+        a.pointer_anchor_counts[:] = torch.tensor([1, 2], dtype=torch.int32)
 
         b = _packed_outputs(1)
         b.token_ids[:4] = torch.tensor([20, 21, 22, 23], dtype=torch.int32)
@@ -227,15 +224,13 @@ class MergePackedOutputsTests(unittest.TestCase):
         b.state_positions[:] = torch.tensor([0], dtype=torch.int32)
         b.card_ref_positions[:, :2] = torch.tensor([[1, -1]], dtype=torch.int32)
         b.token_overflow[:] = torch.tensor([1], dtype=torch.int32)
-        b.blank_positions[:, :2] = torch.tensor([[0, 3]], dtype=torch.int32)
-        b.blank_kind[:, :2] = torch.tensor([[104, 105]], dtype=torch.int32)
-        b.blank_group[:, :2] = torch.tensor([[2, 2]], dtype=torch.int32)
-        b.blank_group_kind[:, :2] = torch.tensor([[3, 3]], dtype=torch.int32)
-        b.blank_legal_ids[:, :2, :2] = torch.tensor([[[41, 42], [51, 52]]], dtype=torch.int32)
-        b.blank_legal_mask[:, :2, :2] = torch.tensor([[[1, 1], [1, 1]]], dtype=torch.uint8)
-        b.blank_overflow[:] = torch.tensor([1], dtype=torch.int32)
-        b.blank_count[:] = torch.tensor([2], dtype=torch.int32)
-        b.blank_legal_count[:, :2] = torch.tensor([[2, 2]], dtype=torch.int32)
+        b.pointer_anchor_positions[:, :2] = torch.tensor([[0, 3]], dtype=torch.int32)
+        b.pointer_anchor_kinds[:, :2] = torch.tensor([[104, 105]], dtype=torch.int32)
+        b.pointer_anchor_handles[:, :2] = torch.tensor([[2, 2]], dtype=torch.int32)
+        b.pointer_anchor_subjects[:, :2] = torch.tensor([[3, 3]], dtype=torch.int32)
+        b.spec_lens[:] = torch.tensor([3], dtype=torch.int32)
+        b.decision_type[:] = torch.tensor([2], dtype=torch.int32)
+        b.pointer_anchor_counts[:] = torch.tensor([2], dtype=torch.int32)
 
         out = _packed_outputs(3)
         merged = _merge_packed_outputs([a, b], out)
@@ -269,42 +264,27 @@ class MergePackedOutputsTests(unittest.TestCase):
             out.token_overflow[:3], torch.tensor([0, 0, 1], dtype=torch.int32)
         )
         torch.testing.assert_close(
-            out.blank_positions[:3, :2],
+            out.pointer_anchor_positions[:3, :2],
             torch.tensor([[1, -1], [2, 4], [5, 8]], dtype=torch.int32),
         )
         torch.testing.assert_close(
-            out.blank_kind[:3, :2],
-            torch.tensor([[101, 0], [102, 103], [104, 105]], dtype=torch.int32),
+            out.pointer_anchor_kinds[:3, :2],
+            torch.tensor([[101, -1], [102, 103], [104, 105]], dtype=torch.int32),
         )
         torch.testing.assert_close(
-            out.blank_group[:3, :2],
+            out.pointer_anchor_handles[:3, :2],
             torch.tensor([[0, -1], [1, 1], [2, 2]], dtype=torch.int32),
         )
         torch.testing.assert_close(
-            out.blank_group_kind[:3, :2],
+            out.pointer_anchor_subjects[:3, :2],
             torch.tensor([[1, 0], [2, 2], [3, 3]], dtype=torch.int32),
         )
+        torch.testing.assert_close(out.spec_lens[:3], torch.tensor([2, 4, 3], dtype=torch.int32))
         torch.testing.assert_close(
-            out.blank_legal_ids[:3, :2, :2],
-            torch.tensor(
-                [[[11, 12], [0, 0]], [[21, 22], [31, 32]], [[41, 42], [51, 52]]],
-                dtype=torch.int32,
-            ),
+            out.decision_type[:3], torch.tensor([0, 1, 2], dtype=torch.int32)
         )
         torch.testing.assert_close(
-            out.blank_legal_mask[:3, :2, :2],
-            torch.tensor(
-                [[[1, 1], [0, 0]], [[1, 1], [1, 1]], [[1, 1], [1, 1]]],
-                dtype=torch.uint8,
-            ),
-        )
-        torch.testing.assert_close(
-            out.blank_overflow[:3], torch.tensor([0, 0, 1], dtype=torch.int32)
-        )
-        torch.testing.assert_close(out.blank_count[:3], torch.tensor([1, 2, 2], dtype=torch.int32))
-        torch.testing.assert_close(
-            out.blank_legal_count[:3, :2],
-            torch.tensor([[2, 0], [2, 2], [2, 2]], dtype=torch.int32),
+            out.pointer_anchor_counts[:3], torch.tensor([1, 2, 2], dtype=torch.int32)
         )
 
 

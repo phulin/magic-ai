@@ -236,7 +236,7 @@ def test_collate_shapes_and_masks(
     seq_lens = [len(ex.token_ids) for ex in examples]
     assert len(set(seq_lens)) > 1, "expected differing-length examples"
 
-    batch: TextEncodedBatch = collate(examples, pad_id=pad_id)
+    batch: TextEncodedBatch = collate(examples, [None] * len(examples), pad_id=pad_id)
     b = len(examples)
     max_t = max(seq_lens)
 
@@ -273,4 +273,4 @@ def test_collate_shapes_and_masks(
 
 def test_collate_empty_raises(tokenizer) -> None:
     with pytest.raises(ValueError):
-        collate([], pad_id=int(tokenizer.pad_token_id))
+        collate([], [], pad_id=int(tokenizer.pad_token_id))

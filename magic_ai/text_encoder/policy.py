@@ -76,9 +76,16 @@ class TextPolicy(nn.Module):
             initialize_text_state_encoder_from_hf(self.encoder, cfg)
         self.value_head = ValueHead(cfg.d_model)
         self.mlm_head = MLMHead(self.encoder)
-        self.grammar_decoder = GrammarDecoder(
-            decoder_cfg or GrammarDecoderConfig(d_model=cfg.d_model)
-        )
+        if decoder_cfg is None:
+            # Pick the largest n_heads <= the default that divides d_model so
+            # tiny test configs (d_model=32, etc.) don't trip the assertion.
+            default_heads = GrammarDecoderConfig.n_heads
+            n_heads = next(
+                (h for h in range(default_heads, 0, -1) if cfg.d_model % h == 0),
+                1,
+            )
+            decoder_cfg = GrammarDecoderConfig(d_model=cfg.d_model, n_heads=n_heads)
+        self.grammar_decoder = GrammarDecoder(decoder_cfg)
 
     def encode_only(self, batch: TextEncodedBatch) -> EncodedSnapshots:
         packed = pack_batch(batch)
@@ -160,7 +167,7 @@ class TextPolicy(nn.Module):
                 continue
             try:
                 spec = spec_renderer.render(snap, card_refs=rendered.card_refs)
-            except (NotImplementedError, ValueError):
+            except NotImplementedError, ValueError:
                 spec = None
             specs.append(spec)
         pad_id = tokenizer.pad_token_id

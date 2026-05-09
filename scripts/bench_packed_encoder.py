@@ -68,6 +68,7 @@ def _move_packed(batch, device):  # type: ignore[no-untyped-def]
     def to(t):  # type: ignore[no-untyped-def]
         return t.to(device, non_blocking=True)
 
+    legal_edge_bitmap = to(batch.legal_edge_bitmap) if batch.legal_edge_bitmap is not None else None
     return PackedTextBatch(
         token_ids=to(batch.token_ids),
         seq_id=to(batch.seq_id),
@@ -79,13 +80,13 @@ def _move_packed(batch, device):  # type: ignore[no-untyped-def]
         total_tokens=batch.total_tokens,
         seq_lengths_host=batch.seq_lengths_host,
         max_seqlen=batch.max_seqlen,
-        blank_positions=to(batch.blank_positions),
-        blank_kind=to(batch.blank_kind),
-        blank_group=to(batch.blank_group),
-        blank_group_kind=to(batch.blank_group_kind),
-        blank_option_index=to(batch.blank_option_index),
-        blank_legal_ids=to(batch.blank_legal_ids),
-        blank_legal_mask=to(batch.blank_legal_mask),
+        spec_lens=to(batch.spec_lens),
+        decision_type=to(batch.decision_type),
+        pointer_anchor_positions=to(batch.pointer_anchor_positions),
+        pointer_anchor_kinds=to(batch.pointer_anchor_kinds),
+        pointer_anchor_subjects=to(batch.pointer_anchor_subjects),
+        pointer_anchor_handles=to(batch.pointer_anchor_handles),
+        legal_edge_bitmap=legal_edge_bitmap,
     )
 
 

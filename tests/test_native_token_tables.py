@@ -9,7 +9,6 @@ from magic_ai.text_encoder.card_cache import build_card_cache
 from magic_ai.text_encoder.native_token_tables import (
     LOOKUP_ABILITY,
     LOOKUP_ACTION_VERB,
-    LOOKUP_BLANK_SINGLETON,
     LOOKUP_CARD_BODY,
     LOOKUP_CARD_NAME,
     LOOKUP_CARD_REF,
@@ -17,11 +16,9 @@ from magic_ai.text_encoder.native_token_tables import (
     LOOKUP_FRAGMENT,
     LOOKUP_LIFE_OWNER,
     LOOKUP_MANA_GLYPH,
-    LOOKUP_NUM_ID,
     LOOKUP_TURN_STEP,
     LOOKUP_ZONE_CLOSE,
     LOOKUP_ZONE_OPEN,
-    active_packed,
     native_lookup,
     native_summary,
     register_native_token_tables,
@@ -47,7 +44,7 @@ from magic_ai.text_encoder.token_tables import (
     Frag,
     build_token_tables,
 )
-from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, MAX_NUM, load_tokenizer
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, load_tokenizer
 
 
 @pytest.fixture(scope="module")
@@ -69,7 +66,7 @@ def cache(oracle, tokenizer):
 @pytest.fixture(scope="module")
 def registered_tables(tokenizer, cache):
     tables = build_token_tables(tokenizer, cache)
-    register_native_token_tables(tables)
+    register_native_token_tables(tables, tokenizer=tokenizer)
     return tables
 
 
@@ -169,39 +166,6 @@ def test_card_name_round_trip(registered_tables) -> None:
     for row in (0, 1, 100, 1000, len(registered_tables.card_name) - 1):
         if 0 <= row < len(registered_tables.card_name):
             assert native_lookup(LOOKUP_CARD_NAME, row) == registered_tables.card_name[row]
-
-
-_INLINE_BLANK_SINGLETON_FIELDS: tuple[str, ...] = (
-    "choose_target_id",
-    "choose_block_id",
-    "choose_damage_order_id",
-    "choose_mode_id",
-    "choose_may_id",
-    "choose_x_digit_id",
-    "choose_mana_source_id",
-    "choose_play_id",
-    "use_ability_id",
-    "chosen_id",
-    "yes_id",
-    "no_id",
-    "none_id",
-    "x_end_id",
-    "mulligan_id",
-    "keep_id",
-)
-
-
-def test_inline_blank_packed_round_trip(registered_tables) -> None:
-    """Inline-blank ids land in Python-held buffers and native token tables."""
-    packed = active_packed()
-    assert packed is not None
-    for idx, attr in enumerate(_INLINE_BLANK_SINGLETON_FIELDS):
-        assert getattr(packed, attr) == getattr(registered_tables, attr), attr
-        assert native_lookup(LOOKUP_BLANK_SINGLETON, idx) == [getattr(registered_tables, attr)]
-    assert packed.num_ids.numel() == MAX_NUM
-    assert packed.num_ids.tolist() == list(registered_tables.num_ids)
-    for idx, token_id in enumerate(registered_tables.num_ids):
-        assert native_lookup(LOOKUP_NUM_ID, idx) == [token_id]
 
 
 def test_out_of_bounds_returns_empty(registered_tables) -> None:

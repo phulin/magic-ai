@@ -507,7 +507,12 @@ def decode_decoder_action(
     is malformed.
     """
 
-    dt = DecisionType(int(layout.decision_type))
+    dt_val = int(layout.decision_type)
+    if dt_val < 0:
+        # No pending decision spec was attached to this row; fall back to a
+        # pass / no-op action that the engine will accept for the current pending.
+        return action_from_choice_index(0)
+    dt = DecisionType(dt_val)
     tokens = layout.output_token_ids.detach().to("cpu", dtype=torch.long).tolist()
     is_ptr = layout.output_is_pointer.detach().to("cpu").tolist()
     pad = layout.output_pad_mask.detach().to("cpu").tolist()

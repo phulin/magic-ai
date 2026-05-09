@@ -102,11 +102,34 @@ from magic_ai.slot_encoder.native_rollout import (  # noqa: E402
 from magic_ai.text_encoder.actor_critic import (  # noqa: E402
     NativeTextReplayPayload,
     TextActorCritic,  # noqa: E402
-    TextDecisionLayout,
-    _decode_text_action,
-    build_text_decision_layout,
-    infer_text_trace_kind,
 )
+
+
+# Phase 6 of the inline-blank cutover removed these helpers; the live
+# text-encoder rollout / training paths in this script have not yet been
+# rewired around the decoder pipeline (Phase 7 work). The placeholders
+# below let the module import; any code that calls them will fail loudly.
+class TextDecisionLayout:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise NotImplementedError(
+            "TextDecisionLayout was removed in the inline-blank cutover; "
+            "scripts/train.py text-encoder rollout will be re-wired around the "
+            "decoder pipeline in Phase 7."
+        )
+
+
+def build_text_decision_layout(*args: Any, **kwargs: Any) -> TextDecisionLayout:  # type: ignore[empty-body]
+    raise NotImplementedError("build_text_decision_layout was removed in the inline-blank cutover.")
+
+
+def infer_text_trace_kind(*args: Any, **kwargs: Any) -> int:  # type: ignore[empty-body]
+    raise NotImplementedError("infer_text_trace_kind was removed in the inline-blank cutover.")
+
+
+def _decode_text_action(*args: Any, **kwargs: Any) -> Any:
+    raise NotImplementedError("_decode_text_action was removed in the inline-blank cutover.")
+
+
 from magic_ai.text_encoder.batch import collate, tokenize_snapshot  # noqa: E402
 from magic_ai.text_encoder.card_cache import (  # noqa: E402
     DEFAULT_ORACLE_DB_PATH,
@@ -135,12 +158,17 @@ from magic_ai.text_encoder.render import OracleEntry, render_snapshot  # noqa: E
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer  # noqa: E402
 from magic_ai.text_encoder.tokenizer import (  # noqa: E402
     MAX_CARD_REFS,
-    MAX_NUM,
     MODERNBERT_REPO,
     MODERNBERT_REVISION,
     TOKENIZER_DIR,
     load_tokenizer,
 )
+
+# Inline-blank pipeline used a fixed ``<num:k>`` token table; the decoder
+# pipeline emits digits via the grammar so MAX_NUM is no longer a tokenizer
+# constant. Keep a local upper bound for the few legacy rollout helpers in
+# this script that haven't been ported to the decoder yet.
+MAX_NUM = 64
 
 DEFAULT_DECK = {
     "name": "bolt-mountain",
@@ -369,7 +397,12 @@ class TextTrainingBackend:
 
 
 class NativeTextTrajectoryBuffer:
-    """Fixed-width per-env staging for native text rollouts before replay commit."""
+    """Fixed-width per-env staging for native text rollouts before replay commit.
+
+    Phase 6 of the inline-blank cutover stripped this class's inline-blank-shaped
+    staging buffers. The decoder-pipeline rewrite of the native text rollout is
+    Phase 7 work; for now this class raises on construction so callers fail fast.
+    """
 
     def __init__(
         self,
@@ -379,23 +412,11 @@ class NativeTextTrajectoryBuffer:
         max_steps: int,
         validate: bool = True,
     ) -> None:
-        self.num_envs = int(num_envs)
-        self.max_steps = int(max_steps)
-        self.validate = bool(validate)
-        self.device = replay_buffer.device
-        self.max_tokens = replay_buffer.max_tokens
-        self.max_options = replay_buffer.max_options
-        self.max_targets_per_option = replay_buffer.max_targets_per_option
-        self.max_blanks_per_row = replay_buffer.max_blanks_per_row
-        self.max_legal_per_blank = replay_buffer.max_legal_per_blank
-        self.max_decision_groups = replay_buffer.max_decision_groups
-        self.max_cached_choices = replay_buffer.max_cached_choices
-        self.max_card_refs = replay_buffer.max_card_refs
-        self.max_blanks_per_row = replay_buffer.max_blanks_per_row
-        self.max_legal_per_blank = replay_buffer.max_legal_per_blank
-        self.recurrent_layers = replay_buffer.recurrent_layers
-        self.recurrent_hidden_dim = replay_buffer.recurrent_hidden_dim
-        self.lstm_proj_hidden = replay_buffer.lstm_proj_hidden
+        del replay_buffer, num_envs, max_steps, validate
+        raise NotImplementedError(
+            "NativeTextTrajectoryBuffer was wired around the inline-blank text "
+            "rollout shape; the decoder-pipeline rewrite is Phase 7 work."
+        )
         self._lock = threading.Lock()
         self.timing_stats: Any | None = None
         shape = (self.num_envs, self.max_steps)

@@ -329,7 +329,6 @@ def test_text_policy_end_to_end(
 
     batch = TextPolicy.encode_snapshots(
         snapshots,
-        actions_per_snapshot=None,
         oracle=oracle,
         tokenizer=tokenizer,
     )
@@ -361,158 +360,7 @@ def test_text_policy_end_to_end(
     assert torch.isfinite(out.values).all()
     assert torch.isfinite(out.state_vector).all()
 
-    assert out.blank_logits is not None
-    assert out.blank_logits.shape == batch.blank_legal_ids.shape
-    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
-
-
-def test_text_policy_inline_blank_forward(
-    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
-) -> None:
-    cfg = _small_cfg(tokenizer)
-    policy = build_text_policy(tokenizer, cfg)
-    batch = TextPolicy.encode_snapshots(
-        [_snapshot_with_action(real_card_names)],
-        actions_per_snapshot=None,
-        oracle=oracle,
-        tokenizer=tokenizer,
-    )
-
-    assert batch.blank_positions.shape[1] > 0
-    assert batch.blank_legal_mask.any()
-
-    out = policy(batch)
-
-    assert out.blank_logits is not None
-    assert out.blank_logits.shape == batch.blank_legal_ids.shape
-    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
-    assert (out.blank_logits[~batch.blank_legal_mask] == float("-inf")).all()
-    assert out.blank_group is batch.blank_group
-    assert out.blank_group_kind is batch.blank_group_kind
-
-
-def test_text_policy_inline_block_blank_forward(
-    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
-) -> None:
-    cfg = _small_cfg(tokenizer)
-    policy = build_text_policy(tokenizer, cfg)
-    batch = TextPolicy.encode_snapshots(
-        [_snapshot_with_blockers(real_card_names)],
-        actions_per_snapshot=None,
-        oracle=oracle,
-        tokenizer=tokenizer,
-    )
-
-    assert batch.blank_positions.shape == (1, 1)
-    assert batch.blank_legal_ids.shape == (1, 1, 2)
-    assert int(batch.blank_option_index[0, 0]) == 0
-    none_id = tokenizer.convert_tokens_to_ids("<none>")
-    assert int(batch.blank_legal_ids[0, 0, 0]) == int(none_id)
-
-    out = policy(batch)
-
-    assert out.blank_logits is not None
-    assert out.blank_logits.shape == batch.blank_legal_ids.shape
-    assert out.blank_option_index is batch.blank_option_index
-    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
-
-
-def test_text_policy_inline_may_blank_forward(
-    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
-) -> None:
-    cfg = _small_cfg(tokenizer)
-    policy = build_text_policy(tokenizer, cfg)
-    batch = TextPolicy.encode_snapshots(
-        [_snapshot_with_may(real_card_names)],
-        actions_per_snapshot=None,
-        oracle=oracle,
-        tokenizer=tokenizer,
-    )
-
-    assert batch.blank_positions.shape == (1, 1)
-    no_id = tokenizer.convert_tokens_to_ids("<no>")
-    yes_id = tokenizer.convert_tokens_to_ids("<yes>")
-    assert int(batch.blank_legal_ids[0, 0, 0]) == int(no_id)
-    assert int(batch.blank_legal_ids[0, 0, 1]) == int(yes_id)
-
-    out = policy(batch)
-
-    assert out.blank_logits is not None
-    assert out.blank_logits.shape == batch.blank_legal_ids.shape
-    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
-
-
-def test_text_policy_inline_mode_blank_forward(
-    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
-) -> None:
-    cfg = _small_cfg(tokenizer)
-    policy = build_text_policy(tokenizer, cfg)
-    batch = TextPolicy.encode_snapshots(
-        [_snapshot_with_mode(real_card_names)],
-        actions_per_snapshot=None,
-        oracle=oracle,
-        tokenizer=tokenizer,
-    )
-
-    assert batch.blank_positions.shape == (1, 1)
-    num0_id = tokenizer.convert_tokens_to_ids("<num:0>")
-    num1_id = tokenizer.convert_tokens_to_ids("<num:1>")
-    assert int(batch.blank_legal_ids[0, 0, 0]) == int(num0_id)
-    assert int(batch.blank_legal_ids[0, 0, 1]) == int(num1_id)
-
-    out = policy(batch)
-
-    assert out.blank_logits is not None
-    assert out.blank_logits.shape == batch.blank_legal_ids.shape
-    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
-
-
-def test_text_policy_inline_number_blank_forward(
-    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
-) -> None:
-    cfg = _small_cfg(tokenizer)
-    policy = build_text_policy(tokenizer, cfg)
-    batch = TextPolicy.encode_snapshots(
-        [_snapshot_with_number(real_card_names)],
-        actions_per_snapshot=None,
-        oracle=oracle,
-        tokenizer=tokenizer,
-    )
-
-    assert batch.blank_positions.shape == (1, 1)
-    for k in range(3):
-        num_id = tokenizer.convert_tokens_to_ids(f"<num:{k}>")
-        assert int(batch.blank_legal_ids[0, 0, k]) == int(num_id)
-
-    out = policy(batch)
-
-    assert out.blank_logits is not None
-    assert out.blank_logits.shape == batch.blank_legal_ids.shape
-    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
-
-
-def test_text_policy_inline_mana_color_blank_forward(
-    tokenizer, oracle: dict[str, OracleEntry], real_card_names: list[str]
-) -> None:
-    cfg = _small_cfg(tokenizer)
-    policy = build_text_policy(tokenizer, cfg)
-    batch = TextPolicy.encode_snapshots(
-        [_snapshot_with_mana_color(real_card_names)],
-        actions_per_snapshot=None,
-        oracle=oracle,
-        tokenizer=tokenizer,
-    )
-
-    assert batch.blank_positions.shape == (1, 1)
-    for k, symbol in enumerate(("W", "U", "B", "R", "G", "C")):
-        mana_id = tokenizer.convert_tokens_to_ids(f"<mana:{symbol}>")
-        assert int(batch.blank_legal_ids[0, 0, k]) == int(mana_id)
-
-    out = policy(batch)
-
-    assert out.blank_logits is not None
-    assert out.blank_logits.shape == batch.blank_legal_ids.shape
-    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+    # Inline-blank logits were removed in Phase 6; only the value head is exercised.
 
 
 def test_text_policy_backward(
@@ -520,12 +368,11 @@ def test_text_policy_backward(
 ) -> None:
     snapshots = [_snapshot_with_action(real_card_names), _snapshot_simple(real_card_names)]
     policy = build_text_policy(tokenizer, _small_cfg(tokenizer))
-    batch = TextPolicy.encode_snapshots(snapshots, None, oracle, tokenizer)
+    batch = TextPolicy.encode_snapshots(snapshots, oracle, tokenizer)
 
     out = policy(batch)
 
-    assert out.blank_logits is not None
-    loss = out.values.sum() + out.blank_logits[batch.blank_legal_mask].sum()
+    loss = out.values.sum()
     loss.backward()
 
     grad_norms = [

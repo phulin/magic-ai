@@ -27,7 +27,7 @@ from magic_ai.game_state import (
 from magic_ai.text_encoder.decoder import GrammarDecoderConfig
 from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE, GrammarVocab
 from magic_ai.text_encoder.model import TextEncoderConfig
-from magic_ai.text_encoder.policy import TextPolicy, build_text_policy
+from magic_ai.text_encoder.policy import TextPolicy
 from magic_ai.text_encoder.render import (
     DEFAULT_ORACLE_PATH,
     OracleEntry,
@@ -163,14 +163,12 @@ def test_grammar_decoder_teacher_forced_smoke(
     snapshots = [_snapshot_priority(real_card_name), _snapshot_may(real_card_name)]
     policy = TextPolicy(
         _small_cfg(tokenizer),
-        use_grammar_decoder=True,
         decoder_cfg=_small_decoder_cfg(),
     )
-    batch = TextPolicy.encode_snapshots_with_specs(
+    batch = TextPolicy.encode_snapshots(
         snapshots,
-        actions_per_snapshot=None,
-        oracle=oracle,
-        tokenizer=tokenizer,
+        oracle,
+        tokenizer,
     )
 
     # Combined-stream invariants.
@@ -225,32 +223,6 @@ def test_grammar_decoder_teacher_forced_smoke(
     assert any(g > 0 for g in grads), "no decoder gradient flowed"
 
 
-def test_grammar_decoder_off_preserves_inline_path(
-    tokenizer, oracle: dict[str, OracleEntry], real_card_name: str
-) -> None:
-    """``use_grammar_decoder=False`` must leave the inline-blank path unchanged.
-
-    Reproduces the shape / finiteness assertions from
-    ``tests/test_text_policy.py::test_text_policy_inline_may_blank_forward``
-    against the same fixture, but constructs the policy without the decoder.
-    """
-    cfg = _small_cfg(tokenizer)
-    policy = build_text_policy(tokenizer, cfg)
-    assert policy.grammar_decoder is None
-    batch = TextPolicy.encode_snapshots(
-        [_snapshot_may(real_card_name)],
-        actions_per_snapshot=None,
-        oracle=oracle,
-        tokenizer=tokenizer,
-    )
-
-    assert batch.blank_positions.shape == (1, 1)
-    no_id = tokenizer.convert_tokens_to_ids("<no>")
-    yes_id = tokenizer.convert_tokens_to_ids("<yes>")
-    assert int(batch.blank_legal_ids[0, 0, 0]) == int(no_id)
-    assert int(batch.blank_legal_ids[0, 0, 1]) == int(yes_id)
-
-    out = policy(batch)
-    assert out.blank_logits is not None
-    assert out.blank_logits.shape == batch.blank_legal_ids.shape
-    assert torch.isfinite(out.blank_logits[batch.blank_legal_mask]).all()
+# test_grammar_decoder_off_preserves_inline_path was removed in Phase 6 of the
+# inline-blank cutover: the ``use_grammar_decoder`` flag is gone (the decoder is
+# always wired) and the inline-blank head no longer exists.

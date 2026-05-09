@@ -14,14 +14,8 @@ from typing import Any
 import pytest
 from magic_ai.text_encoder.tokenizer import (
     ALL_CUSTOM_TOKENS,
-    BLANK_ANSWER_TOKENS,
-    CHOOSE_KIND_TOKENS,
-    INLINE_BLANK_TOKENS,
-    MAX_NUM,
-    NUM_TOKENS,
     TOKENIZER_DIR,
     load_tokenizer,
-    num_token,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -48,34 +42,6 @@ def test_every_custom_token_is_single_id(tokenizer) -> None:
         ids = tokenizer.encode(tok_str, add_special_tokens=False)
         assert len(ids) == 1, f"{tok_str!r} tokenized to {len(ids)} ids: {ids}"
         assert ids[0] != unk_id, f"{tok_str!r} mapped to <unk>"
-
-
-def test_inline_blank_tokens_are_distinct_singletons(tokenizer) -> None:
-    # Every blank-kind / answer / num token resolves to a unique single id,
-    # and the set is disjoint from the priority-anchor ``<pass>`` token
-    # (which is reused, not redeclared).
-    seen: dict[int, str] = {}
-    for tok_str in INLINE_BLANK_TOKENS:
-        ids = tokenizer.encode(tok_str, add_special_tokens=False)
-        assert len(ids) == 1, f"{tok_str!r} -> {ids}"
-        tid = ids[0]
-        assert tid not in seen, f"{tok_str!r} collides with {seen[tid]!r}"
-        seen[tid] = tok_str
-    assert len(CHOOSE_KIND_TOKENS) == 9
-    assert len(BLANK_ANSWER_TOKENS) == 5
-    assert len(NUM_TOKENS) == MAX_NUM == 16
-    assert num_token(0) == "<num:0>"
-    assert num_token(MAX_NUM - 1) == f"<num:{MAX_NUM - 1}>"
-    with pytest.raises(ValueError):
-        num_token(MAX_NUM)
-    with pytest.raises(ValueError):
-        num_token(-1)
-
-
-def test_pass_token_not_duplicated_in_inline_blanks() -> None:
-    # ``<pass>`` lives in ACTION_KIND_TOKENS as the priority-anchor; the
-    # inline-blank plan reuses it rather than redeclaring it.
-    assert "<pass>" not in INLINE_BLANK_TOKENS
 
 
 @pytest.mark.parametrize("symbol", ["{W}", "{2/W}"])

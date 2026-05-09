@@ -166,7 +166,7 @@ class TextRolloutSmokeTests(unittest.TestCase):
             h_in = state.h.detach().clone()
             result = original(self, game, snapshot, legal_options, state, perspective_player_idx)
             if result is not None:
-                _, _, new_state = result
+                _, new_state, _ = result
                 events.append((player_idx, h_in, new_state.h.detach().clone()))
             return result
 

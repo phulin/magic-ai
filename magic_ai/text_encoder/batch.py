@@ -57,13 +57,15 @@ class TextEncodedBatch:
     attention_mask: Tensor  # [B, T] int64
     card_ref_positions: Tensor  # [B, MAX_CARD_REFS] int64, -1 = absent
     seq_lengths: Tensor  # [B] int64
-    spec_tokens: Tensor  # [B, T_spec_max] int32, 0 = pad
-    spec_lens: Tensor  # [B] int32
-    decision_type: Tensor  # [B] int32 (DecisionType enum, -1 = no pending)
-    pointer_anchor_positions: Tensor  # [B, N_anchors_max] int32, -1 = pad
-    pointer_anchor_kinds: Tensor  # [B, N_anchors_max] int32 (AnchorKind), -1 = pad
-    pointer_anchor_subjects: Tensor  # [B, N_anchors_max] int32, -1 = pad
-    pointer_anchor_handles: Tensor  # [B, N_anchors_max] int32, -1 = pad
+    # Decision-spec fields are optional; rows that batch state-only snapshots
+    # (e.g. for MLM pretraining) leave these empty.
+    spec_tokens: Tensor | None = None  # [B, T_spec_max] int32, 0 = pad
+    spec_lens: Tensor | None = None  # [B] int32
+    decision_type: Tensor | None = None  # [B] int32 (DecisionType enum, -1 = no pending)
+    pointer_anchor_positions: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
+    pointer_anchor_kinds: Tensor | None = None  # [B, N_anchors_max] int32 (AnchorKind), -1 = pad
+    pointer_anchor_subjects: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
+    pointer_anchor_handles: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
     # ``[B, N_blockers_max, N_attackers_max]`` bool. ``None`` when no row in
     # the batch has DECLARE_BLOCKERS legal-edge data.
     legal_edge_bitmap: Tensor | None = None
@@ -75,6 +77,22 @@ class TextEncodedBatch:
             self.seq_lengths_host = tuple(int(x) for x in self.seq_lengths.tolist())
         if self.total_tokens is None and self.seq_lengths_host is not None:
             self.total_tokens = sum(self.seq_lengths_host)
+        b = int(self.seq_lengths.shape[0])
+        device = self.seq_lengths.device
+        if self.spec_tokens is None:
+            self.spec_tokens = torch.zeros((b, 0), dtype=torch.int32, device=device)
+        if self.spec_lens is None:
+            self.spec_lens = torch.zeros((b,), dtype=torch.int32, device=device)
+        if self.decision_type is None:
+            self.decision_type = torch.full((b,), -1, dtype=torch.int32, device=device)
+        if self.pointer_anchor_positions is None:
+            self.pointer_anchor_positions = torch.full((b, 0), -1, dtype=torch.int32, device=device)
+        if self.pointer_anchor_kinds is None:
+            self.pointer_anchor_kinds = torch.full((b, 0), -1, dtype=torch.int32, device=device)
+        if self.pointer_anchor_subjects is None:
+            self.pointer_anchor_subjects = torch.full((b, 0), -1, dtype=torch.int32, device=device)
+        if self.pointer_anchor_handles is None:
+            self.pointer_anchor_handles = torch.full((b, 0), -1, dtype=torch.int32, device=device)
 
 
 @dataclass
@@ -89,16 +107,32 @@ class PackedTextBatch:
 
     state_positions: Tensor  # [B] int32, packed-offset of each row's first token
     card_ref_positions: Tensor  # [B, MAX_CARD_REFS] int32, -1 = absent
-    spec_lens: Tensor  # [B] int32
-    decision_type: Tensor  # [B] int32
-    pointer_anchor_positions: Tensor  # [B, N_anchors_max] int32, -1 = pad
-    pointer_anchor_kinds: Tensor  # [B, N_anchors_max] int32, -1 = pad
-    pointer_anchor_subjects: Tensor  # [B, N_anchors_max] int32, -1 = pad
-    pointer_anchor_handles: Tensor  # [B, N_anchors_max] int32, -1 = pad
+    spec_lens: Tensor | None = None  # [B] int32
+    decision_type: Tensor | None = None  # [B] int32
+    pointer_anchor_positions: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
+    pointer_anchor_kinds: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
+    pointer_anchor_subjects: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
+    pointer_anchor_handles: Tensor | None = None  # [B, N_anchors_max] int32, -1 = pad
     legal_edge_bitmap: Tensor | None = None
     total_tokens: int | None = None
     seq_lengths_host: tuple[int, ...] | None = None
     max_seqlen: int | None = None
+
+    def __post_init__(self) -> None:
+        b = int(self.seq_lengths.shape[0])
+        device = self.seq_lengths.device
+        if self.spec_lens is None:
+            self.spec_lens = torch.zeros((b,), dtype=torch.int32, device=device)
+        if self.decision_type is None:
+            self.decision_type = torch.full((b,), -1, dtype=torch.int32, device=device)
+        if self.pointer_anchor_positions is None:
+            self.pointer_anchor_positions = torch.full((b, 0), -1, dtype=torch.int32, device=device)
+        if self.pointer_anchor_kinds is None:
+            self.pointer_anchor_kinds = torch.full((b, 0), -1, dtype=torch.int32, device=device)
+        if self.pointer_anchor_subjects is None:
+            self.pointer_anchor_subjects = torch.full((b, 0), -1, dtype=torch.int32, device=device)
+        if self.pointer_anchor_handles is None:
+            self.pointer_anchor_handles = torch.full((b, 0), -1, dtype=torch.int32, device=device)
 
 
 def packed_sequence_layout(

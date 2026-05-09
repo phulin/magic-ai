@@ -36,14 +36,13 @@ from magic_ai.game_state import MANA_COLORS, GameStateSnapshot
 from magic_ai.text_encoder.render import RenderError, load_oracle_text, render_snapshot
 from magic_ai.text_encoder.tokenizer import (
     MANA_TOKENS,
-    NUM_TOKENS,
     load_tokenizer,
 )
 
 ChoiceKind = Literal["priority", "attack", "block", "may", "choose"]
 OutputFormat = Literal["torch_shards", "jsonl.gz"]
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 DEFAULT_KIND_PRIORITY: tuple[ChoiceKind, ...] = ("may", "block", "attack", "choose", "priority")
 CHOICE_KINDS: tuple[ChoiceKind, ...] = ("priority", "attack", "block", "may", "choose")
 
@@ -390,15 +389,8 @@ def _tokenize_state(
     rendered = render_snapshot(
         cast(GameStateSnapshot, snapshot),
         oracle=oracle,
-        chosen_token_id=token_ids_by_name["<chosen>"],
-        none_token_id=token_ids_by_name["<none>"],
-        yes_token_id=token_ids_by_name["<yes>"],
-        no_token_id=token_ids_by_name["<no>"],
-        mulligan_token_id=token_ids_by_name["<mulligan>"],
-        keep_token_id=token_ids_by_name["<keep>"],
         self_token_id=token_ids_by_name["<self>"],
         opp_token_id=token_ids_by_name["<opp>"],
-        num_token_ids=[token_ids_by_name[t] for t in NUM_TOKENS],
         mana_token_ids=[token_ids_by_name[t] for t in MANA_TOKENS[:6]],
         card_ref_token_ids=[token_ids_by_name[f"<card-ref:{i}>"] for i in range(64)],
     )
@@ -727,15 +719,8 @@ def _parse_kind_priority(raw: str) -> tuple[ChoiceKind, ...]:
 
 def _token_ids_by_name(tokenizer: Any) -> dict[str, int]:
     names = {
-        "<chosen>",
-        "<none>",
-        "<yes>",
-        "<no>",
-        "<mulligan>",
-        "<keep>",
         "<self>",
         "<opp>",
-        *NUM_TOKENS,
         *MANA_TOKENS[:6],
         *(f"<card-ref:{i}>" for i in range(64)),
     }

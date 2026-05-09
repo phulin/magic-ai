@@ -117,7 +117,6 @@ def _load_text_rollout_ctypes_lib(mage: Any) -> ctypes.CDLL | None:
     try:
         from magic_ai.slot_encoder.native_encoder import _MageEncodeOutputs
         from magic_ai.text_encoder.native_assembler import (
-            _MagePackedBlankOutputsC,
             _MagePackedTokenAssemblerOutputsC,
         )
 
@@ -136,7 +135,6 @@ def _load_text_rollout_ctypes_lib(mage: Any) -> ctypes.CDLL | None:
                 ("terminal_life_p1", POINTER(c_int64)),
                 ("encode", _MageEncodeOutputs),
                 ("packed_tokens", _MagePackedTokenAssemblerOutputsC),
-                ("blanks", _MagePackedBlankOutputsC),
             ]
 
         lib.MageStartTextRollout.argtypes = [POINTER(_MageTextRolloutStartRequestC)]
@@ -654,85 +652,12 @@ class NativeTextRolloutDriver:
         max_blanks: int,
         max_legal_per_blank: int,
     ) -> _TextReadyOutputBuffers:
-        from magic_ai.text_encoder.native_assembler import (
-            _MageBlankAssemblerConfigC,
-            _MagePackedBlankOutputsC,
-            _MagePackedTokenAssemblerOutputsC,
-            _MageTokenAssemblerConfigC,
-            _tensor_ptr,
-            allocate_packed_outputs,
+        del encoder, n, max_tokens, max_card_refs, max_blanks, max_legal_per_blank
+        raise NotImplementedError(
+            "NativeTextRolloutDriver was wired around the inline-blank text "
+            "assembler; the decoder-pipeline rewrite of the native ready-batch "
+            "surface is Phase 7 work."
         )
-
-        key = (
-            int(n),
-            int(max_tokens),
-            int(encoder.max_options),
-            int(encoder.max_targets_per_option),
-            int(max_card_refs),
-            int(max_blanks),
-            int(max_legal_per_blank),
-        )
-        cached = self._output_cache.get(key)
-        if cached is not None:
-            return cached
-
-        packed_outputs = allocate_packed_outputs(
-            n,
-            max_tokens=max_tokens,
-            max_options=encoder.max_options,
-            max_targets=encoder.max_targets_per_option,
-            max_card_refs=max_card_refs,
-            max_blanks=max_blanks,
-            max_legal_per_blank=max_legal_per_blank,
-        )
-        packed_outputs._tok_cfg_ctypes = _MageTokenAssemblerConfigC(
-            max_tokens=max_tokens,
-            max_options=encoder.max_options,
-            max_targets=encoder.max_targets_per_option,
-            max_card_refs=max_card_refs,
-        )
-        packed_outputs._packed_out_ctypes = _MagePackedTokenAssemblerOutputsC(
-            token_ids=_tensor_ptr(packed_outputs.token_ids, ctypes.c_int32),
-            cu_seqlens=_tensor_ptr(packed_outputs.cu_seqlens, ctypes.c_int32),
-            seq_lengths=_tensor_ptr(packed_outputs.seq_lengths, ctypes.c_int32),
-            state_positions=_tensor_ptr(packed_outputs.state_positions, ctypes.c_int32),
-            card_ref_positions=_tensor_ptr(packed_outputs.card_ref_positions, ctypes.c_int32),
-            token_overflow=_tensor_ptr(packed_outputs.token_overflow, ctypes.c_int32),
-        )
-        packed_outputs._blank_cfg_ctypes = _MageBlankAssemblerConfigC(
-            max_blanks=max_blanks,
-            max_legal_per_blank=max_legal_per_blank,
-        )
-        packed_outputs._blank_out_ctypes = _MagePackedBlankOutputsC(
-            k_max=max_blanks,
-            v_max=max_legal_per_blank,
-            blank_positions=_tensor_ptr(packed_outputs.blank_positions, ctypes.c_int32),
-            blank_kind=_tensor_ptr(packed_outputs.blank_kind, ctypes.c_int32),
-            blank_group=_tensor_ptr(packed_outputs.blank_group, ctypes.c_int32),
-            blank_group_kind=_tensor_ptr(packed_outputs.blank_group_kind, ctypes.c_int32),
-            blank_option_index=_tensor_ptr(packed_outputs.blank_option_index, ctypes.c_int32),
-            blank_legal_ids=_tensor_ptr(packed_outputs.blank_legal_ids, ctypes.c_int32),
-            blank_legal_mask=_tensor_ptr(packed_outputs.blank_legal_mask, ctypes.c_uint8),
-            blank_overflow=_tensor_ptr(packed_outputs.blank_overflow, ctypes.c_int32),
-            blank_count=_tensor_ptr(packed_outputs.blank_count, ctypes.c_int32),
-            blank_legal_count=_tensor_ptr(packed_outputs.blank_legal_count, ctypes.c_int32),
-        )
-        cached = _TextReadyOutputBuffers(
-            packed_outputs=packed_outputs,
-            request_ids=torch.empty(n, dtype=torch.int64),
-            slot_ids=torch.empty(n, dtype=torch.int64),
-            episode_ids=torch.empty(n, dtype=torch.int64),
-            step_indices=torch.empty(n, dtype=torch.int64),
-            perspectives=torch.empty(n, dtype=torch.int64),
-            terminal_slot_ids=torch.empty(n, dtype=torch.int64),
-            terminal_episode_ids=torch.empty(n, dtype=torch.int64),
-            terminal_winner=torch.empty(n, dtype=torch.int64),
-            terminal_timeout=torch.empty(n, dtype=torch.int64),
-            terminal_life_p0=torch.empty(n, dtype=torch.int64),
-            terminal_life_p1=torch.empty(n, dtype=torch.int64),
-        )
-        self._output_cache[key] = cached
-        return cached
 
     def next_text_inference_batch(
         self,
