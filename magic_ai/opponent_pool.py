@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import itertools
 import math
 import random
 from collections.abc import Iterator
@@ -491,19 +490,19 @@ def run_eval_matches(
         while free_slots and next_game_idx < total_games_target:
             live.append(start_game(free_slots.pop()))
 
-    from magic_ai.text_encoder.actor_critic import TextActorCritic
+    from magic_ai.text_encoder.actor_critic import TextActorCritic, decoder_sample
 
     def run_policy(
         policy: Any,
         envs: list[_EvalGame],
         players: list[int],
-    ) -> tuple[list[int], list[int], list[int], list[int]]:
+    ) -> None:
         slot_indices = [env.slot_idx for env in envs]
         games = [env.game for env in envs]
         if isinstance(policy, TextActorCritic):
             if text_max_tokens is None:
                 raise ValueError("run_eval_matches: text_max_tokens is required for text policies")
-            native_batch, nat_outputs = native_encoder.encode_tokens_packed(
+            _, nat_outputs = native_encoder.encode_tokens_packed(
                 games,
                 perspective_player_indices=players,
                 max_tokens=text_max_tokens,
@@ -511,37 +510,50 @@ def run_eval_matches(
                 max_targets=max_targets_per_option,
                 max_card_refs=256,
             )
-            packed_text_batch = nat_outputs.to_packed_text_batch(
-                trim=True, derive_token_metadata=True
-            )
+            packed = nat_outputs.to_packed_text_batch(trim=True, derive_token_metadata=True)
+            text_policy = policy.policy.text_policy
             with torch.no_grad():
-                sample = policy.sample_native_tensor_batch(
-                    native_batch=native_batch,
-                    env_indices=slot_indices,
-                    perspective_player_indices=players,
-                    packed_batch=packed_text_batch,
-                    deterministic=False,
-                    append_replay=False,
+                encoded_snaps = text_policy.encode_packed_only(packed)
+                encoded = encoded_snaps.encoded
+                device = encoded.device
+                b = int(packed.seq_lengths.shape[0])
+                seq_lengths = packed.seq_lengths.to(device=device, dtype=torch.long)
+                t_enc = int(encoded.shape[1])
+                positions = torch.arange(t_enc, device=device).unsqueeze(0).expand(b, -1)
+                attn_mask = positions < seq_lengths.unsqueeze(-1)
+                sample = decoder_sample(
+                    text_policy,
+                    encoded,
+                    attn_mask,
+                    packed.decision_type.to(device=device, dtype=torch.long),
+                    packed.pointer_anchor_positions.to(device=device, dtype=torch.long),
+                    packed.pointer_anchor_kinds.to(device=device, dtype=torch.long),
+                    packed.pointer_anchor_subjects.to(device=device, dtype=torch.long),
+                    packed.pointer_anchor_handles.to(device=device, dtype=torch.long),
+                    legal_edge_bitmap=packed.legal_edge_bitmap,
+                    greedy=False,
                 )
-            counts = list(sample.decision_counts)
-            selected_cols = list(sample.selected_choice_cols)
-            may_selected = list(sample.may_selected)
-            starts = list(itertools.accumulate(counts, initial=0))[:-1]
-        else:
-            parsed = native_encoder.encode_handles(
-                games,
-                perspective_player_indices=players,
+            output_lens = sample.output_pad_mask.sum(dim=-1).to(dtype=torch.int32)
+            mage.batch_step_by_decoder_action(
+                handles=[int(g._id) for g in games],
+                decision_type=sample.decision_type.to(torch.int32),
+                output_token_ids=sample.output_token_ids.to(torch.int32),
+                output_pointer_subjects=sample.output_pointer_subjects.to(torch.int32),
+                output_is_pointer=sample.output_is_pointer.to(torch.bool),
+                output_lens=output_lens,
+                pointer_anchor_handles=sample.pointer_anchor_handles.to(torch.int32),
+                pointer_anchor_count=sample.pointer_anchor_count.to(torch.int32),
             )
+        else:
+            parsed = native_encoder.encode_handles(games, perspective_player_indices=players)
             with torch.no_grad():
                 steps = policy.sample_native_batch(
-                    parsed,
-                    env_indices=slot_indices,
-                    deterministic=False,
+                    parsed, env_indices=slot_indices, deterministic=False
                 )
-            starts = []
-            counts = []
-            selected_cols = []
-            may_selected = []
+            starts: list[int] = []
+            counts: list[int] = []
+            selected_cols: list[int] = []
+            may_selected: list[int] = []
             cursor = 0
             for step in steps:
                 cols = list(step.selected_choice_cols)
@@ -550,18 +562,17 @@ def run_eval_matches(
                 selected_cols.extend(cols)
                 may_selected.append(step.may_selected)
                 cursor += len(cols)
-        native_rollout.step_by_choice(
-            games,
-            decision_starts=starts,
-            decision_counts=counts,
-            selected_choice_cols=selected_cols,
-            may_selected=may_selected,
-            max_options=max_options,
-            max_targets_per_option=max_targets_per_option,
-        )
+            native_rollout.step_by_choice(
+                games,
+                decision_starts=starts,
+                decision_counts=counts,
+                selected_choice_cols=selected_cols,
+                may_selected=may_selected,
+                max_options=max_options,
+                max_targets_per_option=max_targets_per_option,
+            )
         for env in envs:
             env.action_count += 1
-        return starts, counts, selected_cols, may_selected
 
     with _disable_text_replay_capture(main_policy, opponent_policy):
         fill_slots()
