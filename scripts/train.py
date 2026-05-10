@@ -4741,6 +4741,7 @@ def train_text_native_batched_envs(
             deterministic=bool(args.deterministic_rollout),
             timing_stats=timing_stats,
             min_batch_rows=min_batch_rows,
+            bucketed_inference=bool(args.torch_compile),
         )
         server.start()
 

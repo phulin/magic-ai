@@ -860,6 +860,7 @@ class TextInferenceServer:
         timing_stats: RolloutTimingStats | None = None,
         ring_capacity_rows: int | None = None,
         min_batch_rows: int = 1,
+        bucketed_inference: bool = False,
     ) -> None:
         if max_batch < 1:
             raise ValueError("max_batch must be >= 1")
@@ -873,13 +874,13 @@ class TextInferenceServer:
         self._max_batch = int(max_batch)
         self._min_batch_rows = min(int(min_batch_rows), int(max_batch))
         self._deterministic = bool(deterministic)
-        # Enable bucketed CUDA-Graph inference forward on CUDA. The
-        # bucketed path needs the host batch (so it can pad before H→D),
-        # which the server now passes through unconditionally.
+        # Phase C/F compile knobs are off by default; the caller opts in via
+        # ``bucketed_inference=True`` (typically when ``--torch-compile`` is
+        # set so the policy stack's eager fallbacks line up).
         self._pipeline = TextInferencePipeline(
             deterministic=self._deterministic,
-            bucketed=self._device.type == "cuda",
-            compile_decoder=self._device.type == "cuda",
+            bucketed=bucketed_inference and self._device.type == "cuda",
+            compile_decoder=bucketed_inference and self._device.type == "cuda",
         )
         self._arena = _HostPackedArena(use_pinned=self._device.type == "cuda")
         self._timing = timing_stats
