@@ -731,15 +731,24 @@ class TextReplayBuffer:
             if first_row != self.row_ring.start:
                 raise RuntimeError("claimed replay window must begin at the row ring head")
             self._claimed_windows.pop(0)
-            self.row_ring.release(row_count, new_start=last_row + 1)
-            self.token_ring.release(
-                token_count,
-                new_start=last_token_start + last_token_len if token_count > 0 else None,
+            # The new ring head is the oldest still-held row, not naively
+            # ``last_row + 1``: a wrap-around reservation can sit "behind"
+            # the just-released window, so the row-ring start needs to
+            # follow whichever entry is now the oldest (next claim → next
+            # committed window → oldest uncommitted reservation). Falling
+            # back to ``last_row + 1`` keeps the contiguous case correct;
+            # if everything has drained, ``_RingTracker.release`` resets
+            # start/cursor to 0 once ``used`` hits 0.
+            next_row, next_token, next_decision = self._oldest_held_starts_locked(
+                fallback_row=last_row + 1,
+                fallback_token=last_token_start + last_token_len if token_count > 0 else None,
+                fallback_decision=(
+                    last_decision_start + last_decision_len if decision_count > 0 else None
+                ),
             )
-            self.decision_ring.release(
-                decision_count,
-                new_start=last_decision_start + last_decision_len if decision_count > 0 else None,
-            )
+            self.row_ring.release(row_count, new_start=next_row)
+            self.token_ring.release(token_count, new_start=next_token)
+            self.decision_ring.release(decision_count, new_start=next_decision)
             self.core._row_cursor = self.row_ring.cursor
             self.core._decision_cursor = self.decision_ring.cursor
             for row in rows_host:
@@ -1086,6 +1095,42 @@ class TextReplayBuffer:
             limit = self._claimable_prefix_end_for_window_locked(next_window, next_window.row_start)
             idx += 1
         return int(row_start), int(limit)
+
+    def _oldest_held_starts_locked(
+        self,
+        *,
+        fallback_row: int,
+        fallback_token: int | None,
+        fallback_decision: int | None,
+    ) -> tuple[int, int | None, int | None]:
+        """Return (row_start, token_start, decision_start) of the oldest still-held
+        reservation/window after a release, or the fallbacks if nothing is still
+        held (in which case ``_RingTracker.release`` will reset start/cursor to 0
+        once ``used`` hits zero).
+
+        "Held" means anything that has reserved ring space but isn't yet
+        released: the next pending claim, then the next committed window,
+        then the oldest uncommitted reservation. The fallbacks reproduce
+        the historical "advance to ``last_row + 1``" behavior, which is
+        only correct in the contiguous (non-wrap) case.
+        """
+        if self._claimed_windows:
+            first_row = int(self._claimed_windows[0][0])
+        elif self._committed_windows:
+            first_row = int(self._committed_windows[0].row_start)
+        else:
+            head = self._reservations.get(self._commit_reservation_id)
+            if head is None:
+                return fallback_row, fallback_token, fallback_decision
+            return (
+                int(head.row_start),
+                int(head.token_start),
+                int(head.decision_start),
+            )
+        row_idx = first_row % self.capacity
+        token_start = int(self.row_token_start[row_idx].item())
+        decision_start = int(self.decision_start[row_idx].item())
+        return first_row, token_start, decision_start
 
     def _consume_committed_prefix_locked(self, row_end: int) -> None:
         row_end = int(row_end)
