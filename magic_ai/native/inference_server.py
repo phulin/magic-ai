@@ -21,13 +21,12 @@ import threading
 import time
 from collections.abc import Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from queue import Empty
 from typing import Any, cast
 
 import torch
 
-from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
 from magic_ai.text_encoder.batch import (
     PackedTextBatch,
     scatter_packed_to_padded,
@@ -52,10 +51,6 @@ def _infer_policy_device(policy: Any) -> torch.device:
         except StopIteration:
             pass
     return torch.device("cpu")
-
-
-def _arena_empty(*shape: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    return torch.empty(shape, dtype=dtype, device=device)
 
 
 class _HeadItemDoesNotFit(Exception):
@@ -114,17 +109,16 @@ class DecoderHostView:
 class TextInferenceReply:
     """Per-actor inference reply for the decoder-shaped IMPALA pipeline.
 
-    The actor uses ``host_decoder`` to step its envs via
-    ``mage.batch_step_by_decoder_action`` and to populate transcripts /
-    record_step. ``decoder_batch`` is the GPU-resident form, kept around
-    for staging clones into the replay buffer. ``packed_rows`` carries the
-    per-env encoded snapshots needed at episode-commit time for replay
-    scoring.
+    The actor reads everything from ``host_decoder`` (decoder fields needed
+    for cgo step, transcript bookkeeping, and per-env staging into the
+    replay buffer). ``decoder_batch`` is kept on the policy device for
+    callers that still want a GPU view (e.g. transcript fallback paths).
+    Per-env encoded snapshots live on the actor side — the actor saves its
+    pre-submit host packed batch in the in-flight record.
     """
 
     decoder_batch: NativeTextDecoderBatch
     host_decoder: DecoderHostView
-    packed_rows: list[PackedTextBatch]
     perspective_player_indices: list[int]
     # Per-row LSTM state captured before encode_with_history advanced it.
     # Replay scoring re-runs the encoder under this state to match sample-time
@@ -352,58 +346,51 @@ ForwardCallable = Any
 
 @dataclass
 class _PendingItem:
+    """One actor's submitted batch waiting on the inference queue.
+
+    The ring holds the item by reference (no arena copy). Per-actor host
+    tensors live inside ``request.packed_batch`` and ``request.native_batch``;
+    the dispatch loop concatenates them on host right before the single
+    ``merged.to(device)`` H→D that feeds the policy forward.
+    """
+
     future: Future[TextInferenceReply]
+    request: TextInferenceRequest
     rows: int
-    row_start: int
-    row_end: int
-    token_start: int
-    token_end: int
-    decision_start: int
-    decision_end: int
-    env_indices: list[int]
-    perspective_player_indices: list[int]
     seq_lengths_host: tuple[int, ...]
-    blank_cols: int
-    legal_cols: int
-    copy_event: torch.cuda.Event | None = None
     released: bool = False
+
+    @property
+    def env_indices(self) -> list[int]:
+        return self.request.env_indices
+
+    @property
+    def perspective_player_indices(self) -> list[int]:
+        return self.request.perspective_player_indices
 
 
 class _InferenceWorkRing:
-    """Thread-safe FIFO backed by contiguous arena storage.
+    """Thread-safe bounded FIFO of pending inference items.
 
-    Producers reserve row/token/decision spans, copy their encoded microbatch
-    into shared arena tensors, then publish only a small descriptor. The server
-    drains descriptors in FIFO order and slices one contiguous arena range for
-    the policy call, avoiding per-batch ``torch.cat`` work on the critical path.
+    Producers (actors) push :class:`_PendingItem` records carrying their
+    own pinned host tensors; the server thread pops one or more items per
+    dispatch group, merges them on host, then issues a single H→D for the
+    forward pass. Capacity is in rows: the queue stops accepting new items
+    once the total queued row count would exceed ``capacity_rows``,
+    bounding pinned-host pressure across actors.
     """
 
-    def __init__(self, *, capacity_rows: int, arena_device: torch.device) -> None:
+    def __init__(self, *, capacity_rows: int) -> None:
         if capacity_rows < 1:
             raise ValueError("capacity_rows must be >= 1")
         self.capacity_rows = int(capacity_rows)
-        self.arena_device = torch.device(arena_device)
-        self.token_capacity = self.capacity_rows * 1024
-        self.decision_capacity = self.capacity_rows * 128
         self._cond = threading.Condition()
         self._items: list[_PendingItem | None] = []
+        self._queued_rows = 0
         self._active_rows = 0
-        self._active_tokens = 0
-        self._active_decisions = 0
-        self._reserved_rows = 0
-        self._reserved_tokens = 0
-        self._reserved_decisions = 0
         self._waiting_producers = 0
-        self._row_cursor = 0
-        self._token_cursor = 0
-        self._decision_cursor = 0
-        self._next_reservation_seq = 0
-        self._next_publish_seq = 0
-        self._pending_publish: dict[int, _PendingItem] = {}
         self._closed = False
         self._force_flush = False
-        self._native_arena: dict[str, torch.Tensor] | None = None
-        self._packed_arena: dict[str, torch.Tensor] | None = None
 
     def put(
         self,
@@ -418,19 +405,12 @@ class _InferenceWorkRing:
                 f"inference work item has {rows} rows, exceeds ring capacity {self.capacity_rows}"
             )
         packed = request.packed_batch
-        token_count = int(packed.token_ids.shape[0])
-        native = cast(NativeEncodedBatch, request.native_batch)
-        decision_count = int(native.decision_rows_written)
-        self._validate_item_capacity(rows=rows, tokens=token_count, decisions=decision_count)
+        seq_lengths_host = packed.seq_lengths_host
+        if seq_lengths_host is None:
+            raise ValueError("inference requests require packed seq_lengths_host")
         with self._cond:
-            self._ensure_arenas(native, packed)
             while not self._closed:
-                self._reset_if_empty_locked()
-                if self._has_tail_capacity_locked(
-                    rows=rows,
-                    tokens=token_count,
-                    decisions=decision_count,
-                ):
+                if self._queued_rows + self._active_rows + rows <= self.capacity_rows:
                     break
                 if not block:
                     self._force_flush = True
@@ -444,81 +424,14 @@ class _InferenceWorkRing:
                     self._waiting_producers -= 1
             if self._closed:
                 raise RuntimeError("inference work ring is closed")
-            row_start = self._row_cursor
-            row_end = row_start + rows
-            token_start = self._token_cursor
-            token_end = token_start + token_count
-            decision_start = self._decision_cursor
-            decision_end = decision_start + decision_count
-            publish_seq = self._next_reservation_seq
-            self._next_reservation_seq += 1
-            native_arena = self._native_arena
-            packed_arena = self._packed_arena
-            self._row_cursor = row_end
-            self._token_cursor = token_end
-            self._decision_cursor = decision_end
-            self._reserved_rows += rows
-            self._reserved_tokens += token_count
-            self._reserved_decisions += decision_count
-
-        copy_event: torch.cuda.Event | None = None
-        try:
-            self._copy_into_arena(
-                native=native,
-                packed=packed,
-                native_arena=cast(dict[str, torch.Tensor], native_arena),
-                packed_arena=cast(dict[str, torch.Tensor], packed_arena),
-                row_start=row_start,
-                row_end=row_end,
-                token_start=token_start,
-                token_end=token_end,
-                decision_start=decision_start,
-                decision_end=decision_end,
-            )
-            if self.arena_device.type == "cuda":
-                copy_event = torch.cuda.Event()
-                copy_event.record(torch.cuda.current_stream(self.arena_device))
-        except BaseException:
-            with self._cond:
-                self._reserved_rows -= rows
-                self._reserved_tokens -= token_count
-                self._reserved_decisions -= decision_count
-                self._reset_if_empty_locked()
-                self._cond.notify_all()
-            raise
-
-        with self._cond:
-            self._reserved_rows -= rows
-            self._reserved_tokens -= token_count
-            self._reserved_decisions -= decision_count
-            if self._closed:
-                self._reset_if_empty_locked()
-                self._cond.notify_all()
-                raise RuntimeError("inference work ring is closed")
-            seq_lengths_host = packed.seq_lengths_host
-            if seq_lengths_host is None:
-                raise ValueError("inference requests require packed seq_lengths_host")
             item = _PendingItem(
                 future=future,
+                request=request,
                 rows=rows,
-                row_start=row_start,
-                row_end=row_end,
-                token_start=token_start,
-                token_end=token_end,
-                decision_start=decision_start,
-                decision_end=decision_end,
-                env_indices=list(request.env_indices),
-                perspective_player_indices=list(request.perspective_player_indices),
                 seq_lengths_host=seq_lengths_host,
-                blank_cols=int(packed.pointer_anchor_positions.shape[1]),
-                legal_cols=0,
-                copy_event=copy_event,
             )
-            self._pending_publish[publish_seq] = item
-            while self._next_publish_seq in self._pending_publish:
-                published = self._pending_publish.pop(self._next_publish_seq)
-                self._items.append(published)
-                self._next_publish_seq += 1
+            self._items.append(item)
+            self._queued_rows += rows
             self._cond.notify_all()
         return True
 
@@ -544,9 +457,8 @@ class _InferenceWorkRing:
                 self._cond.wait(timeout=remaining)
             item = self._items.pop(0)
             if item is not None:
+                self._queued_rows -= item.rows
                 self._active_rows += item.rows
-                self._active_tokens += item.token_end - item.token_start
-                self._active_decisions += item.decision_end - item.decision_start
             self._cond.notify_all()
             return item
 
@@ -562,9 +474,8 @@ class _InferenceWorkRing:
             if item.rows > remaining_rows:
                 raise _HeadItemDoesNotFit
             self._items.pop(0)
+            self._queued_rows -= item.rows
             self._active_rows += item.rows
-            self._active_tokens += item.token_end - item.token_start
-            self._active_decisions += item.decision_end - item.decision_start
             self._cond.notify_all()
             return item
 
@@ -582,9 +493,8 @@ class _InferenceWorkRing:
                         return item
                     if item.rows <= remaining_rows:
                         self._items.pop(0)
+                        self._queued_rows -= item.rows
                         self._active_rows += item.rows
-                        self._active_tokens += item.token_end - item.token_start
-                        self._active_decisions += item.decision_end - item.decision_start
                         self._cond.notify_all()
                         return item
                 remaining = deadline - time.monotonic()
@@ -611,8 +521,7 @@ class _InferenceWorkRing:
         with self._cond:
             items = [item for item in self._items if item is not None]
             self._items.clear()
-            self._pending_publish.clear()
-            self._reset_if_empty_locked()
+            self._queued_rows = 0
             self._cond.notify_all()
             return items
 
@@ -622,15 +531,11 @@ class _InferenceWorkRing:
 
     def queued_rows(self) -> int:
         with self._cond:
-            return sum(item.rows for item in self._items if item is not None)
+            return self._queued_rows
 
     def has_tail_capacity_for_another_item(self) -> bool:
         with self._cond:
-            return (
-                self._row_cursor < self.capacity_rows
-                and self._token_cursor < self.token_capacity
-                and self._decision_cursor < self.decision_capacity
-            )
+            return self._queued_rows + self._active_rows < self.capacity_rows
 
     def has_capacity_blocked_producers(self) -> bool:
         with self._cond:
@@ -657,396 +562,7 @@ class _InferenceWorkRing:
                     continue
                 item.released = True
                 self._active_rows -= item.rows
-                self._active_tokens -= item.token_end - item.token_start
-                self._active_decisions -= item.decision_end - item.decision_start
-            self._reset_if_empty_locked()
             self._cond.notify_all()
-
-    def native_batch_for(self, items: list[_PendingItem]) -> NativeEncodedBatch:
-        arena = self._native_arena
-        if arena is None:
-            raise RuntimeError("native arena is not initialized")
-        row_start = items[0].row_start
-        row_end = items[-1].row_end
-        decision_start = items[0].decision_start
-        decision_end = items[-1].decision_end
-
-        def row(name: str) -> torch.Tensor:
-            return arena[name][row_start:row_end]
-
-        def decisions(name: str) -> torch.Tensor:
-            return arena[name][decision_start:decision_end]
-
-        return NativeEncodedBatch(
-            trace_kind_id=row("trace_kind_id"),
-            slot_card_rows=row("slot_card_rows"),
-            slot_occupied=row("slot_occupied"),
-            slot_tapped=row("slot_tapped"),
-            game_info=row("game_info"),
-            pending_kind_id=row("pending_kind_id"),
-            num_present_options=row("num_present_options"),
-            option_kind_ids=row("option_kind_ids"),
-            option_scalars=row("option_scalars"),
-            option_mask=row("option_mask"),
-            option_ref_slot_idx=row("option_ref_slot_idx"),
-            option_ref_card_row=row("option_ref_card_row"),
-            target_mask=row("target_mask"),
-            target_type_ids=row("target_type_ids"),
-            target_scalars=row("target_scalars"),
-            target_overflow=row("target_overflow"),
-            target_ref_slot_idx=row("target_ref_slot_idx"),
-            target_ref_is_player=row("target_ref_is_player"),
-            target_ref_is_self=row("target_ref_is_self"),
-            may_mask=row("may_mask"),
-            decision_start=row("decision_start") - int(decision_start),
-            decision_count=row("decision_count"),
-            decision_option_idx=decisions("decision_option_idx"),
-            decision_target_idx=decisions("decision_target_idx"),
-            decision_mask=decisions("decision_mask"),
-            uses_none_head=decisions("uses_none_head"),
-            decision_rows_written=int(decision_end - decision_start),
-            pendings=cast(Any, [None] * int(row_end - row_start)),
-            trace_kinds=[""] * int(row_end - row_start),
-        )
-
-    def packed_batch_for(self, items: list[_PendingItem]) -> PackedTextBatch:
-        if self._packed_arena is None:
-            raise RuntimeError("packed arena is not initialized")
-        row_start = items[0].row_start
-        row_end = items[-1].row_end
-        token_start = items[0].token_start
-        token_end = items[-1].token_end
-        seq_lengths_host = tuple(n for item in items for n in item.seq_lengths_host)
-        arena_batch = PackedTextBatch(
-            token_ids=self._packed_arena["token_ids"],
-            seq_id=self._packed_arena["seq_id"],
-            pos_in_seq=self._packed_arena["pos_in_seq"],
-            cu_seqlens=self._packed_arena["cu_seqlens"],
-            seq_lengths=self._packed_arena["seq_lengths"],
-            state_positions=self._packed_arena["state_positions"],
-            card_ref_positions=self._packed_arena["card_ref_positions"],
-            total_tokens=self._token_cursor,
-            seq_lengths_host=seq_lengths_host,
-            spec_lens=self._packed_arena["spec_lens"],
-            decision_type=self._packed_arena["decision_type"],
-            pointer_anchor_positions=self._packed_arena["pointer_anchor_positions"],
-            pointer_anchor_kinds=self._packed_arena["pointer_anchor_kinds"],
-            pointer_anchor_subjects=self._packed_arena["pointer_anchor_subjects"],
-            pointer_anchor_handles=self._packed_arena["pointer_anchor_handles"],
-            legal_edge_bitmap=None,
-        )
-        sliced = _slice_packed_text_batch(
-            arena_batch,
-            row_start=row_start,
-            row_end=row_end,
-            token_start=token_start,
-            token_end=token_end,
-        )
-        sliced.seq_lengths_host = seq_lengths_host
-        sliced.max_seqlen = max(seq_lengths_host, default=0)
-        anchor_cols = max((item.blank_cols for item in items), default=0)
-        sliced.pointer_anchor_positions = sliced.pointer_anchor_positions[:, :anchor_cols]
-        sliced.pointer_anchor_kinds = sliced.pointer_anchor_kinds[:, :anchor_cols]
-        sliced.pointer_anchor_subjects = sliced.pointer_anchor_subjects[:, :anchor_cols]
-        sliced.pointer_anchor_handles = sliced.pointer_anchor_handles[:, :anchor_cols]
-        return sliced
-
-    def wait_for_item_copies(self, items: list[_PendingItem]) -> None:
-        if self.arena_device.type != "cuda":
-            return
-        stream = torch.cuda.current_stream(self.arena_device)
-        for item in items:
-            if item.copy_event is not None:
-                stream.wait_event(item.copy_event)
-
-    def _validate_item_capacity(self, *, rows: int, tokens: int, decisions: int) -> None:
-        if tokens > self.token_capacity:
-            raise RuntimeError(
-                f"inference work item has {tokens} tokens, exceeds arena token capacity "
-                f"{self.token_capacity}"
-            )
-        if decisions > self.decision_capacity:
-            raise RuntimeError(
-                f"inference work item has {decisions} decision rows, exceeds arena decision "
-                f"capacity {self.decision_capacity}"
-            )
-
-    def _has_tail_capacity_locked(self, *, rows: int, tokens: int, decisions: int) -> bool:
-        return (
-            self._row_cursor + rows <= self.capacity_rows
-            and self._token_cursor + tokens <= self.token_capacity
-            and self._decision_cursor + decisions <= self.decision_capacity
-        )
-
-    def _reset_if_empty_locked(self) -> None:
-        if (
-            not any(item is not None for item in self._items)
-            and self._active_rows == 0
-            and self._active_tokens == 0
-            and self._active_decisions == 0
-            and self._reserved_rows == 0
-            and self._reserved_tokens == 0
-            and self._reserved_decisions == 0
-            and not self._pending_publish
-        ):
-            self._row_cursor = 0
-            self._token_cursor = 0
-            self._decision_cursor = 0
-            self._next_reservation_seq = 0
-            self._next_publish_seq = 0
-
-    def _ensure_arenas(self, native: NativeEncodedBatch, packed: PackedTextBatch) -> None:
-        if self._native_arena is None:
-            self._native_arena = {}
-            row_names = {
-                "trace_kind_id",
-                "slot_card_rows",
-                "slot_occupied",
-                "slot_tapped",
-                "game_info",
-                "pending_kind_id",
-                "num_present_options",
-                "option_kind_ids",
-                "option_scalars",
-                "option_mask",
-                "option_ref_slot_idx",
-                "option_ref_card_row",
-                "target_mask",
-                "target_type_ids",
-                "target_scalars",
-                "target_overflow",
-                "target_ref_slot_idx",
-                "target_ref_is_player",
-                "target_ref_is_self",
-                "may_mask",
-                "decision_start",
-                "decision_count",
-            }
-            decision_names = {
-                "decision_option_idx",
-                "decision_target_idx",
-                "decision_mask",
-                "uses_none_head",
-            }
-            for field in fields(NativeEncodedBatch):
-                name = field.name
-                if name in row_names:
-                    src = cast(torch.Tensor, getattr(native, name))
-                    self._native_arena[name] = _arena_empty(
-                        self.capacity_rows,
-                        *src.shape[1:],
-                        dtype=src.dtype,
-                        device=self.arena_device,
-                    )
-                elif name in decision_names:
-                    src = cast(torch.Tensor, getattr(native, name))
-                    self._native_arena[name] = _arena_empty(
-                        self.decision_capacity,
-                        *src.shape[1:],
-                        dtype=src.dtype,
-                        device=self.arena_device,
-                    )
-        if self._packed_arena is None:
-            anchor_capacity = max(64, int(packed.pointer_anchor_positions.shape[1]))
-            self._packed_arena = {
-                "token_ids": _arena_empty(
-                    self.token_capacity,
-                    dtype=packed.token_ids.dtype,
-                    device=self.arena_device,
-                ),
-                "seq_id": _arena_empty(
-                    self.token_capacity,
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "pos_in_seq": _arena_empty(
-                    self.token_capacity,
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "cu_seqlens": _arena_empty(
-                    self.capacity_rows + 1,
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "seq_lengths": _arena_empty(
-                    self.capacity_rows,
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "state_positions": _arena_empty(
-                    self.capacity_rows,
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "card_ref_positions": _arena_empty(
-                    self.capacity_rows,
-                    *packed.card_ref_positions.shape[1:],
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "spec_lens": _arena_empty(
-                    self.capacity_rows,
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "decision_type": _arena_empty(
-                    self.capacity_rows,
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "pointer_anchor_positions": _arena_empty(
-                    self.capacity_rows,
-                    anchor_capacity,
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "pointer_anchor_kinds": _arena_empty(
-                    self.capacity_rows,
-                    anchor_capacity,
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "pointer_anchor_subjects": _arena_empty(
-                    self.capacity_rows,
-                    anchor_capacity,
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-                "pointer_anchor_handles": _arena_empty(
-                    self.capacity_rows,
-                    anchor_capacity,
-                    dtype=torch.int32,
-                    device=self.arena_device,
-                ),
-            }
-
-    def _copy_into_arena(
-        self,
-        *,
-        native: NativeEncodedBatch,
-        packed: PackedTextBatch,
-        native_arena: dict[str, torch.Tensor],
-        packed_arena: dict[str, torch.Tensor],
-        row_start: int,
-        row_end: int,
-        token_start: int,
-        token_end: int,
-        decision_start: int,
-        decision_end: int,
-    ) -> None:
-        rows = row_end - row_start
-        decision_rows = decision_end - decision_start
-        for name, dst in native_arena.items():
-            if name in {
-                "decision_option_idx",
-                "decision_target_idx",
-                "decision_mask",
-                "uses_none_head",
-            }:
-                dst[decision_start:decision_end].copy_(
-                    cast(torch.Tensor, getattr(native, name))[:decision_rows]
-                )
-            elif name == "decision_start":
-                dst[row_start:row_end].copy_(native.decision_start[:rows] + int(decision_start))
-            else:
-                dst[row_start:row_end].copy_(cast(torch.Tensor, getattr(native, name))[:rows])
-
-        packed_arena["token_ids"][token_start:token_end].copy_(packed.token_ids)
-        packed_arena["seq_id"][token_start:token_end].copy_(
-            packed.seq_id.to(torch.int32) + int(row_start)
-        )
-        packed_arena["pos_in_seq"][token_start:token_end].copy_(packed.pos_in_seq.to(torch.int32))
-        packed_arena["cu_seqlens"][row_start : row_end + 1].copy_(
-            packed.cu_seqlens.to(torch.int32) + int(token_start)
-        )
-        packed_arena["seq_lengths"][row_start:row_end].copy_(packed.seq_lengths.to(torch.int32))
-        packed_arena["state_positions"][row_start:row_end].copy_(
-            packed.state_positions.to(torch.int32) + int(token_start)
-        )
-        # card_ref / pointer_anchor positions are row-local end-to-end —
-        # no per-row offset add when staging into the arena.
-        packed_arena["card_ref_positions"][row_start:row_end].copy_(
-            packed.card_ref_positions.to(torch.int32)
-        )
-
-        packed_arena["spec_lens"][row_start:row_end].copy_(packed.spec_lens.to(torch.int32))
-        packed_arena["decision_type"][row_start:row_end].copy_(packed.decision_type.to(torch.int32))
-        self._copy_blank_2d(
-            name="pointer_anchor_positions",
-            src=packed.pointer_anchor_positions.to(torch.int32),
-            packed_arena=packed_arena,
-            row_start=row_start,
-            row_end=row_end,
-            fill=-1,
-        )
-        self._copy_blank_2d(
-            name="pointer_anchor_kinds",
-            src=packed.pointer_anchor_kinds.to(torch.int32),
-            packed_arena=packed_arena,
-            row_start=row_start,
-            row_end=row_end,
-            fill=-1,
-        )
-        self._copy_blank_2d(
-            name="pointer_anchor_subjects",
-            src=packed.pointer_anchor_subjects.to(torch.int32),
-            packed_arena=packed_arena,
-            row_start=row_start,
-            row_end=row_end,
-            fill=-1,
-        )
-        self._copy_blank_2d(
-            name="pointer_anchor_handles",
-            src=packed.pointer_anchor_handles.to(torch.int32),
-            packed_arena=packed_arena,
-            row_start=row_start,
-            row_end=row_end,
-            fill=-1,
-        )
-
-    def _copy_blank_2d(
-        self,
-        *,
-        name: str,
-        src: torch.Tensor,
-        packed_arena: dict[str, torch.Tensor],
-        row_start: int,
-        row_end: int,
-        fill: int,
-    ) -> None:
-        dst = packed_arena[name][row_start:row_end]
-        src_cols = int(src.shape[1])
-        if src_cols > int(dst.shape[1]):
-            raise RuntimeError(
-                f"packed arena field {name} has width {int(dst.shape[1])}, request needs {src_cols}"
-            )
-        dst.fill_(fill)
-        if src_cols == 0:
-            return
-        dst[:, :src_cols].copy_(src)
-
-    def _copy_blank_3d(
-        self,
-        *,
-        name: str,
-        src: torch.Tensor,
-        packed_arena: dict[str, torch.Tensor],
-        row_start: int,
-        row_end: int,
-    ) -> None:
-        dst = packed_arena[name][row_start:row_end]
-        src_k = int(src.shape[1])
-        src_v = int(src.shape[2])
-        if src_k > int(dst.shape[1]) or src_v > int(dst.shape[2]):
-            raise RuntimeError(
-                f"packed arena field {name} has shape {tuple(dst.shape[1:])}, "
-                f"request needs {(src_k, src_v)}"
-            )
-        dst.zero_()
-        if src_k == 0 or src_v == 0:
-            return
-        dst[:, :src_k, :src_v].copy_(src)
 
 
 class TextInferenceServer:
@@ -1079,12 +595,12 @@ class TextInferenceServer:
         self._policy_version_manager = (
             sampling_policy if hasattr(sampling_policy, "acquire_inference_policy") else None
         )
+        self._device = _infer_policy_device(sampling_policy)
         self._max_batch = int(max_batch)
         self._min_batch_rows = min(int(min_batch_rows), int(max_batch))
         self._deterministic = bool(deterministic)
         self._timing = timing_stats
         self._queue = _InferenceWorkRing(
-            arena_device=_infer_policy_device(sampling_policy),
             capacity_rows=(
                 int(ring_capacity_rows)
                 if ring_capacity_rows is not None
@@ -1314,21 +830,25 @@ class TextInferenceServer:
 
     def _process(self, items: list[_PendingItem]) -> None:
         start = time.perf_counter()
-        self._queue.wait_for_item_copies(items)
-        merged_packed = self._queue.packed_batch_for(items)
+        # Merge actor batches on host first (cheap int32 concat over pinned
+        # CPU tensors), then a single H→D transfer feeds the forward pass.
+        host_packed = _concat_packed_text_batches([it.request.packed_batch for it in items])
         env_indices: list[int] = [i for it in items for i in it.env_indices]
         perspective: list[int] = [p for it in items for p in it.perspective_player_indices]
         if self._timing is not None:
             self._timing.add("server_concat", time.perf_counter() - start)
-            seq_lengths_host = merged_packed.seq_lengths_host
+            seq_lengths_host = host_packed.seq_lengths_host
             if seq_lengths_host is None:
                 raise ValueError("merged packed batch missing seq_lengths_host")
             max_seq = max(seq_lengths_host, default=0)
             self._timing.add_batch(
                 rows=len(env_indices),
-                tokens=int(merged_packed.token_ids.shape[0]),
+                tokens=int(host_packed.token_ids.shape[0]),
                 max_seq=max_seq,
             )
+
+        # Single bulk H→D for the merged batch right before the forward.
+        merged_packed = host_packed.to(self._device) if self._device.type != "cpu" else host_packed
 
         start = time.perf_counter()
         policy_version = 0
@@ -1380,31 +900,17 @@ class TextInferenceServer:
             pointer_mask=d.pointer_mask.detach().cpu(),
         )
 
-        # Scatter per-actor decoder-batch slices and per-row encoded snapshots.
+        # Scatter per-actor decoder-batch slices. The actor uses its
+        # pre-submit host packed_batch (saved in the in-flight record) for
+        # staging — no need to slice merged_packed per-actor here.
         start = time.perf_counter()
         row_cursor = 0
-        token_cursor = 0
         seq_lengths_host = merged_packed.seq_lengths_host
         if seq_lengths_host is None:
             raise ValueError("merged packed batch missing seq_lengths_host")
         for it in items:
             n = len(it.env_indices)
             row_end = row_cursor + n
-            row_lengths = [int(x) for x in seq_lengths_host[row_cursor:row_end]]
-            packed_rows: list[PackedTextBatch] = []
-            tcur = token_cursor
-            for n_tokens in row_lengths:
-                tend = tcur + n_tokens
-                packed_rows.append(
-                    _slice_packed_text_batch(
-                        merged_packed,
-                        row_start=row_cursor + len(packed_rows),
-                        row_end=row_cursor + len(packed_rows) + 1,
-                        token_start=tcur,
-                        token_end=tend,
-                    )
-                )
-                tcur = tend
             actor_decoder = decoder_batch[row_cursor:row_end]
             # LSTM state is host-side now; per-actor slice is a free view.
             actor_h_in = (
@@ -1434,7 +940,6 @@ class TextInferenceServer:
             reply = TextInferenceReply(
                 decoder_batch=actor_decoder,
                 host_decoder=actor_host_decoder,
-                packed_rows=packed_rows,
                 perspective_player_indices=list(perspective[row_cursor:row_end]),
                 lstm_h_in=actor_h_in,
                 lstm_c_in=actor_c_in,
@@ -1443,7 +948,6 @@ class TextInferenceServer:
                 release_item=lambda item=it: self._queue.finish_items([item]),
             )
             row_cursor = row_end
-            token_cursor += sum(row_lengths)
             it.future.set_result(reply)
         if self._timing is not None:
             self._timing.add("server_scatter", time.perf_counter() - start)
