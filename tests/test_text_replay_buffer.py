@@ -268,6 +268,63 @@ class ReservationLifecycleTests(unittest.TestCase):
         torch.testing.assert_close(window.rows, torch.tensor([0, 1], dtype=torch.long))
         buffer.release_train_window(window)
 
+    def test_wraparound_reservation_survives_claim_release_cycle(self) -> None:
+        """Repro: claim spans a contiguous chain, then a wrap-around reservation
+        sits behind it; the next claim/release of the wrap-around window must not
+        crash with "claimed replay window must begin at the row ring head".
+
+        Specifically exercises _consume_committed_prefix_locked: it must only
+        pop windows whose row_start chains forward from the claim_start, never
+        a wrap-around window that happens to satisfy row_end <= claim_end.
+        """
+        # capacity=6. Sequence: reserve (0,2), reserve (2,6); commit + meta
+        # both, claim+release (0,2) so ring start advances to 2 while ring is
+        # still partially used; then reserve a wrap-around (0,2) before
+        # claiming the (2,6) chain. The next claim must take the chain,
+        # leaving the wrap-around window for the following claim — and the
+        # release of the chain claim must not pop the wrap-around window
+        # by accident.
+        buffer = _buffer(capacity=6)
+
+        r0 = buffer.reserve_append(row_count=2, token_count=0, decision_count=0)
+        r1 = buffer.reserve_append(row_count=4, token_count=0, decision_count=0)
+        buffer.commit(r0)
+        buffer.commit(r1)
+        buffer.write_episode_metadata(
+            torch.tensor([0, 1]), episode_id=0, terminal_reward_p0=0.0, zero_sum=True
+        )
+        buffer.write_episode_metadata(
+            torch.tensor([2, 3, 4, 5]), episode_id=1, terminal_reward_p0=0.0, zero_sum=True
+        )
+
+        # Claim+release the first window so the ring start advances to 2
+        # while r1 (rows 2..5) is still held.
+        w0 = buffer.claim_train_window(min_rows=2, max_rows=2)
+        assert w0 is not None
+        self.assertEqual((w0.row_start, w0.row_end), (0, 2))
+        buffer.release_train_window(w0)
+
+        # Now r2 wraps: cursor=0, count=2, count <= start=2.
+        r2 = buffer.reserve_append(row_count=2, token_count=0, decision_count=0)
+        buffer.commit(r2)
+        buffer.write_episode_metadata(
+            torch.tensor([0, 1]), episode_id=2, terminal_reward_p0=0.0, zero_sum=True
+        )
+
+        # committed_windows now == [(2,6), (0,2)]; the chain prefix is
+        # just (2,6) because (0,2).row_start (0) != (2,6).row_end (6).
+        w1 = buffer.claim_train_window(min_rows=4, max_rows=4)
+        assert w1 is not None
+        self.assertEqual((w1.row_start, w1.row_end), (2, 6))
+        # Releasing must NOT pop the wrap-around window (0,2) by accident.
+        buffer.release_train_window(w1)
+
+        # The wrap-around window (rows 0..1) must still be claimable.
+        w2 = buffer.claim_train_window(min_rows=2, max_rows=2)
+        assert w2 is not None
+        self.assertEqual((w2.row_start, w2.row_end), (0, 2))
+        buffer.release_train_window(w2)
+
 
 if __name__ == "__main__":
     unittest.main()

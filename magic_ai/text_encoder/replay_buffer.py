@@ -1197,14 +1197,29 @@ class TextReplayBuffer:
 
     def _consume_committed_prefix_locked(self, row_end: int) -> None:
         row_end = int(row_end)
-        if self._committed_windows:
-            start = int(self._committed_windows[0].row_start)
-            for row in range(start, row_end):
-                self._row_append_ready_events[row % self.capacity] = None
-                self._row_ready_events[row % self.capacity] = None
-        while self._committed_windows and self._committed_windows[0].row_end <= row_end:
+        if not self._committed_windows:
+            return
+        # The claim covers a CONTIGUOUS chain of committed windows starting
+        # at committed_windows[0].row_start; pop/trim only those, not any
+        # wrap-around window sitting behind in the ring. ``expected_next``
+        # tracks the row_start the next window must have to remain in the
+        # chain.
+        expected_next = int(self._committed_windows[0].row_start)
+        for row in range(expected_next, row_end):
+            self._row_append_ready_events[row % self.capacity] = None
+            self._row_ready_events[row % self.capacity] = None
+        while (
+            self._committed_windows
+            and int(self._committed_windows[0].row_start) == expected_next
+            and int(self._committed_windows[0].row_end) <= row_end
+        ):
+            expected_next = int(self._committed_windows[0].row_end)
             self._committed_windows.pop(0)
-        if self._committed_windows and self._committed_windows[0].row_start < row_end:
+        if (
+            self._committed_windows
+            and int(self._committed_windows[0].row_start) == expected_next
+            and int(self._committed_windows[0].row_start) < row_end
+        ):
             window = self._committed_windows[0]
             offset = int(row_end) - int(window.row_start)
             self._committed_windows[0] = _CommittedWindow(
