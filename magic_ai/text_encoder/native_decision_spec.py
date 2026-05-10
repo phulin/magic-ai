@@ -73,13 +73,16 @@ def register_decision_spec_token_table(
     dt_name_ids = [_id(t) for t in _DT_NAME_TOKENS]
     stack_ref_ids = [_id(f"<stack-ref:{k}>") for k in range(MAX_STACK_REFS)]
 
-    # Precomputed digit-token lookup: for each i ∈ [0, max_value_digit_max),
+    # Precomputed digit-token lookup: for each i ∈ [0, max_value_digit_max],
     # store the BPE token-id sequence for str(i). Concatenate into a flat
     # int32 buffer with length-prefixed offsets — the Go side iterates
-    # offsets[i]:offsets[i+1].
+    # offsets[i]:offsets[i+1] and treats max_value_digit_max as the
+    # *inclusive* upper bound (so it reads up to offsets[max_value_digit_max+1]).
+    # ``offsets`` therefore needs ``max_value_digit_max + 2`` entries: one
+    # leading 0 plus a right-boundary for every value in the inclusive range.
     digits_flat: list[int] = []
     digit_offsets: list[int] = [0]
-    for i in range(max_value_digit_max):
+    for i in range(max_value_digit_max + 1):
         ids = tokenizer.encode(str(i), add_special_tokens=False)
         digits_flat.extend(int(x) for x in ids)
         digit_offsets.append(len(digits_flat))
