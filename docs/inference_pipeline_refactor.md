@@ -76,21 +76,30 @@ server.
 - [x] Tests pass.
 - [ ] (Future) opponent-pool inline forward → pipeline. Low priority.
 
-## Phase E — Host arena replaces `_concat_packed_text_batches`
+## Phase E — Host arena replaces `_concat_packed_text_batches` ⚠️ (server-side variant)
 
-**Goal:** eliminate the 137 ms/5 s `aten::index_fill_` from host concat
-padding; give CUDA Graphs fixed-address inputs.
+**Goal:** eliminate the per-merge alloc/concat pattern; give CUDA Graphs
+fixed-address inputs.
 
-- [ ] Define `HostPackedArena` (pinned-host ring buffers mirroring the old
-      GPU arena's fields).
-- [ ] `_PendingItem` regains `row_start/row_end/token_start/token_end`.
-- [ ] `_InferenceWorkRing.put` writes into the arena with offset shifts.
-- [ ] Replace `_concat_packed_text_batches` in `_process` with
-      `arena.slice_for(items)` returning a host `PackedTextBatch` view.
-- [ ] Actors keep their `batch.packed` reference for per-row staging
-      slices (simpler than plumbing the arena through).
-- [ ] Drop `_concat_packed_text_batches` (or move to tests/).
-- [ ] Profile: `index_fill_` gone.
+Scope: server-side arena (single-threaded write inside `_process`, not
+the actor-direct-write ring originally sketched). The actor-side
+direct-write variant — actors reserve a slot and write their packed
+batch into pinned host memory before submitting — is a follow-up. The
+server-side arena delivers the same fixed-address property for Phase C
+and removes the per-merge allocations; the only thing it doesn't
+amortize is the per-actor copy from encoder scratch to merged buffers,
+which is fast anyway.
+
+- [x] `_HostPackedArena`: long-lived (lazily grown, pinned-host where
+      CUDA is available) buffers for the merged batch.
+- [x] `_process` calls `arena.merge(items)` instead of
+      `_concat_packed_text_batches(...)`.
+- [x] Actors keep their `batch.packed` reference for per-row staging.
+- [x] Arena correctness covered by tests (matches `_concat_*` output
+      on single + multi-merge with shrinking widths).
+- [ ] (Future) Actor-side direct-write arena, slot reservation.
+- [ ] (Future) Drop `_concat_packed_text_batches` entirely once nothing
+      uses it outside tests.
 
 ## Phase C — Bucketing + CUDA Graphs
 

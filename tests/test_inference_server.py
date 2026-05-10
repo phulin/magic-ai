@@ -21,6 +21,7 @@ from typing import Any
 import torch
 from magic_ai.native.inference_server import (
     _concat_packed_text_batches,
+    _HostPackedArena,
 )
 from magic_ai.text_encoder.batch import PackedTextBatch
 
@@ -99,6 +100,88 @@ class ConcatPackedBatchTest(unittest.TestCase):
         batch.pos_in_seq = batch.pos_in_seq[:0]
         with self.assertRaisesRegex(ValueError, "token metadata length"):
             _concat_packed_text_batches([batch])
+
+
+class HostPackedArenaTest(unittest.TestCase):
+    def _assert_batches_equal(self, a: PackedTextBatch, b: PackedTextBatch) -> None:
+        for name in (
+            "token_ids",
+            "seq_id",
+            "pos_in_seq",
+            "cu_seqlens",
+            "seq_lengths",
+            "state_positions",
+            "card_ref_positions",
+            "spec_lens",
+            "decision_type",
+            "pointer_anchor_positions",
+            "pointer_anchor_kinds",
+            "pointer_anchor_subjects",
+            "pointer_anchor_handles",
+        ):
+            ta = getattr(a, name).to(torch.int32)
+            tb = getattr(b, name).to(torch.int32)
+            torch.testing.assert_close(ta, tb)
+        self.assertEqual(a.seq_lengths_host, b.seq_lengths_host)
+        self.assertEqual(a.max_seqlen, b.max_seqlen)
+
+    def test_arena_matches_concat_on_single_merge(self) -> None:
+        a = _make_packed_batch([3, 2], anchor_token_offset=0)
+        b = _make_packed_batch([4], anchor_token_offset=1)
+        arena = _HostPackedArena(use_pinned=False)
+        merged_arena = arena.merge([a, b])
+        merged_concat = _concat_packed_text_batches([a, b])
+        # Compare values (clone to detach from arena storage for safety).
+        cloned = PackedTextBatch(
+            token_ids=merged_arena.token_ids.clone(),
+            seq_id=merged_arena.seq_id.clone(),
+            pos_in_seq=merged_arena.pos_in_seq.clone(),
+            cu_seqlens=merged_arena.cu_seqlens.clone(),
+            seq_lengths=merged_arena.seq_lengths.clone(),
+            state_positions=merged_arena.state_positions.clone(),
+            card_ref_positions=merged_arena.card_ref_positions.clone(),
+            spec_lens=merged_arena.spec_lens.clone(),
+            decision_type=merged_arena.decision_type.clone(),
+            pointer_anchor_positions=merged_arena.pointer_anchor_positions.clone(),
+            pointer_anchor_kinds=merged_arena.pointer_anchor_kinds.clone(),
+            pointer_anchor_subjects=merged_arena.pointer_anchor_subjects.clone(),
+            pointer_anchor_handles=merged_arena.pointer_anchor_handles.clone(),
+            seq_lengths_host=merged_arena.seq_lengths_host,
+            max_seqlen=merged_arena.max_seqlen,
+        )
+        self._assert_batches_equal(cloned, merged_concat)
+
+    def test_arena_reused_across_merges_smaller_then_larger(self) -> None:
+        # First merge populates the arena, second merge with more rows /
+        # tokens triggers growth — both results should match concat.
+        a = _make_packed_batch([2])
+        arena = _HostPackedArena(use_pinned=False)
+        first = arena.merge([a])
+        # Capture values before reuse.
+        first_tokens = first.token_ids.clone()
+        # Sanity vs concat (single shard fast path).
+        torch.testing.assert_close(first_tokens, a.token_ids.to(torch.int32))
+
+        b = _make_packed_batch([3, 4, 5], anchor_token_offset=2)
+        c = _make_packed_batch([6])
+        merged = arena.merge([b, c])
+        expected = _concat_packed_text_batches([b, c])
+        torch.testing.assert_close(
+            merged.token_ids.to(torch.int32), expected.token_ids.to(torch.int32)
+        )
+        torch.testing.assert_close(
+            merged.cu_seqlens.to(torch.int32), expected.cu_seqlens.to(torch.int32)
+        )
+        # Past-live anchor / card-ref columns must be -1 even after a wide
+        # earlier shard expanded the arena: shrinks across merges should
+        # still produce identical merged output.
+        a2 = _make_packed_batch([1])  # narrow shard
+        merged_narrow = arena.merge([a2])
+        expected_narrow = _concat_packed_text_batches([a2])
+        torch.testing.assert_close(
+            merged_narrow.pointer_anchor_positions.to(torch.int32),
+            expected_narrow.pointer_anchor_positions.to(torch.int32),
+        )
 
 
 @dataclass

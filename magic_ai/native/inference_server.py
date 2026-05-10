@@ -168,6 +168,290 @@ class RolloutTimingStats:
         return out
 
 
+class _HostPackedArena:
+    """Pre-allocated (pinned where available) host buffers for the merged
+    packed batch.
+
+    Replaces ``_concat_packed_text_batches``'s per-merge ``torch.cat`` +
+    ``torch.full`` allocation pattern with a single set of long-lived
+    buffers that the merge writes into in place. Buffers grow on demand
+    (doubling) and are kept across merges so steady-state inference
+    allocates nothing.
+
+    The arena holds buffers for the *next* H→D's input. The server does
+    a blocking ``host.to(device)`` after the merge so reuse on the next
+    merge is safe; Phase C will switch to ``non_blocking=True`` and a
+    second slot to keep the H→D async.
+    """
+
+    def __init__(self, *, use_pinned: bool) -> None:
+        self._use_pinned = bool(use_pinned)
+        self._max_rows = 0
+        self._max_tokens = 0
+        self._max_anchors = 0
+        self._max_blockers = 0
+        self._max_attackers = 0
+        self._has_bitmap = False
+        # Allocated lazily on first merge.
+        self.token_ids: torch.Tensor | None = None
+        self.seq_id: torch.Tensor | None = None
+        self.pos_in_seq: torch.Tensor | None = None
+        self.cu_seqlens: torch.Tensor | None = None
+        self.seq_lengths: torch.Tensor | None = None
+        self.state_positions: torch.Tensor | None = None
+        self.card_ref_positions: torch.Tensor | None = None
+        self.spec_lens: torch.Tensor | None = None
+        self.decision_type: torch.Tensor | None = None
+        self.pointer_anchor_positions: torch.Tensor | None = None
+        self.pointer_anchor_kinds: torch.Tensor | None = None
+        self.pointer_anchor_subjects: torch.Tensor | None = None
+        self.pointer_anchor_handles: torch.Tensor | None = None
+        self.legal_edge_bitmap: torch.Tensor | None = None
+
+    def _empty(
+        self,
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+        fill: int | bool | None = None,
+    ) -> torch.Tensor:
+        kw: dict[str, Any] = {"dtype": dtype}
+        if self._use_pinned:
+            kw["pin_memory"] = True
+        if fill is None:
+            return torch.empty(shape, **kw)
+        return torch.full(shape, fill, **kw)
+
+    def _ensure_capacity(
+        self,
+        *,
+        rows: int,
+        tokens: int,
+        anchors: int,
+        blockers: int,
+        attackers: int,
+        need_bitmap: bool,
+        card_refs: int,
+    ) -> None:
+        grow_rows = rows > self._max_rows
+        grow_tokens = tokens > self._max_tokens
+        grow_anchors = anchors > self._max_anchors
+        grow_bitmap = need_bitmap and (
+            not self._has_bitmap or blockers > self._max_blockers or attackers > self._max_attackers
+        )
+
+        if grow_tokens:
+            new_tokens = max(tokens, self._max_tokens * 2, 1024)
+            self.token_ids = self._empty((new_tokens,), dtype=torch.int32)
+            self.seq_id = self._empty((new_tokens,), dtype=torch.int32)
+            self.pos_in_seq = self._empty((new_tokens,), dtype=torch.int32)
+            self._max_tokens = new_tokens
+        if grow_rows:
+            new_rows = max(rows, self._max_rows * 2, 8)
+            self.cu_seqlens = self._empty((new_rows + 1,), dtype=torch.int32)
+            self.seq_lengths = self._empty((new_rows,), dtype=torch.int32)
+            self.state_positions = self._empty((new_rows,), dtype=torch.int32)
+            self.spec_lens = self._empty((new_rows,), dtype=torch.int32)
+            self.decision_type = self._empty((new_rows,), dtype=torch.int32)
+            self._max_rows = new_rows
+        if (
+            grow_rows
+            or self.card_ref_positions is None
+            or card_refs > int(self.card_ref_positions.shape[1])
+        ):
+            cap_refs = max(
+                card_refs,
+                int(self.card_ref_positions.shape[1]) if self.card_ref_positions is not None else 0,
+            )
+            self.card_ref_positions = self._empty((self._max_rows, cap_refs), dtype=torch.int32)
+        if grow_rows or grow_anchors:
+            new_anchors = max(anchors, self._max_anchors * 2, 4)
+            shape = (self._max_rows, new_anchors)
+            # Sentinel -1 across the whole buffer; per-merge writes only
+            # touch the live portion of each row, so columns past each
+            # shard's live width stay at -1 (matches concat-with-pad).
+            self.pointer_anchor_positions = self._empty(shape, dtype=torch.int32, fill=-1)
+            self.pointer_anchor_kinds = self._empty(shape, dtype=torch.int32, fill=-1)
+            self.pointer_anchor_subjects = self._empty(shape, dtype=torch.int32, fill=-1)
+            self.pointer_anchor_handles = self._empty(shape, dtype=torch.int32, fill=-1)
+            self._max_anchors = new_anchors
+        if grow_bitmap:
+            new_blockers = max(blockers, self._max_blockers * 2, 1)
+            new_attackers = max(attackers, self._max_attackers * 2, 1)
+            self.legal_edge_bitmap = self._empty(
+                (self._max_rows, new_blockers, new_attackers), dtype=torch.bool, fill=False
+            )
+            self._max_blockers = new_blockers
+            self._max_attackers = new_attackers
+            self._has_bitmap = True
+
+    def merge(self, batches: list[PackedTextBatch]) -> PackedTextBatch:
+        """Write ``batches`` into the arena and return a sliced view.
+
+        The returned ``PackedTextBatch`` shares storage with the arena's
+        long-lived buffers — callers must consume it (typically via
+        ``.to(device)``) before the next ``merge`` overwrites them.
+        """
+        if not batches:
+            raise ValueError("empty batches")
+        # Discover target capacities.
+        total_rows = 0
+        total_tokens = 0
+        max_anchors = 0
+        max_blockers = 0
+        max_attackers = 0
+        need_bitmap = False
+        max_card_refs = 0
+        for b in batches:
+            total_rows += int(b.seq_lengths.shape[0])
+            total_tokens += int(b.token_ids.shape[0])
+            max_anchors = max(max_anchors, int(b.pointer_anchor_positions.shape[1]))
+            max_card_refs = max(max_card_refs, int(b.card_ref_positions.shape[1]))
+            if b.legal_edge_bitmap is not None:
+                need_bitmap = True
+                max_blockers = max(max_blockers, int(b.legal_edge_bitmap.shape[1]))
+                max_attackers = max(max_attackers, int(b.legal_edge_bitmap.shape[2]))
+
+        self._ensure_capacity(
+            rows=total_rows,
+            tokens=total_tokens,
+            anchors=max_anchors,
+            blockers=max_blockers,
+            attackers=max_attackers,
+            need_bitmap=need_bitmap,
+            card_refs=max_card_refs,
+        )
+
+        # The typecheck-asserting helper keeps line-noise out of the loop.
+        assert self.token_ids is not None and self.seq_id is not None
+        assert self.pos_in_seq is not None and self.cu_seqlens is not None
+        assert self.seq_lengths is not None and self.state_positions is not None
+        assert self.card_ref_positions is not None and self.spec_lens is not None
+        assert self.decision_type is not None
+        assert self.pointer_anchor_positions is not None
+        assert self.pointer_anchor_kinds is not None
+        assert self.pointer_anchor_subjects is not None
+        assert self.pointer_anchor_handles is not None
+
+        # First cu_seqlens entry is always 0; per-shard writes fill (row+1:row_end+1).
+        self.cu_seqlens[0] = 0
+
+        row_cursor = 0
+        token_cursor = 0
+        seq_lengths_host: list[int] = []
+        for b in batches:
+            n_rows = int(b.seq_lengths.shape[0])
+            n_tokens = int(b.token_ids.shape[0])
+            row_end = row_cursor + n_rows
+            token_end = token_cursor + n_tokens
+
+            # Token-axis fields. seq_id needs row_offset shift; the rest copy.
+            self.token_ids[token_cursor:token_end].copy_(b.token_ids.to(torch.int32))
+            shifted_seq_id = b.seq_id.to(torch.int32) + int(row_cursor)
+            self.seq_id[token_cursor:token_end].copy_(shifted_seq_id)
+            self.pos_in_seq[token_cursor:token_end].copy_(b.pos_in_seq.to(torch.int32))
+
+            # Row-axis fields. cu_seqlens needs token_offset; state_positions too.
+            self.seq_lengths[row_cursor:row_end].copy_(b.seq_lengths.to(torch.int32))
+            # b.cu_seqlens is [n_rows + 1]; we want [n_rows] entries starting from
+            # cu_seqlens[1:] shifted by token_cursor, written into
+            # arena.cu_seqlens[row_cursor + 1 : row_end + 1].
+            self.cu_seqlens[row_cursor + 1 : row_end + 1].copy_(
+                b.cu_seqlens[1:].to(torch.int32) + int(token_cursor)
+            )
+            self.state_positions[row_cursor:row_end].copy_(
+                b.state_positions.to(torch.int32) + int(token_cursor)
+            )
+            self.spec_lens[row_cursor:row_end].copy_(b.spec_lens.to(torch.int32))
+            self.decision_type[row_cursor:row_end].copy_(b.decision_type.to(torch.int32))
+
+            # 2-D row-aligned fields. Width may be smaller than arena's; we
+            # only write the live portion (rest stays at sentinel from init).
+            cref_w = int(b.card_ref_positions.shape[1])
+            if cref_w > 0:
+                self.card_ref_positions[row_cursor:row_end, :cref_w].copy_(
+                    b.card_ref_positions.to(torch.int32)
+                )
+            # NOTE: arena.card_ref_positions for cols past cref_w may carry
+            # stale data from previous merges. _concat fills them with the
+            # shard's own values (which would already be -1 if absent). We
+            # need to reset past-live cols here to match — see explicit fill.
+            if cref_w < int(self.card_ref_positions.shape[1]):
+                self.card_ref_positions[row_cursor:row_end, cref_w:].fill_(-1)
+
+            a_w = int(b.pointer_anchor_positions.shape[1])
+            if a_w > 0:
+                self.pointer_anchor_positions[row_cursor:row_end, :a_w].copy_(
+                    b.pointer_anchor_positions.to(torch.int32)
+                )
+                self.pointer_anchor_kinds[row_cursor:row_end, :a_w].copy_(
+                    b.pointer_anchor_kinds.to(torch.int32)
+                )
+                self.pointer_anchor_subjects[row_cursor:row_end, :a_w].copy_(
+                    b.pointer_anchor_subjects.to(torch.int32)
+                )
+                self.pointer_anchor_handles[row_cursor:row_end, :a_w].copy_(
+                    b.pointer_anchor_handles.to(torch.int32)
+                )
+            if a_w < self._max_anchors:
+                # Reset stale cols to -1 sentinel for this shard's rows.
+                self.pointer_anchor_positions[row_cursor:row_end, a_w:].fill_(-1)
+                self.pointer_anchor_kinds[row_cursor:row_end, a_w:].fill_(-1)
+                self.pointer_anchor_subjects[row_cursor:row_end, a_w:].fill_(-1)
+                self.pointer_anchor_handles[row_cursor:row_end, a_w:].fill_(-1)
+
+            if need_bitmap:
+                assert self.legal_edge_bitmap is not None
+                if b.legal_edge_bitmap is not None:
+                    bk = int(b.legal_edge_bitmap.shape[1])
+                    ak = int(b.legal_edge_bitmap.shape[2])
+                    if bk > 0 and ak > 0:
+                        self.legal_edge_bitmap[row_cursor:row_end, :bk, :ak].copy_(
+                            b.legal_edge_bitmap
+                        )
+                    # Zero stale cells outside this shard's live region.
+                    if bk < self._max_blockers:
+                        self.legal_edge_bitmap[row_cursor:row_end, bk:, :].fill_(False)
+                    if ak < self._max_attackers:
+                        self.legal_edge_bitmap[row_cursor:row_end, :bk, ak:].fill_(False)
+                else:
+                    self.legal_edge_bitmap[row_cursor:row_end].fill_(False)
+
+            sl_host = b.seq_lengths_host
+            if sl_host is None:
+                raise ValueError("packed batch arena merge requires seq_lengths_host")
+            seq_lengths_host.extend(int(x) for x in sl_host)
+
+            row_cursor = row_end
+            token_cursor = token_end
+
+        cref_view_w = int(self.card_ref_positions.shape[1])
+        bitmap_view: torch.Tensor | None = None
+        if need_bitmap:
+            assert self.legal_edge_bitmap is not None
+            bitmap_view = self.legal_edge_bitmap[:total_rows, :max_blockers, :max_attackers]
+
+        return PackedTextBatch(
+            token_ids=self.token_ids[:total_tokens],
+            seq_id=self.seq_id[:total_tokens],
+            pos_in_seq=self.pos_in_seq[:total_tokens],
+            cu_seqlens=self.cu_seqlens[: total_rows + 1],
+            seq_lengths=self.seq_lengths[:total_rows],
+            state_positions=self.state_positions[:total_rows],
+            card_ref_positions=self.card_ref_positions[:total_rows, :cref_view_w],
+            spec_lens=self.spec_lens[:total_rows],
+            decision_type=self.decision_type[:total_rows],
+            pointer_anchor_positions=self.pointer_anchor_positions[:total_rows, :max_anchors],
+            pointer_anchor_kinds=self.pointer_anchor_kinds[:total_rows, :max_anchors],
+            pointer_anchor_subjects=self.pointer_anchor_subjects[:total_rows, :max_anchors],
+            pointer_anchor_handles=self.pointer_anchor_handles[:total_rows, :max_anchors],
+            legal_edge_bitmap=bitmap_view,
+            total_tokens=total_tokens,
+            seq_lengths_host=tuple(seq_lengths_host),
+            max_seqlen=max(seq_lengths_host, default=0),
+        )
+
+
 def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBatch:
     """Concatenate ``PackedTextBatch`` objects along the row axis.
 
@@ -590,6 +874,7 @@ class TextInferenceServer:
         self._min_batch_rows = min(int(min_batch_rows), int(max_batch))
         self._deterministic = bool(deterministic)
         self._pipeline = TextInferencePipeline(deterministic=self._deterministic)
+        self._arena = _HostPackedArena(use_pinned=self._device.type == "cuda")
         self._timing = timing_stats
         self._queue = _InferenceWorkRing(
             capacity_rows=(
@@ -821,9 +1106,9 @@ class TextInferenceServer:
 
     def _process(self, items: list[_PendingItem]) -> None:
         start = time.perf_counter()
-        # Merge actor batches on host first (cheap int32 concat over pinned
-        # CPU tensors), then a single H→D transfer feeds the forward pass.
-        host_packed = _concat_packed_text_batches([it.request.packed_batch for it in items])
+        # Merge actor batches on host first via the long-lived arena (no
+        # per-merge allocs), then a single H→D transfer feeds the forward.
+        host_packed = self._arena.merge([it.request.packed_batch for it in items])
         env_indices: list[int] = [i for it in items for i in it.env_indices]
         perspective: list[int] = [p for it in items for p in it.perspective_player_indices]
         if self._timing is not None:
