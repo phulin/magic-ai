@@ -120,6 +120,14 @@ def _load_packed_ctypes_lib() -> ctypes.CDLL | None:
             ctypes.POINTER(ctypes.c_int64),
         ]
         lib.MageEncodeDecisionSpec.restype = _MageEncodeResult
+        lib.MagePackCombinedTokens.argtypes = [
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.POINTER(_MagePackedTokenAssemblerOutputsC),
+            ctypes.POINTER(_MagePackedSpecOutputsC),
+        ]
+        lib.MagePackCombinedTokens.restype = ctypes.c_int32
         lib.MageReleaseBatchHandle.argtypes = [ctypes.c_int64]
         lib.MageReleaseBatchHandle.restype = None
         lib.MageFreeString.argtypes = [ctypes.c_void_p]
@@ -505,6 +513,27 @@ def encode_tokens_packed(
             f"MageEncodeDecisionSpec spec_overflow={int(spec_out.spec_overflow)}: "
             f"per-row spec exceeded T_spec_max={int(outputs.spec_tokens.shape[1])} "
             f"or N_anchors_max={int(outputs.pointer_anchor_positions.shape[1])}"
+        )
+
+    # Third pass: rewrite the packed token stream so each row's spec tokens
+    # follow its state tokens contiguously. After this call,
+    # ``packed_out.token_ids[:cu_seqlens[B]]`` holds ``state || spec`` per row,
+    # ``cu_seqlens`` / ``seq_lengths`` / ``state_positions`` reflect the
+    # combined lengths, and pointer-anchor positions are in packed-combined
+    # coords (matching card-ref convention). Without this step the encoder
+    # only sees state tokens, while pointer anchors target spec-section
+    # positions past ``state_lens[b]`` — producing empty grammar pointer
+    # masks at every PRIORITY/CHOOSE_TARGETS step.
+    token_capacity = int(outputs.token_ids.shape[0])
+    max_card_refs = int(outputs.card_ref_positions.shape[1])
+    rc = lib.MagePackCombinedTokens(batch_size, token_capacity, max_card_refs, packed_out, spec_out)
+    if int(rc) != 0:
+        from magic_ai.slot_encoder.native_encoder import NativeEncodingError
+
+        raise NativeEncodingError(
+            f"MagePackCombinedTokens failed (rc={int(rc)}): "
+            f"token capacity {token_capacity} too small for combined state+spec stream "
+            "(increase max_tokens)"
         )
 
     decision_rows_written = int(result.decision_rows_written)
