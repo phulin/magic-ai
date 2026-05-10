@@ -45,8 +45,16 @@ class LSTMStatefulTextPolicy(nn.Module):
         self.policy = RecurrentTextPolicy(cfg)
         self.lstm_layers = cfg.lstm_layers
         self.lstm_hidden = cfg.lstm_hidden
-        self.register_buffer("live_lstm_h", torch.zeros(self.lstm_layers, 0, self.lstm_hidden))
-        self.register_buffer("live_lstm_c", torch.zeros(self.lstm_layers, 0, self.lstm_hidden))
+        self.register_buffer(
+            "live_lstm_h",
+            torch.zeros(self.lstm_layers, 0, self.lstm_hidden),
+            persistent=False,
+        )
+        self.register_buffer(
+            "live_lstm_c",
+            torch.zeros(self.lstm_layers, 0, self.lstm_hidden),
+            persistent=False,
+        )
         self._num_envs = 0
         self._players_per_env = 2
         self.rollout_buffer: TextReplayBuffer | None = None

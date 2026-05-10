@@ -490,6 +490,7 @@ def run_eval_matches(
         while free_slots and next_game_idx < total_games_target:
             live.append(start_game(free_slots.pop()))
 
+    from magic_ai.text_encoder.batch import scatter_packed_to_padded, subtract_packed_offsets
     from magic_ai.text_encoder.decoder_inference import decoder_sample
     from magic_ai.text_encoder.lstm_stateful_text_policy import LSTMStatefulTextPolicy
 
@@ -519,19 +520,17 @@ def run_eval_matches(
                     packed, h_in=h_in, c_in=c_in
                 )
                 policy.scatter_lstm_env_states(slot_indices, players, h_out, c_out)
-                encoded = encoded_snaps.encoded
+                encoded, attn_mask = scatter_packed_to_padded(encoded_snaps.encoded, packed)
                 device = encoded.device
-                b = int(packed.seq_lengths.shape[0])
-                seq_lengths = packed.seq_lengths.to(device=device, dtype=torch.long)
-                t_enc = int(encoded.shape[1])
-                positions = torch.arange(t_enc, device=device).unsqueeze(0).expand(b, -1)
-                attn_mask = positions < seq_lengths.unsqueeze(-1)
+                anchor_positions_rowlocal = subtract_packed_offsets(
+                    packed.pointer_anchor_positions, packed.state_positions
+                )
                 sample = decoder_sample(
                     text_policy,
                     encoded,
                     attn_mask,
                     packed.decision_type.to(device=device, dtype=torch.long),
-                    packed.pointer_anchor_positions.to(device=device, dtype=torch.long),
+                    anchor_positions_rowlocal.to(device=device, dtype=torch.long),
                     packed.pointer_anchor_kinds.to(device=device, dtype=torch.long),
                     packed.pointer_anchor_subjects.to(device=device, dtype=torch.long),
                     packed.pointer_anchor_handles.to(device=device, dtype=torch.long),
@@ -539,15 +538,22 @@ def run_eval_matches(
                     greedy=False,
                 )
             output_lens = sample.output_pad_mask.sum(dim=-1).to(dtype=torch.int32)
+            # mage reads buffers via data_ptr() with no device check; force CPU.
             mage.batch_step_by_decoder_action(
                 handles=[int(g._id) for g in games],
-                decision_type=sample.decision_type.to(torch.int32),
-                output_token_ids=sample.output_token_ids.to(torch.int32),
-                output_pointer_subjects=sample.output_pointer_subjects.to(torch.int32),
-                output_is_pointer=sample.output_is_pointer.to(torch.bool),
-                output_lens=output_lens,
-                pointer_anchor_handles=sample.pointer_anchor_handles.to(torch.int32),
-                pointer_anchor_count=sample.pointer_anchor_count.to(torch.int32),
+                decision_type=sample.decision_type.to(dtype=torch.int32).cpu().contiguous(),
+                output_token_ids=sample.output_token_ids.to(dtype=torch.int32).cpu().contiguous(),
+                output_pointer_subjects=sample.output_pointer_subjects.to(dtype=torch.int32)
+                .cpu()
+                .contiguous(),
+                output_is_pointer=sample.output_is_pointer.to(dtype=torch.uint8).cpu().contiguous(),
+                output_lens=output_lens.cpu().contiguous(),
+                pointer_anchor_handles=sample.pointer_anchor_handles.to(dtype=torch.int32)
+                .cpu()
+                .contiguous(),
+                pointer_anchor_count=sample.pointer_anchor_count.to(dtype=torch.int32)
+                .cpu()
+                .contiguous(),
             )
         else:
             parsed = native_encoder.encode_handles(games, perspective_player_indices=players)

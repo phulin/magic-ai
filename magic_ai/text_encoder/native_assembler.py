@@ -20,6 +20,8 @@ from typing import Any
 import mage
 import torch
 
+from magic_ai.text_encoder.batch import PackedTextBatch
+
 
 class _MageTokenAssemblerConfigC(ctypes.Structure):
     _fields_ = [
@@ -173,6 +175,80 @@ class NativePackedAssemblerOutputs:
     _packed_out_ctypes: _MagePackedTokenAssemblerOutputsC | None = None
     _tok_cfg_ctypes: _MageTokenAssemblerConfigC | None = None
     _spec_out_ctypes: _MagePackedSpecOutputsC | None = None
+
+    def to_packed_text_batch(
+        self, *, trim: bool = True, derive_token_metadata: bool = True
+    ) -> PackedTextBatch:
+        """Slice the live region into a :class:`PackedTextBatch`.
+
+        Trims to ``active_batch_size`` rows; when ``trim`` is True the
+        anchor and legal-edge dims are tightened to the per-batch maxima
+        so the result matches compact batch shapes rather than the full
+        pre-allocated capacity.
+        """
+
+        active_n = self.active_batch_size or int(self.seq_lengths.shape[0])
+        cu_seqlens = self.cu_seqlens[: active_n + 1]
+        seq_lengths = self.seq_lengths[:active_n]
+        state_positions = self.state_positions[:active_n]
+        card_ref_positions = self.card_ref_positions[:active_n]
+        spec_lens = self.spec_lens[:active_n]
+        decision_type = self.decision_type[:active_n]
+        anchor_counts = self.pointer_anchor_counts[:active_n]
+        n_blockers = self.legal_edge_n_blockers[:active_n]
+        n_attackers = self.legal_edge_n_attackers[:active_n]
+
+        total = int(cu_seqlens[-1].item()) if cu_seqlens.numel() else 0
+        seq_lengths_host = tuple(int(x) for x in seq_lengths.tolist())
+        token_ids = self.token_ids[:total]
+        if derive_token_metadata:
+            seq_id = torch.repeat_interleave(
+                torch.arange(active_n, dtype=torch.int32, device=seq_lengths.device),
+                seq_lengths,
+                output_size=total,
+            )
+            pos_in_seq = torch.arange(total, dtype=torch.int32, device=seq_lengths.device) - (
+                cu_seqlens[:-1].repeat_interleave(seq_lengths, output_size=total)
+            )
+        else:
+            seq_id = self.token_ids[:0]
+            pos_in_seq = self.token_ids[:0]
+
+        if trim:
+            anchors_max = int(anchor_counts.max().item()) if anchor_counts.numel() else 0
+            blk_max = int(n_blockers.max().item()) if n_blockers.numel() else 0
+            att_max = int(n_attackers.max().item()) if n_attackers.numel() else 0
+        else:
+            anchors_max = self.pointer_anchor_positions.shape[1]
+            blk_max = self.legal_edge_bitmap.shape[1]
+            att_max = self.legal_edge_bitmap.shape[2]
+
+        pointer_anchor_positions = self.pointer_anchor_positions[:active_n, :anchors_max]
+        pointer_anchor_kinds = self.pointer_anchor_kinds[:active_n, :anchors_max]
+        pointer_anchor_subjects = self.pointer_anchor_subjects[:active_n, :anchors_max]
+        pointer_anchor_handles = self.pointer_anchor_handles[:active_n, :anchors_max]
+        legal_edge_bitmap = self.legal_edge_bitmap[:active_n, :blk_max, :att_max]
+
+        max_seqlen = max(seq_lengths_host, default=0)
+        return PackedTextBatch(
+            token_ids=token_ids,
+            seq_id=seq_id,
+            pos_in_seq=pos_in_seq,
+            cu_seqlens=cu_seqlens,
+            seq_lengths=seq_lengths,
+            state_positions=state_positions,
+            card_ref_positions=card_ref_positions,
+            spec_lens=spec_lens,
+            decision_type=decision_type,
+            pointer_anchor_positions=pointer_anchor_positions,
+            pointer_anchor_kinds=pointer_anchor_kinds,
+            pointer_anchor_subjects=pointer_anchor_subjects,
+            pointer_anchor_handles=pointer_anchor_handles,
+            legal_edge_bitmap=legal_edge_bitmap,
+            total_tokens=total,
+            seq_lengths_host=seq_lengths_host,
+            max_seqlen=max_seqlen,
+        )
 
 
 def allocate_packed_outputs(

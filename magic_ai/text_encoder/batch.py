@@ -190,6 +190,38 @@ def subtract_packed_offsets(pos: Tensor, state_positions: Tensor) -> Tensor:
     return torch.where(valid, shifted, pos_i32)
 
 
+def scatter_packed_to_padded(
+    packed_hidden: Tensor,
+    batch: PackedTextBatch,
+) -> tuple[Tensor, Tensor]:
+    """Scatter ``[T_packed, D]`` hidden states into ``[B, T_max, D]``.
+
+    Returns ``(padded, attention_mask)`` where ``padded`` is zero outside
+    each row's live span and ``attention_mask`` is the per-row bool mask.
+    """
+
+    if packed_hidden.dim() != 2:
+        raise ValueError(f"packed_hidden must be rank-2 [T, D], got shape {packed_hidden.shape}")
+    device = packed_hidden.device
+    b = int(batch.seq_lengths.shape[0])
+    seq_lengths = batch.seq_lengths.to(device=device, dtype=torch.long)
+    t_max = (
+        int(batch.max_seqlen)
+        if batch.max_seqlen is not None
+        else int(seq_lengths.max().item())
+        if b > 0
+        else 0
+    )
+    d = int(packed_hidden.shape[-1])
+    padded = packed_hidden.new_zeros((b, t_max, d))
+    seq_id = batch.seq_id.to(device=device, dtype=torch.long)
+    pos_in_seq = batch.pos_in_seq.to(device=device, dtype=torch.long)
+    padded[seq_id, pos_in_seq] = packed_hidden
+    positions = torch.arange(t_max, device=device).unsqueeze(0).expand(b, -1)
+    attn_mask = positions < seq_lengths.unsqueeze(-1)
+    return padded, attn_mask
+
+
 def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
     """Pack a padded :class:`TextEncodedBatch` into a :class:`PackedTextBatch`."""
 
@@ -425,4 +457,5 @@ __all__ = [
     "packed_sequence_layout",
     "add_packed_offsets",
     "subtract_packed_offsets",
+    "scatter_packed_to_padded",
 ]

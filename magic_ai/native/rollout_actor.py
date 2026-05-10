@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
 
+import torch
+
 from magic_ai.native.inference_server import (
     RolloutTimingStats,
     TextInferenceRequest,
@@ -37,6 +39,7 @@ from magic_ai.native.inference_server import (
 )
 from magic_ai.text_encoder.decoder_action import decode_decoder_action
 from magic_ai.text_encoder.decoder_batch import DecoderDecisionLayout
+from magic_ai.text_encoder.native_assembler import NativePackedAssemblerOutputs
 
 if TYPE_CHECKING:
     from magic_ai.slot_encoder.native_encoder import NativeBatchEncoder
@@ -346,6 +349,8 @@ class TextRolloutActor:
                 reply.decoder_batch,
                 packed_rows=reply.packed_rows,
                 perspective_player_indices=reply.perspective_player_indices,
+                lstm_h_in=reply.lstm_h_in,
+                lstm_c_in=reply.lstm_c_in,
                 ready_event=getattr(reply, "ready_event", None),
             )
             self._record_timing("actor_stage", start)
@@ -400,15 +405,18 @@ class TextRolloutActor:
         import mage  # noqa: PLC0415
 
         handles = [int(g._id) for g in batch.ready_games]
+        # mage.batch_step_by_decoder_action reads buffers via data_ptr() with
+        # no device check — GPU tensors would be dereferenced as host pointers
+        # and segfault inside cgo. Force a contiguous CPU copy first.
         mage.batch_step_by_decoder_action(
             handles=handles,
-            decision_type=decoder.decision_type,
-            output_token_ids=decoder.output_token_ids,
-            output_pointer_subjects=decoder.output_pointer_subjects,
-            output_is_pointer=decoder.output_is_pointer,
-            output_lens=decoder.output_lens,
-            pointer_anchor_handles=decoder.pointer_anchor_handles,
-            pointer_anchor_count=decoder.pointer_anchor_count,
+            decision_type=decoder.decision_type.cpu().contiguous(),
+            output_token_ids=decoder.output_token_ids.cpu().contiguous(),
+            output_pointer_subjects=decoder.output_pointer_subjects.cpu().contiguous(),
+            output_is_pointer=decoder.output_is_pointer.to(dtype=torch.uint8).cpu().contiguous(),
+            output_lens=decoder.output_lens.cpu().contiguous(),
+            pointer_anchor_handles=decoder.pointer_anchor_handles.cpu().contiguous(),
+            pointer_anchor_count=decoder.pointer_anchor_count.cpu().contiguous(),
         )
         self._record_timing("actor_step", start)
         return list(batch.ready_envs)
@@ -431,7 +439,9 @@ class TextRolloutActor:
         if completed_envs:
             self.refill_response_queue.put_nowait(_PollBatch(completed_envs))
 
-    def _encode_packed(self, games: list[Any], perspectives: list[int]) -> tuple[Any, Any]:
+    def _encode_packed(
+        self, games: list[Any], perspectives: list[int]
+    ) -> tuple[Any, NativePackedAssemblerOutputs]:
         from magic_ai.text_encoder.native_assembler import encode_tokens_packed
 
         return encode_tokens_packed(

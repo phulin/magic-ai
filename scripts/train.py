@@ -496,11 +496,13 @@ class NativeTextTrajectoryBuffer:
                 env_i = int(env_idx)
                 if self.validate and len(self._rows[env_i]) >= self.max_steps:
                     raise RuntimeError(f"native text staging buffer is full for env {env_i}")
+                # Replay writer wants [layers, hidden] per row; the source
+                # tensor is [layers, n, hidden] so squeeze the per-row dim.
                 h_slice = (
-                    lstm_h_in[:, i : i + 1].detach().clone() if lstm_h_in is not None else None
+                    lstm_h_in[:, i].detach().clone().contiguous() if lstm_h_in is not None else None
                 )
                 c_slice = (
-                    lstm_c_in[:, i : i + 1].detach().clone() if lstm_c_in is not None else None
+                    lstm_c_in[:, i].detach().clone().contiguous() if lstm_c_in is not None else None
                 )
                 self._rows[env_i].append(
                     _StagedDecoderRow(
@@ -669,6 +671,34 @@ class NativeTextTrajectoryBuffer:
 
     def append_env_to_replay(self, env_idx: int, replay_buffer: TextReplayBuffer) -> list[int]:
         return self.append_envs_to_replay([env_idx], replay_buffer)[0]
+
+    def can_append_envs_to_replay(
+        self,
+        env_indices: list[int],
+        replay_buffer: TextReplayBuffer,
+    ) -> bool:
+        """Check whether ``append_envs_to_replay`` would currently fit.
+
+        Sums staged row + token counts for the proposed env slots and asks
+        the replay buffer whether a reservation of that size is currently
+        available. The learner uses this to defer FinishedEnv commits when
+        the buffer is too full, without holding the per-env staging lock
+        across the whole reservation attempt.
+        """
+
+        with self._lock:
+            total_rows = 0
+            total_tokens = 0
+            for e in env_indices:
+                rows = self._rows[int(e)]
+                total_rows += len(rows)
+                for row in rows:
+                    total_tokens += int(row.packed_row.token_ids.shape[0])
+        if total_rows == 0:
+            return True
+        return replay_buffer.can_reserve(
+            row_count=total_rows, token_count=total_tokens, decision_count=0
+        )
 
 
 @dataclass
@@ -4039,19 +4069,20 @@ def train_text_native_batched_envs(
                     dtype=torch.long,
                     pin_memory=device.type == "cuda",
                 ).to(device, non_blocking=True)
-                # FIXME: NativeTextTrajectoryBuffer doesn't expose .step_count /
-                # .value / .perspective_player_idx as tensors today; this whole
-                # `needs_staging_commit` branch was carried over from the slot-buffer
-                # design and would fail at runtime. Pre-existing bug — silenced
-                # for ty so the rest of the file type-checks.
-                step_counts = staging_buffer.step_count[slot_t].clone()  # ty: ignore[unresolved-attribute]
+                # NativeTextTrajectoryBuffer tracks step counts per env via the
+                # host-side ``step_count_host`` list. ``value`` /
+                # ``perspective_player_idx`` are only consulted on the PPO path
+                # below and live on the per-env staged decoder rows.
+                # NativeTextTrajectoryBuffer.append_envs_to_replay_returning_tensor
+                # commits the reservation internally regardless of ``seal``;
+                # there is no separate seal_staged_rows step to perform.
                 needs_staged_seal = False
                 flat_rows, counts = staging_buffer.append_envs_to_replay_returning_tensor(
                     slot_idxs,
                     backend.replay_buffer,
-                    seal=False,
+                    seal=True,
                 )
-                needs_staged_seal = True
+                step_counts = counts.to(dtype=torch.long)
                 counts_h = counts.detach().cpu().tolist()
                 split_rows = torch.split(flat_rows.detach().cpu(), counts_h)
                 per_env_rows_h = tuple(map(lambda rows: tuple(map(int, rows.tolist())), split_rows))
@@ -5047,7 +5078,7 @@ def train_text_native_batched_envs(
                     candidate_slots: list[int] = []
                     for fe in deferred_finishes:
                         next_slots = [*candidate_slots, fe.slot_idx]
-                        if staging_buffer.can_append_envs_to_replay(  # ty: ignore[unresolved-attribute]
+                        if staging_buffer.can_append_envs_to_replay(
                             next_slots,
                             backend.replay_buffer,
                         ):
