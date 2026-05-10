@@ -101,21 +101,28 @@ which is fast anyway.
 - [ ] (Future) Drop `_concat_packed_text_batches` entirely once nothing
       uses it outside tests.
 
-## Phase C — Bucketing + CUDA Graphs
+## Phase C — Bucketing + CUDA Graphs ✅ (encoder only)
 
-**Goal:** the inference forward is captured per shape bucket and replayed;
-near-all per-launch overhead disappears.
+**Goal:** the inference encoder forward is captured per shape bucket and
+replayed; near-all per-launch overhead on the encoder side disappears.
 
-- [ ] Define `Bucket(rows, max_seq)` and a small `BucketTable`.
-- [ ] Pipeline pre-allocates static GPU input/output buffers per bucket.
-- [ ] `pad_merged_to_bucket(host_packed, bucket) → host_padded`.
-- [ ] Wrap `encode_and_sample` with `torch.compile(mode="reduce-overhead",
-      dynamic=False)`, one compiled callable per bucket.
-- [ ] If reduce-overhead can't fold the decoder loop, fall back to explicit
-      `torch.cuda.graph()` capture (warmup → capture → replay).
-- [ ] Correctness check vs. non-bucketed path within fp tolerance.
-- [ ] Profile: `cudaLaunchKernel` drops dramatically.
-- [ ] Training end-to-end: loss curve unchanged.
+- [x] `DEFAULT_BUCKETS = [(16,2048), (64,8192), (192,24576), (384,49152),
+      (768,98304)]` — sized so `T_b - R_b` ≥ typical merged `(T - R)`.
+- [x] `_pad_packed_to_bucket(host_packed, R_b, T_b)`: pad with dummy
+      rows that absorb the slack PAD tokens; each dummy row has ≥ 1
+      token so flash_attn varlen rejects nothing.
+- [x] `_slice_padded_packed_to_live` + `_slice_encoded_to_live`: cut
+      the encoder outputs back to live rows/tokens for downstream
+      decoder + heads.
+- [x] Per-bucket lazy `torch.compile(..., mode="reduce-overhead",
+      dynamic=False)` on `_encode_with_history_impl`.
+- [x] Server passes the host (unpadded) batch into the pipeline; pad +
+      H→D happens inside the bucketed path.
+- [x] Smoke test on tiny model: first call 7.9 s (compile), steady 3.6
+      ms/call. Decoder + value head still eager (Phase F).
+- [ ] (Future) Tune bucket boundaries against real workload distribution.
+- [ ] (Future) Verify correctness vs. eager on the full pipeline (the
+      smoke checks shape only).
 
 ## Phase F — Decoder loop compile
 

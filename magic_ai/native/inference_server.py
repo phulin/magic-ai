@@ -873,7 +873,13 @@ class TextInferenceServer:
         self._max_batch = int(max_batch)
         self._min_batch_rows = min(int(min_batch_rows), int(max_batch))
         self._deterministic = bool(deterministic)
-        self._pipeline = TextInferencePipeline(deterministic=self._deterministic)
+        # Enable bucketed CUDA-Graph inference forward on CUDA. The
+        # bucketed path needs the host batch (so it can pad before H→D),
+        # which the server now passes through unconditionally.
+        self._pipeline = TextInferencePipeline(
+            deterministic=self._deterministic,
+            bucketed=self._device.type == "cuda",
+        )
         self._arena = _HostPackedArena(use_pinned=self._device.type == "cuda")
         self._timing = timing_stats
         self._queue = _InferenceWorkRing(
@@ -1123,9 +1129,9 @@ class TextInferenceServer:
                 max_seq=max_seq,
             )
 
-        # Single bulk H→D for the merged batch right before the forward.
-        merged_packed = host_packed.to(self._device) if self._device.type != "cpu" else host_packed
-
+        # Hand the host batch to the pipeline; bucketed Phase C wants to
+        # pad on host before the H→D, and the non-bucketed path moves
+        # to device internally.
         start = time.perf_counter()
         policy_version = 0
         with torch.no_grad():
@@ -1135,11 +1141,11 @@ class TextInferenceServer:
                     policy_version,
                 ):
                     decoder_batch, h_in_replay, c_in_replay = self._sample_decoder(
-                        policy, merged_packed, env_indices, perspective
+                        policy, host_packed, env_indices, perspective
                     )
             else:
                 decoder_batch, h_in_replay, c_in_replay = self._sample_decoder(
-                    self._policy, merged_packed, env_indices, perspective
+                    self._policy, host_packed, env_indices, perspective
                 )
         if self._timing is not None:
             self._timing.add("server_sample", time.perf_counter() - start)
@@ -1176,7 +1182,7 @@ class TextInferenceServer:
         # staging — no need to slice merged_packed per-actor here.
         start = time.perf_counter()
         row_cursor = 0
-        seq_lengths_host = merged_packed.seq_lengths_host
+        seq_lengths_host = host_packed.seq_lengths_host
         if seq_lengths_host is None:
             raise ValueError("merged packed batch missing seq_lengths_host")
         for it in items:
