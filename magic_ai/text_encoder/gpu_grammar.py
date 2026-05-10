@@ -248,10 +248,15 @@ class GrammarMaskState:
         per-blocker legal-edge bitmap."""
         kind = int(AnchorKind.LEGAL_ATTACKER)
         kind_match = self.pos_to_kind == kind
-        if self.legal_edge_bitmap is None:
+        # Treat an empty-shape bitmap (``[B, 0, 0]``) like ``None``: the
+        # inference-server batch merger pads non-DECLARE_BLOCKERS batches
+        # with an empty bitmap when *any* batch has one, so a stray empty
+        # tensor would otherwise reach the gather and crash on its
+        # zero-sized dim.
+        edge = self.legal_edge_bitmap
+        if edge is None or edge.shape[1] == 0 or edge.shape[2] == 0:
             avail = kind_match
         else:
-            edge = self.legal_edge_bitmap
             n_blk, n_atk = int(edge.shape[1]), int(edge.shape[2])
             blk_idx = self.last_chosen_blk_subj.clamp(min=0, max=max(n_blk - 1, 0))
             edge_per_atk = edge.gather(

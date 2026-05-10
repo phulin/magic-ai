@@ -514,6 +514,12 @@ def run_eval_matches(
             )
             packed = nat_outputs.to_packed_text_batch(trim=True, derive_token_metadata=True)
             text_policy = policy.policy.text_policy
+            # ``to_packed_text_batch`` returns a CPU batch; the policy lives on
+            # the training device. The IMPALA inference path moves the batch
+            # in the queue arena, but the eval path builds its own — push it
+            # through the policy's device before any model forward.
+            policy_device = next(text_policy.parameters()).device
+            packed = packed.to(policy_device)
             with torch.no_grad():
                 h_in, c_in = policy.lstm_env_state_inputs(slot_indices, players)
                 encoded_snaps, h_out, c_out = policy.policy.encode_with_history(
