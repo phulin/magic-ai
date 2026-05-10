@@ -96,21 +96,17 @@ class RecurrentTextPolicy(nn.Module):
             ]
             | None
         ) = None
-        # Inference path (encode_with_history) also lazily compiles on first
-        # CUDA call. Same shape: encoder forward + in_proj + LSTM step.
-        self._compiled_encode_with_history: (
-            Callable[
-                [PackedTextBatch | TextEncodedBatch, Tensor | None, Tensor | None],
-                tuple[EncodedSnapshots, Tensor, Tensor],
-            ]
-            | None
-        ) = None
         # Compile is wired up lazily on the first CUDA forward (see
-        # ``forward_packed`` / ``encode_with_history``). flash_attn_varlen
-        # replaced the old NJT-subclass attention so the historical
-        # AOT-autograd backward mismatch no longer applies; CPU compile,
-        # however, hits an unrelated inductor bug, so we only compile when we
-        # actually see a CUDA tensor.
+        # ``forward_packed``). flash_attn_varlen replaced the old NJT-subclass
+        # attention so the historical AOT-autograd backward mismatch no longer
+        # applies; CPU compile, however, hits an unrelated inductor bug, so we
+        # only compile when we actually see a CUDA tensor.
+        #
+        # Inference goes through ``TextInferencePipeline``'s bucketed compile
+        # (Phase C). The direct callers of ``encode_with_history``
+        # (opponent-pool eval, the pipeline's bucket-doesn't-fit fallback)
+        # run eager: they're low-frequency and the bucketed compile already
+        # owns the steady-state inference forward.
 
     def init_state(self, batch_size: int, device: torch.device) -> tuple[Tensor, Tensor]:
         shape = (self.lstm_layers, batch_size, self.lstm_hidden)
@@ -184,29 +180,13 @@ class RecurrentTextPolicy(nn.Module):
     ) -> tuple[EncodedSnapshots, Tensor, Tensor]:
         """Run encoder with history-conditioning + LSTM update.
 
-        The encoder sees ``h_in`` via the additive HIST embedding at each
-        doc's BOS position; the LSTM is then advanced to ``(h_out, c_out)``
-        for the next env-step. This is the single forward path used by both
-        sample-time (IMPALA / opponent eval / inference server) and
-        train-time (replay scoring inside the trainer).
-
-        Lazily compile-wrapped on the first CUDA call so the inference
-        hot path doesn't pay per-op dispatch overhead.
+        Eager. The bucketed inference path
+        (:class:`TextInferencePipeline`) compiles ``_encode_with_history_impl``
+        directly per bucket (Phase C); train-time replay scoring uses
+        ``forward_packed`` (compiled separately). Direct callers of this
+        method are infrequent enough that a third compile point isn't worth
+        the warmup cost.
         """
-        if (
-            self.cfg.compile_forward
-            and self._compiled_encode_with_history is None
-            and batch.token_ids.device.type == "cuda"
-        ):
-            self._compiled_encode_with_history = cast(
-                Callable[
-                    [PackedTextBatch | TextEncodedBatch, Tensor | None, Tensor | None],
-                    tuple[EncodedSnapshots, Tensor, Tensor],
-                ],
-                torch.compile(self._encode_with_history_impl, dynamic=True),
-            )
-        if self._compiled_encode_with_history is not None and not is_fx_symbolic_tracing():
-            return self._compiled_encode_with_history(batch, h_in, c_in)
         return self._encode_with_history_impl(batch, h_in, c_in)
 
     def _encode_with_history_impl(

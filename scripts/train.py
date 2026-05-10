@@ -11,6 +11,7 @@ import importlib
 import itertools
 import json
 import math
+import os
 import random
 import re
 import sys
@@ -23,10 +24,20 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, TextIO, cast
 
-import numpy as np
-import torch
-import torch._dynamo
-from dotenv import load_dotenv
+# Inductor cache: pin to a project-local dir so torch.compile output survives
+# across runs. First run pays the full ~minutes compile cost; subsequent runs
+# load .so / cached FX graphs from disk. Set BEFORE importing torch so
+# inductor reads the right value when its config module initializes.
+os.environ.setdefault(
+    "TORCHINDUCTOR_CACHE_DIR",
+    str(Path(__file__).resolve().parents[1] / ".cache" / "torch_inductor"),
+)
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import torch._dynamo  # noqa: E402
+from dotenv import load_dotenv  # noqa: E402
 
 # Let Dynamo trace through nn.LSTM (cuDNN op stays opaque) instead of breaking
 # the graph at every LSTM call. Without this the recurrent text policy is

@@ -15,5 +15,6 @@ wheels/
 /decks/
 /checkpoints/
 /wandb/
+/.cache/
 tea_debug.log
 .env
