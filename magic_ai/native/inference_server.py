@@ -1438,7 +1438,10 @@ class TextInferenceServer:
             legal_edge_bitmap=merged_packed.legal_edge_bitmap,
             greedy=self._deterministic,
         )
-        value = text_policy.run_heads(encoded_snaps).squeeze(-1)
+        # ``ValueHead.forward`` already squeezes the trailing 1-dim axis;
+        # an extra squeeze(-1) collapses ``[B=1]`` to a 0-dim tensor and
+        # breaks the per-actor slicing of ``decoder_batch.value`` below.
+        value = text_policy.run_heads(encoded_snaps)
         return (
             native_decoder_batch_from_sample(sample, value=value),
             h_in_replay,
