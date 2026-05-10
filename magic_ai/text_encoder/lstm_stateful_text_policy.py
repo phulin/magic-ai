@@ -260,7 +260,9 @@ class LSTMStatefulTextPolicy(nn.Module):
             )
         else:
             host_rows = [int(x) for x in replay_rows]
-        return self.rollout_buffer.gather(host_rows)
+        # Replay storage is host-side; bring the gathered batch to the
+        # policy device for the forward pass.
+        return self.rollout_buffer.gather(host_rows).to(self.device)
 
     def precompute_replay_forward(
         self,
@@ -296,7 +298,8 @@ class LSTMStatefulTextPolicy(nn.Module):
         flat = [int(r) for ep in per_episode_replay_rows for r in ep]
         if not flat:
             return 0, 0
-        idx = torch.tensor(flat, dtype=torch.long, device=self.device)
+        # Replay storage may be host-side; index on the buffer's device.
+        idx = torch.tensor(flat, dtype=torch.long, device=self.rollout_buffer.device)
         decision_type = self.rollout_buffer.decoder.decision_type[idx]
         active = int((decision_type >= 0).sum().item())
         return active, active
@@ -522,7 +525,13 @@ class LSTMStatefulTextPolicy(nn.Module):
             raise RuntimeError(
                 "LSTMStatefulTextPolicy.rollout_buffer is None; cannot gather PPO targets."
             )
-        return self.rollout_buffer.gather_ppo_targets(replay_rows)
+        # Replay buffer is host-side; bring the targets onto the policy device.
+        log_p, ret, adv = self.rollout_buffer.gather_ppo_targets(replay_rows)
+        return (
+            log_p.to(self.device, non_blocking=True),
+            ret.to(self.device, non_blocking=True),
+            adv.to(self.device, non_blocking=True),
+        )
 
     def gather_replay_old_log_prob_value(
         self,
@@ -533,7 +542,10 @@ class LSTMStatefulTextPolicy(nn.Module):
                 "LSTMStatefulTextPolicy.rollout_buffer is None; cannot gather replay rows."
             )
         idx = replay_rows.to(device=self.rollout_buffer.device, dtype=torch.long)
-        return self.rollout_buffer.core.old_log_prob[idx], self.rollout_buffer.core.value[idx]
+        return (
+            self.rollout_buffer.core.old_log_prob[idx].to(self.device, non_blocking=True),
+            self.rollout_buffer.core.value[idx].to(self.device, non_blocking=True),
+        )
 
     def compute_spr_loss(
         self,

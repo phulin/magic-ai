@@ -83,6 +83,33 @@ class DecoderGatherOutput:
     vocab_mask: Tensor  # [B, L, V_vocab] bool
     pointer_mask: Tensor  # [B, L, max_tokens] bool
 
+    def to(self, device: torch.device | str) -> DecoderGatherOutput:
+        target = torch.device(device)
+        if self.output_token_ids.device == target:
+            return self
+
+        def _mv(t: Tensor) -> Tensor:
+            return t.to(device=target, non_blocking=True)
+
+        return DecoderGatherOutput(
+            output_token_ids=_mv(self.output_token_ids),
+            output_pointer_pos=_mv(self.output_pointer_pos),
+            output_is_pointer=_mv(self.output_is_pointer),
+            output_pad_mask=_mv(self.output_pad_mask),
+            output_log_prob=_mv(self.output_log_prob),
+            decision_type=_mv(self.decision_type),
+            pointer_anchor_positions=_mv(self.pointer_anchor_positions),
+            pointer_anchor_kinds=_mv(self.pointer_anchor_kinds),
+            pointer_anchor_subjects=_mv(self.pointer_anchor_subjects),
+            pointer_anchor_handles=_mv(self.pointer_anchor_handles),
+            pointer_anchor_count=_mv(self.pointer_anchor_count),
+            legal_edge_bitmap=_mv(self.legal_edge_bitmap),
+            legal_edge_n_blockers=_mv(self.legal_edge_n_blockers),
+            legal_edge_n_attackers=_mv(self.legal_edge_n_attackers),
+            vocab_mask=_mv(self.vocab_mask),
+            pointer_mask=_mv(self.pointer_mask),
+        )
+
 
 @dataclass(frozen=True)
 class TextReplayBatch:
@@ -104,6 +131,42 @@ class TextReplayBatch:
     lstm_h_in: Tensor | None
     lstm_c_in: Tensor | None
     decoder: DecoderGatherOutput
+
+    def to(self, device: torch.device | str) -> TextReplayBatch:
+        """Move every tensor field to ``device``. Used to H→D a CPU-resident
+        replay gather before feeding the policy forward."""
+
+        target = torch.device(device)
+        if self.trace_kind_id.device == target:
+            return self
+
+        def _mv(t: Tensor | None) -> Tensor | None:
+            return t.to(device=target, non_blocking=True) if t is not None else None
+
+        return TextReplayBatch(
+            encoded=self.encoded.to(target),
+            trace_kind_id=self.trace_kind_id.to(device=target, non_blocking=True),
+            decision_start=self.decision_start.to(device=target, non_blocking=True),
+            decision_count=self.decision_count.to(device=target, non_blocking=True),
+            decision_option_idx=self.decision_option_idx.to(device=target, non_blocking=True),
+            decision_target_idx=self.decision_target_idx.to(device=target, non_blocking=True),
+            decision_mask=self.decision_mask.to(device=target, non_blocking=True),
+            uses_none_head=self.uses_none_head.to(device=target, non_blocking=True),
+            selected_indices=self.selected_indices.to(device=target, non_blocking=True),
+            behavior_action_log_prob=self.behavior_action_log_prob.to(
+                device=target, non_blocking=True
+            ),
+            step_for_decision_group=self.step_for_decision_group.to(
+                device=target, non_blocking=True
+            ),
+            may_selected=self.may_selected.to(device=target, non_blocking=True),
+            old_log_prob=self.old_log_prob.to(device=target, non_blocking=True),
+            value=self.value.to(device=target, non_blocking=True),
+            perspective_player_idx=self.perspective_player_idx.to(device=target, non_blocking=True),
+            lstm_h_in=_mv(self.lstm_h_in),
+            lstm_c_in=_mv(self.lstm_c_in),
+            decoder=self.decoder.to(target),
+        )
 
 
 @dataclass

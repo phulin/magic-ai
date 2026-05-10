@@ -632,9 +632,10 @@ class NativeTextTrajectoryBuffer:
                 row_cursor += 1
                 token_cursor += token_width
             # Common fields written once per finish batch instead of per
-            # row. Building scalars on device avoids the ~3N .item() syncs
-            # the per-row path used to do.
+            # row. Compute on device, then bring everything down to the
+            # buffer's storage device in a single fused D→H stack.
             core = replay_buffer.core
+            store_dev = core.trace_kind_id.device
             decision_type_t = merged_decoder.decision_type.to(device=device, dtype=torch.long)
             trace_kind_lut = _decision_type_trace_kind_lut(device)
             trace_kind_ids = trace_kind_lut[decision_type_t.clamp(min=0)]
@@ -643,20 +644,29 @@ class NativeTextTrajectoryBuffer:
                 torch.zeros_like(trace_kind_ids),
                 trace_kind_ids,
             )
-            old_log_prob = merged_decoder.log_probs.to(device=device, dtype=torch.float32)
-            old_log_prob = old_log_prob.reshape(total, -1).sum(dim=-1)
-            value_t = merged_decoder.value.to(device=device, dtype=torch.float32).reshape(total)
+            old_log_prob_dev = (
+                merged_decoder.log_probs.to(device=device, dtype=torch.float32)
+                .reshape(total, -1)
+                .sum(dim=-1)
+            )
+            value_t_dev = merged_decoder.value.to(device=device, dtype=torch.float32).reshape(total)
+            # Single fused D→H of the device-side scalars. The float fields
+            # stack into one transfer; trace_kind_ids is a separate small
+            # int64 tensor.
+            scalars_dev = torch.stack([old_log_prob_dev, value_t_dev], dim=0)
+            scalars_host = scalars_dev.to(device=store_dev, non_blocking=True)
+            trace_kind_ids_host = trace_kind_ids.to(device=store_dev, non_blocking=True)
             perspective_t = torch.tensor(
                 [int(row.perspective_player_idx) for row in staged],
                 dtype=core.perspective_player_idx.dtype,
-                pin_memory=device.type == "cuda",
-            ).to(device, non_blocking=True)
-            core.trace_kind_id[row_start:row_end] = trace_kind_ids.to(
+                device=store_dev,
+            )
+            core.trace_kind_id[row_start:row_end] = trace_kind_ids_host.to(
                 dtype=core.trace_kind_id.dtype
             )
             core.may_selected[row_start:row_end] = 0.0
-            core.old_log_prob[row_start:row_end] = old_log_prob
-            core.value[row_start:row_end] = value_t
+            core.old_log_prob[row_start:row_end] = scalars_host[0]
+            core.value[row_start:row_end] = scalars_host[1]
             core.perspective_player_idx[row_start:row_end] = perspective_t
             core.decision_start[row_start:row_end] = 0
             core.decision_count[row_start:row_end] = 0
@@ -873,6 +883,10 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             max(6 * int(args.rollout_steps), 2 * int(args.num_envs)),
         )
     )
+    # Replay buffer lives on CPU; the rollout finish path writes via host
+    # memcpy (no per-row GPU dispatch storm), and gathered training batches
+    # are H→D'd once per update by the consumer. Triton gather/append are
+    # CUDA-only kernels — keep them off when storage is host-side.
     replay_buffer = TextReplayBuffer(
         capacity=rollout_capacity,
         max_tokens=combined_max_tokens,
@@ -883,9 +897,11 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         recurrent_layers=recurrent_cfg.lstm_layers,
         recurrent_hidden_dim=cfg.d_model,
         lstm_proj_hidden=recurrent_cfg.lstm_hidden,
-        device=device,
+        device=torch.device("cpu"),
         validate=not getattr(args, "no_validate", False),
-        materialize_gather_seq_id=device.type != "cuda",
+        materialize_gather_seq_id=True,
+        use_triton_append=False,
+        use_triton_gather=False,
     )
     policy.rollout_buffer = replay_buffer
     batch_workers = max(1, getattr(args, "batch_workers", 1))
@@ -5263,21 +5279,32 @@ def train_text_native_batched_envs(
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     prof.stop()
-                    out_path = Path(_profile_out)
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    prof.export_chrome_trace(str(out_path))
                     print(
                         cli_step_prefix(),
-                        f"[profile] torch.profiler stopped; trace written to {out_path}",
+                        "[profile] torch.profiler stopped; computing key_averages…",
                         flush=True,
                     )
+                    skip_export = _os.environ.get("MAGIC_AI_PROFILE_RL_SKIP_EXPORT") == "1"
                     try:
                         print(
-                            prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=25),
+                            prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=40),
+                            flush=True,
+                        )
+                        print(
+                            prof.key_averages().table(sort_by="cpu_time_total", row_limit=40),
                             flush=True,
                         )
                     except Exception as _e:
                         print(f"[profile] key_averages table failed: {_e}", flush=True)
+                    if not skip_export:
+                        out_path = Path(_profile_out)
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        prof.export_chrome_trace(str(out_path))
+                        print(
+                            cli_step_prefix(),
+                            f"[profile] trace written to {out_path}",
+                            flush=True,
+                        )
                     _profile_state["done"] = True
                     _profile_state["prof"] = None
                     raise SystemExit(0)
