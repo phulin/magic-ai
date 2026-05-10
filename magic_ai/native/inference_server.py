@@ -77,25 +77,37 @@ class DecoderHostView:
     """Host-side decoder fields the actor needs after inference.
 
     Pre-staged on the server (one D→H pass per merged batch, sliced
-    per-actor in scatter) so the actor's post-inference critical path —
-    transcript bookkeeping plus the cgo ``batch_step_by_decoder_action``
-    call — touches no GPU tensors. This collapses 7+ actor-side ``.cpu()``
-    syncs per inference reply down to zero.
+    per-actor in scatter) so the actor's post-inference critical path is
+    GPU-free — transcript bookkeeping, the cgo ``batch_step_by_decoder_action``
+    call, and per-env staging into the replay buffer all read from these
+    host tensors directly.
+
+    The view carries the full decoder batch (everything an episode-commit
+    write into the CPU replay buffer needs), not just the cgo-step subset.
+    ``output_is_pointer_u8`` is the uint8 form cgo expects;
+    ``output_is_pointer`` is the bool view used by staging / training
+    paths. ``log_probs_sum`` is precomputed from ``log_probs`` for
+    actor record_step.
 
     All fields are CPU tensors with leading dim equal to the per-actor row
-    count. ``output_is_pointer_u8`` is pre-cast to uint8 because cgo wants
-    a single-byte payload.
+    count.
     """
 
     decision_type: torch.Tensor  # [n] int
     output_token_ids: torch.Tensor  # [n, L_max] int32
+    output_pointer_pos: torch.Tensor  # [n, L_max] int32
     output_pointer_subjects: torch.Tensor  # [n, L_max] int32
-    output_is_pointer_u8: torch.Tensor  # [n, L_max] uint8
+    output_is_pointer: torch.Tensor  # [n, L_max] bool
+    output_is_pointer_u8: torch.Tensor  # [n, L_max] uint8 (cgo)
+    output_pad_mask: torch.Tensor  # [n, L_max] bool
     output_lens: torch.Tensor  # [n] int
     pointer_anchor_handles: torch.Tensor  # [n, N_max] int
     pointer_anchor_count: torch.Tensor  # [n] int
-    log_probs_sum: torch.Tensor  # [n] float32 (sum over output positions)
+    log_probs: torch.Tensor  # [n, L_max] float32 (zero at pad)
+    log_probs_sum: torch.Tensor  # [n] float32 (sum over L_max)
     value: torch.Tensor  # [n] float32
+    vocab_mask: torch.Tensor  # [n, L_max, V_vocab] bool
+    pointer_mask: torch.Tensor  # [n, L_max, T_enc] bool
 
 
 @dataclass(frozen=True)
@@ -1341,21 +1353,31 @@ class TextInferenceServer:
             ready_event = torch.cuda.Event()
             ready_event.record(torch.cuda.current_stream(decoder_batch.value.device))
 
-        # Stage host copies of decoder fields the actors need post-inference
-        # (cgo step + transcript / record_step). One D→H pass per merged
-        # batch instead of N actors × 9 separate ``.cpu()`` syncs.
+        # Stage host copies of the full decoder batch + LSTM state in a
+        # single D→H pass per merged batch. Replaces N actors × many
+        # ``.cpu()`` syncs and lets the actors stage rows for replay
+        # without holding GPU clones.
+        h_in_host = h_in_replay.detach().cpu() if h_in_replay is not None else None
+        c_in_host = c_in_replay.detach().cpu() if c_in_replay is not None else None
+        d = decoder_batch
+        log_probs_host = d.log_probs.detach().cpu()
+        is_pointer_u8 = d.output_is_pointer.to(dtype=torch.uint8).detach().cpu()
         host_decoder_full = DecoderHostView(
-            decision_type=decoder_batch.decision_type.detach().cpu(),
-            output_token_ids=decoder_batch.output_token_ids.detach().cpu(),
-            output_pointer_subjects=decoder_batch.output_pointer_subjects.detach().cpu(),
-            output_is_pointer_u8=decoder_batch.output_is_pointer.to(dtype=torch.uint8)
-            .detach()
-            .cpu(),
-            output_lens=decoder_batch.output_lens.detach().cpu(),
-            pointer_anchor_handles=decoder_batch.pointer_anchor_handles.detach().cpu(),
-            pointer_anchor_count=decoder_batch.pointer_anchor_count.detach().cpu(),
-            log_probs_sum=decoder_batch.log_probs.sum(dim=-1).detach().cpu(),
-            value=decoder_batch.value.detach().cpu(),
+            decision_type=d.decision_type.detach().cpu(),
+            output_token_ids=d.output_token_ids.detach().cpu(),
+            output_pointer_pos=d.output_pointer_pos.detach().cpu(),
+            output_pointer_subjects=d.output_pointer_subjects.detach().cpu(),
+            output_is_pointer=is_pointer_u8.bool(),
+            output_is_pointer_u8=is_pointer_u8,
+            output_pad_mask=d.output_pad_mask.detach().cpu(),
+            output_lens=d.output_lens.detach().cpu(),
+            pointer_anchor_handles=d.pointer_anchor_handles.detach().cpu(),
+            pointer_anchor_count=d.pointer_anchor_count.detach().cpu(),
+            log_probs=log_probs_host,
+            log_probs_sum=log_probs_host.sum(dim=-1),
+            value=d.value.detach().cpu(),
+            vocab_mask=d.vocab_mask.detach().cpu(),
+            pointer_mask=d.pointer_mask.detach().cpu(),
         )
 
         # Scatter per-actor decoder-batch slices and per-row encoded snapshots.
@@ -1384,24 +1406,30 @@ class TextInferenceServer:
                 )
                 tcur = tend
             actor_decoder = decoder_batch[row_cursor:row_end]
+            # LSTM state is host-side now; per-actor slice is a free view.
             actor_h_in = (
-                h_in_replay[:, row_cursor:row_end].contiguous() if h_in_replay is not None else None
+                h_in_host[:, row_cursor:row_end].contiguous() if h_in_host is not None else None
             )
             actor_c_in = (
-                c_in_replay[:, row_cursor:row_end].contiguous() if c_in_replay is not None else None
+                c_in_host[:, row_cursor:row_end].contiguous() if c_in_host is not None else None
             )
+            sl = slice(row_cursor, row_end)
             actor_host_decoder = DecoderHostView(
-                decision_type=host_decoder_full.decision_type[row_cursor:row_end],
-                output_token_ids=host_decoder_full.output_token_ids[row_cursor:row_end],
-                output_pointer_subjects=host_decoder_full.output_pointer_subjects[
-                    row_cursor:row_end
-                ],
-                output_is_pointer_u8=host_decoder_full.output_is_pointer_u8[row_cursor:row_end],
-                output_lens=host_decoder_full.output_lens[row_cursor:row_end],
-                pointer_anchor_handles=host_decoder_full.pointer_anchor_handles[row_cursor:row_end],
-                pointer_anchor_count=host_decoder_full.pointer_anchor_count[row_cursor:row_end],
-                log_probs_sum=host_decoder_full.log_probs_sum[row_cursor:row_end],
-                value=host_decoder_full.value[row_cursor:row_end],
+                decision_type=host_decoder_full.decision_type[sl],
+                output_token_ids=host_decoder_full.output_token_ids[sl],
+                output_pointer_pos=host_decoder_full.output_pointer_pos[sl],
+                output_pointer_subjects=host_decoder_full.output_pointer_subjects[sl],
+                output_is_pointer=host_decoder_full.output_is_pointer[sl],
+                output_is_pointer_u8=host_decoder_full.output_is_pointer_u8[sl],
+                output_pad_mask=host_decoder_full.output_pad_mask[sl],
+                output_lens=host_decoder_full.output_lens[sl],
+                pointer_anchor_handles=host_decoder_full.pointer_anchor_handles[sl],
+                pointer_anchor_count=host_decoder_full.pointer_anchor_count[sl],
+                log_probs=host_decoder_full.log_probs[sl],
+                log_probs_sum=host_decoder_full.log_probs_sum[sl],
+                value=host_decoder_full.value[sl],
+                vocab_mask=host_decoder_full.vocab_mask[sl],
+                pointer_mask=host_decoder_full.pointer_mask[sl],
             )
             reply = TextInferenceReply(
                 decoder_batch=actor_decoder,

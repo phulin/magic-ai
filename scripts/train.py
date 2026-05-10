@@ -397,12 +397,11 @@ class _StagedDecoderRow:
     the actor reuses its scratch for the next batch.
     """
 
-    decoder: NativeTextDecoderBatch  # length-1 row slice (cloned)
-    packed_row: Any  # PackedTextBatch length-1 slice (cloned)
+    decoder: NativeTextDecoderBatch  # length-1 row slice (host, cloned)
+    packed_row: Any  # PackedTextBatch length-1 slice (host, cloned)
     perspective_player_idx: int
-    lstm_h_in: torch.Tensor | None  # [layers, 1, hidden] cloned
+    lstm_h_in: torch.Tensor | None  # [layers, hidden] host, cloned
     lstm_c_in: torch.Tensor | None
-    ready_event: Any | None = None
 
 
 class NativeTextTrajectoryBuffer:
@@ -445,53 +444,54 @@ class NativeTextTrajectoryBuffer:
     def stage_batch(
         self,
         env_indices: list[int],
-        decoder_batch: NativeTextDecoderBatch,
+        host_decoder: Any,
         *,
         packed_rows: Sequence[Any],
         perspective_player_indices: Sequence[int],
         lstm_h_in: torch.Tensor | None = None,
         lstm_c_in: torch.Tensor | None = None,
-        ready_event: Any | None = None,
     ) -> None:
         """Append per-env decoder rows + their encoded snapshots.
 
-        ``decoder_batch`` is the inference-server reply slice for these envs;
-        ``packed_rows[i]`` is the matching length-1 PackedTextBatch row. All
-        tensor data is cloned so the actor can recycle its scratch. Caller
-        holds responsibility for translating positions into the row-local
-        frame before slicing.
+        ``host_decoder`` is a :class:`DecoderHostView` carrying the full
+        decoder batch on host. ``packed_rows[i]`` is the matching
+        length-1 :class:`PackedTextBatch` row, also host-side (sliced
+        from the actor's pre-submit packed scratch). LSTM state slices
+        come from the inference reply already on host.
+
+        All tensor data is cloned so the actor can recycle its scratch on
+        the next encode tick. Cloning host int32 tensors is a memcpy with
+        no GPU dispatch cost.
         """
 
         n = len(env_indices)
-        if int(len(decoder_batch)) != n:
-            raise ValueError("decoder_batch row count must match env_indices length")
+        if int(host_decoder.decision_type.shape[0]) != n:
+            raise ValueError("host_decoder row count must match env_indices length")
         if len(packed_rows) != n:
             raise ValueError("packed_rows length must match env_indices length")
         if len(perspective_player_indices) != n:
             raise ValueError("perspective length must match env_indices length")
 
-        # Pre-slice the decoder batch into single-row clones outside the
-        # lock; cloning is cheap-relative-to-replay-write and keeps the
-        # critical section short. Clone individually so each env-step row
-        # is independent of the actor's reusable scratch tensors.
+        # Pre-slice the host decoder into single-row clones outside the
+        # lock so each env-step is independent of the actor's reusable
+        # scratch tensors.
         per_row: list[NativeTextDecoderBatch] = []
         for i in range(n):
-            row = decoder_batch[i]
             per_row.append(
                 NativeTextDecoderBatch(
-                    decision_type=row.decision_type.detach().clone(),
-                    output_token_ids=row.output_token_ids.detach().clone(),
-                    output_pointer_pos=row.output_pointer_pos.detach().clone(),
-                    output_pointer_subjects=row.output_pointer_subjects.detach().clone(),
-                    output_is_pointer=row.output_is_pointer.detach().clone(),
-                    output_lens=row.output_lens.detach().clone(),
-                    pointer_anchor_handles=row.pointer_anchor_handles.detach().clone(),
-                    pointer_anchor_count=row.pointer_anchor_count.detach().clone(),
-                    log_probs=row.log_probs.detach().clone(),
-                    value=row.value.detach().clone(),
-                    output_pad_mask=row.output_pad_mask.detach().clone(),
-                    vocab_mask=row.vocab_mask.detach().clone(),
-                    pointer_mask=row.pointer_mask.detach().clone(),
+                    decision_type=host_decoder.decision_type[i : i + 1].clone(),
+                    output_token_ids=host_decoder.output_token_ids[i : i + 1].clone(),
+                    output_pointer_pos=host_decoder.output_pointer_pos[i : i + 1].clone(),
+                    output_pointer_subjects=host_decoder.output_pointer_subjects[i : i + 1].clone(),
+                    output_is_pointer=host_decoder.output_is_pointer[i : i + 1].clone(),
+                    output_lens=host_decoder.output_lens[i : i + 1].clone(),
+                    pointer_anchor_handles=host_decoder.pointer_anchor_handles[i : i + 1].clone(),
+                    pointer_anchor_count=host_decoder.pointer_anchor_count[i : i + 1].clone(),
+                    log_probs=host_decoder.log_probs[i : i + 1].clone(),
+                    value=host_decoder.value[i : i + 1].clone(),
+                    output_pad_mask=host_decoder.output_pad_mask[i : i + 1].clone(),
+                    vocab_mask=host_decoder.vocab_mask[i : i + 1].clone(),
+                    pointer_mask=host_decoder.pointer_mask[i : i + 1].clone(),
                 )
             )
 
@@ -502,12 +502,8 @@ class NativeTextTrajectoryBuffer:
                     raise RuntimeError(f"native text staging buffer is full for env {env_i}")
                 # Replay writer wants [layers, hidden] per row; the source
                 # tensor is [layers, n, hidden] so squeeze the per-row dim.
-                h_slice = (
-                    lstm_h_in[:, i].detach().clone().contiguous() if lstm_h_in is not None else None
-                )
-                c_slice = (
-                    lstm_c_in[:, i].detach().clone().contiguous() if lstm_c_in is not None else None
-                )
+                h_slice = lstm_h_in[:, i].clone().contiguous() if lstm_h_in is not None else None
+                c_slice = lstm_c_in[:, i].clone().contiguous() if lstm_c_in is not None else None
                 self._rows[env_i].append(
                     _StagedDecoderRow(
                         decoder=per_row[i],
@@ -515,7 +511,6 @@ class NativeTextTrajectoryBuffer:
                         perspective_player_idx=int(perspective_player_indices[i]),
                         lstm_h_in=h_slice,
                         lstm_c_in=c_slice,
-                        ready_event=ready_event,
                     )
                 )
                 self.step_count_host[env_i] = len(self._rows[env_i])
@@ -565,32 +560,35 @@ class NativeTextTrajectoryBuffer:
         # both pointer-position and subject-index. We don't carry encoder
         # positions here (they were translated to subjects at sample time);
         # store -1 for output_pointer_pos and the subjects for the new field.
+        # Everything is host-side now (replay storage, staged decoder
+        # rows, and the merged decoder built from them) — no D→H needed.
+        store_dev = replay_buffer.core.trace_kind_id.device
         l_max = int(merged_decoder.output_token_ids.shape[1])
         n_max = int(merged_decoder.pointer_anchor_handles.shape[1])
-        zero_pos = torch.full((total, l_max), -1, dtype=torch.int32, device=device)
-        anchor_kinds = torch.full((total, n_max), -1, dtype=torch.int32, device=device)
-        anchor_subjects = torch.arange(n_max, device=device, dtype=torch.int32).expand(total, n_max)
+        zero_pos = torch.full((total, l_max), -1, dtype=torch.int32, device=store_dev)
+        anchor_kinds = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
+        anchor_subjects = torch.arange(n_max, device=store_dev, dtype=torch.int32).expand(
+            total, n_max
+        )
         # Mask out anchors past pointer_anchor_count.
-        cnt = merged_decoder.pointer_anchor_count.to(device=device, dtype=torch.int32)
+        cnt = merged_decoder.pointer_anchor_count.to(dtype=torch.int32)
         mask = anchor_subjects < cnt.unsqueeze(-1)
         anchor_subjects = torch.where(mask, anchor_subjects, torch.full_like(anchor_subjects, -1))
-        anchor_handles = merged_decoder.pointer_anchor_handles.to(device=device, dtype=torch.int32)
+        anchor_handles = merged_decoder.pointer_anchor_handles.to(dtype=torch.int32)
         anchor_handles = torch.where(mask, anchor_handles, torch.full_like(anchor_handles, -1))
         # Empty legal-edge bitmap; combat decisions need it filled out
         # by the encoder, but for IMPALA staging we leave a placeholder.
-        legal_edge = torch.zeros((total, 0, 0), dtype=torch.bool, device=device)
-        legal_n = torch.zeros((total,), dtype=torch.int32, device=device)
+        legal_edge = torch.zeros((total, 0, 0), dtype=torch.bool, device=store_dev)
+        legal_n = torch.zeros((total,), dtype=torch.int32, device=store_dev)
         from magic_ai.text_encoder.replay_buffer import DecoderDecisionPayload
 
         payload = DecoderDecisionPayload(
-            output_token_ids=merged_decoder.output_token_ids.to(device=device, dtype=torch.int32),
-            output_pointer_pos=merged_decoder.output_pointer_pos.to(
-                device=device, dtype=torch.int32
-            ),
-            output_is_pointer=merged_decoder.output_is_pointer.to(device=device, dtype=torch.bool),
-            output_pad_mask=merged_decoder.output_pad_mask.to(device=device, dtype=torch.bool),
-            output_log_prob=merged_decoder.log_probs.to(device=device, dtype=torch.float32),
-            decision_type=merged_decoder.decision_type.to(device=device, dtype=torch.int32),
+            output_token_ids=merged_decoder.output_token_ids.to(dtype=torch.int32),
+            output_pointer_pos=merged_decoder.output_pointer_pos.to(dtype=torch.int32),
+            output_is_pointer=merged_decoder.output_is_pointer.to(dtype=torch.bool),
+            output_pad_mask=merged_decoder.output_pad_mask.to(dtype=torch.bool),
+            output_log_prob=merged_decoder.log_probs.to(dtype=torch.float32),
+            decision_type=merged_decoder.decision_type.to(dtype=torch.int32),
             pointer_anchor_positions=zero_pos[:, :n_max].clone(),
             pointer_anchor_kinds=anchor_kinds,
             pointer_anchor_subjects=anchor_subjects,
@@ -599,8 +597,8 @@ class NativeTextTrajectoryBuffer:
             legal_edge_bitmap=legal_edge,
             legal_edge_n_blockers=legal_n,
             legal_edge_n_attackers=legal_n,
-            vocab_mask=merged_decoder.vocab_mask.to(device=device, dtype=torch.bool),
-            pointer_mask=merged_decoder.pointer_mask.to(device=device, dtype=torch.bool),
+            vocab_mask=merged_decoder.vocab_mask.to(dtype=torch.bool),
+            pointer_mask=merged_decoder.pointer_mask.to(dtype=torch.bool),
         )
 
         # Reserve a window in the replay buffer covering all rows. Tokens
@@ -631,42 +629,32 @@ class NativeTextTrajectoryBuffer:
                 )
                 row_cursor += 1
                 token_cursor += token_width
-            # Common fields written once per finish batch instead of per
-            # row. Compute on device, then bring everything down to the
-            # buffer's storage device in a single fused D→H stack.
+            # Common fields, all host-to-host now that staging + storage
+            # are both on host.
             core = replay_buffer.core
-            store_dev = core.trace_kind_id.device
-            decision_type_t = merged_decoder.decision_type.to(device=device, dtype=torch.long)
-            trace_kind_lut = _decision_type_trace_kind_lut(device)
+            decision_type_t = merged_decoder.decision_type.to(dtype=torch.long)
+            trace_kind_lut = _decision_type_trace_kind_lut(store_dev)
             trace_kind_ids = trace_kind_lut[decision_type_t.clamp(min=0)]
             trace_kind_ids = torch.where(
                 decision_type_t < 0,
                 torch.zeros_like(trace_kind_ids),
                 trace_kind_ids,
             )
-            old_log_prob_dev = (
-                merged_decoder.log_probs.to(device=device, dtype=torch.float32)
-                .reshape(total, -1)
-                .sum(dim=-1)
+            old_log_prob = (
+                merged_decoder.log_probs.to(dtype=torch.float32).reshape(total, -1).sum(dim=-1)
             )
-            value_t_dev = merged_decoder.value.to(device=device, dtype=torch.float32).reshape(total)
-            # Single fused D→H of the device-side scalars. The float fields
-            # stack into one transfer; trace_kind_ids is a separate small
-            # int64 tensor.
-            scalars_dev = torch.stack([old_log_prob_dev, value_t_dev], dim=0)
-            scalars_host = scalars_dev.to(device=store_dev, non_blocking=True)
-            trace_kind_ids_host = trace_kind_ids.to(device=store_dev, non_blocking=True)
+            value_t = merged_decoder.value.to(dtype=torch.float32).reshape(total)
             perspective_t = torch.tensor(
                 [int(row.perspective_player_idx) for row in staged],
                 dtype=core.perspective_player_idx.dtype,
                 device=store_dev,
             )
-            core.trace_kind_id[row_start:row_end] = trace_kind_ids_host.to(
+            core.trace_kind_id[row_start:row_end] = trace_kind_ids.to(
                 dtype=core.trace_kind_id.dtype
             )
             core.may_selected[row_start:row_end] = 0.0
-            core.old_log_prob[row_start:row_end] = scalars_host[0]
-            core.value[row_start:row_end] = scalars_host[1]
+            core.old_log_prob[row_start:row_end] = old_log_prob
+            core.value[row_start:row_end] = value_t
             core.perspective_player_idx[row_start:row_end] = perspective_t
             core.decision_start[row_start:row_end] = 0
             core.decision_count[row_start:row_end] = 0

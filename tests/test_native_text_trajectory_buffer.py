@@ -14,6 +14,7 @@ from __future__ import annotations
 import unittest
 
 import torch
+from magic_ai.native.inference_server import DecoderHostView
 from magic_ai.text_encoder.batch import PackedTextBatch
 from magic_ai.text_encoder.decoder_batch import (
     NativeTextDecoderBatch,
@@ -22,6 +23,28 @@ from magic_ai.text_encoder.decoder_batch import (
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from scripts.train import NativeTextTrajectoryBuffer
+
+
+def _host_view(d: NativeTextDecoderBatch) -> DecoderHostView:
+    """Wrap a host-side ``NativeTextDecoderBatch`` as a ``DecoderHostView``."""
+    is_ptr_u8 = d.output_is_pointer.to(torch.uint8)
+    return DecoderHostView(
+        decision_type=d.decision_type,
+        output_token_ids=d.output_token_ids,
+        output_pointer_pos=d.output_pointer_pos,
+        output_pointer_subjects=d.output_pointer_subjects,
+        output_is_pointer=d.output_is_pointer,
+        output_is_pointer_u8=is_ptr_u8,
+        output_pad_mask=d.output_pad_mask,
+        output_lens=d.output_lens,
+        pointer_anchor_handles=d.pointer_anchor_handles,
+        pointer_anchor_count=d.pointer_anchor_count,
+        log_probs=d.log_probs,
+        log_probs_sum=d.log_probs.sum(dim=-1),
+        value=d.value,
+        vocab_mask=d.vocab_mask,
+        pointer_mask=d.pointer_mask,
+    )
 
 
 def _make_replay_buffer(*, capacity: int = 16) -> TextReplayBuffer:
@@ -105,7 +128,7 @@ class NativeTextTrajectoryBufferTest(unittest.TestCase):
             decoder = _make_decoder_batch(b=1)
             buf.stage_batch(
                 env_indices=[0],
-                decoder_batch=decoder,
+                host_decoder=_host_view(decoder),
                 packed_rows=[_make_packed_row(token_count=3)],
                 perspective_player_indices=[0],
             )
@@ -113,7 +136,7 @@ class NativeTextTrajectoryBufferTest(unittest.TestCase):
         decoder = _make_decoder_batch(b=1)
         buf.stage_batch(
             env_indices=[1],
-            decoder_batch=decoder,
+            host_decoder=_host_view(decoder),
             packed_rows=[_make_packed_row(token_count=2)],
             perspective_player_indices=[1],
         )
@@ -142,7 +165,7 @@ class NativeTextTrajectoryBufferTest(unittest.TestCase):
         decoder = _make_decoder_batch(b=1)
         buf.stage_batch(
             env_indices=[0],
-            decoder_batch=decoder,
+            host_decoder=_host_view(decoder),
             packed_rows=[_make_packed_row()],
             perspective_player_indices=[0],
         )

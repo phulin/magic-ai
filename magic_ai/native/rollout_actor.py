@@ -92,6 +92,10 @@ class _InFlightBatch:
     ready_env_indices: list[int]
     submitted_at: float
     future: Future[Any]
+    # Host-side packed batch we sent to the server. Reused by staging
+    # so the per-env trajectory rows don't need GPU clones of the
+    # server's arena slices.
+    packed: Any = None
 
 
 @dataclass
@@ -325,6 +329,7 @@ class TextRolloutActor:
             ready_env_indices=batch.ready_env_indices,
             submitted_at=time.perf_counter(),
             future=future,
+            packed=batch.packed,
         )
         setattr(future, "_magic_ai_actor_batch", in_flight)
         self._pending_inference += 1
@@ -342,14 +347,39 @@ class TextRolloutActor:
         self._record_timing("actor_wait_inference", batch.submitted_at)
         try:
             start = time.perf_counter()
+            host = reply.host_decoder
+            # Slice the actor's pre-submit host packed batch into per-row
+            # length-1 PackedTextBatch views, one per env-step. These get
+            # cloned inside ``stage_batch`` so the actor can recycle its
+            # encoder scratch on the next tick.
+            from magic_ai.native.inference_server import (  # noqa: PLC0415
+                _slice_packed_text_batch,
+            )
+
+            packed = batch.packed
+            seq_lengths_host = packed.seq_lengths_host or tuple(
+                int(x) for x in packed.seq_lengths.tolist()
+            )
+            host_packed_rows: list[Any] = []
+            tcur = 0
+            for i, n_tokens in enumerate(seq_lengths_host):
+                host_packed_rows.append(
+                    _slice_packed_text_batch(
+                        packed,
+                        row_start=i,
+                        row_end=i + 1,
+                        token_start=tcur,
+                        token_end=tcur + int(n_tokens),
+                    )
+                )
+                tcur += int(n_tokens)
             self.staging_buffer.stage_batch(
                 batch.ready_env_indices,
-                reply.decoder_batch,
-                packed_rows=reply.packed_rows,
+                host,
+                packed_rows=host_packed_rows,
                 perspective_player_indices=reply.perspective_player_indices,
                 lstm_h_in=reply.lstm_h_in,
                 lstm_c_in=reply.lstm_c_in,
-                ready_event=getattr(reply, "ready_event", None),
             )
             self._record_timing("actor_stage", start)
         finally:
@@ -360,10 +390,8 @@ class TextRolloutActor:
         # Build transcripts + RolloutSteps (CPU-only, actor-local) and then
         # advance the engine via the decoder-action batched cgo entry.
         start = time.perf_counter()
-        decoder = reply.decoder_batch
-        host = reply.host_decoder
-        # Server already pre-staged D→H copies into reply.host_decoder; the
-        # actor's post-inference critical path stays GPU-free.
+        # All transcript / record_step inputs live in ``host_decoder`` —
+        # the GPU ``reply.decoder_batch`` is no longer touched here.
         log_probs_per_row = host.log_probs_sum.tolist()
         values_host = host.value.tolist()
         decision_types_host = [int(x) for x in host.decision_type.tolist()]
@@ -377,13 +405,13 @@ class TextRolloutActor:
                 try:
                     state, pending = self.transcript_snapshot(env.game)
                     layout = DecoderDecisionLayout(
-                        output_token_ids=decoder.output_token_ids[step_idx],
-                        output_pointer_pos=decoder.output_pointer_subjects[step_idx],
-                        output_pointer_subjects=decoder.output_pointer_subjects[step_idx],
-                        output_is_pointer=decoder.output_is_pointer[step_idx],
-                        output_pad_mask=decoder.output_pad_mask[step_idx],
+                        output_token_ids=host.output_token_ids[step_idx],
+                        output_pointer_pos=host.output_pointer_subjects[step_idx],
+                        output_pointer_subjects=host.output_pointer_subjects[step_idx],
+                        output_is_pointer=host.output_is_pointer[step_idx],
+                        output_pad_mask=host.output_pad_mask[step_idx],
                         decision_type=int(decision_types_host[step_idx]),
-                        pointer_anchor_handles=decoder.pointer_anchor_handles[step_idx],
+                        pointer_anchor_handles=host.pointer_anchor_handles[step_idx],
                         pointer_anchor_count=int(host.pointer_anchor_count[step_idx].item()),
                     )
                     action = decode_decoder_action(pending, layout)
