@@ -619,32 +619,53 @@ class NativeTextTrajectoryBuffer:
             # helper clears the decoder row as part of its scratch reset
             # (see ``TextReplayBuffer._write_packed_encoded_row``), so the
             # decoder commit must come after.
-            row_cursor = int(reservation.row_start)
+            row_start = int(reservation.row_start)
+            row_end = int(reservation.row_end)
+            row_cursor = row_start
             token_cursor = int(reservation.token_start)
-            zeros_int = torch.zeros((1,), dtype=torch.long, device=device)
             for row in staged:
                 packed = cast(PackedTextBatch, row.packed_row)
                 token_width = int(packed.token_ids.shape[0])
                 replay_buffer._write_packed_encoded_row(
                     row_cursor, token_cursor, packed, batch_index=0
                 )
-                replay_buffer.core._write_common_row(
-                    row_cursor,
-                    trace_kind_id=int(
-                        _decision_type_to_trace_kind_id(int(row.decoder.decision_type[0].item()))
-                    ),
-                    may_selected=0.0,
-                    old_log_prob=float(row.decoder.log_probs.sum().item()),
-                    value=float(row.decoder.value[0].item()),
-                    perspective_player_idx=int(row.perspective_player_idx),
-                    lstm_h_in=row.lstm_h_in,
-                    lstm_c_in=row.lstm_c_in,
-                )
-                # decision_count = 0 for decoder rows.
-                replay_buffer.core.decision_start[row_cursor] = zeros_int
-                replay_buffer.core.decision_count[row_cursor] = zeros_int
                 row_cursor += 1
                 token_cursor += token_width
+            # Common fields written once per finish batch instead of per
+            # row. Building scalars on device avoids the ~3N .item() syncs
+            # the per-row path used to do.
+            core = replay_buffer.core
+            decision_type_t = merged_decoder.decision_type.to(device=device, dtype=torch.long)
+            trace_kind_lut = _decision_type_trace_kind_lut(device)
+            trace_kind_ids = trace_kind_lut[decision_type_t.clamp(min=0)]
+            trace_kind_ids = torch.where(
+                decision_type_t < 0,
+                torch.zeros_like(trace_kind_ids),
+                trace_kind_ids,
+            )
+            old_log_prob = merged_decoder.log_probs.to(device=device, dtype=torch.float32)
+            old_log_prob = old_log_prob.reshape(total, -1).sum(dim=-1)
+            value_t = merged_decoder.value.to(device=device, dtype=torch.float32).reshape(total)
+            perspective_t = torch.tensor(
+                [int(row.perspective_player_idx) for row in staged],
+                dtype=core.perspective_player_idx.dtype,
+                pin_memory=device.type == "cuda",
+            ).to(device, non_blocking=True)
+            core.trace_kind_id[row_start:row_end] = trace_kind_ids.to(
+                dtype=core.trace_kind_id.dtype
+            )
+            core.may_selected[row_start:row_end] = 0.0
+            core.old_log_prob[row_start:row_end] = old_log_prob
+            core.value[row_start:row_end] = value_t
+            core.perspective_player_idx[row_start:row_end] = perspective_t
+            core.decision_start[row_start:row_end] = 0
+            core.decision_count[row_start:row_end] = 0
+            if core.lstm_h_in is not None and core.lstm_c_in is not None:
+                if any(row.lstm_h_in is None or row.lstm_c_in is None for row in staged):
+                    raise ValueError("recurrent buffer requires lstm states on every staged row")
+                h_stack = torch.stack([cast(torch.Tensor, row.lstm_h_in) for row in staged], dim=0)
+                c_stack = torch.stack([cast(torch.Tensor, row.lstm_c_in) for row in staged], dim=0)
+                core._write_recurrent_batch(row_start, row_end, h_stack, c_stack)
             replay_buffer.commit_decoder_decision(reservation, payload)
             replay_buffer._mark_append_ready_range(
                 int(reservation.row_start), int(reservation.row_end)
@@ -1038,6 +1059,31 @@ def _decision_type_to_trace_kind_id(decision_type: int) -> int:
     from magic_ai.actions import TRACE_KIND_TO_ID
 
     return int(TRACE_KIND_TO_ID[cast(Any, _decision_type_to_trace_kind(decision_type))])
+
+
+_DECISION_TYPE_TRACE_KIND_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _decision_type_trace_kind_lut(device: torch.device) -> torch.Tensor:
+    """Device-resident LUT mapping ``DecisionType`` value → trace_kind_id.
+
+    Built once per device. ``decision_type < 0`` (priority) is handled by
+    the caller; this LUT is indexed with the clamped non-negative value.
+    """
+
+    cached = _DECISION_TYPE_TRACE_KIND_LUT_CACHE.get(device)
+    if cached is not None:
+        return cached
+    from magic_ai.text_encoder.decision_spec import DecisionType
+
+    max_dt = max(int(d) for d in DecisionType)
+    host = torch.tensor(
+        [_decision_type_to_trace_kind_id(i) for i in range(max_dt + 1)],
+        dtype=torch.int64,
+    )
+    lut = host.to(device=device)
+    _DECISION_TYPE_TRACE_KIND_LUT_CACHE[device] = lut
+    return lut
 
 
 def _single_token_id(tokenizer: Any, token: str) -> int:
