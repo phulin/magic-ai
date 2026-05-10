@@ -231,11 +231,23 @@ class NativePackedAssemblerOutputs:
             blk_max = self.legal_edge_bitmap.shape[1]
             att_max = self.legal_edge_bitmap.shape[2]
 
-        pointer_anchor_positions = self.pointer_anchor_positions[:active_n, :anchors_max]
         pointer_anchor_kinds = self.pointer_anchor_kinds[:active_n, :anchors_max]
         pointer_anchor_subjects = self.pointer_anchor_subjects[:active_n, :anchors_max]
         pointer_anchor_handles = self.pointer_anchor_handles[:active_n, :anchors_max]
         legal_edge_bitmap = self.legal_edge_bitmap[:active_n, :blk_max, :att_max]
+        # Convert anchor / card-ref positions to row-local at the cgo
+        # boundary. Go's MagePackCombinedTokens emits packed-combined
+        # coords (per-row offset added); the rest of the pipeline only
+        # ever uses these positions row-local (decoder cross-attn, replay
+        # storage), so subtract once here and stop the add-then-subtract
+        # churn through concat/arena/slice/sample.
+        from magic_ai.text_encoder.batch import subtract_packed_offsets
+
+        pointer_anchor_positions = subtract_packed_offsets(
+            self.pointer_anchor_positions[:active_n, :anchors_max],
+            state_positions,
+        )
+        card_ref_positions = subtract_packed_offsets(card_ref_positions, state_positions)
 
         max_seqlen = max(seq_lengths_host, default=0)
         return PackedTextBatch(

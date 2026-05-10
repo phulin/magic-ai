@@ -286,12 +286,15 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
         cu_seqlens=cu,
         seq_lengths=seq_lens,
         state_positions=state_positions.clone(),
-        card_ref_positions=add_packed_offsets(padded.card_ref_positions, state_positions),
+        # card_ref / anchor positions are kept row-local end-to-end; the
+        # consumers (decoder cross-attn, replay storage) want them that way,
+        # and shifting + unshifting through pack/concat/arena/slice was pure
+        # churn. cu_seqlens / seq_id / state_positions still span the merged
+        # arena because varlen attention requires it.
+        card_ref_positions=padded.card_ref_positions.to(torch.int32),
         spec_lens=padded.spec_lens,
         decision_type=padded.decision_type,
-        pointer_anchor_positions=add_packed_offsets(
-            padded.pointer_anchor_positions, state_positions
-        ),
+        pointer_anchor_positions=padded.pointer_anchor_positions.to(torch.int32),
         pointer_anchor_kinds=padded.pointer_anchor_kinds,
         pointer_anchor_subjects=padded.pointer_anchor_subjects,
         pointer_anchor_handles=padded.pointer_anchor_handles,

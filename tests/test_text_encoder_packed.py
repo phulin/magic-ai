@@ -66,13 +66,10 @@ def test_pack_batch_shapes_and_anchors() -> None:
         assert torch.equal(seg, torch.arange(end - start, dtype=torch.int64))
         assert (packed.seq_id[start:end] == i).all()
 
-    # Card anchors get rebased; -1s stay -1.
-    base = expected_cu[:-1]
-    valid = padded.card_ref_positions >= 0
-    expected_cards = torch.where(
-        valid, padded.card_ref_positions + base.unsqueeze(-1), padded.card_ref_positions
-    )
-    assert torch.equal(packed.card_ref_positions, expected_cards)
+    # Card anchors stay row-local end-to-end; pack_batch is a no-op for them
+    # (just dtype cast). gather_card_vectors_packed converts to packed coords
+    # internally where it actually needs absolute offsets into [T_packed, D].
+    assert torch.equal(packed.card_ref_positions, padded.card_ref_positions.to(torch.int32))
 
 
 def test_padded_vs_packed_parity() -> None:

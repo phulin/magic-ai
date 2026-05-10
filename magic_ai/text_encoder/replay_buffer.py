@@ -21,9 +21,7 @@ from magic_ai.returns import gae_returns_batched
 from magic_ai.text_encoder.batch import (
     PackedTextBatch,
     TextEncodedBatch,
-    add_packed_offsets,
     packed_sequence_layout,
-    subtract_packed_offsets,
 )
 from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE, GrammarVocab
 from magic_ai.text_encoder.replay_triton import (
@@ -1415,11 +1413,10 @@ class TextReplayBuffer:
         )
         self.row_token_length[rows] = seq_lengths_i32
 
-        state_positions = encoded.state_positions.to(device=self.device, dtype=torch.int32)
-
-        self.card_ref_positions[rows] = subtract_packed_offsets(
-            encoded.card_ref_positions.to(device=self.device),
-            state_positions,
+        # card_ref_positions are stored row-local both in the live
+        # PackedTextBatch and in the replay buffer; copy through.
+        self.card_ref_positions[rows] = encoded.card_ref_positions.to(
+            device=self.device, dtype=self.card_ref_positions.dtype
         )
 
         self._mark_append_ready_range(row_start, row_end)
@@ -1724,7 +1721,7 @@ class TextReplayBuffer:
             cu_seqlens=cu_seqlens,
             seq_lengths=seq_lengths,
             state_positions=state_positions,
-            card_ref_positions=add_packed_offsets(self.card_ref_positions[idx], state_positions),
+            card_ref_positions=self.card_ref_positions[idx],
             spec_lens=empty_i32,
             decision_type=empty_dec_type,
             pointer_anchor_positions=empty_anchor,
@@ -1813,17 +1810,9 @@ class TextReplayBuffer:
             encoded.token_ids[start:end].to(device=self.device, dtype=torch.int32),
         )
 
-        state_positions = encoded.state_positions[batch_index : batch_index + 1].to(
-            device=self.device, dtype=torch.int32
-        )
-
+        # card_ref_positions are row-local end-to-end; just slice + copy.
         self.card_ref_positions[row].copy_(
-            subtract_packed_offsets(
-                encoded.card_ref_positions[batch_index : batch_index + 1].to(device=self.device),
-                state_positions,
-            )
-            .squeeze(0)
-            .to(device=self.device, dtype=torch.int32)
+            encoded.card_ref_positions[batch_index].to(device=self.device, dtype=torch.int32)
         )
         self.seq_lengths[row] = encoded.seq_lengths[batch_index].to(
             device=self.device, dtype=torch.int32

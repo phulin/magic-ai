@@ -487,7 +487,7 @@ def run_eval_matches(
         while free_slots and next_game_idx < total_games_target:
             live.append(start_game(free_slots.pop()))
 
-    from magic_ai.text_encoder.batch import scatter_packed_to_padded, subtract_packed_offsets
+    from magic_ai.text_encoder.batch import scatter_packed_to_padded
     from magic_ai.text_encoder.decoder_inference import decoder_sample
     from magic_ai.text_encoder.lstm_stateful_text_policy import LSTMStatefulTextPolicy
 
@@ -525,9 +525,8 @@ def run_eval_matches(
                 policy.scatter_lstm_env_states(slot_indices, players, h_out, c_out)
                 encoded, attn_mask = scatter_packed_to_padded(encoded_snaps.encoded, packed)
                 device = encoded.device
-                anchor_positions_rowlocal = subtract_packed_offsets(
-                    packed.pointer_anchor_positions, packed.state_positions
-                )
+                # ``pointer_anchor_positions`` is row-local end-to-end.
+                anchor_positions_rowlocal = packed.pointer_anchor_positions
                 sample = decoder_sample(
                     text_policy,
                     encoded,

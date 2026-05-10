@@ -39,8 +39,9 @@ def _make_packed_batch(
     seq_id = torch.repeat_interleave(torch.arange(len(rows), dtype=torch.int32), rows_t)
     pos_in_seq = torch.arange(total, dtype=torch.int32) - state_pos.repeat_interleave(rows_t)
     token_ids = torch.arange(total, dtype=torch.int32) + 1
-    card_ref_pos = state_pos.unsqueeze(1).clone() + anchor_token_offset
-    card_ref_pos = torch.where(card_ref_pos >= 0, card_ref_pos, torch.full_like(card_ref_pos, -1))
+    # card_ref positions are row-local everywhere; one anchor per row at
+    # ``anchor_token_offset`` within its own row.
+    card_ref_pos = torch.full((len(rows), 1), int(anchor_token_offset), dtype=torch.int32)
     n = len(rows)
     pointer_anchor_positions = torch.full((n, 1), -1, dtype=torch.int32)
     pointer_anchor_kinds = torch.full((n, 1), -1, dtype=torch.int32)
@@ -81,10 +82,11 @@ class ConcatPackedBatchTest(unittest.TestCase):
             merged.state_positions,
             torch.tensor([0, 3, 5], dtype=torch.int32),
         )
-        # b's card-ref position (row-local 1, state 5 -> global 6).
+        # card_ref positions are row-local end-to-end; concat preserves
+        # them unchanged (b's row-local-1 anchor stays at 1).
         torch.testing.assert_close(
             merged.card_ref_positions[2],
-            torch.tensor([6], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
         )
         # seq_id contiguous and shifted (a: rows 0,1; b: row 2)
         self.assertEqual(int(merged.seq_id[-1].item()), 2)

@@ -766,7 +766,13 @@ def _gather_packed(hidden: Tensor, positions: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def gather_card_vectors_packed(hidden: Tensor, batch: PackedTextBatch) -> tuple[Tensor, Tensor]:
-    return _gather_packed(hidden, batch.card_ref_positions)
+    # ``card_ref_positions`` is stored row-local end-to-end; convert to
+    # packed-absolute offsets only here, where the gather actually needs
+    # to index into ``hidden[T_packed, D]``.
+    from magic_ai.text_encoder.batch import add_packed_offsets
+
+    packed_positions = add_packed_offsets(batch.card_ref_positions, batch.state_positions)
+    return _gather_packed(hidden, packed_positions)
 
 
 def gather_state_vector_packed(hidden: Tensor, batch: PackedTextBatch) -> Tensor:

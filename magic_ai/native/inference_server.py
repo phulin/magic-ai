@@ -31,7 +31,6 @@ from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
 from magic_ai.text_encoder.batch import (
     PackedTextBatch,
     scatter_packed_to_padded,
-    subtract_packed_offsets,
 )
 from magic_ai.text_encoder.decoder_batch import (
     NativeTextDecoderBatch,
@@ -226,29 +225,17 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
         state_parts.append(b.state_positions.to(torch.int32) + int(off))
     state_positions = torch.cat(state_parts, dim=0)
 
-    def _shift_anchor(name: str) -> torch.Tensor:
-        out_parts: list[torch.Tensor] = []
-        for b, off in zip(batches, token_offsets.tolist(), strict=True):
-            t = cast(torch.Tensor, getattr(b, name)).to(torch.int32)
-            valid = t >= 0
-            out_parts.append(torch.where(valid, t + int(off), t))
-        return torch.cat(out_parts, dim=0)
-
     max_anchors = max((int(b.pointer_anchor_positions.shape[1]) for b in batches), default=0)
 
-    def _pad_anchor_2d(name: str, *, fill: int = -1, shift: bool = False) -> torch.Tensor:
+    def _pad_anchor_2d(name: str, *, fill: int = -1) -> torch.Tensor:
         parts: list[torch.Tensor] = []
-        for b, off in zip(batches, token_offsets.tolist(), strict=True):
+        for b in batches:
             t = cast(torch.Tensor, getattr(b, name)).to(torch.int32)
             rows = int(t.shape[0])
             out = torch.full((rows, max_anchors), fill, dtype=torch.int32, device=t.device)
             cols = int(t.shape[1])
             if cols > 0:
-                src = t[:, :cols]
-                if shift:
-                    valid = src >= 0
-                    src = torch.where(valid, src + int(off), src)
-                out[:, :cols] = src
+                out[:, :cols] = t[:, :cols]
             parts.append(out)
         return torch.cat(parts, dim=0)
 
@@ -282,23 +269,20 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
         cu_seqlens=cu_seqlens,
         seq_lengths=seq_lengths,
         state_positions=state_positions,
-        card_ref_positions=_shift_anchor("card_ref_positions"),
+        card_ref_positions=torch.cat(
+            [b.card_ref_positions.to(torch.int32) for b in batches], dim=0
+        ),
         total_tokens=int(token_ids.shape[0]),
         seq_lengths_host=seq_lengths_host,
         spec_lens=torch.cat([b.spec_lens.to(torch.int32) for b in batches], dim=0),
         decision_type=torch.cat([b.decision_type.to(torch.int32) for b in batches], dim=0),
-        pointer_anchor_positions=_pad_anchor_2d("pointer_anchor_positions", shift=True),
+        pointer_anchor_positions=_pad_anchor_2d("pointer_anchor_positions"),
         pointer_anchor_kinds=_pad_anchor_2d("pointer_anchor_kinds"),
         pointer_anchor_subjects=_pad_anchor_2d("pointer_anchor_subjects"),
         pointer_anchor_handles=_pad_anchor_2d("pointer_anchor_handles"),
         legal_edge_bitmap=legal_edge_bitmap,
         max_seqlen=max(seq_lengths_host, default=0),
     )
-
-
-def _shift_packed_positions(pos: torch.Tensor, token_start: int) -> torch.Tensor:
-    valid = pos >= 0
-    return torch.where(valid, pos - int(token_start), pos)
 
 
 def _slice_packed_text_batch(
@@ -328,18 +312,14 @@ def _slice_packed_text_batch(
         cu_seqlens=cu_seqlens,
         seq_lengths=seq_lengths,
         state_positions=state_positions,
-        card_ref_positions=_shift_packed_positions(
-            batch.card_ref_positions[row_start:row_end],
-            token_start,
-        ),
+        # card_ref / anchor positions are row-local end-to-end; slicing
+        # the row range is enough — no token_start shift needed.
+        card_ref_positions=batch.card_ref_positions[row_start:row_end],
         total_tokens=total_tokens,
         seq_lengths_host=seq_lengths_host,
         spec_lens=batch.spec_lens[row_start:row_end],
         decision_type=batch.decision_type[row_start:row_end],
-        pointer_anchor_positions=_shift_packed_positions(
-            batch.pointer_anchor_positions[row_start:row_end],
-            token_start,
-        ),
+        pointer_anchor_positions=batch.pointer_anchor_positions[row_start:row_end],
         pointer_anchor_kinds=batch.pointer_anchor_kinds[row_start:row_end],
         pointer_anchor_subjects=batch.pointer_anchor_subjects[row_start:row_end],
         pointer_anchor_handles=batch.pointer_anchor_handles[row_start:row_end],
@@ -972,9 +952,10 @@ class _InferenceWorkRing:
         packed_arena["state_positions"][row_start:row_end].copy_(
             packed.state_positions.to(torch.int32) + int(token_start)
         )
-        src_refs = packed.card_ref_positions.to(torch.int32)
+        # card_ref / pointer_anchor positions are row-local end-to-end —
+        # no per-row offset add when staging into the arena.
         packed_arena["card_ref_positions"][row_start:row_end].copy_(
-            torch.where(src_refs >= 0, src_refs + int(token_start), src_refs)
+            packed.card_ref_positions.to(torch.int32)
         )
 
         packed_arena["spec_lens"][row_start:row_end].copy_(packed.spec_lens.to(torch.int32))
@@ -986,7 +967,6 @@ class _InferenceWorkRing:
             row_start=row_start,
             row_end=row_end,
             fill=-1,
-            token_start=token_start,
         )
         self._copy_blank_2d(
             name="pointer_anchor_kinds",
@@ -1022,7 +1002,6 @@ class _InferenceWorkRing:
         row_start: int,
         row_end: int,
         fill: int,
-        token_start: int | None = None,
     ) -> None:
         dst = packed_arena[name][row_start:row_end]
         src_cols = int(src.shape[1])
@@ -1033,8 +1012,6 @@ class _InferenceWorkRing:
         dst.fill_(fill)
         if src_cols == 0:
             return
-        if token_start is not None:
-            src = torch.where(src >= 0, src + int(token_start), src)
         dst[:, :src_cols].copy_(src)
 
     def _copy_blank_3d(
@@ -1481,9 +1458,10 @@ class TextInferenceServer:
         # the per-row packed offset.
         encoded, attn_mask = scatter_packed_to_padded(encoded_snaps.encoded, merged_packed)
         device = encoded.device
-        anchor_positions_rowlocal = subtract_packed_offsets(
-            merged_packed.pointer_anchor_positions, merged_packed.state_positions
-        )
+        # ``pointer_anchor_positions`` is row-local end-to-end (see
+        # native_assembler.to_packed_text_batch); the decoder consumes it
+        # directly as an index into the [B, T_max, D] padded tensor.
+        anchor_positions_rowlocal = merged_packed.pointer_anchor_positions
 
         sample = decoder_sample(
             text_policy,

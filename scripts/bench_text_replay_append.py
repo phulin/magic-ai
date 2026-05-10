@@ -26,18 +26,16 @@ def _device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def _random_abs_positions(
+def _random_row_local_positions(
     shape: tuple[int, ...],
     *,
-    state_positions: torch.Tensor,
     seq_lengths: torch.Tensor,
     absent_p: float,
 ) -> torch.Tensor:
     trailing = (1,) * (len(shape) - 1)
-    rel = (torch.rand(shape, device=seq_lengths.device) * seq_lengths.view(-1, *trailing)).to(
+    pos = (torch.rand(shape, device=seq_lengths.device) * seq_lengths.view(-1, *trailing)).to(
         torch.int64
     )
-    pos = rel + state_positions.view(-1, *trailing)
     absent = torch.rand(shape, device=seq_lengths.device) < absent_p
     return torch.where(absent, torch.full_like(pos, -1), pos)
 
@@ -67,9 +65,8 @@ def _make_packed_batch(
         seq_lengths,
         output_size=total_tokens,
     )
-    card_ref_positions = _random_abs_positions(
+    card_ref_positions = _random_row_local_positions(
         (batch_size, MAX_CARD_REFS),
-        state_positions=state_positions,
         seq_lengths=seq_lengths,
         absent_p=0.70,
     )
