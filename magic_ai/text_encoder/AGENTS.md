@@ -18,6 +18,7 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 - `policy_value_pretrain.py` — Forge choice-situation dataset and trainer for joint policy/value pretraining; supports both the inline-blank path and (with `cfg.decoder=True`) the autoregressive grammar decoder pipeline (decoder CE + decision-spec rendering).
 - `forge_target_encoding.py` — Translate observed Forge events (priority/attack/block/may/choose/mode/X) into flat decoder-target token sequences (`DecoderTarget`) the grammar decoder is asked to reproduce.
 - `recurrent.py` — LSTM history adapter wrapping TextPolicy; carries recurrence through encoder state vector.
+- `inference_pipeline.py` — `TextInferencePipeline`: stateless encoder + decoder forward used by the inference server and offline eval. Phase C will host bucketed CUDA-graph capture here.
 - `render.py` — Deterministic GameStateSnapshot → text renderer; produces custom-token-laced strings plus inline-blank anchor metadata.
 - `render_spec.py` — GameStateSnapshot pending → DecisionSpec renderer for the autoregressive grammar decoder (additive, does not touch inline-blank path).
 - `replay_buffer.py` — Single global concurrent ring for encoded text snapshots, inline blank metadata, episode/policy-version metadata, completed-window claims, and GPU-side PPO return building.

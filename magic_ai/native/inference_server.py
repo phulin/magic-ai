@@ -27,15 +27,9 @@ from typing import Any, cast
 
 import torch
 
-from magic_ai.text_encoder.batch import (
-    PackedTextBatch,
-    scatter_packed_to_padded,
-)
-from magic_ai.text_encoder.decoder_batch import (
-    NativeTextDecoderBatch,
-    native_decoder_batch_from_sample,
-)
-from magic_ai.text_encoder.decoder_inference import decoder_sample
+from magic_ai.text_encoder.batch import PackedTextBatch
+from magic_ai.text_encoder.decoder_batch import NativeTextDecoderBatch
+from magic_ai.text_encoder.inference_pipeline import TextInferencePipeline
 
 _PROFILE_SAMPLE_COMPONENTS = os.environ.get("MAGIC_AI_PROFILE_SAMPLE_COMPONENTS") == "1"
 
@@ -595,6 +589,7 @@ class TextInferenceServer:
         self._max_batch = int(max_batch)
         self._min_batch_rows = min(int(min_batch_rows), int(max_batch))
         self._deterministic = bool(deterministic)
+        self._pipeline = TextInferencePipeline(deterministic=self._deterministic)
         self._timing = timing_stats
         self._queue = _InferenceWorkRing(
             capacity_rows=(
@@ -947,63 +942,31 @@ class TextInferenceServer:
         env_indices: Sequence[int],
         perspective_player_indices: Sequence[int],
     ) -> tuple[NativeTextDecoderBatch, torch.Tensor | None, torch.Tensor | None]:
-        """Run encode_with_history + decoder_sample on the merged packed batch.
+        """Fetch env LSTM state, run the pipeline, scatter state back.
 
-        Per-env LSTM state is fetched from the acquired ``policy``'s live state,
-        injected into the encoder via the additive HIST embedding, advanced
-        by one step, then scattered back. Train-time and sample-time share
-        the identical encode-with-history path.
+        The model forward lives in ``TextInferencePipeline``. The server
+        only owns env-state cache plumbing (LSTM h/c per env, captured
+        pre-update for replay scoring).
         """
-
-        text_policy = policy.policy.text_policy if hasattr(policy, "policy") else policy.text_policy
         recurrent_policy = policy.policy if hasattr(policy, "policy") else None
+        h_in: torch.Tensor | None = None
+        c_in: torch.Tensor | None = None
         h_in_replay: torch.Tensor | None = None
         c_in_replay: torch.Tensor | None = None
         if recurrent_policy is not None:
             h_in, c_in = policy.lstm_env_state_inputs(env_indices, perspective_player_indices)
-            # Capture the pre-update state so the actor can pin it onto each
-            # staged replay row; replay scoring re-runs encode_with_history
-            # under the same recurrent input to match sample-time log-π.
+            # Capture pre-update state for replay scoring: it pins each row's
+            # log-π under the same recurrent input the actor saw.
             h_in_replay = h_in.detach().clone()
             c_in_replay = c_in.detach().clone()
-            encoded_snaps, h_out, c_out = recurrent_policy.encode_with_history(
-                merged_packed, h_in=h_in, c_in=c_in
-            )
-            policy.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
-        else:
-            encoded_snaps = text_policy.encode_packed_only(merged_packed)
-        # encoder.forward_packed returns rank-2 [T_packed, D]; decoder cross-attn
-        # needs rank-3 [B, T_max, D]. After unpacking, pointer anchor positions
-        # must be row-local to index into the padded encoded tensor — strip
-        # the per-row packed offset.
-        encoded, attn_mask = scatter_packed_to_padded(encoded_snaps.encoded, merged_packed)
-        device = encoded.device
-        # ``pointer_anchor_positions`` is row-local end-to-end (see
-        # native_assembler.to_packed_text_batch); the decoder consumes it
-        # directly as an index into the [B, T_max, D] padded tensor.
-        anchor_positions_rowlocal = merged_packed.pointer_anchor_positions
 
-        sample = decoder_sample(
-            text_policy,
-            encoded,
-            attn_mask,
-            merged_packed.decision_type.to(device=device, dtype=torch.long),
-            anchor_positions_rowlocal.to(device=device, dtype=torch.long),
-            merged_packed.pointer_anchor_kinds.to(device=device, dtype=torch.long),
-            merged_packed.pointer_anchor_subjects.to(device=device, dtype=torch.long),
-            merged_packed.pointer_anchor_handles.to(device=device, dtype=torch.long),
-            legal_edge_bitmap=merged_packed.legal_edge_bitmap,
-            greedy=self._deterministic,
-        )
-        # ``ValueHead.forward`` already squeezes the trailing 1-dim axis;
-        # an extra squeeze(-1) collapses ``[B=1]`` to a 0-dim tensor and
-        # breaks the per-actor slicing of ``decoder_batch.value`` below.
-        value = text_policy.run_heads(encoded_snaps)
-        return (
-            native_decoder_batch_from_sample(sample, value=value),
-            h_in_replay,
-            c_in_replay,
-        )
+        out = self._pipeline.encode_and_sample(policy, merged_packed, h_in, c_in)
+
+        if recurrent_policy is not None and out.h_out is not None and out.c_out is not None:
+            policy.scatter_lstm_env_states(
+                env_indices, perspective_player_indices, out.h_out, out.c_out
+            )
+        return out.decoder, h_in_replay, c_in_replay
 
 
 __all__ = [
