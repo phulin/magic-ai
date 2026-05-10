@@ -262,11 +262,18 @@ class TextInferencePipeline:
         deterministic: bool = False,
         bucketed: bool = False,
         buckets: tuple[tuple[int, int], ...] = DEFAULT_BUCKETS,
+        compile_decoder: bool = False,
     ) -> None:
         self._deterministic = bool(deterministic)
         self._bucketed = bool(bucketed)
         self._buckets = tuple(sorted(buckets, key=lambda rt: (rt[0], rt[1])))
         self._compiled_encoders: dict[tuple[int, int], Callable[..., Any]] = {}
+        # Phase F: lazily compile decoder_sample with dynamic=True. Per-bucket
+        # decoder bucketing would also need a fixed S_max (scatter_padded output)
+        # — deferred. dynamic=True doesn't get CUDA Graphs but inductor can
+        # still fuse the per-step ops, cutting per-iteration launches.
+        self._compile_decoder = bool(compile_decoder)
+        self._compiled_decoder_sample: Callable[..., Any] | None = None
 
     # --- Bucketed encoder forward -------------------------------------
 
@@ -395,7 +402,15 @@ class TextInferencePipeline:
         # it directly as an index into the [B, T_max, D] padded tensor.
         anchor_positions_rowlocal = encoded_device_batch.pointer_anchor_positions
 
-        sample = decoder_sample(
+        decoder_fn: Callable[..., Any] = decoder_sample
+        if self._compile_decoder and device.type == "cuda":
+            if self._compiled_decoder_sample is None:
+                self._compiled_decoder_sample = cast(
+                    Callable[..., Any],
+                    torch.compile(decoder_sample, dynamic=True),
+                )
+            decoder_fn = self._compiled_decoder_sample
+        sample = decoder_fn(
             text_policy,
             encoded,
             attn_mask,

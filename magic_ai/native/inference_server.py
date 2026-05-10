@@ -879,6 +879,7 @@ class TextInferenceServer:
         self._pipeline = TextInferencePipeline(
             deterministic=self._deterministic,
             bucketed=self._device.type == "cuda",
+            compile_decoder=self._device.type == "cuda",
         )
         self._arena = _HostPackedArena(use_pinned=self._device.type == "cuda")
         self._timing = timing_stats

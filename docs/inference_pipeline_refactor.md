@@ -124,17 +124,23 @@ replayed; near-all per-launch overhead on the encoder side disappears.
 - [ ] (Future) Verify correctness vs. eager on the full pipeline (the
       smoke checks shape only).
 
-## Phase F — Decoder loop compile
+## Phase F — Decoder loop compile ⚠️ (dynamic only)
 
 **Goal:** capture the autoregressive decoder inside the graph too.
 
-- [ ] Try `torch.compile(fullgraph=True)` on `encode_and_sample`.
-- [ ] If it fails, capture the decoder loop as a separate graph with fixed
-      L_max per bucket.
-- [ ] Verify outputs match the non-compiled path.
-- [ ] Profile: `cudaLaunchKernel` ~= 1 launch per bucket replay.
-- [ ] Document bucket set + tuning knobs in
-      `magic_ai/text_encoder/AGENTS.md`.
+Scope: lazy `torch.compile(decoder_sample, dynamic=True)`. Full bucketed
+CUDA-Graph capture on the decoder requires a fixed `S_max` per bucket
+(scatter-to-padded output dim), which would need a 3-tuple bucket — a
+larger refactor. Dynamic compile doesn't get CUDA Graphs but inductor
+can still fuse the per-step ops and cut per-iteration launches.
+
+- [x] `TextInferencePipeline(compile_decoder=True)` wraps `decoder_sample`
+      with `torch.compile(dynamic=True)` on first CUDA call.
+- [x] Server opts in when `device.type == "cuda"`.
+- [ ] (Future) Bucket the decoder shape (`R_b`, `S_max`, `L_max`) for
+      CUDA-Graph capture.
+- [ ] (Future) Verify outputs match the non-compiled path on a real
+      workload.
 
 ---
 
