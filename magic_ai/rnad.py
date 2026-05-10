@@ -279,28 +279,24 @@ def two_player_vtrace(
     dtype = rewards.dtype
     device = rewards.device
     is_own = perspective_is_player_i.to(dtype=torch.bool)
-    ratio = (logp_theta - logp_mu).exp()
+    # Stay in log-space; clip-then-exp at every use (IMPALA-style). The
+    # only quantity we ever exponentiate is the IS log-ratio, capped so
+    # the resulting weight is bounded by rho_bar / c_bar. Forming
+    # ``ratio = exp(log_ratio)`` and then ``log_ratio = ratio.log()``
+    # was poisoning the recursion: when the gap underflowed ``ratio`` to
+    # 0, ``log(0) = -inf`` propagated through the opp-segment cumsum.
+    log_rho = logp_theta - logp_mu
+    log_rho_bar = math.log(rho_bar) if rho_bar > 0 else float("-inf")
+    log_c_bar = math.log(c_bar) if c_bar > 0 else float("-inf")
 
     v_hat = torch.zeros(T, dtype=dtype, device=device)
     q_hat = torch.zeros(T, dtype=dtype, device=device)
     r_hat_next_step = torch.zeros(T, dtype=dtype, device=device)
     v_hat_next_step = torch.zeros(T, dtype=dtype, device=device)
 
-    # Vectorized backward pass (paper §170-182, algebraically rewritten).
-    #
-    # The per-step recursion resets at every own-turn step, so we split
-    # the trajectory into segments delimited by own-turn indices. Between
-    # own-turn k and own-turn k+1 there are zero or more opponent-turn
-    # steps; all of their reward / importance-ratio accumulation can be
-    # computed with cumsum/cumprod in O(T) tensor ops. Only the final
-    # own-turn-indexed ``v_hat`` linear recurrence remains, and that runs
-    # on K scalars on-device (no .item() sync per step, unlike the
-    # previous per-T Python loop).
     own_idx = is_own.nonzero(as_tuple=False).squeeze(-1)  # (K,) sorted ascending
     K = int(own_idx.numel())
     if K == 0:
-        # No own-turn steps in this trajectory: both outputs stay zero
-        # (the original recursion's sentinels never bootstrap).
         return VTraceOutput(
             v_hat=v_hat,
             q_hat=q_hat,
@@ -308,80 +304,65 @@ def two_player_vtrace(
             v_hat_next=v_hat_next_step,
         )
 
-    # Per-step segmentation: ``seg[t]`` = index of the most recent own-turn
-    # at or before t (= k when t == own_idx[k]; = k when t is opp-turn in
-    # the segment immediately after own_idx[k]; = -1 for opp-turn steps
-    # before the first own-turn).
+    # Per-step segmentation.
     cum_own = is_own.to(dtype=torch.long).cumsum(0)
-    seg = cum_own - 1  # (T,); -1 before any own-turn
+    seg = cum_own - 1
     safe_seg = seg.clamp_min(0)
 
-    # ``r_acc[k]`` = sum over opp-turn steps s in (own_idx[k], own_idx[k+1])
-    # of rewards[s] * prod_{s' in that range, s' < s} ratio[s']. The
-    # "per-step multiplier" is exp(cumA[s] - opp_log_ratio[s] - cumA[own_idx[k]])
-    # where opp_log_ratio is log(ratio) on opp-turn steps only.
-    log_ratio = ratio.log()
-    opp_log_ratio = torch.where(is_own, torch.zeros_like(log_ratio), log_ratio)
-    cumA = opp_log_ratio.cumsum(0)
-    cumA_at_own = cumA[own_idx]  # (K,)
-    base_cumA = cumA_at_own[safe_seg]  # (T,); garbage for seg == -1 but zeroed below
-    multiplier = torch.exp(cumA - opp_log_ratio - base_cumA)
-
+    opp_log_rho = torch.where(is_own, torch.zeros_like(log_rho), log_rho)
+    cum_log_rho = opp_log_rho.cumsum(0)
+    cum_log_rho_at_own = cum_log_rho[own_idx]
+    base_cum_log_rho = cum_log_rho_at_own[safe_seg]
+    # Cumulative IS over the opp-segment, capped at ``log(rho_bar)`` in
+    # log space (mirrors IMPALA's clipped rho) so the resulting weight
+    # is finite and bounded by rho_bar.
+    seg_log_rho = cum_log_rho - opp_log_rho - base_cum_log_rho
+    multiplier = torch.exp(seg_log_rho.clamp(max=log_rho_bar)).to(dtype=dtype)
     opp_contrib = torch.where(
         is_own | (seg < 0),
         torch.zeros_like(rewards),
-        rewards * multiplier.to(dtype=dtype),
+        rewards * multiplier,
     )
     r_acc = torch.zeros(K, dtype=dtype, device=device)
     r_acc.scatter_add_(0, safe_seg, opp_contrib)
 
-    # ``xi_prod[k]`` = prod of ratio over opp-turn steps in the segment after
-    # own_idx[k]. Last segment extends to the trajectory end.
     if K > 1:
         right_boundary = torch.cat(
             [own_idx[1:] - 1, torch.tensor([T - 1], dtype=torch.long, device=device)]
         )
     else:
         right_boundary = torch.tensor([T - 1], dtype=torch.long, device=device)
-    xi_prod = torch.exp(cumA[right_boundary] - cumA_at_own).to(dtype=dtype)
+    xi_log = cum_log_rho[right_boundary] - cum_log_rho_at_own
 
-    # Per-own-turn rho / c clips.
-    ratio_own = ratio[own_idx].to(dtype=dtype)
-    rho_arg = ratio_own * xi_prod
-    rho = torch.clamp(rho_arg, max=rho_bar)
-    c = torch.clamp(rho_arg, max=c_bar)
+    log_rho_own = log_rho[own_idx]
+    log_rho_arg = log_rho_own + xi_log
+    rho = torch.exp(log_rho_arg.clamp(max=log_rho_bar)).to(dtype=dtype)
+    c = torch.exp(log_rho_arg.clamp(max=log_c_bar)).to(dtype=dtype)
+    ratio_own = torch.exp(log_rho_own.clamp(max=log_rho_bar)).to(dtype=dtype)
 
-    # Per-own-turn pre-c quantity: this is also ``q_hat_sampled`` for the
-    # paper's per-action Q form used by the full-NeuRD trainer.
-    #
-    # Paper §177:
-    #   δV = ρ_t · (r^i_t + (π/μ)_t · r̂^i_{t+1} + V_next - v(o_t))
-    # The (π/μ)_t prefactor on the opp-tail accumulator r̂_{t+1} is the
-    # *unclipped* own-turn importance ratio. ``ratio_own`` already holds
-    # this scalar (clipped variants are computed below as ``rho``/``c``);
-    # multiply r_acc by it before the ρ-clip on the bracket as a whole.
     values_own = values[own_idx]
     rewards_own = rewards[own_idx]
     v_next_own_vec = torch.cat([values_own[1:], values_own.new_zeros(1)])
     pre_c = values_own + rho * (rewards_own + ratio_own * r_acc + v_next_own_vec - values_own)
 
-    # Own-turn linear recurrence:
-    #   v_hat_own[k] = A[k] + B[k] * v_hat_own[k+1],  v_hat_own[K] = 0
-    #
-    # Closed-form on-device scan (mirrors :func:`magic_ai.returns.gae_returns`
-    # and the batched v-trace below): no GPU->CPU sync. ``B`` is the
-    # coefficient between v[k] and v[k+1]; B[-1] never multiplies a real
-    # v[k+1] (terminal) and is dropped. v-trace inputs are detached at every
-    # call site, so this branch carries no gradient regardless.
+    # Iterative reverse scan ``v[k] = A[k] + B[k] * v[k+1]`` — numerically
+    # stable for any c in (0, c_bar]. The previous closed-form
+    # ``scan_coeffs = cumprod(c)`` collapsed to 0 within tens of steps
+    # under small c, then ``A / scan_coeffs = inf`` and ``inf * 0 = NaN``
+    # contaminated every output. K is per-trajectory and bounded, so the
+    # Python loop here is cheap.
     A = pre_c - c * v_next_own_vec
     B = c
     if K == 1:
         v_hat_own = A.detach().clone()
     else:
-        coeffs_rev = B[:-1].detach().flip(0)
-        deltas_rev = A.detach().flip(0)
-        scan_coeffs = torch.cat([A.new_ones(1), coeffs_rev.cumprod(0)])
-        v_hat_own = (scan_coeffs * torch.cumsum(deltas_rev / scan_coeffs, dim=0)).flip(0)
+        A_d = A.detach()
+        B_d = B.detach()
+        v_hat_own = torch.zeros_like(A_d)
+        v_next = A_d.new_zeros(())
+        for k in range(K - 1, -1, -1):
+            v_next = A_d[k] + B_d[k] * v_next
+            v_hat_own[k] = v_next
 
     # Scatter own-turn results back; opp-turn steps inherit v_hat from the
     # next own-turn (or zero if none follows).
@@ -450,7 +431,16 @@ def _two_player_vtrace_batched(
     dtype = rewards.dtype
     device = rewards.device
     is_own = perspective_is_player_i.to(dtype=torch.bool)
-    ratio = (logp_theta - logp_mu).exp()
+    # Stay in log-space and clip *before* exponentiating, IMPALA-style.
+    # The per-step IS log-ratio is the only quantity ever exponentiated,
+    # and we always cap the exponent so the resulting weight is bounded
+    # by rho_bar / c_bar. Forming ``ratio = exp(log_ratio)`` and then
+    # ``log_ratio = ratio.log()`` was poisoning everything: when the gap
+    # underflows ``ratio`` to 0, ``log(0) = -inf`` propagates into the
+    # opp-segment cumsum and the recurrence collapses to NaN.
+    log_rho = logp_theta - logp_mu
+    log_rho_bar = math.log(rho_bar) if rho_bar > 0 else float("-inf")
+    log_c_bar = math.log(c_bar) if c_bar > 0 else float("-inf")
 
     v_hat = torch.zeros(T, dtype=dtype, device=device)
     q_hat = torch.zeros(T, dtype=dtype, device=device)
@@ -487,12 +477,17 @@ def _two_player_vtrace_batched(
     own_ep_at_safe = own_ep_idx[safe_seg]
     valid_seg = (seg >= 0) & (own_ep_at_safe == ep_idx_step)
 
-    log_ratio = ratio.log()
-    opp_log_ratio = torch.where(is_own, torch.zeros_like(log_ratio), log_ratio)
-    cumA = opp_log_ratio.cumsum(0)
-    cumA_at_own = cumA[own_idx]
-    base_cumA = cumA_at_own[safe_seg]
-    multiplier = torch.exp(cumA - opp_log_ratio - base_cumA).to(dtype=dtype)
+    opp_log_rho = torch.where(is_own, torch.zeros_like(log_rho), log_rho)
+    cum_log_rho = opp_log_rho.cumsum(0)
+    cum_log_rho_at_own = cum_log_rho[own_idx]
+    base_cum_log_rho = cum_log_rho_at_own[safe_seg]
+    # The opp-segment multiplier is the cumulative IS ratio over the
+    # opp-turn steps that have occurred since the most recent own-turn.
+    # Cap *in log space* at ``log(rho_bar)`` (mirrors the IMPALA clipped
+    # ``rho``) so the resulting weight is always in (0, rho_bar] —
+    # finite, bounded, and ``rewards * multiplier`` cannot blow up.
+    seg_log_rho = cum_log_rho - opp_log_rho - base_cum_log_rho
+    multiplier = torch.exp(seg_log_rho.clamp(max=log_rho_bar)).to(dtype=dtype)
     opp_contrib = torch.where(
         is_own | (~valid_seg),
         torch.zeros_like(rewards),
@@ -517,12 +512,20 @@ def _two_player_vtrace_batched(
     else:
         right_boundary = (ep_offsets[own_ep_idx[0] + 1] - 1).reshape(1)
         same_ep_next_full = torch.zeros(1, dtype=torch.bool, device=device)
-    xi_prod = torch.exp(cumA[right_boundary] - cumA_at_own).to(dtype=dtype)
+    xi_log = cum_log_rho[right_boundary] - cum_log_rho_at_own
 
-    ratio_own = ratio[own_idx].to(dtype=dtype)
-    rho_arg = ratio_own * xi_prod
-    rho = torch.clamp(rho_arg, max=rho_bar)
-    c = torch.clamp(rho_arg, max=c_bar)
+    log_rho_own = log_rho[own_idx]
+    # ``rho_arg = ratio_own * xi_prod`` becomes ``log_rho_own + xi_log``.
+    # ``rho = min(rho_arg, rho_bar)`` and ``c = min(rho_arg, c_bar)`` are
+    # then computed entirely in log space, exp'd at the cap, so neither
+    # can overflow regardless of how mismatched the policies are.
+    log_rho_arg = log_rho_own + xi_log
+    rho = torch.exp(log_rho_arg.clamp(max=log_rho_bar)).to(dtype=dtype)
+    c = torch.exp(log_rho_arg.clamp(max=log_c_bar)).to(dtype=dtype)
+    # ``ratio_own`` only feeds ``ratio_own * r_acc`` below; cap it at
+    # rho_bar too so an off-the-charts target/behavior gap can't reach
+    # the recurrence as a multiplicative inf.
+    ratio_own = torch.exp(log_rho_own.clamp(max=log_rho_bar)).to(dtype=dtype)
 
     values_own = values[own_idx]
     rewards_own = rewards[own_idx]
@@ -533,20 +536,15 @@ def _two_player_vtrace_batched(
     A = pre_c - c * v_next_own_vec
     B = c
 
-    # Vectorized reverse scan: ``v[k] = A[k] + B[k] * v[k+1]`` per episode,
-    # resetting at episode boundaries. The host-side Python loop this
-    # replaced forced three ``.cpu().tolist()`` syncs per call (A, B,
-    # own_ep_idx). Same flip + cumprod + cumsum trick as
-    # :func:`magic_ai.returns.gae_returns_batched`: pad to (n_eps, max_own_per_ep)
-    # with A=0 / B=1 outside each episode's valid prefix, do a single
-    # reverse scan along dim=1, then gather per own-turn step.
+    # Reverse scan ``v[k] = A[k] + B[k] * v[k+1]`` per episode. The
+    # previous closed form (``scan_coeffs * cumsum(A / scan_coeffs)``)
+    # underflowed: ``scan_coeffs = cumprod(c)`` collapses to 0 within
+    # 30-40 steps when c is small, then ``A / scan_coeffs = inf`` and
+    # ``inf * 0 = NaN`` poisons every output. Iterate instead — with
+    # max_own_per_ep ≈ 30-100 it's just that many fused-elementwise
+    # tensor ops over (n_eps,), no per-step host syncs.
     K_per_ep = torch.zeros(n_eps, dtype=torch.long, device=device)
     K_per_ep.scatter_add_(0, own_ep_idx, torch.ones_like(own_ep_idx))
-    # Pad bound: if the caller supplied an upper bound (host-known max
-    # episode length), use it to skip the GPU->CPU sync that
-    # ``int(K_per_ep.max().item())`` would force. Own-turn count per
-    # episode is bounded above by total ep length, so over-padding by ~2x
-    # is safe and the closed-form scan masks padded positions out.
     if max_ep_len is None:
         max_own_per_ep = int(K_per_ep.max().item())
     else:
@@ -555,25 +553,15 @@ def _two_player_vtrace_batched(
     own_pos_in_ep = torch.arange(K, device=device) - cumlen_before_ep[own_ep_idx]
 
     A_pad = torch.zeros(n_eps, max_own_per_ep, dtype=dtype, device=device)
-    B_pad = torch.ones(n_eps, max_own_per_ep, dtype=dtype, device=device)
+    B_pad = torch.zeros(n_eps, max_own_per_ep, dtype=dtype, device=device)
     A_pad[own_ep_idx, own_pos_in_ep] = A
     B_pad[own_ep_idx, own_pos_in_ep] = B
 
-    if max_own_per_ep == 1:
-        v_pad = A_pad
-    else:
-        # ``c`` is the recurrence coefficient *between* positions k and k+1.
-        # B at the last column never multiplies a real ``v[k+1]`` (terminal),
-        # so we drop it and run the scan over (max_own_per_ep - 1) coefficients
-        # — same convention as gae_returns_batched. Padded positions have
-        # B=1, so the cumprod stays positive and the division below is safe
-        # (real B values come from clamp(rho_arg, max=c_bar) > 0).
-        c_pad = B_pad[:, :-1]
-        c_pad_rev = c_pad.flip(1)
-        A_pad_rev = A_pad.flip(1)
-        ones_col = A_pad.new_ones(n_eps, 1)
-        scan_coeffs = torch.cat([ones_col, c_pad_rev.cumprod(dim=1)], dim=1)
-        v_pad = (scan_coeffs * torch.cumsum(A_pad_rev / scan_coeffs, dim=1)).flip(1)
+    v_pad = torch.zeros(n_eps, max_own_per_ep, dtype=dtype, device=device)
+    v_next = torch.zeros(n_eps, dtype=dtype, device=device)
+    for k in range(max_own_per_ep - 1, -1, -1):
+        v_next = A_pad[:, k] + B_pad[:, k] * v_next
+        v_pad[:, k] = v_next
 
     v_hat_own = v_pad[own_ep_idx, own_pos_in_ep]
 

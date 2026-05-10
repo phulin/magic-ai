@@ -276,7 +276,7 @@ class GrammarMaskState:
         active = ~self.ended
 
         # Look up subject_index and kind of the chosen pointer position.
-        safe_pos = sampled_pointer_pos.clamp(min=0)
+        safe_pos = sampled_pointer_pos.clamp(min=0, max=max(self.T_enc - 1, 0))
         subj_at_chosen = self.pos_to_subj.gather(1, safe_pos.unsqueeze(-1)).squeeze(-1)
         kind_at_chosen = self.pos_to_kind.gather(1, safe_pos.unsqueeze(-1)).squeeze(-1)
         valid_choice = is_pointer_step & active & (subj_at_chosen >= 0)

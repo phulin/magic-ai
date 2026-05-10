@@ -187,6 +187,13 @@ def decoder_score_replay(
     v_chosen = v_logp.gather(-1, target_tok.unsqueeze(-1)).squeeze(-1)
     p_chosen = p_logp.gather(-1, target_ptr.unsqueeze(-1)).squeeze(-1)
     step_logp = torch.where(is_pointer_step, p_chosen, v_chosen)
+    # Replay-time mask reconstruction can drop a token that was legal at
+    # rollout time, leaving the sampled action with the masked_fill's
+    # ``finfo(dtype).min`` log-prob (≈ -3.4e38 for fp32). The downstream
+    # IS ratio is now safe — v-trace clips ``log_rho`` in log space — but
+    # ``finfo.min`` still poisons per-row sums and entropy diagnostics.
+    # Floor it at -50 so the row's IS contribution decays cleanly to 0.
+    step_logp = step_logp.clamp_min(-50.0)
     step_logp = step_logp.where(pad_mask, torch.zeros_like(step_logp))
 
     # Entropy under the same mask.
