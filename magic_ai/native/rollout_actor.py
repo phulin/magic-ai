@@ -30,8 +30,6 @@ from dataclasses import dataclass, field
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any
 
-import torch
-
 from magic_ai.native.inference_server import (
     RolloutTimingStats,
     TextInferenceRequest,
@@ -363,24 +361,12 @@ class TextRolloutActor:
         # advance the engine via the decoder-action batched cgo entry.
         start = time.perf_counter()
         decoder = reply.decoder_batch
-        # Fuse the three D→H pulls (log-prob sum, value, decision type) into
-        # one stacked transfer. Three separate .cpu() calls would each force
-        # a stream sync; one stacked copy syncs once.
-        scalars_host = (
-            torch.stack(
-                [
-                    decoder.log_probs.sum(dim=-1).float(),
-                    decoder.value.float(),
-                    decoder.decision_type.float(),
-                ],
-                dim=0,
-            )
-            .detach()
-            .cpu()
-        )
-        log_probs_per_row = scalars_host[0].tolist()
-        values_host = scalars_host[1].tolist()
-        decision_types_host = [int(x) for x in scalars_host[2].tolist()]
+        host = reply.host_decoder
+        # Server already pre-staged D→H copies into reply.host_decoder; the
+        # actor's post-inference critical path stays GPU-free.
+        log_probs_per_row = host.log_probs_sum.tolist()
+        values_host = host.value.tolist()
+        decision_types_host = [int(x) for x in host.decision_type.tolist()]
         for step_idx, (env, player_idx) in enumerate(
             zip(batch.ready_envs, batch.ready_players, strict=True)
         ):
@@ -398,7 +384,7 @@ class TextRolloutActor:
                         output_pad_mask=decoder.output_pad_mask[step_idx],
                         decision_type=int(decision_types_host[step_idx]),
                         pointer_anchor_handles=decoder.pointer_anchor_handles[step_idx],
-                        pointer_anchor_count=int(decoder.pointer_anchor_count[step_idx].item()),
+                        pointer_anchor_count=int(host.pointer_anchor_count[step_idx].item()),
                     )
                     action = decode_decoder_action(pending, layout)
                     self.append_transcript_action(env, state, pending, action)
@@ -421,17 +407,18 @@ class TextRolloutActor:
 
         handles = [int(g._id) for g in batch.ready_games]
         # mage.batch_step_by_decoder_action reads buffers via data_ptr() with
-        # no device check — GPU tensors would be dereferenced as host pointers
-        # and segfault inside cgo. Force a contiguous CPU copy first.
+        # no device check — GPU tensors would segfault inside cgo. The server
+        # pre-staged host copies into reply.host_decoder; we just need to
+        # ensure each slice is contiguous before handing pointers to Go.
         mage.batch_step_by_decoder_action(
             handles=handles,
-            decision_type=decoder.decision_type.cpu().contiguous(),
-            output_token_ids=decoder.output_token_ids.cpu().contiguous(),
-            output_pointer_subjects=decoder.output_pointer_subjects.cpu().contiguous(),
-            output_is_pointer=decoder.output_is_pointer.to(dtype=torch.uint8).cpu().contiguous(),
-            output_lens=decoder.output_lens.cpu().contiguous(),
-            pointer_anchor_handles=decoder.pointer_anchor_handles.cpu().contiguous(),
-            pointer_anchor_count=decoder.pointer_anchor_count.cpu().contiguous(),
+            decision_type=host.decision_type.contiguous(),
+            output_token_ids=host.output_token_ids.contiguous(),
+            output_pointer_subjects=host.output_pointer_subjects.contiguous(),
+            output_is_pointer=host.output_is_pointer_u8.contiguous(),
+            output_lens=host.output_lens.contiguous(),
+            pointer_anchor_handles=host.pointer_anchor_handles.contiguous(),
+            pointer_anchor_count=host.pointer_anchor_count.contiguous(),
         )
         self._record_timing("actor_step", start)
         return list(batch.ready_envs)

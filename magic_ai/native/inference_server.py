@@ -74,17 +74,45 @@ class TextInferenceRequest:
 
 
 @dataclass(frozen=True)
+class DecoderHostView:
+    """Host-side decoder fields the actor needs after inference.
+
+    Pre-staged on the server (one D→H pass per merged batch, sliced
+    per-actor in scatter) so the actor's post-inference critical path —
+    transcript bookkeeping plus the cgo ``batch_step_by_decoder_action``
+    call — touches no GPU tensors. This collapses 7+ actor-side ``.cpu()``
+    syncs per inference reply down to zero.
+
+    All fields are CPU tensors with leading dim equal to the per-actor row
+    count. ``output_is_pointer_u8`` is pre-cast to uint8 because cgo wants
+    a single-byte payload.
+    """
+
+    decision_type: torch.Tensor  # [n] int
+    output_token_ids: torch.Tensor  # [n, L_max] int32
+    output_pointer_subjects: torch.Tensor  # [n, L_max] int32
+    output_is_pointer_u8: torch.Tensor  # [n, L_max] uint8
+    output_lens: torch.Tensor  # [n] int
+    pointer_anchor_handles: torch.Tensor  # [n, N_max] int
+    pointer_anchor_count: torch.Tensor  # [n] int
+    log_probs_sum: torch.Tensor  # [n] float32 (sum over output positions)
+    value: torch.Tensor  # [n] float32
+
+
+@dataclass(frozen=True)
 class TextInferenceReply:
     """Per-actor inference reply for the decoder-shaped IMPALA pipeline.
 
-    The actor uses ``decoder_batch`` to step its envs via
-    ``mage.batch_step_by_decoder_action`` and to stage decoder targets into
-    the per-actor :class:`NativeTextTrajectoryBuffer`. ``packed_rows`` carries
-    the per-env encoded snapshots needed at episode-commit time for replay
+    The actor uses ``host_decoder`` to step its envs via
+    ``mage.batch_step_by_decoder_action`` and to populate transcripts /
+    record_step. ``decoder_batch`` is the GPU-resident form, kept around
+    for staging clones into the replay buffer. ``packed_rows`` carries the
+    per-env encoded snapshots needed at episode-commit time for replay
     scoring.
     """
 
     decoder_batch: NativeTextDecoderBatch
+    host_decoder: DecoderHostView
     packed_rows: list[PackedTextBatch]
     perspective_player_indices: list[int]
     # Per-row LSTM state captured before encode_with_history advanced it.
@@ -1336,6 +1364,23 @@ class TextInferenceServer:
             ready_event = torch.cuda.Event()
             ready_event.record(torch.cuda.current_stream(decoder_batch.value.device))
 
+        # Stage host copies of decoder fields the actors need post-inference
+        # (cgo step + transcript / record_step). One D→H pass per merged
+        # batch instead of N actors × 9 separate ``.cpu()`` syncs.
+        host_decoder_full = DecoderHostView(
+            decision_type=decoder_batch.decision_type.detach().cpu(),
+            output_token_ids=decoder_batch.output_token_ids.detach().cpu(),
+            output_pointer_subjects=decoder_batch.output_pointer_subjects.detach().cpu(),
+            output_is_pointer_u8=decoder_batch.output_is_pointer.to(dtype=torch.uint8)
+            .detach()
+            .cpu(),
+            output_lens=decoder_batch.output_lens.detach().cpu(),
+            pointer_anchor_handles=decoder_batch.pointer_anchor_handles.detach().cpu(),
+            pointer_anchor_count=decoder_batch.pointer_anchor_count.detach().cpu(),
+            log_probs_sum=decoder_batch.log_probs.sum(dim=-1).detach().cpu(),
+            value=decoder_batch.value.detach().cpu(),
+        )
+
         # Scatter per-actor decoder-batch slices and per-row encoded snapshots.
         start = time.perf_counter()
         row_cursor = 0
@@ -1368,8 +1413,22 @@ class TextInferenceServer:
             actor_c_in = (
                 c_in_replay[:, row_cursor:row_end].contiguous() if c_in_replay is not None else None
             )
+            actor_host_decoder = DecoderHostView(
+                decision_type=host_decoder_full.decision_type[row_cursor:row_end],
+                output_token_ids=host_decoder_full.output_token_ids[row_cursor:row_end],
+                output_pointer_subjects=host_decoder_full.output_pointer_subjects[
+                    row_cursor:row_end
+                ],
+                output_is_pointer_u8=host_decoder_full.output_is_pointer_u8[row_cursor:row_end],
+                output_lens=host_decoder_full.output_lens[row_cursor:row_end],
+                pointer_anchor_handles=host_decoder_full.pointer_anchor_handles[row_cursor:row_end],
+                pointer_anchor_count=host_decoder_full.pointer_anchor_count[row_cursor:row_end],
+                log_probs_sum=host_decoder_full.log_probs_sum[row_cursor:row_end],
+                value=host_decoder_full.value[row_cursor:row_end],
+            )
             reply = TextInferenceReply(
                 decoder_batch=actor_decoder,
+                host_decoder=actor_host_decoder,
                 packed_rows=packed_rows,
                 perspective_player_indices=list(perspective[row_cursor:row_end]),
                 lstm_h_in=actor_h_in,
@@ -1450,6 +1509,7 @@ class TextInferenceServer:
 
 
 __all__ = [
+    "DecoderHostView",
     "TextInferenceRequest",
     "TextInferenceReply",
     "TextInferenceServer",
