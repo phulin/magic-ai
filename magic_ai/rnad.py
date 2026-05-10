@@ -47,6 +47,24 @@ class RNaDConfig:
     eta: float = 0.2
     """Regularization strength for the reward transform (paper: 0.2)."""
 
+    reg_log_ratio_clip: float = float("inf")
+    """Optional symmetric clip on ``log π_θ - log π_reg`` inside
+    :func:`transform_rewards`. **Off by default and not in the DeepNash
+    paper.**
+
+    The reward shaping ``r'_t = r_t + sign · η · log_ratio`` lives on the
+    paper's assumption that the reg policy tracks online tightly (so
+    ``log_ratio`` is naturally small). With our default
+    ``target_ema_gamma · delta_m = 5`` the reg lags much further behind
+    online during the early-training transient, the per-step shaping can
+    reach ``η · 50``, and ``v_hat`` accumulates over the trajectory until
+    the L1 critic loss looks alarming (the gradient is still bounded —
+    L1 — so training is stable; the loss report just becomes a
+    misleading scalar). Set to a finite value (e.g. 5–10) to bound the
+    transient, but the principled fix is to bump
+    ``target_ema_gamma · delta_m`` so the reg tracks online tightly
+    enough to keep the log-ratio small without an external clip."""
+
     delta_m: int = 1_000
     """Gradient steps per outer iteration. Paper §199 uses 10k-100k on 768
     TPU learners; this default is scaled for a single-GPU rollout-batch
@@ -160,6 +178,7 @@ def transform_rewards(
     alpha: float,
     eta: float,
     perspective_is_player_i: Tensor,
+    log_ratio_clip: float = float("inf"),
 ) -> Tensor:
     """Apply the R-NaD entropy-regularization reward transformation.
 
@@ -191,6 +210,8 @@ def transform_rewards(
 
     blended_logp_reg = alpha * logp_reg_cur + (1.0 - alpha) * logp_reg_prev
     log_ratio = logp_theta - blended_logp_reg
+    if math.isfinite(log_ratio_clip):
+        log_ratio = log_ratio.clamp(min=-log_ratio_clip, max=log_ratio_clip)
     # sign = -1 on own-turn steps, +1 on opponent-turn steps
     sign = 1.0 - 2.0 * perspective_is_player_i.to(dtype=rewards.dtype)
     return rewards + sign * eta * log_ratio
@@ -1422,6 +1443,7 @@ def _trajectory_loss_from_forwards(
             alpha=alpha,
             eta=config.eta,
             perspective_is_player_i=is_own,
+            log_ratio_clip=config.reg_log_ratio_clip,
         )
         v_out = two_player_vtrace(
             rewards=transformed.detach(),
@@ -1778,6 +1800,7 @@ def _batched_trajectory_loss_from_forwards(
             alpha=alpha,
             eta=config.eta,
             perspective_is_player_i=is_own_p,
+            log_ratio_clip=config.reg_log_ratio_clip,
         )
         v_out = _two_player_vtrace_batched(
             rewards=transformed.detach(),
