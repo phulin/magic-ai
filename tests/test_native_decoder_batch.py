@@ -12,7 +12,9 @@ from magic_ai.text_encoder.decoder_batch import (
 )
 
 
-def _make_sample(b: int, l_max: int, n_max: int) -> DecoderSampleOutput:
+def _make_sample(
+    b: int, l_max: int, n_max: int, t_enc: int = 8, v_vocab: int = 4
+) -> DecoderSampleOutput:
     """Construct a synthetic DecoderSampleOutput."""
 
     return DecoderSampleOutput(
@@ -22,6 +24,8 @@ def _make_sample(b: int, l_max: int, n_max: int) -> DecoderSampleOutput:
         output_is_pointer=torch.zeros((b, l_max), dtype=torch.bool),
         output_pad_mask=torch.ones((b, l_max), dtype=torch.bool),
         log_probs=torch.full((b, l_max), -0.25),
+        vocab_mask=torch.ones((b, l_max, v_vocab), dtype=torch.bool),
+        pointer_mask=torch.ones((b, l_max, t_enc), dtype=torch.bool),
         decision_type=torch.arange(b, dtype=torch.long),
         pointer_anchor_handles=torch.arange(b * n_max, dtype=torch.long).view(b, n_max),
         pointer_anchor_count=torch.full((b,), n_max, dtype=torch.long),

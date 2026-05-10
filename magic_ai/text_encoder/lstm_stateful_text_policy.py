@@ -22,7 +22,6 @@ from magic_ai.text_encoder.decoder_batch import (
     NativeTextSampleBatch,
 )
 from magic_ai.text_encoder.decoder_inference import (
-    build_replay_grammar_masks,
     decoder_sample,
     decoder_score_replay,
 )
@@ -339,44 +338,26 @@ class LSTMStatefulTextPolicy(nn.Module):
         is_pointer_step = decoder.output_is_pointer.to(dtype=torch.bool)
         pad_mask = decoder.output_pad_mask.to(dtype=torch.bool)
 
-        # Reconstruct per-step subject indices from stored encoder positions via
-        # the per-row pointer-anchor metadata. Vocab steps get -1. Built via
-        # a sync-free scatter (see :func:`gpu_grammar` for the same pattern):
-        # invalid (b, j) anchor entries scatter into a trash slot and are
-        # sliced off, so we never need ``valid.any().item()``.
-        anchor_pos_dev = batch.decoder.pointer_anchor_positions.to(
-            device=encoded.device, dtype=torch.long
-        )
-        anchor_subj_dev = batch.decoder.pointer_anchor_subjects.to(
-            device=encoded.device, dtype=torch.long
-        )
-        valid_anchor = (anchor_pos_dev >= 0) & (anchor_pos_dev < t_enc) & (anchor_subj_dev >= 0)
-        pos_to_subject_full = torch.full(
-            (b, t_enc + 1), -1, dtype=torch.long, device=encoded.device
-        )
-        trash_pos = torch.full_like(anchor_pos_dev, t_enc)
-        safe_pos = torch.where(valid_anchor, anchor_pos_dev, trash_pos)
-        pos_to_subject_full.scatter_(1, safe_pos, anchor_subj_dev)
-        pos_to_subject_map = pos_to_subject_full[:, :t_enc].contiguous()
-        target_pointer_subjects = torch.where(
-            is_pointer_step,
-            pos_to_subject_map.gather(1, target_pointer_pos.clamp_min(0)),
-            torch.full_like(target_pointer_pos, -1),
-        )
-
-        vocab_mask, pointer_mask = build_replay_grammar_masks(
-            decision_type=batch.decoder.decision_type,
-            pointer_anchor_kinds=batch.decoder.pointer_anchor_kinds,
-            pointer_anchor_subjects=batch.decoder.pointer_anchor_subjects,
-            pointer_anchor_positions=batch.decoder.pointer_anchor_positions,
-            pointer_anchor_handles=batch.decoder.pointer_anchor_handles,
-            target_tokens=decoder.output_token_ids,
-            target_pointer_subjects=target_pointer_subjects,
-            target_is_pointer=is_pointer_step,
-            target_pad_mask=pad_mask,
-            encoded_seq_len=t_enc,
-            legal_edge_bitmap=getattr(batch.decoder, "legal_edge_bitmap", None),
-        )
+        # Per-step grammar masks were saved by the live sampler at rollout
+        # time; carry them straight to the score function. The replay
+        # buffer stores ``pointer_mask`` at the buffer's ``max_tokens``
+        # column width — truncate to the current encoder padding.
+        # (Stored cells past ``T_enc_sample`` are False by construction,
+        # so truncation never drops a True cell.)
+        vocab_mask = decoder.vocab_mask.to(device=encoded.device, dtype=torch.bool)
+        pointer_mask_full = decoder.pointer_mask.to(device=encoded.device, dtype=torch.bool)
+        if pointer_mask_full.shape[2] >= t_enc:
+            pointer_mask = pointer_mask_full[:, :, :t_enc].contiguous()
+        else:
+            # Replay-time encoder is wider than what the buffer stored —
+            # zero-pad the tail. Anchor positions never exceed sample-time
+            # T_enc, so the padded tail is False anyway.
+            pad = torch.zeros(
+                (b, pointer_mask_full.shape[1], t_enc - pointer_mask_full.shape[2]),
+                dtype=torch.bool,
+                device=encoded.device,
+            )
+            pointer_mask = torch.cat([pointer_mask_full, pad], dim=2)
         scores = decoder_score_replay(
             self.policy.text_policy,
             encoded,

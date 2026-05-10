@@ -26,6 +26,14 @@ class DecoderSampleOutput:
     output_is_pointer: Tensor  # [B, L] bool
     output_pad_mask: Tensor  # [B, L] bool (True = valid, False = post-END/pad)
     log_probs: Tensor  # [B, L] float — per-step log p of chosen action
+    # Per-step grammar masks captured straight from the live sampler so
+    # replay scoring softmaxes over the same support. Saving them removes
+    # the only source of rollout-vs-replay mask drift; rebuilding the FSA
+    # at replay time (the previous design) was provably equivalent in
+    # principle but a single bug in the reconstruction silently corrupts
+    # IS ratios for every step in every minibatch until you trip on it.
+    vocab_mask: Tensor  # [B, L, V_vocab] bool
+    pointer_mask: Tensor  # [B, L, T_enc] bool
     decision_type: Tensor  # [B] int64 (passed through)
     pointer_anchor_handles: Tensor  # [B, N_max] int64 (passed through)
     pointer_anchor_count: Tensor  # [B] int64 (passed through)
@@ -78,6 +86,7 @@ class NativeTextDecoderBatch:
 
     decision_type: Tensor  # [B] int32
     output_token_ids: Tensor  # [B, L_max] int32 (PAD = 0)
+    output_pointer_pos: Tensor  # [B, L_max] int32 (encoder position, -1 fill)
     output_pointer_subjects: Tensor  # [B, L_max] int32 (anchor subject_index, -1 fill)
     output_is_pointer: Tensor  # [B, L_max] bool
     output_lens: Tensor  # [B] int32 (number of valid steps per row)
@@ -86,6 +95,11 @@ class NativeTextDecoderBatch:
     log_probs: Tensor  # [B, L_max] float (zero at pad)
     value: Tensor  # [B] float
     output_pad_mask: Tensor  # [B, L_max] bool
+    # Per-step grammar masks captured at sample time. Shapes are
+    # ``[B, L_max, V_vocab]`` and ``[B, L_max, T_enc]`` — concat pads the
+    # T_enc dim across parts that have different encoder widths.
+    vocab_mask: Tensor
+    pointer_mask: Tensor
 
     def __len__(self) -> int:
         return int(self.decision_type.shape[0])
@@ -97,6 +111,7 @@ class NativeTextDecoderBatch:
         return NativeTextDecoderBatch(
             decision_type=self.decision_type[key],
             output_token_ids=self.output_token_ids[key],
+            output_pointer_pos=self.output_pointer_pos[key],
             output_pointer_subjects=self.output_pointer_subjects[key],
             output_is_pointer=self.output_is_pointer[key],
             output_lens=self.output_lens[key],
@@ -105,15 +120,19 @@ class NativeTextDecoderBatch:
             log_probs=self.log_probs[key],
             value=self.value[key],
             output_pad_mask=self.output_pad_mask[key],
+            vocab_mask=self.vocab_mask[key],
+            pointer_mask=self.pointer_mask[key],
         )
 
     @classmethod
     def concat(cls, parts: Sequence[NativeTextDecoderBatch]) -> NativeTextDecoderBatch:
-        """Row-axis concatenation; left-pads ragged L_max / N_max with fill."""
+        """Row-axis concatenation; left-pads ragged L_max / N_max / T_enc with fill."""
         if len(parts) == 1:
             return parts[0]
         l_max = max(int(p.output_token_ids.shape[1]) for p in parts)
         n_max = max(int(p.pointer_anchor_handles.shape[1]) for p in parts)
+        v_max = max(int(p.vocab_mask.shape[2]) for p in parts)
+        t_enc_max = max(int(p.pointer_mask.shape[2]) for p in parts)
 
         def _pad2d(t: Tensor, width: int, *, fill: int | float) -> Tensor:
             cur = int(t.shape[1])
@@ -124,10 +143,22 @@ class NativeTextDecoderBatch:
             out[:, :cur] = t
             return out
 
+        def _pad3d(t: Tensor, l_w: int, c_w: int, *, fill: int | float) -> Tensor:
+            l_cur, c_cur = int(t.shape[1]), int(t.shape[2])
+            if l_cur == l_w and c_cur == c_w:
+                return t
+            rows = int(t.shape[0])
+            out = torch.full((rows, l_w, c_w), fill, dtype=t.dtype, device=t.device)
+            out[:, :l_cur, :c_cur] = t
+            return out
+
         return cls(
             decision_type=torch.cat([p.decision_type for p in parts], dim=0),
             output_token_ids=torch.cat(
                 [_pad2d(p.output_token_ids, l_max, fill=0) for p in parts], dim=0
+            ),
+            output_pointer_pos=torch.cat(
+                [_pad2d(p.output_pointer_pos, l_max, fill=-1) for p in parts], dim=0
             ),
             output_pointer_subjects=torch.cat(
                 [_pad2d(p.output_pointer_subjects, l_max, fill=-1) for p in parts], dim=0
@@ -144,6 +175,12 @@ class NativeTextDecoderBatch:
             value=torch.cat([p.value for p in parts], dim=0),
             output_pad_mask=torch.cat(
                 [_pad2d(p.output_pad_mask, l_max, fill=0) for p in parts], dim=0
+            ),
+            vocab_mask=torch.cat(
+                [_pad3d(p.vocab_mask, l_max, v_max, fill=0) for p in parts], dim=0
+            ),
+            pointer_mask=torch.cat(
+                [_pad3d(p.pointer_mask, l_max, t_enc_max, fill=0) for p in parts], dim=0
             ),
         )
 
@@ -171,6 +208,7 @@ def native_decoder_batch_from_sample(
     return NativeTextDecoderBatch(
         decision_type=sample.decision_type.to(dtype=torch.int32),
         output_token_ids=sample.output_token_ids.to(dtype=torch.int32),
+        output_pointer_pos=sample.output_pointer_pos.to(dtype=torch.int32),
         output_pointer_subjects=sample.output_pointer_subjects.to(dtype=torch.int32),
         output_is_pointer=sample.output_is_pointer.to(dtype=torch.bool),
         output_lens=output_lens,
@@ -179,6 +217,8 @@ def native_decoder_batch_from_sample(
         log_probs=sample.log_probs.to(dtype=torch.float32),
         value=value.to(dtype=torch.float32),
         output_pad_mask=sample.output_pad_mask.to(dtype=torch.bool),
+        vocab_mask=sample.vocab_mask.to(dtype=torch.bool),
+        pointer_mask=sample.pointer_mask.to(dtype=torch.bool),
     )
 
 

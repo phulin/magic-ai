@@ -480,6 +480,7 @@ class NativeTextTrajectoryBuffer:
                 NativeTextDecoderBatch(
                     decision_type=row.decision_type.detach().clone(),
                     output_token_ids=row.output_token_ids.detach().clone(),
+                    output_pointer_pos=row.output_pointer_pos.detach().clone(),
                     output_pointer_subjects=row.output_pointer_subjects.detach().clone(),
                     output_is_pointer=row.output_is_pointer.detach().clone(),
                     output_lens=row.output_lens.detach().clone(),
@@ -488,6 +489,8 @@ class NativeTextTrajectoryBuffer:
                     log_probs=row.log_probs.detach().clone(),
                     value=row.value.detach().clone(),
                     output_pad_mask=row.output_pad_mask.detach().clone(),
+                    vocab_mask=row.vocab_mask.detach().clone(),
+                    pointer_mask=row.pointer_mask.detach().clone(),
                 )
             )
 
@@ -580,7 +583,9 @@ class NativeTextTrajectoryBuffer:
 
         payload = DecoderDecisionPayload(
             output_token_ids=merged_decoder.output_token_ids.to(device=device, dtype=torch.int32),
-            output_pointer_pos=zero_pos,
+            output_pointer_pos=merged_decoder.output_pointer_pos.to(
+                device=device, dtype=torch.int32
+            ),
             output_is_pointer=merged_decoder.output_is_pointer.to(device=device, dtype=torch.bool),
             output_pad_mask=merged_decoder.output_pad_mask.to(device=device, dtype=torch.bool),
             output_log_prob=merged_decoder.log_probs.to(device=device, dtype=torch.float32),
@@ -593,6 +598,8 @@ class NativeTextTrajectoryBuffer:
             legal_edge_bitmap=legal_edge,
             legal_edge_n_blockers=legal_n,
             legal_edge_n_attackers=legal_n,
+            vocab_mask=merged_decoder.vocab_mask.to(device=device, dtype=torch.bool),
+            pointer_mask=merged_decoder.pointer_mask.to(device=device, dtype=torch.bool),
         )
 
         # Reserve a window in the replay buffer covering all rows. Tokens

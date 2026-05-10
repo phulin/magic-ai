@@ -6,10 +6,9 @@
   per-step log probabilities under the (vocab|pointer) mask of the chosen
   action so PPO/R-NaD can compute importance ratios.
 - :func:`decoder_score_replay` — teacher-forced per-row log p of stored
-  decoder targets, plus per-step entropy.
-- :func:`build_replay_grammar_masks` — roll the on-device grammar state
-  machine forward over stored target sequences to recover per-step
-  ``(vocab_mask, pointer_mask)`` for replay scoring.
+  decoder targets, plus per-step entropy. Replay scoring reuses the
+  per-step grammar masks captured at sample time (carried through the
+  replay buffer on :class:`DecoderSampleOutput`); no FSA rebuild here.
 """
 
 from __future__ import annotations
@@ -78,6 +77,11 @@ def decoder_sample(
     out_is_pointer = torch.zeros((b, L), dtype=torch.bool, device=device)
     out_pad_mask = torch.zeros((b, L), dtype=torch.bool, device=device)
     out_log_probs = torch.zeros((b, L), device=device)
+    # Capture the live mask each step so replay scoring softmaxes over
+    # the exact same support. The FSA-reconstruction path the buffer
+    # used to take has been removed.
+    out_vocab_mask = torch.zeros((b, L, GRAMMAR_VOCAB_SIZE), dtype=torch.bool, device=device)
+    out_pointer_mask = torch.zeros((b, L, t_enc), dtype=torch.bool, device=device)
 
     pos_to_subject_map = state.pos_to_subj  # [B, T_enc] long, -1 fill
 
@@ -88,6 +92,8 @@ def decoder_sample(
     for step in range(L):
         valid_step = ~state.ended
         vocab_mask, pointer_mask = state.next_mask()
+        out_vocab_mask[:, step, :] = vocab_mask
+        out_pointer_mask[:, step, :] = pointer_mask
 
         vocab_logits, pointer_logits, decoder_state = grammar_decoder.step(
             prev_token, prev_pointer_pos, encoded, encoder_attention_mask, decoder_state
@@ -149,6 +155,8 @@ def decoder_sample(
         output_is_pointer=out_is_pointer,
         output_pad_mask=out_pad_mask,
         log_probs=out_log_probs,
+        vocab_mask=out_vocab_mask,
+        pointer_mask=out_pointer_mask,
         decision_type=decision_type_dev,
         pointer_anchor_handles=anchor_handles_dev,
         pointer_anchor_count=pointer_anchor_count,
@@ -182,18 +190,19 @@ def decoder_score_replay(
     neg_inf = torch.finfo(vocab_logits.dtype).min
     v_logp = torch.log_softmax(vocab_logits.masked_fill(~vocab_mask, neg_inf), dim=-1)
     p_logp = torch.log_softmax(pointer_logits.masked_fill(~pointer_mask, neg_inf), dim=-1)
-    target_tok = target_tokens.to(dtype=torch.long).clamp_min(0)
-    target_ptr = target_pointer_pos.to(dtype=torch.long).clamp_min(0)
+    # Clamp the gather indices into bounds. ``target_pointer_pos`` is the
+    # encoder position the sampler chose; replay-time T_enc may be smaller
+    # than sample-time T_enc (different batch padding) so vocab steps —
+    # which write -1 here — would otherwise OOB-gather. ``is_pointer_step``
+    # downstream zeroes the contribution at non-matching steps, so the
+    # clamped value at vocab/pad steps is irrelevant.
+    v_max = v_logp.shape[-1] - 1
+    p_max = p_logp.shape[-1] - 1
+    target_tok = target_tokens.to(dtype=torch.long).clamp(min=0, max=max(v_max, 0))
+    target_ptr = target_pointer_pos.to(dtype=torch.long).clamp(min=0, max=max(p_max, 0))
     v_chosen = v_logp.gather(-1, target_tok.unsqueeze(-1)).squeeze(-1)
     p_chosen = p_logp.gather(-1, target_ptr.unsqueeze(-1)).squeeze(-1)
     step_logp = torch.where(is_pointer_step, p_chosen, v_chosen)
-    # Replay-time mask reconstruction can drop a token that was legal at
-    # rollout time, leaving the sampled action with the masked_fill's
-    # ``finfo(dtype).min`` log-prob (≈ -3.4e38 for fp32). The downstream
-    # IS ratio is now safe — v-trace clips ``log_rho`` in log space — but
-    # ``finfo.min`` still poisons per-row sums and entropy diagnostics.
-    # Floor it at -50 so the row's IS contribution decays cleanly to 0.
-    step_logp = step_logp.clamp_min(-50.0)
     step_logp = step_logp.where(pad_mask, torch.zeros_like(step_logp))
 
     # Entropy under the same mask.
@@ -215,111 +224,7 @@ def decoder_score_replay(
     )
 
 
-def build_replay_grammar_masks(
-    decision_type: Tensor,
-    pointer_anchor_kinds: Tensor,
-    pointer_anchor_subjects: Tensor,
-    pointer_anchor_positions: Tensor,
-    pointer_anchor_handles: Tensor,
-    target_tokens: Tensor,
-    target_pointer_subjects: Tensor,
-    target_is_pointer: Tensor,
-    target_pad_mask: Tensor,
-    *,
-    encoded_seq_len: int,
-    legal_edge_bitmap: Tensor | None = None,
-    spec_max_value: Tensor | None = None,
-) -> tuple[Tensor, Tensor]:
-    """Reconstruct per-step ``(vocab_mask, pointer_mask)`` for stored decoder targets.
-
-    Rolls the on-device grammar state machine forward over the stored
-    prefix and reads off the legal mask at each step. Output shapes:
-    ``vocab_mask`` ``[B, L, GRAMMAR_VOCAB_SIZE]``, ``pointer_mask``
-    ``[B, L, encoded_seq_len]``, both bool, on the input device.
-
-    Mirrors the mask-build path used by the sampler so replay scoring
-    softmaxes over the same support — silent all-True masks would compute
-    log-π over the wrong support and corrupt PPO importance ratios.
-    """
-    del pointer_anchor_handles  # accepted for API symmetry; not needed here
-
-    device = decision_type.device
-    b = int(decision_type.shape[0])
-    L = int(target_tokens.shape[1])
-    t_enc = int(encoded_seq_len)
-
-    state = GrammarMaskState(
-        decision_type=decision_type.to(device=device, dtype=torch.long),
-        pointer_anchor_kinds=pointer_anchor_kinds.to(device=device, dtype=torch.long),
-        pointer_anchor_subjects=pointer_anchor_subjects.to(device=device, dtype=torch.long),
-        pointer_anchor_positions=pointer_anchor_positions.to(device=device, dtype=torch.long),
-        encoded_seq_len=t_enc,
-        legal_edge_bitmap=legal_edge_bitmap,
-        max_value=spec_max_value,
-    )
-
-    target_tokens_dev = target_tokens.to(device=device, dtype=torch.long)
-    is_ptr_dev = target_is_pointer.to(device=device, dtype=torch.bool)
-    pad_dev = target_pad_mask.to(device=device, dtype=torch.bool)
-    # The grammar state needs encoder-position pointers, not subject indices.
-    # Map subject_index → encoder position via the per-row anchor lookup.
-    target_subj_dev = target_pointer_subjects.to(device=device, dtype=torch.long)
-    pos_for_subj = _build_subject_to_position_map(state.pos_to_subj, b, t_enc, device)
-    safe_subj = target_subj_dev.clamp(min=0, max=max(pos_for_subj.shape[1] - 1, 0))
-    target_pos = pos_for_subj.gather(1, safe_subj)
-    target_pos = torch.where(target_subj_dev >= 0, target_pos, torch.full_like(target_pos, -1))
-
-    vocab_out = torch.zeros((b, L, GRAMMAR_VOCAB_SIZE), dtype=torch.bool, device=device)
-    ptr_out = torch.zeros((b, L, t_enc), dtype=torch.bool, device=device)
-
-    for step in range(L):
-        v_mask, p_mask = state.next_mask()
-        vocab_out[:, step, :] = v_mask
-        ptr_out[:, step, :] = p_mask
-        # Advance only rows whose stored target has a step here.
-        active_step = pad_dev[:, step]
-        sampled_vocab = torch.where(
-            active_step,
-            target_tokens_dev[:, step],
-            torch.full_like(target_tokens_dev[:, step], int(GrammarVocab.PAD)),
-        )
-        sampled_pointer = torch.where(
-            active_step,
-            target_pos[:, step],
-            torch.full_like(target_pos[:, step], -1),
-        )
-        is_ptr = is_ptr_dev[:, step] & active_step
-        state.update(sampled_vocab, sampled_pointer, is_ptr)
-
-    return vocab_out, ptr_out
-
-
-def _build_subject_to_position_map(
-    pos_to_subj: Tensor,  # [B, T_enc] long
-    b: int,
-    t_enc: int,
-    device: torch.device,
-) -> Tensor:
-    """Invert ``pos_to_subj`` into a per-row ``[B, T_enc]`` map.
-
-    Stored decoder targets carry ``subject_index`` (anchor's local ordinal)
-    as the pointer label; the GPU grammar state advances on encoder
-    *positions*. ``T_enc`` is a safe upper bound for ``subject_index`` since
-    every subject occupies at most one encoder position.
-    """
-    width = max(t_enc, 1)
-    # Allocate one trash column past ``width`` so invalid (b, t) entries
-    # scatter into it and then get sliced off — keeps the scatter sync-free.
-    out = torch.full((b, width + 1), -1, dtype=torch.long, device=device)
-    valid = pos_to_subj >= 0
-    pos_arange = torch.arange(t_enc, device=device).unsqueeze(0).expand(b, t_enc)
-    safe_subj = torch.where(valid, pos_to_subj, torch.full_like(pos_to_subj, width))
-    out.scatter_(1, safe_subj, pos_arange)
-    return out[:, :width]
-
-
 __all__ = [
-    "build_replay_grammar_masks",
     "decoder_sample",
     "decoder_score_replay",
 ]

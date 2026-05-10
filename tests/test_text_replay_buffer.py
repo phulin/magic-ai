@@ -68,6 +68,10 @@ def _make_payload(
     legal_edge_n_blockers = torch.full((batch,), n_blockers, dtype=torch.int32)
     legal_edge_n_attackers = torch.full((batch,), n_attackers, dtype=torch.int32)
     output_log_prob = torch.zeros(batch, decoder_len, dtype=torch.float32)
+    # Synthetic per-step grammar masks — small fixed widths sufficient for
+    # the buffer round-trip tests (the buffer pads to its configured caps).
+    vocab_mask = torch.zeros(batch, decoder_len, 4, dtype=torch.bool)
+    pointer_mask = torch.zeros(batch, decoder_len, 4, dtype=torch.bool)
     return DecoderDecisionPayload(
         output_token_ids=output_token_ids,
         output_pointer_pos=output_pointer_pos,
@@ -83,6 +87,8 @@ def _make_payload(
         legal_edge_bitmap=legal_edge_bitmap,
         legal_edge_n_blockers=legal_edge_n_blockers,
         legal_edge_n_attackers=legal_edge_n_attackers,
+        vocab_mask=vocab_mask,
+        pointer_mask=pointer_mask,
     )
 
 

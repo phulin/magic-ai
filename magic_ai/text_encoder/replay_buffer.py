@@ -25,7 +25,7 @@ from magic_ai.text_encoder.batch import (
     packed_sequence_layout,
     subtract_packed_offsets,
 )
-from magic_ai.text_encoder.grammar import GrammarVocab
+from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE, GrammarVocab
 from magic_ai.text_encoder.replay_triton import (
     gather_decisions_triton,
     gather_encoded_triton,
@@ -59,6 +59,9 @@ class DecoderDecisionPayload:
     legal_edge_bitmap: Tensor  # [B, max_blockers, max_attackers] bool
     legal_edge_n_blockers: Tensor  # [B] int32
     legal_edge_n_attackers: Tensor  # [B] int32
+    # Per-step grammar masks captured by the live sampler.
+    vocab_mask: Tensor  # [B, L, V_vocab] bool
+    pointer_mask: Tensor  # [B, L, T_enc] bool — col width may be < buffer.max_tokens
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,8 @@ class DecoderGatherOutput:
     legal_edge_bitmap: Tensor
     legal_edge_n_blockers: Tensor
     legal_edge_n_attackers: Tensor
+    vocab_mask: Tensor  # [B, L, V_vocab] bool
+    pointer_mask: Tensor  # [B, L, max_tokens] bool
 
 
 @dataclass(frozen=True)
@@ -343,6 +348,18 @@ class TextReplayBuffer:
                 ),
                 Field("legal_edge_n_blockers", torch.int32, fill=0),
                 Field("legal_edge_n_attackers", torch.int32, fill=0),
+                Field(
+                    "vocab_mask",
+                    torch.bool,
+                    fill=False,
+                    inner_shape=(self.max_decoder_len, GRAMMAR_VOCAB_SIZE),
+                ),
+                Field(
+                    "pointer_mask",
+                    torch.bool,
+                    fill=False,
+                    inner_shape=(self.max_decoder_len, self.max_tokens),
+                ),
             ),
             device=self.device,
         )
@@ -1421,6 +1438,8 @@ class TextReplayBuffer:
         self.decoder.legal_edge_bitmap.index_fill_(0, rows, 0)
         self.decoder.legal_edge_n_blockers.index_fill_(0, rows, 0)
         self.decoder.legal_edge_n_attackers.index_fill_(0, rows, 0)
+        self.decoder.vocab_mask.index_fill_(0, rows, 0)
+        self.decoder.pointer_mask.index_fill_(0, rows, 0)
 
     def _scatter_decoder(self, rows: Tensor, payload: DecoderDecisionPayload) -> None:
         b = int(rows.shape[0])
@@ -1502,6 +1521,30 @@ class TextReplayBuffer:
             device=dev, dtype=torch.int32
         )
 
+        # Per-step grammar masks captured by the live sampler. ``vocab_mask``
+        # is fixed-width along the vocab axis; ``pointer_mask``'s column
+        # axis is ``T_enc`` at sample time and can be < buffer.max_tokens
+        # (encoder padding for that batch). Pad with False; replay-time
+        # readers truncate to the current ``T_enc``.
+        v_w = int(payload.vocab_mask.shape[2])
+        p_w = int(payload.pointer_mask.shape[2])
+        if v_w > GRAMMAR_VOCAB_SIZE:
+            raise ValueError(
+                f"vocab_mask width {v_w} exceeds GRAMMAR_VOCAB_SIZE {GRAMMAR_VOCAB_SIZE}"
+            )
+        if p_w > self.max_tokens:
+            raise ValueError(
+                f"pointer_mask T_enc {p_w} exceeds buffer max_tokens {self.max_tokens}"
+            )
+        if l_payload > 0 and v_w > 0:
+            self.decoder.vocab_mask[rows, :l_payload, :v_w] = payload.vocab_mask.to(
+                device=dev, dtype=torch.bool
+            )
+        if l_payload > 0 and p_w > 0:
+            self.decoder.pointer_mask[rows, :l_payload, :p_w] = payload.pointer_mask.to(
+                device=dev, dtype=torch.bool
+            )
+
     def gather_decoder(self, indices: Tensor) -> DecoderGatherOutput:
         idx = indices.to(device=self.device, dtype=torch.long)
         return DecoderGatherOutput(
@@ -1519,6 +1562,8 @@ class TextReplayBuffer:
             legal_edge_bitmap=self.decoder.legal_edge_bitmap[idx],
             legal_edge_n_blockers=self.decoder.legal_edge_n_blockers[idx],
             legal_edge_n_attackers=self.decoder.legal_edge_n_attackers[idx],
+            vocab_mask=self.decoder.vocab_mask[idx],
+            pointer_mask=self.decoder.pointer_mask[idx],
         )
 
     # ------------------------------------------------------------------

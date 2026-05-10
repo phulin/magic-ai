@@ -45,13 +45,16 @@ def _make_replay_buffer(*, capacity: int = 16) -> TextReplayBuffer:
 def _make_decoder_batch(b: int, *, l_max: int = 4, n_max: int = 2) -> NativeTextDecoderBatch:
     from magic_ai.text_encoder.decoder_batch import DecoderSampleOutput
 
+    t_enc = 8
     sample = DecoderSampleOutput(
         output_token_ids=torch.arange(b * l_max, dtype=torch.long).view(b, l_max) % 5,
-        output_pointer_pos=torch.full((b, l_max), -1, dtype=torch.long),
+        output_pointer_pos=torch.full((b, l_max), 0, dtype=torch.long),
         output_pointer_subjects=torch.zeros((b, l_max), dtype=torch.long),
         output_is_pointer=torch.zeros((b, l_max), dtype=torch.bool),
         output_pad_mask=torch.ones((b, l_max), dtype=torch.bool),
         log_probs=torch.full((b, l_max), -0.1),
+        vocab_mask=torch.ones((b, l_max, 4), dtype=torch.bool),
+        pointer_mask=torch.ones((b, l_max, t_enc), dtype=torch.bool),
         decision_type=torch.zeros((b,), dtype=torch.long),  # PRIORITY
         pointer_anchor_handles=torch.arange(b * n_max, dtype=torch.long).view(b, n_max),
         pointer_anchor_count=torch.full((b,), n_max, dtype=torch.long),
