@@ -19,8 +19,11 @@ from magic_ai.text_encoder.decoder_batch import (
     DecoderDecisionLayout,
     NativeTextSampleBatch,
 )
-from magic_ai.text_encoder.decoder_inference import decoder_sample, decoder_score_replay
-from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE
+from magic_ai.text_encoder.decoder_inference import (
+    build_replay_grammar_masks,
+    decoder_sample,
+    decoder_score_replay,
+)
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy, RecurrentTextPolicyConfig
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
 
@@ -298,9 +301,49 @@ class LSTMStatefulTextPolicy(nn.Module):
         target_pointer_pos = decoder.output_pointer_pos.to(dtype=torch.long).clamp_min(0)
         is_pointer_step = decoder.output_is_pointer.to(dtype=torch.bool)
         pad_mask = decoder.output_pad_mask.to(dtype=torch.bool)
-        L = int(target_tokens.shape[1])
-        vocab_mask = torch.ones((b, L, GRAMMAR_VOCAB_SIZE), dtype=torch.bool, device=encoded.device)
-        pointer_mask = torch.ones((b, L, t_enc), dtype=torch.bool, device=encoded.device)
+
+        # Reconstruct per-step subject indices from stored encoder positions via
+        # the per-row pointer-anchor metadata. Vocab steps get -1.
+        anchor_pos_dev = batch.decoder.pointer_anchor_positions.to(
+            device=encoded.device, dtype=torch.long
+        )
+        anchor_subj_dev = batch.decoder.pointer_anchor_subjects.to(
+            device=encoded.device, dtype=torch.long
+        )
+        pos_to_subject_map = torch.full((b, t_enc), -1, dtype=torch.long, device=encoded.device)
+        valid_anchor = (anchor_pos_dev >= 0) & (anchor_pos_dev < t_enc) & (anchor_subj_dev >= 0)
+        if int(valid_anchor.any().item()):
+            n_anchors = int(anchor_pos_dev.shape[1])
+            flat_row = (torch.arange(b, device=encoded.device).view(-1, 1).expand(b, n_anchors))[
+                valid_anchor
+            ]
+            pos_to_subject_map[flat_row, anchor_pos_dev[valid_anchor]] = anchor_subj_dev[
+                valid_anchor
+            ]
+        target_pointer_subjects = torch.where(
+            is_pointer_step,
+            pos_to_subject_map.gather(1, target_pointer_pos.clamp_min(0)),
+            torch.full_like(target_pointer_pos, -1),
+        )
+
+        # Reconstruct grammar masks from stored anchor metadata so the
+        # softmax-renormalization matches the sampler — silent all-True
+        # masks would compute log-π over the wrong support and corrupt
+        # PPO importance ratios.
+        vocab_mask_cpu, pointer_mask_cpu = build_replay_grammar_masks(
+            decision_type=batch.decoder.decision_type,
+            pointer_anchor_kinds=batch.decoder.pointer_anchor_kinds,
+            pointer_anchor_subjects=batch.decoder.pointer_anchor_subjects,
+            pointer_anchor_positions=batch.decoder.pointer_anchor_positions,
+            pointer_anchor_handles=batch.decoder.pointer_anchor_handles,
+            target_tokens=decoder.output_token_ids,
+            target_pointer_subjects=target_pointer_subjects,
+            target_is_pointer=is_pointer_step,
+            target_pad_mask=pad_mask,
+            encoded_seq_len=t_enc,
+        )
+        vocab_mask = vocab_mask_cpu.to(device=encoded.device)
+        pointer_mask = pointer_mask_cpu.to(device=encoded.device)
         scores = decoder_score_replay(
             self.policy.text_policy,
             encoded,
@@ -323,37 +366,21 @@ class LSTMStatefulTextPolicy(nn.Module):
         hidden_override: Tensor | None = None,
         cached: Any | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Any]:
-        """Decoder analog of slot's per-choice scoring.
+        """R-NaD per-choice scoring is not implemented for the decoder pipeline.
 
-        Each replay row is exactly one decision; the per-choice flat
-        tensors collapse to one entry per row. The returned
-        :class:`ReplayPerChoice` packs the row-level logits / log-probs
-        so R-NaD's NeuRD assembly can run on the decoder pipeline with
-        the same downstream code.
+        Slot policy's NeuRD update consumes per-decision-group flat-action
+        logits over a fixed action space. The grammar decoder factors a
+        decision into a variable-length token sequence, so the slot-shaped
+        ``ReplayPerChoice`` payload doesn't have a coherent translation
+        without a redesign of the NeuRD assembly. Until that lands, R-NaD
+        is unsupported on the decoder path; use ``--trainer ppo``.
         """
-        del lstm_state_override, hidden_override, cached  # decoder path is stateless across calls
-        from magic_ai.replay_decisions import ReplayPerChoice
-
-        log_pi, entropy, values, _ = self.evaluate_replay_batch(replay_rows)
-        device = log_pi.device
-        n = int(log_pi.shape[0])
-        zeros_b = torch.zeros(n, dtype=log_pi.dtype, device=device)
-        zeros_long_b = torch.zeros(n, dtype=torch.long, device=device)
-        # Decoder rows have no may-bit; expose an inactive may mask.
-        per_choice = ReplayPerChoice(
-            flat_logits=log_pi,  # one logit per row (the row's log p, in lieu of per-choice)
-            flat_log_probs=log_pi,
-            group_idx=torch.arange(n, dtype=torch.long, device=device),
-            choice_cols=zeros_long_b,
-            is_sampled_flat=torch.ones(n, dtype=torch.bool, device=device),
-            decision_group_id_flat=torch.arange(n, dtype=torch.long, device=device),
-            step_for_decision_group=torch.arange(n, dtype=torch.long, device=device),
-            may_is_active=torch.zeros(n, dtype=torch.bool, device=device),
-            may_logits_per_step=zeros_b,
-            may_selected_per_step=zeros_b,
-            behavior_action_log_prob_per_decision_group=zeros_b,
+        del replay_rows, lstm_state_override, hidden_override, cached
+        raise NotImplementedError(
+            "R-NaD evaluate_replay_batch_per_choice is not wired for the decoder "
+            "pipeline. Use --trainer ppo, or design a per-step NeuRD assembly "
+            "for variable-length decoded sequences before calling this."
         )
-        return log_pi, entropy, values, per_choice
 
     def write_ppo_targets(
         self,

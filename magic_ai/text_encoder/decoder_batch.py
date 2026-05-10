@@ -11,8 +11,6 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from magic_ai.text_encoder.batch import PackedTextBatch
-
 
 @dataclass(frozen=True)
 class DecoderSampleOutput:
@@ -140,32 +138,13 @@ class NativeTextDecoderBatch:
         )
 
 
-# Kept for backwards-compatible imports while the rest of the cutover lands.
-@dataclass(frozen=True)
-class NativeTextReplayPayload:
-    """Placeholder for the legacy native replay payload struct.
-
-    Phase 5 stripped the inline-blank training path. The native replay
-    pipeline will be re-wired around :class:`DecoderDecisionPayload` in
-    a later phase. Symbol kept so unrelated import sites don't blow up
-    mid-cutover; constructing one will fail on access.
-    """
-
-    encoded: PackedTextBatch | None = None
-
-
 @dataclass(frozen=True)
 class NativeTextSampleBatch:
-    """Result of ``LSTMStatefulTextPolicy.sample_batch`` — a list of decoded actions.
-
-    ``replay_payload`` will be wired up in a later phase; for now the field
-    is kept ``None`` so call-sites that pass it through don't crash.
-    """
+    """Result of ``LSTMStatefulTextPolicy.sample_batch`` — a list of decoded actions."""
 
     decoded: list[DecoderDecisionLayout]
     log_probs: Tensor  # [B, L]
     replay_rows: list[int]
-    replay_payload: NativeTextReplayPayload | None = None
 
 
 def native_decoder_batch_from_sample(
@@ -198,7 +177,6 @@ __all__ = [
     "DecoderReplayScores",
     "DecoderSampleOutput",
     "NativeTextDecoderBatch",
-    "NativeTextReplayPayload",
     "NativeTextSampleBatch",
     "native_decoder_batch_from_sample",
 ]

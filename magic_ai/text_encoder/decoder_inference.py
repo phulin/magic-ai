@@ -24,7 +24,7 @@ from magic_ai.text_encoder.decision_spec import (
 )
 from magic_ai.text_encoder.decoder import DecoderState, combined_sample
 from magic_ai.text_encoder.decoder_batch import DecoderReplayScores, DecoderSampleOutput
-from magic_ai.text_encoder.grammar import GrammarVocab, batch_next_mask
+from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE, GrammarVocab, batch_next_mask
 from magic_ai.text_encoder.policy import TextPolicy
 
 
@@ -396,4 +396,91 @@ def decoder_score_replay(
     )
 
 
-__all__ = ["decoder_sample", "decoder_score_replay"]
+def build_replay_grammar_masks(
+    decision_type: Tensor,
+    pointer_anchor_kinds: Tensor,
+    pointer_anchor_subjects: Tensor,
+    pointer_anchor_positions: Tensor,
+    pointer_anchor_handles: Tensor,
+    target_tokens: Tensor,
+    target_pointer_subjects: Tensor,
+    target_is_pointer: Tensor,
+    target_pad_mask: Tensor,
+    *,
+    encoded_seq_len: int,
+) -> tuple[Tensor, Tensor]:
+    """Reconstruct per-step ``(vocab_mask, pointer_mask)`` for stored decoder targets.
+
+    Rolls the grammar state machine forward over the stored prefix and asks
+    :func:`grammar.batch_next_mask` for the legal mask at each step. Output
+    shapes: ``vocab_mask`` ``[B, L, GRAMMAR_VOCAB_SIZE]``, ``pointer_mask``
+    ``[B, L, encoded_seq_len]``, both bool, on CPU. Caller is responsible for
+    moving them to the encoder device.
+
+    Mirrors the mask-build path in :mod:`policy_value_pretrain` so replay
+    scoring softmaxes over the same support the sampler did.
+    """
+
+    specs = _build_batched_specs(
+        decision_type,
+        pointer_anchor_kinds,
+        pointer_anchor_subjects,
+        pointer_anchor_positions,
+        pointer_anchor_handles,
+        legal_edge_bitmap=None,
+    )
+
+    b, L = int(target_tokens.shape[0]), int(target_tokens.shape[1])
+    tokens_np = target_tokens.detach().to("cpu", dtype=torch.int64).numpy()
+    subjects_np = target_pointer_subjects.detach().to("cpu", dtype=torch.int64).numpy()
+    is_ptr_np = target_is_pointer.detach().to("cpu", dtype=torch.bool).numpy()
+    pad_np = target_pad_mask.detach().to("cpu", dtype=torch.bool).numpy()
+
+    # Prefix at step `s` is the first `s` stored tokens. Pointer steps store
+    # PAD as the structural token; the subject_index lives in the parallel
+    # subjects array — same convention as the sampler's prefix buffers.
+    prefix_tokens_np = np.zeros((b, L), dtype=np.int64)
+    prefix_subjects_np = np.full((b, L), -1, dtype=np.int64)
+    for i in range(b):
+        for s in range(L):
+            if not pad_np[i, s]:
+                break
+            if is_ptr_np[i, s]:
+                prefix_tokens_np[i, s] = int(GrammarVocab.PAD)
+                prefix_subjects_np[i, s] = int(subjects_np[i, s])
+            else:
+                prefix_tokens_np[i, s] = int(tokens_np[i, s])
+                prefix_subjects_np[i, s] = -1
+
+    vocab_mask = torch.zeros((b, L, GRAMMAR_VOCAB_SIZE), dtype=torch.bool)
+    pointer_mask = torch.zeros((b, L, encoded_seq_len), dtype=torch.bool)
+    prefix_lens_np = np.zeros((b,), dtype=np.int64)
+
+    for step in range(L):
+        expected_kind = [
+            _expected_anchor_kind_for_step(
+                spec, prefix_tokens_np[i, : int(prefix_lens_np[i])].tolist()
+            )
+            for i, spec in enumerate(specs)
+        ]
+        v_mask_np, anchor_mask_np = batch_next_mask(
+            specs, prefix_tokens_np, prefix_subjects_np, prefix_lens_np
+        )
+        ptr_mask_np = _pointer_position_mask_from_anchors(
+            specs, anchor_mask_np, expected_kind, encoded_seq_len
+        )
+        vocab_mask[:, step, :] = torch.from_numpy(v_mask_np)
+        pointer_mask[:, step, :] = torch.from_numpy(ptr_mask_np)
+        # Advance the prefix only for rows whose stored target has another step.
+        for i in range(b):
+            if step < L and pad_np[i, step]:
+                prefix_lens_np[i] = step + 1
+
+    return vocab_mask, pointer_mask
+
+
+__all__ = [
+    "build_replay_grammar_masks",
+    "decoder_sample",
+    "decoder_score_replay",
+]
