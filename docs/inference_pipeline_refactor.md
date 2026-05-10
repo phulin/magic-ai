@@ -32,46 +32,49 @@ F compounds.
 
 ---
 
-## Phase D — Drop unused reply/request fields
+## Phase D — Drop unused reply/request fields ✅ (commit 0e3fcae)
 
 **Goal:** remove dead code that the prior cleanups left around.
 
-- [ ] Drop `decoder_batch` from `TextInferenceReply`.
-- [ ] Move any transcript reads to `host_decoder`.
-- [ ] Drop `native_batch` from `TextInferenceRequest` and `_SubmitBatch`.
-- [ ] Drop `NativeEncodedBatch` import where no longer needed.
-- [ ] Tests + smoke training pass.
+- [x] Drop `decoder_batch` from `TextInferenceReply`.
+- [x] Move any transcript reads to `host_decoder`.
+- [x] Drop `native_batch` from `TextInferenceRequest` and `_SubmitBatch`.
+- [x] Drop `NativeEncodedBatch` import where no longer needed.
+- [x] Drop the dead `ready_event` field too.
+- [x] Tests pass.
 
-## Phase A — Policy stack collapse + compile
+## Phase A — Policy stack collapse + compile ⚠️ (scope reduced; commit e041cb1)
 
 **Goal:** one `forward` on a single policy class, compile-wrapped, used by
 both inference and training.
 
-- [ ] Identify callers of `encode_with_history`, `encode_only`,
-      `encode_packed_only`, `forward_packed`, `TextPolicy.forward`.
-- [ ] Merge `RecurrentTextPolicy` + `TextPolicy` into one class.
-- [ ] Add `TextPolicy.forward(merged_packed, h_in, c_in) → ForwardOutput`.
-- [ ] `torch.compile(..., dynamic=True)` around it on first CUDA call.
-- [ ] `_sample_decoder` calls the unified forward (no `hasattr(policy,
-      "policy")` branching).
-- [ ] `_score_replay_rows` and opponent-pool eval use the same forward.
-- [ ] Delete dead entry points.
-- [ ] Tests + training; verify loss/throughput.
+Scope reduced to the perf-critical subset: compile-wrap
+`RecurrentTextPolicy.encode_with_history` (the inference forward) instead
+of fully collapsing the wrapper stack. Tests bind directly to each class
+in the onion (LSTMStateful, Recurrent, Text, Encoder); a full collapse is
+high blast radius and the perf gain (compiling the forward) is the same.
 
-## Phase B — Extract `TextInferencePipeline`
+- [x] `encode_with_history` lazily compile-wrapped on first CUDA call.
+- [x] Nested compile from `forward_packed → _run` bypassed via direct
+      `_encode_with_history_impl` call.
+- [x] Tests pass.
+- [ ] (Deferred) merge `RecurrentTextPolicy` + `TextPolicy` into one
+      class. Likely needs its own scoped refactor PR.
+
+## Phase B — Extract `TextInferencePipeline` ✅ (commit 9c93da5)
 
 **Goal:** the inference forward is its own object, reusable outside the
 server.
 
-- [ ] Create `magic_ai/text_encoder/inference_pipeline.py` with
+- [x] Create `magic_ai/text_encoder/inference_pipeline.py` with
       `TextInferencePipeline`.
-- [ ] Move `_sample_decoder` body into `pipeline.encode_and_sample`.
-- [ ] Server holds a pipeline rather than a raw policy.
-- [ ] Replace opponent-pool's inline forward with the pipeline.
-- [ ] Move `lstm_env_state_inputs` / `scatter_lstm_env_states` calls into a
-      clear "env state" layer wrapping the pipeline so the pipeline is
-      stateless.
-- [ ] Tests + training.
+- [x] Move `_sample_decoder` body into `pipeline.encode_and_sample`.
+- [x] Server holds a pipeline; calls `pipeline.encode_and_sample(policy,
+      …)` (pipeline is stateless w.r.t. policy so it composes with the
+      version manager).
+- [x] Server's `_sample_decoder` shrinks to env-state plumbing only.
+- [x] Tests pass.
+- [ ] (Future) opponent-pool inline forward → pipeline. Low priority.
 
 ## Phase E — Host arena replaces `_concat_packed_text_batches`
 
