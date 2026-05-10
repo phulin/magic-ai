@@ -136,6 +136,7 @@ from magic_ai.text_encoder.model import (  # noqa: E402
     TextEncoderConfig,
     text_encoder_config_from_hf,
 )
+from magic_ai.text_encoder.native_assembler import DEFAULT_T_SPEC_MAX  # noqa: E402
 from magic_ai.text_encoder.policy_value_pretrain import (  # noqa: E402
     ForgeChoiceDataset,
     ForgePolicyValueConfig,
@@ -809,6 +810,12 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
     pad_id = tokenizer.pad_token_id
     if pad_id is None:
         raise ValueError("text tokenizer must define pad_token_id")
+    # The native assembler caps *state* tokens at ``text_max_tokens`` and
+    # then appends up to ``DEFAULT_T_SPEC_MAX`` decision-spec tokens per row,
+    # so the per-row combined length the encoder and replay buffer have to
+    # absorb is ``text_max_tokens + DEFAULT_T_SPEC_MAX``. Size the RoPE
+    # cache (and downstream replay storage) accordingly.
+    combined_max_tokens = int(args.text_max_tokens) + DEFAULT_T_SPEC_MAX
     if getattr(args, "text_encoder_backend", "scratch") == "hf":
         cfg = text_encoder_config_from_hf(
             model_name=args.text_hf_model,
@@ -816,7 +823,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             truncate_layers=args.text_hf_layers,
             vocab_size=len(tokenizer),
             pad_id=int(pad_id),
-            max_seq_len=args.text_max_tokens,
+            max_seq_len=combined_max_tokens,
             trust_remote_code=args.text_hf_trust_remote_code,
         )
         if getattr(args, "skip_text_hf_init", False):
@@ -829,7 +836,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             n_layers=args.text_layers,
             n_heads=args.text_heads,
             d_ff=args.text_d_ff,
-            max_seq_len=args.text_max_tokens,
+            max_seq_len=combined_max_tokens,
         )
     recurrent_cfg = RecurrentTextPolicyConfig(
         encoder=cfg,
@@ -847,7 +854,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
     )
     replay_buffer = TextReplayBuffer(
         capacity=rollout_capacity,
-        max_tokens=args.text_max_tokens,
+        max_tokens=combined_max_tokens,
         max_options=args.max_options,
         max_targets_per_option=args.max_targets_per_option,
         max_decision_groups=args.max_decision_groups,
@@ -2169,7 +2176,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ORACLE_DB_PATH,
         help="Scryfall oracle-cards.json bulk dump for text encoder oracle text",
     )
-    parser.add_argument("--text-max-tokens", type=int, default=1024)
+    parser.add_argument("--text-max-tokens", type=int, default=1536)
     parser.add_argument("--text-d-model", type=int, default=128)
     parser.add_argument("--text-layers", type=int, default=2)
     parser.add_argument("--text-heads", type=int, default=4)

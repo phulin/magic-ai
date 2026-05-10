@@ -118,7 +118,17 @@ def decoder_sample(
         p_chosen = p_logp.gather(-1, sampled_pointer.clamp_min(0).unsqueeze(-1)).squeeze(-1)
         step_log_prob = torch.where(is_pointer_step, p_chosen, v_chosen)
 
-        out_tokens[:, step] = sampled_vocab
+        # Store the structural token the decoder actually embeds at this
+        # step: PAD on pointer steps (matches the ``prev_token`` fed into
+        # the next iteration below). Storing the raw ``sampled_vocab`` would
+        # leak combined_sample's -1 sentinel through the replay buffer and
+        # OOB the embedding gather in teacher-forced replay scoring.
+        structural_tok = torch.where(
+            is_pointer_step,
+            torch.full_like(sampled_vocab, int(GrammarVocab.PAD)),
+            sampled_vocab,
+        )
+        out_tokens[:, step] = structural_tok
         out_pointer_pos[:, step] = sampled_pointer
         # Translate encoder position → subject_index via the per-row dense map.
         # Vocab steps gather a value too but we mask them to -1 so the wire
@@ -139,11 +149,7 @@ def decoder_sample(
         # teacher-forced training, where the decoder embeds the structural
         # token, not pointer info).
         state.update(sampled_vocab, sampled_pointer, is_pointer_step)
-        prev_token = torch.where(
-            is_pointer_step,
-            torch.full_like(sampled_vocab, int(GrammarVocab.PAD)),
-            sampled_vocab,
-        )
+        prev_token = structural_tok
         prev_pointer_pos = sampled_pointer
 
     pointer_anchor_count = (anchor_subj_dev >= 0).sum(dim=-1).to(dtype=torch.long)
@@ -190,15 +196,15 @@ def decoder_score_replay(
     neg_inf = torch.finfo(vocab_logits.dtype).min
     v_logp = torch.log_softmax(vocab_logits.masked_fill(~vocab_mask, neg_inf), dim=-1)
     p_logp = torch.log_softmax(pointer_logits.masked_fill(~pointer_mask, neg_inf), dim=-1)
-    # Clamp the gather indices into bounds. ``target_pointer_pos`` is the
-    # encoder position the sampler chose; replay-time T_enc may be smaller
-    # than sample-time T_enc (different batch padding) so vocab steps —
-    # which write -1 here — would otherwise OOB-gather. ``is_pointer_step``
-    # downstream zeroes the contribution at non-matching steps, so the
-    # clamped value at vocab/pad steps is irrelevant.
-    v_max = v_logp.shape[-1] - 1
+    # ``target_pointer_pos`` carries combined_sample's -1 sentinel on vocab
+    # steps and may exceed replay-time T_enc when the replay batch pads to
+    # a shorter sequence than sample-time. Clamp into bounds; downstream
+    # ``is_pointer_step`` & ``pad_mask`` zero the contribution at non-pointer
+    # steps so the clamped value there is irrelevant. ``target_tokens`` is
+    # already PAD-substituted at sample time (see ``decoder_sample``), so
+    # no clamp needed there.
     p_max = p_logp.shape[-1] - 1
-    target_tok = target_tokens.to(dtype=torch.long).clamp(min=0, max=max(v_max, 0))
+    target_tok = target_tokens.to(dtype=torch.long)
     target_ptr = target_pointer_pos.to(dtype=torch.long).clamp(min=0, max=max(p_max, 0))
     v_chosen = v_logp.gather(-1, target_tok.unsqueeze(-1)).squeeze(-1)
     p_chosen = p_logp.gather(-1, target_ptr.unsqueeze(-1)).squeeze(-1)
