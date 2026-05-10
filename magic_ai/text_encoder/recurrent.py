@@ -96,11 +96,21 @@ class RecurrentTextPolicy(nn.Module):
             ]
             | None
         ) = None
+        # Inference path (encode_with_history) also lazily compiles on first
+        # CUDA call. Same shape: encoder forward + in_proj + LSTM step.
+        self._compiled_encode_with_history: (
+            Callable[
+                [PackedTextBatch | TextEncodedBatch, Tensor | None, Tensor | None],
+                tuple[EncodedSnapshots, Tensor, Tensor],
+            ]
+            | None
+        ) = None
         # Compile is wired up lazily on the first CUDA forward (see
-        # ``forward_packed``). flash_attn_varlen replaced the old NJT-subclass
-        # attention so the historical AOT-autograd backward mismatch no longer
-        # applies; CPU compile, however, hits an unrelated inductor bug, so we
-        # only compile when we actually see a CUDA tensor.
+        # ``forward_packed`` / ``encode_with_history``). flash_attn_varlen
+        # replaced the old NJT-subclass attention so the historical
+        # AOT-autograd backward mismatch no longer applies; CPU compile,
+        # however, hits an unrelated inductor bug, so we only compile when we
+        # actually see a CUDA tensor.
 
     def init_state(self, batch_size: int, device: torch.device) -> tuple[Tensor, Tensor]:
         shape = (self.lstm_layers, batch_size, self.lstm_hidden)
@@ -179,7 +189,32 @@ class RecurrentTextPolicy(nn.Module):
         for the next env-step. This is the single forward path used by both
         sample-time (IMPALA / opponent eval / inference server) and
         train-time (replay scoring inside the trainer).
+
+        Lazily compile-wrapped on the first CUDA call so the inference
+        hot path doesn't pay per-op dispatch overhead.
         """
+        if (
+            self.cfg.compile_forward
+            and self._compiled_encode_with_history is None
+            and batch.token_ids.device.type == "cuda"
+        ):
+            self._compiled_encode_with_history = cast(
+                Callable[
+                    [PackedTextBatch | TextEncodedBatch, Tensor | None, Tensor | None],
+                    tuple[EncodedSnapshots, Tensor, Tensor],
+                ],
+                torch.compile(self._encode_with_history_impl, dynamic=True),
+            )
+        if self._compiled_encode_with_history is not None and not is_fx_symbolic_tracing():
+            return self._compiled_encode_with_history(batch, h_in, c_in)
+        return self._encode_with_history_impl(batch, h_in, c_in)
+
+    def _encode_with_history_impl(
+        self,
+        batch: PackedTextBatch | TextEncodedBatch,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
+    ) -> tuple[EncodedSnapshots, Tensor, Tensor]:
         if isinstance(batch, PackedTextBatch):
             b = int(batch.seq_lengths.shape[0])
             device = batch.token_ids.device
@@ -297,7 +332,10 @@ class RecurrentTextPolicy(nn.Module):
             h_out, c_out = h_in, c_in
             lstm_input = None
         else:
-            encoded, h_out, c_out = self.encode_with_history(batch, h_in=h_in, c_in=c_in)
+            # Call the impl directly: ``_run`` itself is (lazily) wrapped by
+            # ``forward_packed``'s compile, so we must not nest a second
+            # compile by going through ``encode_with_history``'s wrapper.
+            encoded, h_out, c_out = self._encode_with_history_impl(batch, h_in=h_in, c_in=c_in)
             lstm_input = self.in_proj(encoded.state_vector)
             # The top LSTM layer's hidden output is what feeds the heads.
             state_hidden = h_out[-1]
