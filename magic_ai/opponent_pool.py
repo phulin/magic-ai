@@ -324,23 +324,20 @@ def load_opponent_weights(
 
 @contextmanager
 def _disable_text_replay_capture(*policies: Any) -> Iterator[None]:
-    """Temporarily run text policies in inference mode without replay writes.
+    """No-op context manager kept for call-site stability.
 
-    Saves and clears each policy's ``rollout_buffer`` attribute so calls into
-    the policy during evaluation don't write into the training replay buffer.
-    Restores the original buffers on exit (including on exception).
+    The previous implementation cleared each policy's ``rollout_buffer``
+    during eval as defense-in-depth against accidental replay writes.
+    Eval only ever runs ``encode_with_history`` and ``decoder_sample``
+    on the policies — neither touches the replay buffer; the only
+    writers are PPO target writes from the trainer, which never run
+    during eval. The clear-and-restore was racing the learner thread:
+    the learner reads ``policy.rollout_buffer`` to look up replay
+    metadata for its own update, and a concurrent ``None`` blew it up
+    with ``rollout_buffer is None; cannot count replay steps``.
     """
-
-    saved: list[tuple[Any, Any]] = []
-    for policy in policies:
-        if hasattr(policy, "rollout_buffer"):
-            saved.append((policy, policy.rollout_buffer))
-            policy.rollout_buffer = None
-    try:
-        yield
-    finally:
-        for policy, prev in saved:
-            policy.rollout_buffer = prev
+    del policies
+    yield
 
 
 def distribute_games_by_recency(
