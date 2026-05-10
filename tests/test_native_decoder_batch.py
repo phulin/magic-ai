@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import torch
-from magic_ai.text_encoder.actor_critic import (
+from magic_ai.text_encoder.decoder_batch import (
     DecoderSampleOutput,
     NativeTextDecoderBatch,
     native_decoder_batch_from_sample,

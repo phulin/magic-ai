@@ -22,7 +22,7 @@ from magic_ai.native.sharded import (
 from magic_ai.slot_encoder.model import PPOPolicy
 
 if TYPE_CHECKING:
-    from magic_ai.text_encoder.actor_critic import TextActorCritic
+    from magic_ai.text_encoder.lstm_stateful_text_policy import LSTMStatefulTextPolicy
 
 
 @dataclass
@@ -250,11 +250,11 @@ def build_opponent_policy(main_policy: PPOPolicy, device: torch.device) -> PPOPo
 
 
 def build_text_opponent_policy(
-    main_policy: TextActorCritic, device: torch.device
-) -> TextActorCritic:
-    """Inference-only clone of a TextActorCritic that does not share replay state.
+    main_policy: LSTMStatefulTextPolicy, device: torch.device
+) -> LSTMStatefulTextPolicy:
+    """Inference-only clone of a LSTMStatefulTextPolicy that does not share replay state.
 
-    Constructs a fresh ``TextActorCritic`` with the same config and copies
+    Constructs a fresh ``LSTMStatefulTextPolicy`` with the same config and copies
     weights via ``load_state_dict`` rather than ``copy.deepcopy``. Deepcopy
     walks every submodule and ends up cloning the ``torch.compile`` wrappers
     on the encoder forward; the cloned wrappers don't share dynamo's
@@ -265,7 +265,7 @@ def build_text_opponent_policy(
     on-disk cache normally.
     """
 
-    from magic_ai.text_encoder.actor_critic import TextActorCritic
+    from magic_ai.text_encoder.lstm_stateful_text_policy import LSTMStatefulTextPolicy
 
     # Skip the HF warm-init for the opponent: the trained main policy's
     # state_dict is loaded over it on the next line, so re-downloading and
@@ -274,7 +274,7 @@ def build_text_opponent_policy(
     cfg = main_policy.policy.cfg
     if cfg.encoder.hf_model_name is not None:
         cfg = replace(cfg, encoder=replace(cfg.encoder, hf_model_name=None))
-    opponent = TextActorCritic(cfg).to(device)
+    opponent = LSTMStatefulTextPolicy(cfg).to(device)
 
     # ``live_lstm_h``/``live_lstm_c`` are per-env recurrence buffers sized
     # by the main policy's ``num_envs``; the opponent runs with 0 envs so
@@ -490,7 +490,8 @@ def run_eval_matches(
         while free_slots and next_game_idx < total_games_target:
             live.append(start_game(free_slots.pop()))
 
-    from magic_ai.text_encoder.actor_critic import TextActorCritic, decoder_sample
+    from magic_ai.text_encoder.decoder_inference import decoder_sample
+    from magic_ai.text_encoder.lstm_stateful_text_policy import LSTMStatefulTextPolicy
 
     def run_policy(
         policy: Any,
@@ -499,7 +500,7 @@ def run_eval_matches(
     ) -> None:
         slot_indices = [env.slot_idx for env in envs]
         games = [env.game for env in envs]
-        if isinstance(policy, TextActorCritic):
+        if isinstance(policy, LSTMStatefulTextPolicy):
             if text_max_tokens is None:
                 raise ValueError("run_eval_matches: text_max_tokens is required for text policies")
             _, nat_outputs = native_encoder.encode_tokens_packed(

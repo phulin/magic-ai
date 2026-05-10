@@ -27,14 +27,14 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch  # noqa: E402
 from magic_ai.game_state import PendingState  # noqa: E402
-from magic_ai.text_encoder.actor_critic import (  # noqa: E402
-    DecoderDecisionLayout,
-    decode_decoder_action,
+from magic_ai.text_encoder.decision_spec import AnchorKind, DecisionType  # noqa: E402
+from magic_ai.text_encoder.decoder import GrammarDecoder, GrammarDecoderConfig  # noqa: E402
+from magic_ai.text_encoder.decoder_action import decode_decoder_action  # noqa: E402
+from magic_ai.text_encoder.decoder_batch import DecoderDecisionLayout  # noqa: E402
+from magic_ai.text_encoder.decoder_inference import (  # noqa: E402
     decoder_sample,
     decoder_score_replay,
 )
-from magic_ai.text_encoder.decision_spec import AnchorKind, DecisionType  # noqa: E402
-from magic_ai.text_encoder.decoder import GrammarDecoder, GrammarDecoderConfig  # noqa: E402
 from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE  # noqa: E402
 from magic_ai.text_encoder.policy import TextPolicy  # noqa: E402
 

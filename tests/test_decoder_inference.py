@@ -1,7 +1,7 @@
 """Tests for the autoregressive grammar-decoder sampler / replay scorer.
 
 Scoped to the helpers added in Phase 5 of the inline-blank cutover. The
-end-to-end ``TextActorCritic`` integration lives in Phase 6's tests.
+end-to-end ``LSTMStatefulTextPolicy`` integration lives in Phase 6's tests.
 """
 
 from __future__ import annotations
@@ -9,10 +9,6 @@ from __future__ import annotations
 from typing import cast
 
 import torch
-from magic_ai.text_encoder.actor_critic import (
-    decoder_sample,
-    decoder_score_replay,
-)
 from magic_ai.text_encoder.decision_spec import (
     AnchorKind,
     DecisionType,
@@ -20,6 +16,10 @@ from magic_ai.text_encoder.decision_spec import (
 from magic_ai.text_encoder.decoder import (
     GrammarDecoder,
     GrammarDecoderConfig,
+)
+from magic_ai.text_encoder.decoder_inference import (
+    decoder_sample,
+    decoder_score_replay,
 )
 from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE
 from magic_ai.text_encoder.policy import TextPolicy

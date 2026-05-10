@@ -4,7 +4,10 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 
 ## Files
 - `__init__.py` — Package exports for the tokenizer API.
-- `actor_critic.py` — Training-facing actor-critic wrapper bridging policy outputs to action supervision.
+- `decoder_batch.py` — Wire-shape dataclasses for the grammar-decoder pipeline (`DecoderSampleOutput`, `DecoderReplayScores`, `DecoderDecisionLayout`, `NativeTextDecoderBatch`, `NativeTextSampleBatch`) plus the `native_decoder_batch_from_sample` conversion. Pure data, no policy/engine deps.
+- `decoder_inference.py` — Pure functions over a `TextPolicy`: `decoder_sample` (autoregressive sampling under the grammar mask) and `decoder_score_replay` (teacher-forced per-row log-π + entropy).
+- `decoder_action.py` — Translate a decoded grammar-token sequence into an engine `ActionRequest` (`decode_decoder_action`).
+- `lstm_stateful_text_policy.py` — `LSTMStatefulTextPolicy`: thin wrapper over `RecurrentTextPolicy` that owns live per-env / per-player LSTM state buffers and exposes the polymorphic RL trainer surface (PPO/R-NaD); sampling and replay scoring delegate to `decoder_inference`.
 - `batch.py` — Tokenize snapshots and collate into padded batches with card-ref positions, inline-blank metadata, and (additive) decision-spec tokens, pointer anchors, and legal-edge bitmaps for the grammar decoder via `collate_with_specs`.
 - `card_cache.py` — Pre-tokenized card-body cache (Name/Type/P/T/oracle) keyed by engine card-row IDs.
 - `mlm.py` — Masked-LM pretraining: uint16 .bin token-stream dataset, BERT-style masking, tied LM head, MLMTrainer.

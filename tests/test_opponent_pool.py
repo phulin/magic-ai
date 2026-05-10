@@ -12,7 +12,7 @@ from magic_ai.opponent_pool import (
     opponent_policy_state_dict,
     save_snapshot,
 )
-from magic_ai.text_encoder.actor_critic import TextActorCritic
+from magic_ai.text_encoder.lstm_stateful_text_policy import LSTMStatefulTextPolicy
 from magic_ai.text_encoder.model import TextEncoderConfig
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicyConfig
 
@@ -25,7 +25,7 @@ class _PolicyWithRuntimeBuffers(nn.Module):
         self.register_buffer("live_lstm_c", torch.zeros(1, slots, 8))
 
 
-def _text_policy() -> TextActorCritic:
+def _text_policy() -> LSTMStatefulTextPolicy:
     cfg = RecurrentTextPolicyConfig(
         encoder=TextEncoderConfig(
             vocab_size=16,
@@ -39,7 +39,7 @@ def _text_policy() -> TextActorCritic:
         lstm_hidden=8,
         lstm_layers=1,
     )
-    return TextActorCritic(cfg)
+    return LSTMStatefulTextPolicy(cfg)
 
 
 def test_add_snapshot_uses_default_trueskill_prior_for_each_snapshot() -> None:

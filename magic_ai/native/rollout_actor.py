@@ -35,10 +35,8 @@ from magic_ai.native.inference_server import (
     TextInferenceRequest,
     TextInferenceServer,
 )
-from magic_ai.text_encoder.actor_critic import (
-    DecoderDecisionLayout,
-    decode_decoder_action,
-)
+from magic_ai.text_encoder.decoder_action import decode_decoder_action
+from magic_ai.text_encoder.decoder_batch import DecoderDecisionLayout
 
 if TYPE_CHECKING:
     from magic_ai.slot_encoder.native_encoder import NativeBatchEncoder

@@ -14,11 +14,11 @@ from __future__ import annotations
 import unittest
 
 import torch
-from magic_ai.text_encoder.actor_critic import (
+from magic_ai.text_encoder.batch import PackedTextBatch
+from magic_ai.text_encoder.decoder_batch import (
     NativeTextDecoderBatch,
     native_decoder_batch_from_sample,
 )
-from magic_ai.text_encoder.batch import PackedTextBatch
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from scripts.train import NativeTextTrajectoryBuffer
@@ -43,7 +43,7 @@ def _make_replay_buffer(*, capacity: int = 16) -> TextReplayBuffer:
 
 
 def _make_decoder_batch(b: int, *, l_max: int = 4, n_max: int = 2) -> NativeTextDecoderBatch:
-    from magic_ai.text_encoder.actor_critic import DecoderSampleOutput
+    from magic_ai.text_encoder.decoder_batch import DecoderSampleOutput
 
     sample = DecoderSampleOutput(
         output_token_ids=torch.arange(b * l_max, dtype=torch.long).view(b, l_max) % 5,

@@ -43,12 +43,10 @@ from magic_ai.game_state import (
     PendingOptionState,
     PendingState,
 )
-from magic_ai.text_encoder.actor_critic import (
-    DecoderDecisionLayout,
-    decode_decoder_action,
-    decoder_sample,
-)
 from magic_ai.text_encoder.card_cache import CardTokenCache
+from magic_ai.text_encoder.decoder_action import decode_decoder_action
+from magic_ai.text_encoder.decoder_batch import DecoderDecisionLayout
+from magic_ai.text_encoder.decoder_inference import decoder_sample
 from magic_ai.text_encoder.policy import TextPolicy
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy
 from magic_ai.text_encoder.render import OracleEntry

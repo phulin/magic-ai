@@ -28,12 +28,12 @@ from typing import Any, cast
 import torch
 
 from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
-from magic_ai.text_encoder.actor_critic import (
+from magic_ai.text_encoder.batch import PackedTextBatch
+from magic_ai.text_encoder.decoder_batch import (
     NativeTextDecoderBatch,
-    decoder_sample,
     native_decoder_batch_from_sample,
 )
-from magic_ai.text_encoder.batch import PackedTextBatch
+from magic_ai.text_encoder.decoder_inference import decoder_sample
 
 _PROFILE_SAMPLE_COMPONENTS = os.environ.get("MAGIC_AI_PROFILE_SAMPLE_COMPONENTS") == "1"
 
@@ -316,7 +316,7 @@ def _slice_packed_text_batch(
 
 
 # The protocol the server calls. Concretely this is the decoder-pipeline
-# forward path on ``TextActorCritic`` but parameterizing keeps the server
+# forward path on ``LSTMStatefulTextPolicy`` but parameterizing keeps the server
 # testable against fakes.
 ForwardCallable = Any
 
@@ -1037,7 +1037,7 @@ class TextInferenceServer:
     def __init__(
         self,
         *,
-        sampling_policy: Any,  # TextActorCritic-compatible
+        sampling_policy: Any,  # LSTMStatefulTextPolicy-compatible
         max_batch: int,
         deterministic: bool = False,
         name: str = "text-inference",

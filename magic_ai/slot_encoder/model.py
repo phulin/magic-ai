@@ -73,7 +73,7 @@ from magic_ai.slot_encoder.native_encoder import NativeEncodedBatch
 def _clone_detaching_buffer(module: nn.Module, buffer_attr: str) -> nn.Module:
     """Deep-copy a module while temporarily detaching one nn.Module sub-attribute.
 
-    Used by ``clone_for_rnad`` on both ``PPOPolicy`` and ``TextActorCritic`` to
+    Used by ``clone_for_rnad`` on both ``PPOPolicy`` and ``LSTMStatefulTextPolicy`` to
     share the replay buffer across the online/target/reg copies without
     deep-copying gigabytes of ingested trajectory tensors.
     """

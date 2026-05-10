@@ -323,7 +323,7 @@ class RecurrentTextPolicy(nn.Module):
 
         Used by R-NaD's batched-trajectory path: the encoder forward and the
         per-episode LSTM scan are run once per policy via
-        ``TextActorCritic.precompute_replay_forward``; the resulting ``encoded``
+        ``LSTMStatefulTextPolicy.precompute_replay_forward``; the resulting ``encoded``
         and ``state_hidden`` are then fed here directly so the per-choice scoring
         forward does not re-run the encoder. Wraps the head pass in bf16
         autocast on CUDA so callers can hand in bf16 ``encoded`` directly.

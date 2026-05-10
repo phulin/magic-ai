@@ -99,10 +99,6 @@ from magic_ai.slot_encoder.native_rollout import (  # noqa: E402
     NativeRolloutDriver,  # noqa: F401
     NativeRolloutUnavailable,
 )
-from magic_ai.text_encoder.actor_critic import (  # noqa: E402
-    NativeTextDecoderBatch,
-    TextActorCritic,  # noqa: E402
-)
 
 # Inline-blank → grammar-decoder cutover (Session B):
 #
@@ -114,13 +110,13 @@ from magic_ai.text_encoder.actor_critic import (  # noqa: E402
 #
 # * ``TextDecisionLayout`` / ``build_text_decision_layout`` →
 #   :class:`DecoderDecisionLayout` (sampled directly by
-#   :meth:`TextActorCritic.sample_batch`).
+#   :meth:`LSTMStatefulTextPolicy.sample_batch`).
 # * ``infer_text_trace_kind`` → :func:`_decision_type_to_trace_kind` defined
 #   later in this module.
 # * ``_decode_text_action`` → engine-side translation in Go via
 #   ``mage.batch_step_by_decoder_action``; transcripts use
 #   :func:`decode_decoder_action` from
-#   :mod:`magic_ai.text_encoder.actor_critic`.
+#   :mod:`magic_ai.text_encoder.decoder_action`.
 from magic_ai.text_encoder.card_cache import (  # noqa: E402
     DEFAULT_ORACLE_DB_PATH,
     CardTokenCache,
@@ -130,6 +126,10 @@ from magic_ai.text_encoder.card_cache import (  # noqa: E402
     load_card_cache,
     load_oracle_db,
     save_card_cache,
+)
+from magic_ai.text_encoder.decoder_batch import NativeTextDecoderBatch  # noqa: E402
+from magic_ai.text_encoder.lstm_stateful_text_policy import (  # noqa: E402
+    LSTMStatefulTextPolicy,
 )
 from magic_ai.text_encoder.model import (  # noqa: E402
     DEFAULT_HF_ENCODER_MODEL,
@@ -376,7 +376,7 @@ class SlotTrainingBackend:
 
 @dataclass
 class TextTrainingBackend:
-    policy: TextActorCritic
+    policy: LSTMStatefulTextPolicy
     replay_buffer: TextReplayBuffer
     cache: CardTokenCache
     oracle: dict[str, OracleEntry]
@@ -798,7 +798,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         lstm_hidden=cfg.d_model,
         compile_forward=args.torch_compile,
     )
-    policy = TextActorCritic(recurrent_cfg).to(device)
+    policy = LSTMStatefulTextPolicy(recurrent_cfg).to(device)
     policy.init_lstm_env_states(args.num_envs)
     rollout_capacity = args.rollout_buffer_capacity or int(
         getattr(
@@ -898,9 +898,7 @@ def sample_text_policy_batch(
     an :class:`ActionRequest` via ``decode_decoder_action``.
     """
 
-    from magic_ai.text_encoder.actor_critic import (
-        decode_decoder_action,
-    )
+    from magic_ai.text_encoder.decoder_action import decode_decoder_action
     from magic_ai.text_encoder.policy import TextPolicy
 
     n = len(snapshots)
@@ -3542,7 +3540,7 @@ def train_text_envs(
     opponent_pool: OpponentPool | None = None,
     snapshot_schedule: SnapshotSchedule | None = None,
     retrospective_schedule: RetrospectiveLogSchedule | None = None,
-    opponent_policy: TextActorCritic | None = None,
+    opponent_policy: LSTMStatefulTextPolicy | None = None,
     resume_state: TrainingResumeState | None = None,
 ) -> tuple[TrainingResumeState, None]:
     """Slow Python text-encoder PPO loop.
@@ -3866,7 +3864,7 @@ def train_text_native_batched_envs(
     opponent_pool: OpponentPool | None = None,
     snapshot_schedule: SnapshotSchedule | None = None,
     retrospective_schedule: RetrospectiveLogSchedule | None = None,
-    opponent_policy: TextActorCritic | None = None,
+    opponent_policy: LSTMStatefulTextPolicy | None = None,
     resume_state: TrainingResumeState | None = None,
     resume_checkpoint: dict[str, Any] | None = None,
 ) -> tuple[TrainingResumeState, RNaDTrainerState | None]:
@@ -3917,7 +3915,7 @@ def train_text_native_batched_envs(
             device=backend.policy.device,
         )
         _restore_rnad_state(rnad_state, resume_checkpoint)
-        cast(TextActorCritic, rnad_state.target).init_lstm_env_states(args.num_envs)
+        cast(LSTMStatefulTextPolicy, rnad_state.target).init_lstm_env_states(args.num_envs)
     win_stats = WinFractionStats()
     backend.replay_buffer.reset()
     staging_buffer = NativeTextTrajectoryBuffer(
@@ -3927,8 +3925,10 @@ def train_text_native_batched_envs(
         validate=not getattr(args, "no_validate", False),
     )
     backend.policy.init_lstm_env_states(args.num_envs)
-    sampling_policy: TextActorCritic = (
-        cast(TextActorCritic, rnad_state.target) if rnad_state is not None else backend.policy
+    sampling_policy: LSTMStatefulTextPolicy = (
+        cast(LSTMStatefulTextPolicy, rnad_state.target)
+        if rnad_state is not None
+        else backend.policy
     )
     next_episode_idx = completed_games
     live_games: list[LiveGame] = []
@@ -4555,8 +4555,10 @@ def train_text_native_batched_envs(
 
         num_actors = int(getattr(args, "num_rollout_actors", 1))
         nonlocal sampling_policy
-        publish_source: TextActorCritic = (
-            cast(TextActorCritic, rnad_state.target) if rnad_state is not None else backend.policy
+        publish_source: LSTMStatefulTextPolicy = (
+            cast(LSTMStatefulTextPolicy, rnad_state.target)
+            if rnad_state is not None
+            else backend.policy
         )
         inference_policy = publish_source.clone_for_rnad().to(backend.policy.device)
         inference_policy.init_lstm_env_states(args.num_envs)
