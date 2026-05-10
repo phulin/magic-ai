@@ -1355,16 +1355,14 @@ def _trajectory_loss_from_forwards(
 
         is_bias_step = lp_tgt_scalar - logp_mu_dev
         online_moved_up = lp_online_dt > logp_mu_dev
-        up_count = int(online_moved_up.sum().item())
-        down_count = t_len - up_count
-        if up_count > 0:
-            is_bias_up_sum_t = float(is_bias_step[online_moved_up].sum())
-        else:
-            is_bias_up_sum_t = 0.0
-        if down_count > 0:
-            is_bias_down_sum_t = float(is_bias_step[~online_moved_up].sum())
-        else:
-            is_bias_down_sum_t = 0.0
+        # Sync-free up/down sums: mirror the pattern used by
+        # :func:`_batched_trajectory_loss_from_forwards` so the diagnostics
+        # block doesn't host-sync on ``.item()`` per training step.
+        up_count_t = online_moved_up.to(torch.long).sum()
+        down_count_t = (~online_moved_up).to(torch.long).sum()
+        zeros_b = torch.zeros_like(is_bias_step)
+        is_bias_up_sum_t = torch.where(online_moved_up, is_bias_step, zeros_b).sum()
+        is_bias_down_sum_t = torch.where(~online_moved_up, is_bias_step, zeros_b).sum()
 
     v_target_reg_share_sum_t = torch.zeros((), dtype=dtype, device=device)
     v_target_reg_share_count_t = torch.zeros((), dtype=torch.long, device=device)
@@ -1390,28 +1388,31 @@ def _trajectory_loss_from_forwards(
         v_per_choice = torch.zeros(0, dtype=dtype, device=device)
         base_q_flat = torch.zeros(0, dtype=dtype, device=device)
 
-    may_active_any = bool(pc_online.may_is_active.any().item())
-    if may_active_any:
-        may_logits_step = pc_online.may_logits_per_step.to(dtype=dtype)
-        log_pi_accept = torch.nn.functional.logsigmoid(may_logits_step)
-        log_pi_decline = torch.nn.functional.logsigmoid(-may_logits_step)
-        with torch.no_grad():
-            may_reg_cur_logits = pc_reg_cur.may_logits_per_step.to(dtype=dtype)
-            may_reg_prev_logits = pc_reg_prev.may_logits_per_step.to(dtype=dtype)
-            may_lp_reg_blend_accept = alpha * torch.nn.functional.logsigmoid(may_reg_cur_logits) + (
-                1.0 - alpha
-            ) * torch.nn.functional.logsigmoid(may_reg_prev_logits)
-            may_lp_reg_blend_decline = alpha * torch.nn.functional.logsigmoid(
-                -may_reg_cur_logits
-            ) + (1.0 - alpha) * torch.nn.functional.logsigmoid(-may_reg_prev_logits)
-        log_ratio_accept = log_pi_accept.detach() - may_lp_reg_blend_accept
-        log_ratio_decline = log_pi_decline.detach() - may_lp_reg_blend_decline
-        sampled_is_accept = pc_online.may_selected_per_step > 0.5
-        with torch.no_grad():
-            tgt_p_accept = torch.sigmoid(pc_tgt.may_logits_per_step.to(dtype=dtype))
-            may_mu_sampled = torch.where(sampled_is_accept, tgt_p_accept, 1.0 - tgt_p_accept)
-            may_inv_mu = (1.0 / may_mu_sampled.clamp_min(1e-30)).clamp(max=config.q_corr_rho_bar)
-        may_sampled_log_ratio = torch.where(sampled_is_accept, log_ratio_accept, log_ratio_decline)
+    # May-head setup runs unconditionally — ``may_neurd_loss`` masks padded
+    # positions out by ``may_and_own``, so when no may steps are active the
+    # contribution is exactly zero. Always running avoids a per-call
+    # ``.any().item()`` sync on ``may_is_active``. Mirrors the same
+    # pattern in :func:`_batched_trajectory_loss_from_forwards`.
+    may_logits_step = pc_online.may_logits_per_step.to(dtype=dtype)
+    log_pi_accept = torch.nn.functional.logsigmoid(may_logits_step)
+    log_pi_decline = torch.nn.functional.logsigmoid(-may_logits_step)
+    with torch.no_grad():
+        may_reg_cur_logits = pc_reg_cur.may_logits_per_step.to(dtype=dtype)
+        may_reg_prev_logits = pc_reg_prev.may_logits_per_step.to(dtype=dtype)
+        may_lp_reg_blend_accept = alpha * torch.nn.functional.logsigmoid(may_reg_cur_logits) + (
+            1.0 - alpha
+        ) * torch.nn.functional.logsigmoid(may_reg_prev_logits)
+        may_lp_reg_blend_decline = alpha * torch.nn.functional.logsigmoid(-may_reg_cur_logits) + (
+            1.0 - alpha
+        ) * torch.nn.functional.logsigmoid(-may_reg_prev_logits)
+    log_ratio_accept = log_pi_accept.detach() - may_lp_reg_blend_accept
+    log_ratio_decline = log_pi_decline.detach() - may_lp_reg_blend_decline
+    sampled_is_accept = pc_online.may_selected_per_step > 0.5
+    with torch.no_grad():
+        tgt_p_accept = torch.sigmoid(pc_tgt.may_logits_per_step.to(dtype=dtype))
+        may_mu_sampled = torch.where(sampled_is_accept, tgt_p_accept, 1.0 - tgt_p_accept)
+        may_inv_mu = (1.0 / may_mu_sampled.clamp_min(1e-30)).clamp(max=config.q_corr_rho_bar)
+    may_sampled_log_ratio = torch.where(sampled_is_accept, log_ratio_accept, log_ratio_decline)
 
     # Per-perspective terminal rewards. Zero-sum (engine win/loss,
     # life-tiebreak timeout) flips p1's sign; non-zero-sum (engine draw)
@@ -1494,41 +1495,38 @@ def _trajectory_loss_from_forwards(
 
         # ---- May head: true two-action NeuRD (issue 5) ----
         # Reg blends, log-ratios, and 1/mu are perspective-independent and
-        # hoisted above; only rewards / v_out / is_own change here.
-        if may_active_any:
-            may_and_own = pc_online.may_is_active & is_own
-            may_sampled_inner = (
-                rewards
-                + config.eta * may_sampled_log_ratio
-                + ratio_own_per_step * (v_out.r_hat_next + v_out.v_hat_next)
-                - v_tgt_dt
-            )
-            may_q_sampled_correction = may_inv_mu * may_sampled_inner
-            q_accept = (
-                -config.eta * log_ratio_accept
-                + torch.where(
-                    sampled_is_accept, may_q_sampled_correction, torch.zeros_like(rewards)
-                )
-                + v_tgt_dt
-            )
-            q_decline = (
-                -config.eta * log_ratio_decline
-                + torch.where(
-                    ~sampled_is_accept, may_q_sampled_correction, torch.zeros_like(rewards)
-                )
-                + v_tgt_dt
-            )
-            may_pl_sum, may_pl_count = may_neurd_loss(
-                may_logits=may_logits_step,
-                q_accept=q_accept,
-                q_decline=q_decline,
-                own_turn_may_mask=may_and_own,
-                beta=config.neurd_beta,
-                clip=config.neurd_clip,
-                lr=config.learning_rate,
-            )
-            pl_sum = pl_sum + may_pl_sum
-            pl_count_total += may_pl_count
+        # hoisted above; only rewards / v_out / is_own change here. Runs
+        # unconditionally — the ``may_and_own`` mask zeros out padded
+        # positions when no may steps are active.
+        may_and_own = pc_online.may_is_active & is_own
+        may_sampled_inner = (
+            rewards
+            + config.eta * may_sampled_log_ratio
+            + ratio_own_per_step * (v_out.r_hat_next + v_out.v_hat_next)
+            - v_tgt_dt
+        )
+        may_q_sampled_correction = may_inv_mu * may_sampled_inner
+        q_accept = (
+            -config.eta * log_ratio_accept
+            + torch.where(sampled_is_accept, may_q_sampled_correction, torch.zeros_like(rewards))
+            + v_tgt_dt
+        )
+        q_decline = (
+            -config.eta * log_ratio_decline
+            + torch.where(~sampled_is_accept, may_q_sampled_correction, torch.zeros_like(rewards))
+            + v_tgt_dt
+        )
+        may_pl_sum, may_pl_count = may_neurd_loss(
+            may_logits=may_logits_step,
+            q_accept=q_accept,
+            q_decline=q_decline,
+            own_turn_may_mask=may_and_own,
+            beta=config.neurd_beta,
+            clip=config.neurd_clip,
+            lr=config.learning_rate,
+        )
+        pl_sum = pl_sum + may_pl_sum
+        pl_count_total += may_pl_count
 
         # ---- Decision-group per-action NeuRD with per-group correction ----
         if has_groups:
@@ -1576,10 +1574,10 @@ def _trajectory_loss_from_forwards(
         sampled_log_ratio_sum=v_online.new_tensor(sampled_log_ratio_sum_t),
         sampled_log_ratio_absmax=v_online.new_tensor(sampled_log_ratio_absmax_t),
         sampled_log_ratio_count=sampled_log_ratio_count_t,
-        is_bias_up_sum=v_online.new_tensor(is_bias_up_sum_t),
-        is_bias_up_count=torch.tensor(up_count, dtype=torch.long, device=device),
-        is_bias_down_sum=v_online.new_tensor(is_bias_down_sum_t),
-        is_bias_down_count=torch.tensor(down_count, dtype=torch.long, device=device),
+        is_bias_up_sum=is_bias_up_sum_t.to(dtype=dtype),
+        is_bias_up_count=up_count_t,
+        is_bias_down_sum=is_bias_down_sum_t.to(dtype=dtype),
+        is_bias_down_count=down_count_t,
         v_target_reg_share_sum=v_target_reg_share_sum_t,
         v_target_reg_share_count=v_target_reg_share_count_t,
     )

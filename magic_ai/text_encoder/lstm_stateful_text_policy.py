@@ -80,12 +80,13 @@ class LSTMStatefulTextPolicy(nn.Module):
             self.live_lstm_h[:, base : base + self._players_per_env, :].zero_()
             self.live_lstm_c[:, base : base + self._players_per_env, :].zero_()
 
-    def lstm_env_state_inputs(
+    def _lstm_slots(
         self,
         env_indices: Sequence[int],
         perspective_player_indices: Sequence[int],
-    ) -> tuple[Tensor, Tensor]:
-        slots = torch.tensor(
+    ) -> Tensor:
+        """Build the per-row slot index tensor for live LSTM state buffers."""
+        return torch.tensor(
             [
                 int(e) * self._players_per_env + int(p)
                 for e, p in zip(env_indices, perspective_player_indices, strict=True)
@@ -93,6 +94,16 @@ class LSTMStatefulTextPolicy(nn.Module):
             dtype=torch.long,
             device=self.device,
         )
+
+    def lstm_env_state_inputs(
+        self,
+        env_indices: Sequence[int],
+        perspective_player_indices: Sequence[int],
+        *,
+        slots: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if slots is None:
+            slots = self._lstm_slots(env_indices, perspective_player_indices)
         h_in = self.live_lstm_h.index_select(1, slots).contiguous()
         c_in = self.live_lstm_c.index_select(1, slots).contiguous()
         return h_in, c_in
@@ -103,15 +114,11 @@ class LSTMStatefulTextPolicy(nn.Module):
         perspective_player_indices: Sequence[int],
         h_out: Tensor,
         c_out: Tensor,
+        *,
+        slots: Tensor | None = None,
     ) -> None:
-        slots = torch.tensor(
-            [
-                int(e) * self._players_per_env + int(p)
-                for e, p in zip(env_indices, perspective_player_indices, strict=True)
-            ],
-            dtype=torch.long,
-            device=self.device,
-        )
+        if slots is None:
+            slots = self._lstm_slots(env_indices, perspective_player_indices)
         self.live_lstm_h.index_copy_(1, slots, h_out.to(self.live_lstm_h.dtype))
         self.live_lstm_c.index_copy_(1, slots, c_out.to(self.live_lstm_c.dtype))
 
@@ -131,7 +138,12 @@ class LSTMStatefulTextPolicy(nn.Module):
         tensor needed for PPO importance ratios.
         """
 
-        h_in, c_in = self.lstm_env_state_inputs(env_indices, perspective_player_indices)
+        # Build the slot index tensor once and reuse for the gather and the
+        # subsequent scatter — avoids rebuilding the same tensor twice.
+        slots = self._lstm_slots(env_indices, perspective_player_indices)
+        h_in, c_in = self.lstm_env_state_inputs(
+            env_indices, perspective_player_indices, slots=slots
+        )
         device = self.device
         moved = batch  # caller is expected to have moved the batch already
         # Single encoder forward with history injection + LSTM update;
@@ -139,7 +151,9 @@ class LSTMStatefulTextPolicy(nn.Module):
         encoded, h_out, c_out = self.policy.encoder_forward_padded_with_history(
             moved, h_in=h_in, c_in=c_in
         )
-        self.scatter_lstm_env_states(env_indices, perspective_player_indices, h_out, c_out)
+        self.scatter_lstm_env_states(
+            env_indices, perspective_player_indices, h_out, c_out, slots=slots
+        )
 
         attn_mask = moved.attention_mask.to(device=device, dtype=torch.bool)
         sample = decoder_sample(
@@ -303,23 +317,24 @@ class LSTMStatefulTextPolicy(nn.Module):
         pad_mask = decoder.output_pad_mask.to(dtype=torch.bool)
 
         # Reconstruct per-step subject indices from stored encoder positions via
-        # the per-row pointer-anchor metadata. Vocab steps get -1.
+        # the per-row pointer-anchor metadata. Vocab steps get -1. Built via
+        # a sync-free scatter (see :func:`gpu_grammar` for the same pattern):
+        # invalid (b, j) anchor entries scatter into a trash slot and are
+        # sliced off, so we never need ``valid.any().item()``.
         anchor_pos_dev = batch.decoder.pointer_anchor_positions.to(
             device=encoded.device, dtype=torch.long
         )
         anchor_subj_dev = batch.decoder.pointer_anchor_subjects.to(
             device=encoded.device, dtype=torch.long
         )
-        pos_to_subject_map = torch.full((b, t_enc), -1, dtype=torch.long, device=encoded.device)
         valid_anchor = (anchor_pos_dev >= 0) & (anchor_pos_dev < t_enc) & (anchor_subj_dev >= 0)
-        if int(valid_anchor.any().item()):
-            n_anchors = int(anchor_pos_dev.shape[1])
-            flat_row = (torch.arange(b, device=encoded.device).view(-1, 1).expand(b, n_anchors))[
-                valid_anchor
-            ]
-            pos_to_subject_map[flat_row, anchor_pos_dev[valid_anchor]] = anchor_subj_dev[
-                valid_anchor
-            ]
+        pos_to_subject_full = torch.full(
+            (b, t_enc + 1), -1, dtype=torch.long, device=encoded.device
+        )
+        trash_pos = torch.full_like(anchor_pos_dev, t_enc)
+        safe_pos = torch.where(valid_anchor, anchor_pos_dev, trash_pos)
+        pos_to_subject_full.scatter_(1, safe_pos, anchor_subj_dev)
+        pos_to_subject_map = pos_to_subject_full[:, :t_enc].contiguous()
         target_pointer_subjects = torch.where(
             is_pointer_step,
             pos_to_subject_map.gather(1, target_pointer_pos.clamp_min(0)),
@@ -329,8 +344,8 @@ class LSTMStatefulTextPolicy(nn.Module):
         # Reconstruct grammar masks from stored anchor metadata so the
         # softmax-renormalization matches the sampler — silent all-True
         # masks would compute log-π over the wrong support and corrupt
-        # PPO importance ratios.
-        vocab_mask_cpu, pointer_mask_cpu = build_replay_grammar_masks(
+        # PPO importance ratios. Output is already on ``encoded.device``.
+        vocab_mask, pointer_mask = build_replay_grammar_masks(
             decision_type=batch.decoder.decision_type,
             pointer_anchor_kinds=batch.decoder.pointer_anchor_kinds,
             pointer_anchor_subjects=batch.decoder.pointer_anchor_subjects,
@@ -341,9 +356,8 @@ class LSTMStatefulTextPolicy(nn.Module):
             target_is_pointer=is_pointer_step,
             target_pad_mask=pad_mask,
             encoded_seq_len=t_enc,
+            legal_edge_bitmap=getattr(batch.decoder, "legal_edge_bitmap", None),
         )
-        vocab_mask = vocab_mask_cpu.to(device=encoded.device)
-        pointer_mask = pointer_mask_cpu.to(device=encoded.device)
         scores = decoder_score_replay(
             self.policy.text_policy,
             encoded,
