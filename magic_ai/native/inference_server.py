@@ -61,7 +61,6 @@ class _HeadItemDoesNotFit(Exception):
 class TextInferenceRequest:
     """One actor's encoded batch + per-row routing metadata."""
 
-    native_batch: Any  # NativeEncodedBatch
     packed_batch: PackedTextBatch
     env_indices: list[int]
     perspective_player_indices: list[int]
@@ -109,15 +108,13 @@ class DecoderHostView:
 class TextInferenceReply:
     """Per-actor inference reply for the decoder-shaped IMPALA pipeline.
 
-    The actor reads everything from ``host_decoder`` (decoder fields needed
-    for cgo step, transcript bookkeeping, and per-env staging into the
-    replay buffer). ``decoder_batch`` is kept on the policy device for
-    callers that still want a GPU view (e.g. transcript fallback paths).
-    Per-env encoded snapshots live on the actor side — the actor saves its
-    pre-submit host packed batch in the in-flight record.
+    The actor reads everything from ``host_decoder``: decoder fields
+    needed for cgo step, transcript bookkeeping, and per-env staging into
+    the replay buffer. Per-env encoded snapshots live on the actor side —
+    the actor saves its pre-submit host packed batch in the in-flight
+    record.
     """
 
-    decoder_batch: NativeTextDecoderBatch
     host_decoder: DecoderHostView
     perspective_player_indices: list[int]
     # Per-row LSTM state captured before encode_with_history advanced it.
@@ -126,7 +123,6 @@ class TextInferenceReply:
     lstm_h_in: torch.Tensor | None = None
     lstm_c_in: torch.Tensor | None = None
     inference_policy_version: int = 0
-    ready_event: Any | None = None
     release_item: Any | None = None
 
 
@@ -349,9 +345,9 @@ class _PendingItem:
     """One actor's submitted batch waiting on the inference queue.
 
     The ring holds the item by reference (no arena copy). Per-actor host
-    tensors live inside ``request.packed_batch`` and ``request.native_batch``;
-    the dispatch loop concatenates them on host right before the single
-    ``merged.to(device)`` H→D that feeds the policy forward.
+    tensors live inside ``request.packed_batch``; the dispatch loop
+    concatenates them on host right before the single ``merged.to(device)``
+    H→D that feeds the policy forward.
     """
 
     future: Future[TextInferenceReply]
@@ -868,11 +864,6 @@ class TextInferenceServer:
         if self._timing is not None:
             self._timing.add("server_sample", time.perf_counter() - start)
 
-        ready_event: Any | None = None
-        if decoder_batch.value.device.type == "cuda":
-            ready_event = torch.cuda.Event()
-            ready_event.record(torch.cuda.current_stream(decoder_batch.value.device))
-
         # Stage host copies of the full decoder batch + LSTM state in a
         # single D→H pass per merged batch. Replaces N actors × many
         # ``.cpu()`` syncs and lets the actors stage rows for replay
@@ -911,7 +902,6 @@ class TextInferenceServer:
         for it in items:
             n = len(it.env_indices)
             row_end = row_cursor + n
-            actor_decoder = decoder_batch[row_cursor:row_end]
             # LSTM state is host-side now; per-actor slice is a free view.
             actor_h_in = (
                 h_in_host[:, row_cursor:row_end].contiguous() if h_in_host is not None else None
@@ -938,13 +928,11 @@ class TextInferenceServer:
                 pointer_mask=host_decoder_full.pointer_mask[sl],
             )
             reply = TextInferenceReply(
-                decoder_batch=actor_decoder,
                 host_decoder=actor_host_decoder,
                 perspective_player_indices=list(perspective[row_cursor:row_end]),
                 lstm_h_in=actor_h_in,
                 lstm_c_in=actor_c_in,
                 inference_policy_version=int(policy_version),
-                ready_event=ready_event,
                 release_item=lambda item=it: self._queue.finish_items([item]),
             )
             row_cursor = row_end

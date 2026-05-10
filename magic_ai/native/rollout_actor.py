@@ -104,7 +104,6 @@ class _SubmitBatch:
     ready_games: list[Any]
     ready_players: list[int]
     ready_env_indices: list[int]
-    native_batch: Any
     packed: Any
 
 
@@ -272,7 +271,7 @@ class TextRolloutActor:
         ready_env_indices = [int(env.slot_idx) for env in ready_envs]
 
         start = time.perf_counter()
-        native_batch, nat_outputs = self._encode_packed(ready_games, ready_players)
+        _, nat_outputs = self._encode_packed(ready_games, ready_players)
         self._record_timing("actor_encode", start)
         start = time.perf_counter()
         packed = nat_outputs.to_packed_text_batch(trim=True, derive_token_metadata=True)
@@ -283,7 +282,6 @@ class TextRolloutActor:
             ready_games=ready_games,
             ready_players=ready_players,
             ready_env_indices=ready_env_indices,
-            native_batch=native_batch,
             packed=packed,
         )
         self._submit_batch(batch)
@@ -293,7 +291,6 @@ class TextRolloutActor:
         self._drain_completed_inference()
         start = time.perf_counter()
         request = TextInferenceRequest(
-            native_batch=batch.native_batch,
             packed_batch=batch.packed,
             env_indices=batch.ready_env_indices,
             perspective_player_indices=batch.ready_players,
@@ -302,12 +299,12 @@ class TextRolloutActor:
         if try_submit is None:
             future = self.inference_server.submit(request)
         else:
-            # ``native_batch`` and ``packed`` are views into this actor's
-            # reusable encoder scratch. Retry synchronously until the server
-            # copies them into its arena; do not store the views in the actor
-            # queue and then encode over them. While waiting, drain completed
-            # inference so previous arena slots can be released, then park on
-            # the ring's cond until something changes.
+            # ``packed`` is a view into this actor's reusable encoder
+            # scratch. Retry synchronously until the server copies it into
+            # its arena; do not store the view in the actor queue and then
+            # encode over it. While waiting, drain completed inference so
+            # previous arena slots can be released, then park on the ring's
+            # cond until something changes.
             while True:
                 future = try_submit(request)
                 if future is not None:
@@ -390,8 +387,7 @@ class TextRolloutActor:
         # Build transcripts + RolloutSteps (CPU-only, actor-local) and then
         # advance the engine via the decoder-action batched cgo entry.
         start = time.perf_counter()
-        # All transcript / record_step inputs live in ``host_decoder`` —
-        # the GPU ``reply.decoder_batch`` is no longer touched here.
+        # All transcript / record_step inputs live in ``host_decoder``.
         log_probs_per_row = host.log_probs_sum.tolist()
         values_host = host.value.tolist()
         decision_types_host = [int(x) for x in host.decision_type.tolist()]
