@@ -363,9 +363,24 @@ class TextRolloutActor:
         # advance the engine via the decoder-action batched cgo entry.
         start = time.perf_counter()
         decoder = reply.decoder_batch
-        log_probs_per_row = decoder.log_probs.sum(dim=-1).detach().cpu().tolist()
-        values_host = decoder.value.detach().cpu().tolist()
-        decision_types_host = decoder.decision_type.detach().cpu().tolist()
+        # Fuse the three D→H pulls (log-prob sum, value, decision type) into
+        # one stacked transfer. Three separate .cpu() calls would each force
+        # a stream sync; one stacked copy syncs once.
+        scalars_host = (
+            torch.stack(
+                [
+                    decoder.log_probs.sum(dim=-1).float(),
+                    decoder.value.float(),
+                    decoder.decision_type.float(),
+                ],
+                dim=0,
+            )
+            .detach()
+            .cpu()
+        )
+        log_probs_per_row = scalars_host[0].tolist()
+        values_host = scalars_host[1].tolist()
+        decision_types_host = [int(x) for x in scalars_host[2].tolist()]
         for step_idx, (env, player_idx) in enumerate(
             zip(batch.ready_envs, batch.ready_players, strict=True)
         ):

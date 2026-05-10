@@ -848,8 +848,10 @@ class TextReplayBuffer:
         lstm_c_in: Tensor | None = None,
     ) -> int:
         self._validate_packed_batch_index(encoded, batch_index)
-        start = int(encoded.cu_seqlens[batch_index].item())
-        end = int(encoded.cu_seqlens[batch_index + 1].item())
+        if encoded.seq_lengths_host is None:
+            raise ValueError("packed replay append requires seq_lengths_host")
+        start = sum(int(n) for n in encoded.seq_lengths_host[:batch_index])
+        end = start + int(encoded.seq_lengths_host[batch_index])
         token_width = end - start
         decision_groups = int(decision_option_idx.shape[0])
         stored_decisions = min(decision_groups, self.max_decision_groups)
@@ -1792,8 +1794,12 @@ class TextReplayBuffer:
         batch_index: int,
     ) -> None:
         self._validate_packed_batch_index(encoded, batch_index)
-        start = int(encoded.cu_seqlens[batch_index].item())
-        end = int(encoded.cu_seqlens[batch_index + 1].item())
+        # Avoid syncing on cu_seqlens for every staged row at finish-time.
+        # seq_lengths_host is required by both call paths and is already host data.
+        if encoded.seq_lengths_host is None:
+            raise ValueError("packed replay write requires seq_lengths_host")
+        start = sum(int(n) for n in encoded.seq_lengths_host[:batch_index])
+        end = start + int(encoded.seq_lengths_host[batch_index])
         token_width = end - start
         if token_width > self.max_tokens:
             raise ValueError("encoded packed row token width exceeds buffer max_tokens")
