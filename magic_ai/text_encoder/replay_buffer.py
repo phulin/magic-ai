@@ -49,6 +49,7 @@ class DecoderDecisionPayload:
     output_pointer_pos: Tensor  # [B, L] int32 (-1 fill)
     output_is_pointer: Tensor  # [B, L] bool
     output_pad_mask: Tensor  # [B, L] bool
+    output_log_prob: Tensor  # [B, L] float32 — rollout-time log p of chosen step
     decision_type: Tensor  # [B] int32
     pointer_anchor_positions: Tensor  # [B, N] int32 (-1 fill)
     pointer_anchor_kinds: Tensor  # [B, N] int32 (-1 fill)
@@ -68,6 +69,7 @@ class DecoderGatherOutput:
     output_pointer_pos: Tensor
     output_is_pointer: Tensor
     output_pad_mask: Tensor
+    output_log_prob: Tensor
     decision_type: Tensor
     pointer_anchor_positions: Tensor
     pointer_anchor_kinds: Tensor
@@ -299,6 +301,12 @@ class TextReplayBuffer:
                     "output_pad_mask",
                     torch.bool,
                     fill=False,
+                    inner_shape=(self.max_decoder_len,),
+                ),
+                Field(
+                    "output_log_prob",
+                    torch.float32,
+                    fill=0.0,
                     inner_shape=(self.max_decoder_len,),
                 ),
                 Field("decision_type", torch.int32, fill=-1),
@@ -1403,6 +1411,7 @@ class TextReplayBuffer:
         self.decoder.output_pointer_pos.index_fill_(0, rows, -1)
         self.decoder.output_is_pointer.index_fill_(0, rows, 0)
         self.decoder.output_pad_mask.index_fill_(0, rows, 0)
+        self.decoder.output_log_prob.index_fill_(0, rows, 0.0)
         self.decoder.decision_type.index_fill_(0, rows, -1)
         self.decoder.pointer_anchor_positions.index_fill_(0, rows, -1)
         self.decoder.pointer_anchor_kinds.index_fill_(0, rows, -1)
@@ -1457,6 +1466,9 @@ class TextReplayBuffer:
             self.decoder.output_pad_mask[row_view, col] = payload.output_pad_mask.to(
                 device=dev, dtype=torch.bool
             )
+            self.decoder.output_log_prob[row_view, col] = payload.output_log_prob.to(
+                device=dev, dtype=torch.float32
+            )
 
         self.decoder.decision_type[rows] = payload.decision_type.to(device=dev, dtype=torch.int32)
 
@@ -1497,6 +1509,7 @@ class TextReplayBuffer:
             output_pointer_pos=self.decoder.output_pointer_pos[idx],
             output_is_pointer=self.decoder.output_is_pointer[idx],
             output_pad_mask=self.decoder.output_pad_mask[idx],
+            output_log_prob=self.decoder.output_log_prob[idx],
             decision_type=self.decoder.decision_type[idx],
             pointer_anchor_positions=self.decoder.pointer_anchor_positions[idx],
             pointer_anchor_kinds=self.decoder.pointer_anchor_kinds[idx],

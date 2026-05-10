@@ -214,8 +214,22 @@ def scatter_packed_to_padded(
     )
     d = int(packed_hidden.shape[-1])
     padded = packed_hidden.new_zeros((b, t_max, d))
-    seq_id = batch.seq_id.to(device=device, dtype=torch.long)
-    pos_in_seq = batch.pos_in_seq.to(device=device, dtype=torch.long)
+    # Replay-side gather skips materializing ``seq_id`` / ``pos_in_seq`` on
+    # CUDA (they're cheap to rebuild from ``cu_seqlens``). Reconstruct on
+    # demand so this helper works on both fresh sample-time batches and
+    # gathered replay batches.
+    if int(batch.seq_id.numel()) == int(packed_hidden.shape[0]):
+        seq_id = batch.seq_id.to(device=device, dtype=torch.long)
+        pos_in_seq = batch.pos_in_seq.to(device=device, dtype=torch.long)
+    else:
+        cu = batch.cu_seqlens.to(device=device, dtype=torch.long)
+        total_tokens = int(packed_hidden.shape[0])
+        seq_id = torch.repeat_interleave(
+            torch.arange(b, device=device, dtype=torch.long), seq_lengths
+        )
+        pos_in_seq = torch.arange(total_tokens, device=device, dtype=torch.long) - cu[
+            :-1
+        ].repeat_interleave(seq_lengths)
     padded[seq_id, pos_in_seq] = packed_hidden
     positions = torch.arange(t_max, device=device).unsqueeze(0).expand(b, -1)
     attn_mask = positions < seq_lengths.unsqueeze(-1)

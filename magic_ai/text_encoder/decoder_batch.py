@@ -33,11 +33,21 @@ class DecoderSampleOutput:
 
 @dataclass(frozen=True)
 class DecoderReplayScores:
-    """Result of teacher-forced replay scoring for the grammar decoder."""
+    """Result of teacher-forced replay scoring for the grammar decoder.
+
+    The raw ``vocab_logits`` / ``pointer_logits`` and the masked
+    ``vocab_log_softmax`` / ``pointer_log_softmax`` tensors are exposed so
+    R-NaD's per-choice NeuRD update can build flat (group, choice) tensors
+    against them; PPO discards them and only reads ``per_row_*``.
+    """
 
     per_row_log_pi: Tensor  # [B] sum of per-step log p of stored target
     per_row_entropy: Tensor  # [B] sum of per-step entropy of the stored decision
     per_step_log_pi: Tensor  # [B, L] per-step log p (zeroed at pad positions)
+    vocab_logits: Tensor  # [B, L, V_vocab] raw decoder vocab logits
+    pointer_logits: Tensor  # [B, L, T_enc] raw decoder pointer logits
+    vocab_log_softmax: Tensor  # [B, L, V_vocab] log-softmax under vocab_mask
+    pointer_log_softmax: Tensor  # [B, L, T_enc] log-softmax under pointer_mask
 
 
 @dataclass(frozen=True)

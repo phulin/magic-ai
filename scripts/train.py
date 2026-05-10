@@ -583,6 +583,7 @@ class NativeTextTrajectoryBuffer:
             output_pointer_pos=zero_pos,
             output_is_pointer=merged_decoder.output_is_pointer.to(device=device, dtype=torch.bool),
             output_pad_mask=merged_decoder.output_pad_mask.to(device=device, dtype=torch.bool),
+            output_log_prob=merged_decoder.log_probs.to(device=device, dtype=torch.float32),
             decision_type=merged_decoder.decision_type.to(device=device, dtype=torch.int32),
             pointer_anchor_positions=zero_pos[:, :n_max].clone(),
             pointer_anchor_kinds=anchor_kinds,

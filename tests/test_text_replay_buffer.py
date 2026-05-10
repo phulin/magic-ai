@@ -67,11 +67,13 @@ def _make_payload(
         legal_edge_bitmap[:, 0, 0] = True
     legal_edge_n_blockers = torch.full((batch,), n_blockers, dtype=torch.int32)
     legal_edge_n_attackers = torch.full((batch,), n_attackers, dtype=torch.int32)
+    output_log_prob = torch.zeros(batch, decoder_len, dtype=torch.float32)
     return DecoderDecisionPayload(
         output_token_ids=output_token_ids,
         output_pointer_pos=output_pointer_pos,
         output_is_pointer=output_is_pointer,
         output_pad_mask=output_pad_mask,
+        output_log_prob=output_log_prob,
         decision_type=decision_type,
         pointer_anchor_positions=pointer_anchor_positions,
         pointer_anchor_kinds=pointer_anchor_kinds,

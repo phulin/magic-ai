@@ -201,6 +201,10 @@ def decoder_score_replay(
         per_row_log_pi=step_logp.sum(dim=-1),
         per_row_entropy=step_ent.sum(dim=-1),
         per_step_log_pi=step_logp,
+        vocab_logits=vocab_logits,
+        pointer_logits=pointer_logits,
+        vocab_log_softmax=v_logp,
+        pointer_log_softmax=p_logp,
     )
 
 

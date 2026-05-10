@@ -14,9 +14,11 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
-from magic_ai.text_encoder.batch import TextEncodedBatch
+from magic_ai.replay_decisions import ReplayPerChoice
+from magic_ai.text_encoder.batch import TextEncodedBatch, scatter_packed_to_padded
 from magic_ai.text_encoder.decoder_batch import (
     DecoderDecisionLayout,
+    DecoderReplayScores,
     NativeTextSampleBatch,
 )
 from magic_ai.text_encoder.decoder_inference import (
@@ -64,9 +66,18 @@ class LSTMStatefulTextPolicy(nn.Module):
         return next(self.parameters()).device
 
     def clone_for_rnad(self) -> LSTMStatefulTextPolicy:
-        """Deep-copy the underlying policy weights for R-NaD's target / reg copies."""
+        """Deep-copy the underlying policy weights for R-NaD's target / reg copies.
+
+        The clone shares ``rollout_buffer`` with ``self`` (target/reg policies
+        replay the same trajectories the online policy collected) and starts
+        with empty live LSTM state buffers — clones never sample from a live
+        env, so per-env caches don't apply. See
+        :class:`magic_ai.training_interfaces.RNaDTrainablePolicy.clone_for_rnad`.
+        """
         clone = LSTMStatefulTextPolicy(self.policy.cfg)
         clone.load_state_dict(self.state_dict())
+        clone.to(self.device)
+        clone.rollout_buffer = self.rollout_buffer
         return clone
 
     def init_lstm_env_states(self, num_envs: int, *, players_per_env: int = 2) -> None:
@@ -241,10 +252,16 @@ class LSTMStatefulTextPolicy(nn.Module):
                 "LSTMStatefulTextPolicy.rollout_buffer is None; cannot gather replay decoder."
             )
         if isinstance(replay_rows, Tensor):
-            idx = replay_rows.to(device=self.device, dtype=torch.long)
+            # ``TextReplayBuffer.gather`` needs host row ids for its per-row
+            # token-length lookups; round-trip a non-CPU tensor explicitly.
+            host_rows = (
+                [int(x) for x in replay_rows.tolist()]
+                if replay_rows.device.type == "cpu"
+                else [int(x) for x in replay_rows.cpu().tolist()]
+            )
         else:
-            idx = torch.tensor(list(replay_rows), dtype=torch.long, device=self.device)
-        return self.rollout_buffer.gather(idx)
+            host_rows = [int(x) for x in replay_rows]
+        return self.rollout_buffer.gather(host_rows)
 
     def precompute_replay_forward(
         self,
@@ -285,18 +302,17 @@ class LSTMStatefulTextPolicy(nn.Module):
         active = int((decision_type >= 0).sum().item())
         return active, active
 
-    def evaluate_replay_batch(
-        self,
-        replay_rows: list[int] | Tensor,
-        *,
-        return_extras: bool = False,
-    ) -> tuple[Tensor, Tensor, Tensor, Any | None]:
-        """Per-row ``(log_pi, entropy, value, extras)`` for these replay rows.
+    def _score_replay_rows(
+        self, replay_rows: list[int] | Tensor
+    ) -> tuple[DecoderReplayScores, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Any]:
+        """Shared core for ``evaluate_replay_batch`` and the per-choice variant.
 
-        Used by PPO. ``extras`` is reserved for SPR; the decoder path does
-        not currently emit SPR features so this returns ``None``.
+        Returns the decoder replay scores plus the per-step targets, masks,
+        and value head outputs — everything both PPO and R-NaD downstream
+        paths need. ``batch`` is the gathered replay batch so the per-choice
+        path can also lift stored mu log-probs.
         """
-        del return_extras
+
         batch = self._gather_replay_decoder(replay_rows)
         # Run encoder with the per-row recurrent state recorded at rollout
         # time so train-time scoring matches sample-time exactly. Replay
@@ -310,13 +326,12 @@ class LSTMStatefulTextPolicy(nn.Module):
         encoded_snaps, _h_out, _c_out = self.policy.encode_with_history(
             batch.encoded, h_in=h_in, c_in=c_in
         )
-        encoded = encoded_snaps.encoded
-        # Build the [B, T_enc] attention mask from packed seq lengths.
-        b = int(batch.encoded.seq_lengths.shape[0])
+        # ``encode_with_history`` on a PackedTextBatch returns a packed
+        # ``[T_packed, D]`` hidden tensor; the decoder cross-attn wants the
+        # padded ``[B, T_max, D]`` shape with an explicit attention mask.
+        encoded, attn_mask = scatter_packed_to_padded(encoded_snaps.encoded, batch.encoded)
+        b = int(encoded.shape[0])
         t_enc = int(encoded.shape[1])
-        seq_lengths = batch.encoded.seq_lengths.to(device=encoded.device, dtype=torch.long)
-        positions = torch.arange(t_enc, device=encoded.device).unsqueeze(0).expand(b, -1)
-        attn_mask = positions < seq_lengths.unsqueeze(-1)
 
         decoder = batch.decoder
         target_tokens = decoder.output_token_ids.to(dtype=torch.long).clamp_min(0)
@@ -349,10 +364,6 @@ class LSTMStatefulTextPolicy(nn.Module):
             torch.full_like(target_pointer_pos, -1),
         )
 
-        # Reconstruct grammar masks from stored anchor metadata so the
-        # softmax-renormalization matches the sampler — silent all-True
-        # masks would compute log-π over the wrong support and corrupt
-        # PPO importance ratios. Output is already on ``encoded.device``.
         vocab_mask, pointer_mask = build_replay_grammar_masks(
             decision_type=batch.decoder.decision_type,
             pointer_anchor_kinds=batch.decoder.pointer_anchor_kinds,
@@ -378,7 +389,31 @@ class LSTMStatefulTextPolicy(nn.Module):
             pointer_mask,
         )
         values = self.policy.text_policy.run_heads(encoded_snaps)
-        return scores.per_row_log_pi, scores.per_row_entropy, values.squeeze(-1), None
+        return (
+            scores,
+            values.squeeze(-1),
+            target_tokens,
+            target_pointer_pos,
+            is_pointer_step,
+            pad_mask,
+            vocab_mask,
+            (batch, pointer_mask),
+        )
+
+    def evaluate_replay_batch(
+        self,
+        replay_rows: list[int] | Tensor,
+        *,
+        return_extras: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor, Any | None]:
+        """Per-row ``(log_pi, entropy, value, extras)`` for these replay rows.
+
+        Used by PPO. ``extras`` is reserved for SPR; the decoder path does
+        not currently emit SPR features so this returns ``None``.
+        """
+        del return_extras
+        scores, values, *_ = self._score_replay_rows(replay_rows)
+        return scores.per_row_log_pi, scores.per_row_entropy, values, None
 
     def evaluate_replay_batch_per_choice(
         self,
@@ -387,22 +422,106 @@ class LSTMStatefulTextPolicy(nn.Module):
         lstm_state_override: tuple[Tensor, Tensor] | None = None,
         hidden_override: Tensor | None = None,
         cached: Any | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Any]:
-        """R-NaD per-choice scoring is not implemented for the decoder pipeline.
+    ) -> tuple[Tensor, Tensor, Tensor, ReplayPerChoice]:
+        """R-NaD per-choice scoring over the grammar decoder.
 
-        Slot policy's NeuRD update consumes per-decision-group flat-action
-        logits over a fixed action space. The grammar decoder factors a
-        decision into a variable-length token sequence, so the slot-shaped
-        ``ReplayPerChoice`` payload doesn't have a coherent translation
-        without a redesign of the NeuRD assembly. Until that lands, R-NaD
-        is unsupported on the decoder path; use ``--trainer ppo``.
+        Each active decoder step (``pad_mask``-True position in a replay
+        row) becomes one decision group. Its legal choices are the
+        ``True`` cells of the on-device grammar mask: vocab indices for
+        vocab steps, encoder positions for pointer steps. ``flat_logits``
+        and ``flat_log_probs`` concatenate every (group, legal-choice)
+        pair across the batch in the same order R-NaD's NeuRD update
+        expects from :class:`magic_ai.replay_decisions.ReplayPerChoice`.
+
+        ``lstm_state_override`` / ``hidden_override`` / ``cached`` are
+        accepted for protocol parity with the slot policy. The decoder
+        pipeline always rescans the LSTM from the per-row state stored
+        in the replay buffer (see :meth:`_score_replay_rows`), so all
+        three are ignored.
         """
-        del replay_rows, lstm_state_override, hidden_override, cached
-        raise NotImplementedError(
-            "R-NaD evaluate_replay_batch_per_choice is not wired for the decoder "
-            "pipeline. Use --trainer ppo, or design a per-step NeuRD assembly "
-            "for variable-length decoded sequences before calling this."
+        del lstm_state_override, hidden_override, cached
+        (
+            scores,
+            values,
+            target_tokens,
+            target_pointer_pos,
+            is_pointer_step,
+            pad_mask,
+            vocab_mask,
+            extras,
+        ) = self._score_replay_rows(replay_rows)
+        batch, pointer_mask = extras
+        device = vocab_mask.device
+
+        # ----- Decision groups: one per active decoder step -----
+        # Active cell -> linear group id. ``masked_select`` over a unique
+        # row-major counter gives a sync-free dense mapping.
+        b, l_max = pad_mask.shape
+        group_active = pad_mask  # [B, L] bool
+        # Per-(b,t) integer id (0..G-1) for active cells, -1 elsewhere.
+        active_long = group_active.to(dtype=torch.long)
+        group_ids_dense = active_long.view(-1).cumsum(0) - 1
+        group_ids = group_ids_dense.view(b, l_max)
+        # Flat index list of active (b, t) pairs (one sync via nonzero).
+        active_pos = group_active.nonzero(as_tuple=False)  # [G, 2]
+        g_b = active_pos[:, 0]
+        g_t = active_pos[:, 1]
+        step_for_decision_group = g_b  # batch-step id (0..B-1)
+        behavior_lp_per_group = batch.decoder.output_log_prob.to(device=device, dtype=values.dtype)[
+            g_b, g_t
+        ]
+
+        # ----- Vocab cells: active & !is_pointer & vocab_mask -----
+        vocab_cell_active = (
+            pad_mask.unsqueeze(-1) & (~is_pointer_step).unsqueeze(-1) & vocab_mask
+        )  # [B, L, V]
+        vocab_cells = vocab_cell_active.nonzero(as_tuple=False)  # [Nv, 3]
+        v_b = vocab_cells[:, 0]
+        v_t = vocab_cells[:, 1]
+        v_c = vocab_cells[:, 2]
+        v_logits = scores.vocab_logits[v_b, v_t, v_c]
+        v_logp = scores.vocab_log_softmax[v_b, v_t, v_c]
+        v_group = group_ids[v_b, v_t]
+        v_sampled = v_c == target_tokens[v_b, v_t]
+
+        # ----- Pointer cells: active & is_pointer & pointer_mask -----
+        ptr_cell_active = pad_mask.unsqueeze(-1) & is_pointer_step.unsqueeze(-1) & pointer_mask
+        ptr_cells = ptr_cell_active.nonzero(as_tuple=False)
+        p_b = ptr_cells[:, 0]
+        p_t = ptr_cells[:, 1]
+        p_c = ptr_cells[:, 2]
+        p_logits = scores.pointer_logits[p_b, p_t, p_c]
+        p_logp = scores.pointer_log_softmax[p_b, p_t, p_c]
+        p_group = group_ids[p_b, p_t]
+        p_sampled = p_c == target_pointer_pos[p_b, p_t]
+
+        flat_logits = torch.cat([v_logits, p_logits], dim=0)
+        flat_log_probs = torch.cat([v_logp, p_logp], dim=0)
+        decision_group_id_flat = torch.cat([v_group, p_group], dim=0)
+        is_sampled_flat = torch.cat([v_sampled, p_sampled], dim=0)
+        choice_cols = torch.cat([v_c, p_c], dim=0)
+        group_idx = step_for_decision_group[decision_group_id_flat]
+
+        # Decoder has no "may" Bernoulli head; zero everything so
+        # may_neurd_loss masks itself out via ``may_is_active=False``.
+        may_is_active = torch.zeros(b, dtype=torch.bool, device=device)
+        may_logits_per_step = torch.zeros(b, dtype=values.dtype, device=device)
+        may_selected_per_step = torch.zeros(b, dtype=values.dtype, device=device)
+
+        per_choice = ReplayPerChoice(
+            flat_logits=flat_logits,
+            flat_log_probs=flat_log_probs,
+            group_idx=group_idx,
+            choice_cols=choice_cols,
+            is_sampled_flat=is_sampled_flat,
+            may_is_active=may_is_active,
+            may_logits_per_step=may_logits_per_step,
+            may_selected_per_step=may_selected_per_step,
+            decision_group_id_flat=decision_group_id_flat,
+            step_for_decision_group=step_for_decision_group,
+            behavior_action_log_prob_per_decision_group=behavior_lp_per_group,
         )
+        return scores.per_row_log_pi, scores.per_row_entropy, values, per_choice
 
     def write_ppo_targets(
         self,
