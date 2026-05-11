@@ -151,6 +151,33 @@ class HostPackedArenaTest(unittest.TestCase):
         )
         self._assert_batches_equal(cloned, merged_concat)
 
+    def test_arena_bitmap_grows_with_rows_even_when_blockers_unchanged(self) -> None:
+        # Bug: arena's legal_edge_bitmap first dim is the arena row capacity.
+        # If rows grew but the (blockers, attackers) didn't, the bitmap kept
+        # the old row dim and ``merge`` returned a view shorter (in dim 0)
+        # than seq_lengths for the same merge, causing
+        # ``RuntimeError: The size of tensor a (1024) must match the size
+        # of tensor b (512) at non-singleton dimension 0``.
+        def _with_bitmap(rows: list[int], bk: int, ak: int) -> PackedTextBatch:
+            batch = _make_packed_batch(rows)
+            batch.legal_edge_bitmap = torch.zeros((len(rows), bk, ak), dtype=torch.bool)
+            return batch
+
+        arena = _HostPackedArena(use_pinned=False)
+        # First merge: small row count, real bitmap dims.
+        small = _with_bitmap([2, 3], bk=2, ak=2)
+        merged_small = arena.merge([small])
+        assert merged_small.legal_edge_bitmap is not None
+        self.assertEqual(merged_small.legal_edge_bitmap.shape[0], 2)
+        # Second merge: lots more rows, SAME bitmap dims. Bitmap row capacity
+        # must grow alongside the other row-axis fields.
+        big_rows = [1] * 32
+        big = _with_bitmap(big_rows, bk=2, ak=2)
+        merged_big = arena.merge([big])
+        assert merged_big.legal_edge_bitmap is not None
+        self.assertEqual(merged_big.legal_edge_bitmap.shape[0], len(big_rows))
+        self.assertEqual(merged_big.seq_lengths.shape[0], len(big_rows))
+
     def test_arena_reused_across_merges_smaller_then_larger(self) -> None:
         # First merge populates the arena, second merge with more rows /
         # tokens triggers growth — both results should match concat.

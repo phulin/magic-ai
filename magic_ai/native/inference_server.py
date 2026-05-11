@@ -236,8 +236,15 @@ class _HostPackedArena:
         grow_rows = rows > self._max_rows
         grow_tokens = tokens > self._max_tokens
         grow_anchors = anchors > self._max_anchors
+        # ``grow_rows`` must also trigger ``grow_bitmap`` because the
+        # bitmap's first dim is the arena row capacity — if rows grew but
+        # the bitmap didn't, the bitmap view returned in ``merge`` would
+        # be shorter (in dim 0) than ``seq_lengths`` for the same merge.
         grow_bitmap = need_bitmap and (
-            not self._has_bitmap or blockers > self._max_blockers or attackers > self._max_attackers
+            not self._has_bitmap
+            or grow_rows
+            or blockers > self._max_blockers
+            or attackers > self._max_attackers
         )
 
         if grow_tokens:
@@ -276,8 +283,19 @@ class _HostPackedArena:
             self.pointer_anchor_handles = self._empty(shape, dtype=torch.int32, fill=-1)
             self._max_anchors = new_anchors
         if grow_bitmap:
-            new_blockers = max(blockers, self._max_blockers * 2, 1)
-            new_attackers = max(attackers, self._max_attackers * 2, 1)
+            # Only double the dim that's actually growing; reusing the
+            # existing dim for "rows grew but blockers/attackers didn't"
+            # avoids reallocating the bitmap any larger than necessary.
+            new_blockers = (
+                max(blockers, self._max_blockers * 2, 1)
+                if blockers > self._max_blockers or self._max_blockers == 0
+                else self._max_blockers
+            )
+            new_attackers = (
+                max(attackers, self._max_attackers * 2, 1)
+                if attackers > self._max_attackers or self._max_attackers == 0
+                else self._max_attackers
+            )
             self.legal_edge_bitmap = self._empty(
                 (self._max_rows, new_blockers, new_attackers), dtype=torch.bool, fill=False
             )
