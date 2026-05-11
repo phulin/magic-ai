@@ -32,12 +32,16 @@ from typing import Any, cast
 import torch
 from torch import Tensor
 
+from magic_ai.text_encoder import decoder_inference as _decoder_inference_mod
 from magic_ai.text_encoder.batch import PackedTextBatch, scatter_packed_to_padded
 from magic_ai.text_encoder.decoder_batch import (
     NativeTextDecoderBatch,
     native_decoder_batch_from_sample,
 )
-from magic_ai.text_encoder.decoder_inference import decoder_sample
+from magic_ai.text_encoder.decoder_inference import (
+    _decoder_step_body,
+    decoder_sample,
+)
 from magic_ai.text_encoder.policy import EncodedSnapshots
 
 
@@ -469,14 +473,36 @@ class TextInferencePipeline:
         # it directly as an index into the [B, T_max, D] padded tensor.
         anchor_positions_rowlocal = encoded_device_batch.pointer_anchor_positions
 
+        # Phase F: compile only ONE iteration of decoder_sample's loop
+        # (``_decoder_step_body``), not the L=32-step unroll. Each step is
+        # a small graph so inductor compile is cheap; the outer L-iteration
+        # loop stays Python. Compiled callable is installed by patching
+        # ``_decoder_inference_mod._decoder_step_callable`` so the existing
+        # ``decoder_sample`` body picks it up unchanged.
+        if (
+            self._compile_decoder
+            and device.type == "cuda"
+            and self._compiled_decoder_sample is None
+        ):
+            compiled_step = cast(
+                Callable[..., Any],
+                torch.compile(_decoder_step_body, dynamic=True),
+            )
+
+            def _patched_step_callable(text_policy: Any) -> Callable[..., Any]:
+                gd = text_policy.grammar_decoder
+                if gd is None:
+                    raise RuntimeError("text_policy.grammar_decoder must be configured")
+
+                def step(*args: Any, **kwargs: Any) -> Any:
+                    return compiled_step(gd, *args, **kwargs)
+
+                return step
+
+            cast(Any, _decoder_inference_mod)._decoder_step_callable = _patched_step_callable
+            # Sentinel so we don't reinstall on every call.
+            self._compiled_decoder_sample = compiled_step
         decoder_fn: Callable[..., Any] = decoder_sample
-        if self._compile_decoder and device.type == "cuda":
-            if self._compiled_decoder_sample is None:
-                self._compiled_decoder_sample = cast(
-                    Callable[..., Any],
-                    torch.compile(decoder_sample, dynamic=True),
-                )
-            decoder_fn = self._compiled_decoder_sample
         # Always hand the decoder a fixed-shape bitmap so the compiled
         # decoder_sample doesn't recompile on size-0 vs size-N or
         # varying (n_blk, n_atk). Source can be None, [N, 0, 0], or a

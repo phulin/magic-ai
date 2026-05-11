@@ -13,6 +13,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any, cast
+
 import torch
 from torch import Tensor
 
@@ -21,6 +24,98 @@ from magic_ai.text_encoder.decoder_batch import DecoderReplayScores, DecoderSamp
 from magic_ai.text_encoder.gpu_grammar import GrammarMaskState
 from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE, GrammarVocab
 from magic_ai.text_encoder.policy import TextPolicy
+
+
+def _decoder_step_body(
+    grammar_decoder: Any,
+    state: GrammarMaskState,
+    decoder_state: DecoderState | None,
+    prev_token: Tensor,
+    prev_pointer_pos: Tensor,
+    encoded: Tensor,
+    encoder_attention_mask: Tensor,
+    pos_to_subject_map: Tensor,
+    greedy: bool,
+    temperature: float,
+) -> tuple[
+    Tensor,  # vocab_mask
+    Tensor,  # pointer_mask
+    Tensor,  # structural_tok (PAD on pointer steps, sampled vocab otherwise)
+    Tensor,  # sampled_pointer
+    Tensor,  # sampled_vocab (raw, kept for state.update)
+    Tensor,  # gathered_subj
+    Tensor,  # is_pointer_step
+    Tensor,  # valid_step
+    Tensor,  # step_log_prob
+    DecoderState,  # next decoder_state (always non-None on return)
+]:
+    """One step of ``decoder_sample``'s loop.
+
+    Factored out so :class:`TextInferencePipeline` can ``torch.compile`` a
+    small graph (per-step ops) instead of the 32-iteration unroll, which
+    cuts inductor compile time roughly L× at the cost of losing
+    inter-step fusion. The grammar state's ``update`` and the
+    write-into-output-tensors live in the outer Python loop.
+    """
+    valid_step = ~state.ended
+    vocab_mask, pointer_mask = state.next_mask()
+    vocab_logits, pointer_logits, decoder_state = grammar_decoder.step(
+        prev_token, prev_pointer_pos, encoded, encoder_attention_mask, decoder_state
+    )
+    is_pointer_step = ~vocab_mask.any(dim=-1)
+    sampled_vocab, sampled_pointer = combined_sample(
+        vocab_logits,
+        pointer_logits,
+        vocab_mask,
+        pointer_mask,
+        is_pointer_step,
+        greedy=greedy,
+        temperature=temperature,
+    )
+    neg_inf = torch.finfo(vocab_logits.dtype).min
+    v_logp = torch.log_softmax(vocab_logits.masked_fill(~vocab_mask, neg_inf), dim=-1)
+    p_logp = torch.log_softmax(pointer_logits.masked_fill(~pointer_mask, neg_inf), dim=-1)
+    v_chosen = v_logp.gather(-1, sampled_vocab.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+    p_chosen = p_logp.gather(-1, sampled_pointer.clamp_min(0).unsqueeze(-1)).squeeze(-1)
+    step_log_prob = torch.where(is_pointer_step, p_chosen, v_chosen)
+    structural_tok = torch.where(
+        is_pointer_step,
+        torch.full_like(sampled_vocab, int(GrammarVocab.PAD)),
+        sampled_vocab,
+    )
+    safe_pointer = sampled_pointer.clamp_min(0)
+    gathered_subj = pos_to_subject_map.gather(1, safe_pointer.unsqueeze(-1)).squeeze(-1)
+    return (
+        vocab_mask,
+        pointer_mask,
+        structural_tok,
+        sampled_pointer,
+        sampled_vocab,
+        gathered_subj,
+        is_pointer_step,
+        valid_step,
+        step_log_prob,
+        cast(DecoderState, decoder_state),
+    )
+
+
+def _decoder_step_callable(text_policy: TextPolicy) -> Callable[..., Any]:
+    """Return a closure binding ``grammar_decoder`` to a step function.
+
+    The returned callable is what ``decoder_sample`` calls per iteration.
+    :class:`TextInferencePipeline` can monkey-patch ``decoder_inference._decoder_step_callable``
+    to replace it with a ``torch.compile``-wrapped variant (see
+    Phase F).
+    """
+
+    grammar_decoder = text_policy.grammar_decoder
+    if grammar_decoder is None:
+        raise RuntimeError("text_policy.grammar_decoder must be configured")
+
+    def step(*args: Any, **kwargs: Any) -> Any:
+        return _decoder_step_body(grammar_decoder, *args, **kwargs)
+
+    return step
 
 
 def decoder_sample(
@@ -89,52 +184,34 @@ def decoder_sample(
     prev_token = torch.full((b,), int(GrammarVocab.PAD), dtype=torch.long, device=device)
     prev_pointer_pos = torch.full((b,), -1, dtype=torch.long, device=device)
 
+    step_fn = _decoder_step_callable(text_policy)
     for step in range(L):
-        valid_step = ~state.ended
-        vocab_mask, pointer_mask = state.next_mask()
-        out_vocab_mask[:, step, :] = vocab_mask
-        out_pointer_mask[:, step, :] = pointer_mask
-
-        vocab_logits, pointer_logits, decoder_state = grammar_decoder.step(
-            prev_token, prev_pointer_pos, encoded, encoder_attention_mask, decoder_state
-        )
-
-        is_pointer_step = ~vocab_mask.any(dim=-1)
-
-        sampled_vocab, sampled_pointer = combined_sample(
-            vocab_logits,
-            pointer_logits,
+        (
             vocab_mask,
             pointer_mask,
-            is_pointer_step,
-            greedy=greedy,
-            temperature=temperature,
-        )
-
-        neg_inf = torch.finfo(vocab_logits.dtype).min
-        v_logp = torch.log_softmax(vocab_logits.masked_fill(~vocab_mask, neg_inf), dim=-1)
-        p_logp = torch.log_softmax(pointer_logits.masked_fill(~pointer_mask, neg_inf), dim=-1)
-        v_chosen = v_logp.gather(-1, sampled_vocab.clamp_min(0).unsqueeze(-1)).squeeze(-1)
-        p_chosen = p_logp.gather(-1, sampled_pointer.clamp_min(0).unsqueeze(-1)).squeeze(-1)
-        step_log_prob = torch.where(is_pointer_step, p_chosen, v_chosen)
-
-        # Store the structural token the decoder actually embeds at this
-        # step: PAD on pointer steps (matches the ``prev_token`` fed into
-        # the next iteration below). Storing the raw ``sampled_vocab`` would
-        # leak combined_sample's -1 sentinel through the replay buffer and
-        # OOB the embedding gather in teacher-forced replay scoring.
-        structural_tok = torch.where(
-            is_pointer_step,
-            torch.full_like(sampled_vocab, int(GrammarVocab.PAD)),
+            structural_tok,
+            sampled_pointer,
             sampled_vocab,
+            gathered_subj,
+            is_pointer_step,
+            valid_step,
+            step_log_prob,
+            decoder_state,
+        ) = step_fn(
+            state,
+            decoder_state,
+            prev_token,
+            prev_pointer_pos,
+            encoded,
+            encoder_attention_mask,
+            pos_to_subject_map,
+            greedy,
+            temperature,
         )
+        out_vocab_mask[:, step, :] = vocab_mask
+        out_pointer_mask[:, step, :] = pointer_mask
         out_tokens[:, step] = structural_tok
         out_pointer_pos[:, step] = sampled_pointer
-        # Translate encoder position → subject_index via the per-row dense map.
-        # Vocab steps gather a value too but we mask them to -1 so the wire
-        # shape carries clean -1 fill.
-        safe_pointer = sampled_pointer.clamp_min(0)
-        gathered_subj = pos_to_subject_map.gather(1, safe_pointer.unsqueeze(-1)).squeeze(-1)
         out_pointer_subjects[:, step] = torch.where(
             is_pointer_step & valid_step,
             gathered_subj,
@@ -144,10 +221,9 @@ def decoder_sample(
         out_pad_mask[:, step] = valid_step
         out_log_probs[:, step] = step_log_prob.where(valid_step, torch.zeros_like(step_log_prob))
 
-        # Advance the grammar state, then update the decoder's prev-token
-        # inputs. Pointer steps feed PAD as the structural token (matches
-        # teacher-forced training, where the decoder embeds the structural
-        # token, not pointer info).
+        # Advance grammar state on the host side of the loop (outside the
+        # compiled step) so the compiled body has no in-place side effects
+        # — those are awkward for Dynamo and add guards.
         state.update(sampled_vocab, sampled_pointer, is_pointer_step)
         prev_token = structural_tok
         prev_pointer_pos = sampled_pointer
