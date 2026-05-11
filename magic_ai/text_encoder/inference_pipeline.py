@@ -415,6 +415,12 @@ class TextInferencePipeline:
                     torch.compile(decoder_sample, dynamic=True),
                 )
             decoder_fn = self._compiled_decoder_sample
+        # Pass None for zero-sized bitmap placeholders so Dynamo doesn't
+        # specialize on shape (and recompile every time the bitmap toggles
+        # between ``[B, 0, 0]`` and a real combat shape).
+        bitmap = encoded_device_batch.legal_edge_bitmap
+        if bitmap is not None and (bitmap.shape[1] == 0 or bitmap.shape[2] == 0):
+            bitmap = None
         sample = decoder_fn(
             text_policy,
             encoded,
@@ -424,7 +430,7 @@ class TextInferencePipeline:
             encoded_device_batch.pointer_anchor_kinds.to(device=device, dtype=torch.long),
             encoded_device_batch.pointer_anchor_subjects.to(device=device, dtype=torch.long),
             encoded_device_batch.pointer_anchor_handles.to(device=device, dtype=torch.long),
-            legal_edge_bitmap=encoded_device_batch.legal_edge_bitmap,
+            legal_edge_bitmap=bitmap,
             greedy=self._deterministic,
         )
         value = text_policy.run_heads(encoded_snaps)
