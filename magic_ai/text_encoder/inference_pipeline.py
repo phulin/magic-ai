@@ -62,6 +62,13 @@ DEFAULT_BUCKETS: tuple[tuple[int, int], ...] = (
 # outputs are sliced away before the decoder runs.
 _PAD_TOKEN_ID = 0
 
+# Constant bitmap shape used in the bucketed path so the compiled decoder
+# sees one (n_blockers, n_attackers) variant. Matches the replay buffer's
+# default ``max_blockers`` / ``max_attackers`` (=16). Real combat bitmaps
+# bigger than this would be truncated — assert at copy time.
+_BUCKET_BITMAP_BLOCKERS = 16
+_BUCKET_BITMAP_ATTACKERS = 16
+
 
 def _select_bucket(
     rows: int, tokens: int, buckets: tuple[tuple[int, int], ...]
@@ -158,12 +165,25 @@ def _pad_packed_to_bucket(
     )
     seq_lengths_host = seq_lengths_host + tuple(int(x) for x in dummy_lens.tolist())
 
-    bitmap: Tensor | None = None
+    # Always materialize a constant-shape bitmap so the compiled decoder
+    # sees one shape variant. ``None`` flips a dynamo guard; varying real
+    # (n_blk, n_atk) does too. Zero-fill the buffer then copy the source
+    # values (if any) into the top-left corner — for non-combat batches
+    # this leaves an all-False bitmap, which GrammarMaskState's edge gather
+    # short-circuits via the ``kind_match`` AND below.
+    bitmap = torch.zeros(
+        (bucket_rows, _BUCKET_BITMAP_BLOCKERS, _BUCKET_BITMAP_ATTACKERS), dtype=torch.bool
+    )
     if packed.legal_edge_bitmap is not None:
         bk = int(packed.legal_edge_bitmap.shape[1])
         ak = int(packed.legal_edge_bitmap.shape[2])
-        bitmap = torch.zeros((bucket_rows, bk, ak), dtype=torch.bool)
-        bitmap[:real_rows].copy_(packed.legal_edge_bitmap)
+        if bk > _BUCKET_BITMAP_BLOCKERS or ak > _BUCKET_BITMAP_ATTACKERS:
+            raise ValueError(
+                f"legal_edge_bitmap shape ({bk},{ak}) exceeds bucket cap "
+                f"({_BUCKET_BITMAP_BLOCKERS},{_BUCKET_BITMAP_ATTACKERS})"
+            )
+        if bk > 0 and ak > 0:
+            bitmap[:real_rows, :bk, :ak].copy_(packed.legal_edge_bitmap)
 
     return PackedTextBatch(
         token_ids=token_ids,
@@ -415,12 +435,6 @@ class TextInferencePipeline:
                     torch.compile(decoder_sample, dynamic=True),
                 )
             decoder_fn = self._compiled_decoder_sample
-        # Pass None for zero-sized bitmap placeholders so Dynamo doesn't
-        # specialize on shape (and recompile every time the bitmap toggles
-        # between ``[B, 0, 0]`` and a real combat shape).
-        bitmap = encoded_device_batch.legal_edge_bitmap
-        if bitmap is not None and (bitmap.shape[1] == 0 or bitmap.shape[2] == 0):
-            bitmap = None
         sample = decoder_fn(
             text_policy,
             encoded,
@@ -430,7 +444,7 @@ class TextInferencePipeline:
             encoded_device_batch.pointer_anchor_kinds.to(device=device, dtype=torch.long),
             encoded_device_batch.pointer_anchor_subjects.to(device=device, dtype=torch.long),
             encoded_device_batch.pointer_anchor_handles.to(device=device, dtype=torch.long),
-            legal_edge_bitmap=bitmap,
+            legal_edge_bitmap=encoded_device_batch.legal_edge_bitmap,
             greedy=self._deterministic,
         )
         value = text_policy.run_heads(encoded_snaps)
