@@ -308,11 +308,16 @@ class TextInferencePipeline:
         existing = self._compiled_encoders.get(bucket)
         if existing is not None:
             return existing
+        # mode="default" — inductor fusion without CUDA-Graph capture +
+        # autotuning. "reduce-overhead" gives the launch-overhead win but
+        # costs ~minutes per bucket of compile time; default mode finishes
+        # in seconds and is the right tradeoff while we iterate. Flip back
+        # to "reduce-overhead" once buckets + cache are stable.
         compiled = cast(
             Callable[..., Any],
             torch.compile(
                 recurrent_policy._encode_with_history_impl,
-                mode="reduce-overhead",
+                mode="default",
                 dynamic=False,
                 fullgraph=False,
             ),
