@@ -124,14 +124,25 @@ class PolicyVersionManager:
             return version
 
     def reset_lstm_env_states(self, env_indices: list[int]) -> None:
+        # Don't wait for active readers: the slots being reset have just
+        # been freed (game finished, slot recycled) and by construction
+        # are disjoint from any in-flight inference's env_indices, so the
+        # writes don't race the readers. Waiting on _active_readers > 0
+        # deadlocks under slow first-call compiles (the server thread
+        # holds the reader counter for the whole compile). We still wait
+        # on _swapping to serialize with publish_from_online, which IS a
+        # global write.
         with self._cond:
-            while self._active_readers > 0 or self._swapping:
+            while self._swapping:
                 self._cond.wait()
             self._swapping = True
+        try:
             cast(Any, self._active).reset_lstm_env_states(env_indices)
             cast(Any, self._inactive).reset_lstm_env_states(env_indices)
-            self._swapping = False
-            self._cond.notify_all()
+        finally:
+            with self._cond:
+                self._swapping = False
+                self._cond.notify_all()
 
 
 __all__ = ["PolicyVersionManager"]
