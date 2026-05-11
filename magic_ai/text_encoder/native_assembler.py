@@ -521,10 +521,35 @@ def encode_tokens_packed(
     if int(spec_out.spec_overflow) != 0:
         from magic_ai.slot_encoder.native_encoder import NativeEncodingError
 
+        t_spec_max = int(outputs.spec_tokens.shape[1])
+        n_anchors_max = int(outputs.pointer_anchor_positions.shape[1])
+        spec_lens = outputs.spec_lens[:batch_size].tolist()
+        anchor_counts = outputs.pointer_anchor_counts[:batch_size].tolist()
+        decision_types = outputs.decision_type[:batch_size].tolist()
+        # The native side may either record the attempted length (>cap) or
+        # clamp to the cap on overflow; treat ``>=`` as suspect either way.
+        offenders = [
+            {
+                "row": i,
+                "decision_type": int(decision_types[i]),
+                "spec_len": int(spec_lens[i]),
+                "anchor_count": int(anchor_counts[i]),
+                "spec_at_cap": int(spec_lens[i]) >= t_spec_max,
+                "anchors_at_cap": int(anchor_counts[i]) >= n_anchors_max,
+            }
+            for i in range(batch_size)
+            if int(spec_lens[i]) >= t_spec_max or int(anchor_counts[i]) >= n_anchors_max
+        ]
+        max_spec_len = max((o["spec_len"] for o in offenders), default=0)
+        max_anchor_count = max((o["anchor_count"] for o in offenders), default=0)
+        # Cap the offender list so the message stays readable on big batches.
+        sample = offenders[:8]
+        more = f" (+{len(offenders) - len(sample)} more)" if len(offenders) > len(sample) else ""
         raise NativeEncodingError(
-            f"MageEncodeDecisionSpec spec_overflow={int(spec_out.spec_overflow)}: "
-            f"per-row spec exceeded T_spec_max={int(outputs.spec_tokens.shape[1])} "
-            f"or N_anchors_max={int(outputs.pointer_anchor_positions.shape[1])}"
+            f"MageEncodeDecisionSpec spec_overflow=1: "
+            f"T_spec_max={t_spec_max} (observed max spec_len={max_spec_len}), "
+            f"N_anchors_max={n_anchors_max} (observed max anchor_count={max_anchor_count}); "
+            f"{len(offenders)} offending row(s){more}: {sample}"
         )
 
     # Third pass: rewrite the packed token stream so each row's spec tokens
