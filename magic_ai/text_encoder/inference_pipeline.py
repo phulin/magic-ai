@@ -440,6 +440,22 @@ class TextInferencePipeline:
                     torch.compile(decoder_sample, dynamic=True),
                 )
             decoder_fn = self._compiled_decoder_sample
+        # Always hand the decoder a fixed-shape bitmap so the compiled
+        # decoder_sample doesn't recompile on size-0 vs size-N or
+        # varying (n_blk, n_atk). Source can be None, [N, 0, 0], or a
+        # real combat shape — all collapse to [B, 16, 16] here.
+        b_real = int(encoded_device_batch.seq_lengths.shape[0])
+        bitmap = torch.zeros(
+            (b_real, _BUCKET_BITMAP_BLOCKERS, _BUCKET_BITMAP_ATTACKERS),
+            dtype=torch.bool,
+            device=device,
+        )
+        src_bitmap = encoded_device_batch.legal_edge_bitmap
+        if src_bitmap is not None:
+            bk = min(int(src_bitmap.shape[1]), _BUCKET_BITMAP_BLOCKERS)
+            ak = min(int(src_bitmap.shape[2]), _BUCKET_BITMAP_ATTACKERS)
+            if bk > 0 and ak > 0:
+                bitmap[:, :bk, :ak].copy_(src_bitmap[:, :bk, :ak])
         sample = decoder_fn(
             text_policy,
             encoded,
@@ -449,7 +465,7 @@ class TextInferencePipeline:
             encoded_device_batch.pointer_anchor_kinds.to(device=device, dtype=torch.long),
             encoded_device_batch.pointer_anchor_subjects.to(device=device, dtype=torch.long),
             encoded_device_batch.pointer_anchor_handles.to(device=device, dtype=torch.long),
-            legal_edge_bitmap=encoded_device_batch.legal_edge_bitmap,
+            legal_edge_bitmap=bitmap,
             greedy=self._deterministic,
         )
         value = text_policy.run_heads(encoded_snaps)
