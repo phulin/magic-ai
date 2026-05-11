@@ -182,7 +182,12 @@ def _pad_packed_to_bucket(
         legal_edge_bitmap=bitmap,
         total_tokens=bucket_tokens,
         seq_lengths_host=seq_lengths_host,
-        max_seqlen=max(seq_lengths_host, default=0),
+        # Pin to the bucket's total tokens — a safe upper bound (no single
+        # sequence can exceed the total). flash_attn uses ``max_seqlen``
+        # for scratch sizing; over-shooting is correct, just slightly more
+        # memory. Critically, holding it constant per bucket stops
+        # Dynamo from specializing on a different Python int per call.
+        max_seqlen=bucket_tokens,
     )
 
 
