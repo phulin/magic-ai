@@ -24,6 +24,7 @@ the decoder separately.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
@@ -299,6 +300,10 @@ class TextInferencePipeline:
         # still fuse the per-step ops, cutting per-iteration launches.
         self._compile_decoder = bool(compile_decoder)
         self._compiled_decoder_sample: Callable[..., Any] | None = None
+        # Track whether we've printed the timing line for each (bucket /
+        # decoder) compile so we don't keep printing on steady-state calls.
+        self._encoder_first_call_done: set[tuple[int, int]] = set()
+        self._decoder_first_call_done: bool = False
 
     # --- Bucketed encoder forward -------------------------------------
 
@@ -313,6 +318,10 @@ class TextInferencePipeline:
         # costs ~minutes per bucket of compile time; default mode finishes
         # in seconds and is the right tradeoff while we iterate. Flip back
         # to "reduce-overhead" once buckets + cache are stable.
+        #
+        # Note: torch.compile itself just wraps the fn; the actual compile
+        # work fires on the first call with new shapes. Time at call site
+        # instead — see ``_bucketed_encoder_forward``.
         compiled = cast(
             Callable[..., Any],
             torch.compile(
@@ -324,6 +333,23 @@ class TextInferencePipeline:
         )
         self._compiled_encoders[bucket] = compiled
         return compiled
+
+    @staticmethod
+    def _timed_first_call(label: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run ``fn(*args, **kwargs)``, syncing CUDA before/after and printing
+        elapsed wall-clock. Use to surface first-call torch.compile cost."""
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        result = fn(*args, **kwargs)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        print(
+            f"[inference_pipeline] {label} first-call elapsed={elapsed:.2f}s",
+            flush=True,
+        )
+        return result
 
     def _bucketed_encoder_forward(
         self,
@@ -364,8 +390,19 @@ class TextInferencePipeline:
         h_padded[:, :real_rows].copy_(h_in.to(device))
         c_padded[:, :real_rows].copy_(c_in.to(device))
 
+        first_call = bucket not in self._encoder_first_call_done
         compiled = self._compiled_encoder_for_bucket(recurrent_policy, bucket)
-        encoded_padded, h_out_padded, c_out_padded = compiled(padded_device, h_padded, c_padded)
+        if first_call:
+            encoded_padded, h_out_padded, c_out_padded = self._timed_first_call(
+                f"bucket encoder {bucket}",
+                compiled,
+                padded_device,
+                h_padded,
+                c_padded,
+            )
+            self._encoder_first_call_done.add(bucket)
+        else:
+            encoded_padded, h_out_padded, c_out_padded = compiled(padded_device, h_padded, c_padded)
 
         encoded, h_out, c_out = _slice_encoded_to_live(
             encoded_padded,
@@ -456,7 +493,7 @@ class TextInferencePipeline:
             ak = min(int(src_bitmap.shape[2]), _BUCKET_BITMAP_ATTACKERS)
             if bk > 0 and ak > 0:
                 bitmap[:, :bk, :ak].copy_(src_bitmap[:, :bk, :ak])
-        sample = decoder_fn(
+        decoder_args = (
             text_policy,
             encoded,
             attn_mask,
@@ -465,9 +502,18 @@ class TextInferencePipeline:
             encoded_device_batch.pointer_anchor_kinds.to(device=device, dtype=torch.long),
             encoded_device_batch.pointer_anchor_subjects.to(device=device, dtype=torch.long),
             encoded_device_batch.pointer_anchor_handles.to(device=device, dtype=torch.long),
-            legal_edge_bitmap=bitmap,
-            greedy=self._deterministic,
         )
+        decoder_kwargs: dict[str, Any] = {
+            "legal_edge_bitmap": bitmap,
+            "greedy": self._deterministic,
+        }
+        if self._compile_decoder and not self._decoder_first_call_done:
+            sample = self._timed_first_call(
+                "decoder_sample", decoder_fn, *decoder_args, **decoder_kwargs
+            )
+            self._decoder_first_call_done = True
+        else:
+            sample = decoder_fn(*decoder_args, **decoder_kwargs)
         value = text_policy.run_heads(encoded_snaps)
         return InferenceOutput(
             decoder=native_decoder_batch_from_sample(sample, value=value),
