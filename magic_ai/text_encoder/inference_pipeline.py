@@ -484,6 +484,15 @@ class TextInferencePipeline:
             and device.type == "cuda"
             and self._compiled_decoder_sample is None
         ):
+            # Duck-shape inference notices that distinct dims happen to share
+            # a value on the first trace (e.g. ``cross_k.stride(0) == B*T_enc``)
+            # and bakes that equation into a guard, triggering a recompile any
+            # time the equation breaks. dynamo itself recommends this knob in
+            # the recompile diagnostic ("to avoid this specialization, set
+            # torch.fx.experimental._config.use_duck_shape = False").
+            import torch.fx.experimental._config as _fx_cfg  # noqa: PLC0415
+
+            cast(Any, _fx_cfg).use_duck_shape = False
             compiled_step = cast(
                 Callable[..., Any],
                 torch.compile(_decoder_step_body, dynamic=True),
