@@ -794,12 +794,23 @@ class _MLP(nn.Module):
 
 
 class ValueHead(nn.Module):
+    """Deeper value head: residual MLP block + LayerNorm + projection to scalar.
+
+    The original 1-MLP head saturated near the global target mean during
+    Forge MC pretraining (per-batch v_pred std ≈ 0.02 vs target std ≈ 0.5).
+    The extra capacity lets the head separate winning vs losing trajectories
+    given the per-position state vector.
+    """
+
     def __init__(self, d_model: int) -> None:
         super().__init__()
-        self.mlp = _MLP(d_model, d_model, 1)
+        self.mlp1 = _MLP(d_model, d_model * 2, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.mlp2 = _MLP(d_model, d_model, 1)
 
     def forward(self, state_vec: Tensor) -> Tensor:
-        return self.mlp(state_vec).squeeze(-1)
+        x = self.norm(state_vec + self.mlp1(state_vec))
+        return self.mlp2(x).squeeze(-1)
 
 
 __all__ = [
