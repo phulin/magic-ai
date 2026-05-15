@@ -583,53 +583,6 @@ def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBat
     )
 
 
-def _slice_packed_text_batch(
-    batch: PackedTextBatch,
-    *,
-    row_start: int,
-    row_end: int,
-    token_start: int,
-    token_end: int,
-) -> PackedTextBatch:
-    seq_lengths = batch.seq_lengths[row_start:row_end]
-    seq_lengths_host = (
-        batch.seq_lengths_host[row_start:row_end] if batch.seq_lengths_host is not None else None
-    )
-    if seq_lengths_host is None:
-        raise ValueError("packed batch slicing requires seq_lengths_host")
-    token_ids = batch.token_ids[token_start:token_end]
-    cu_seqlens = batch.cu_seqlens[row_start : row_end + 1].to(torch.int32) - int(token_start)
-    total_tokens = int(token_end - token_start)
-    seq_id = batch.seq_id[token_start:token_end] - int(row_start)
-    pos_in_seq = batch.pos_in_seq[token_start:token_end]
-    state_positions = batch.state_positions[row_start:row_end].to(torch.int32) - int(token_start)
-    return PackedTextBatch(
-        token_ids=token_ids,
-        seq_id=seq_id,
-        pos_in_seq=pos_in_seq,
-        cu_seqlens=cu_seqlens,
-        seq_lengths=seq_lengths,
-        state_positions=state_positions,
-        # card_ref / anchor positions are row-local end-to-end; slicing
-        # the row range is enough — no token_start shift needed.
-        card_ref_positions=batch.card_ref_positions[row_start:row_end],
-        total_tokens=total_tokens,
-        seq_lengths_host=seq_lengths_host,
-        spec_lens=batch.spec_lens[row_start:row_end],
-        decision_type=batch.decision_type[row_start:row_end],
-        pointer_anchor_positions=batch.pointer_anchor_positions[row_start:row_end],
-        pointer_anchor_kinds=batch.pointer_anchor_kinds[row_start:row_end],
-        pointer_anchor_subjects=batch.pointer_anchor_subjects[row_start:row_end],
-        pointer_anchor_handles=batch.pointer_anchor_handles[row_start:row_end],
-        legal_edge_bitmap=(
-            batch.legal_edge_bitmap[row_start:row_end]
-            if batch.legal_edge_bitmap is not None
-            else None
-        ),
-        max_seqlen=max(seq_lengths_host, default=0) if seq_lengths_host is not None else None,
-    )
-
-
 # The protocol the server calls. Concretely this is the decoder-pipeline
 # forward path on ``LSTMStatefulTextPolicy`` but parameterizing keeps the server
 # testable against fakes.

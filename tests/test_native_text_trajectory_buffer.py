@@ -129,7 +129,7 @@ class NativeTextTrajectoryBufferTest(unittest.TestCase):
             buf.stage_batch(
                 env_indices=[0],
                 host_decoder=_host_view(decoder),
-                packed_rows=[_make_packed_row(token_count=3)],
+                packed_parent=_make_packed_row(token_count=3),
                 perspective_player_indices=[0],
             )
         # Stage one env-step for env 1.
@@ -137,7 +137,7 @@ class NativeTextTrajectoryBufferTest(unittest.TestCase):
         buf.stage_batch(
             env_indices=[1],
             host_decoder=_host_view(decoder),
-            packed_rows=[_make_packed_row(token_count=2)],
+            packed_parent=_make_packed_row(token_count=2),
             perspective_player_indices=[1],
         )
         self.assertEqual(buf.active_step_count(0), 2)
@@ -166,7 +166,7 @@ class NativeTextTrajectoryBufferTest(unittest.TestCase):
         buf.stage_batch(
             env_indices=[0],
             host_decoder=_host_view(decoder),
-            packed_rows=[_make_packed_row()],
+            packed_parent=_make_packed_row(),
             perspective_player_indices=[0],
         )
         self.assertEqual(buf.active_step_count(0), 1)

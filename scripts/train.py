@@ -403,15 +403,19 @@ class _StagedDecoderRow:
     """One env-step worth of decoder targets + encoded snapshot.
 
     Stored Python-side (one per finished env-step) and gathered into the
-    shared :class:`TextReplayBuffer` at episode-commit time. Tensor fields
-    are slices into the actor's reusable scratch and must be cloned before
-    the actor reuses its scratch for the next batch.
+    shared :class:`TextReplayBuffer` at episode-commit time. ``packed_parent``
+    holds the whole cloned multi-row :class:`PackedTextBatch` from the actor
+    tick that produced this row; ``packed_index`` is this row's index inside
+    it. Per-row slicing is deferred to commit time where it's effectively
+    free — :meth:`_write_packed_encoded_row` already accepts a batch index.
     """
 
     decoder: NativeTextDecoderBatch  # length-1 row slice (host, cloned)
-    packed_row: Any  # PackedTextBatch length-1 slice (host, cloned)
+    packed_parent: Any  # PackedTextBatch (host, cloned, shared across rows of same tick)
+    packed_index: int  # row index inside packed_parent
+    n_tokens: int  # cached token width for pre-commit accounting
     perspective_player_idx: int
-    lstm_h_in: torch.Tensor | None  # [layers, hidden] host, cloned
+    lstm_h_in: torch.Tensor | None  # [layers, hidden] host, view into clone
     lstm_c_in: torch.Tensor | None
 
 
@@ -457,7 +461,7 @@ class NativeTextTrajectoryBuffer:
         env_indices: list[int],
         host_decoder: Any,
         *,
-        packed_rows: Sequence[Any],
+        packed_parent: Any,
         perspective_player_indices: Sequence[int],
         lstm_h_in: torch.Tensor | None = None,
         lstm_c_in: torch.Tensor | None = None,
@@ -465,46 +469,50 @@ class NativeTextTrajectoryBuffer:
         """Append per-env decoder rows + their encoded snapshots.
 
         ``host_decoder`` is a :class:`DecoderHostView` carrying the full
-        decoder batch on host. ``packed_rows[i]`` is the matching
-        length-1 :class:`PackedTextBatch` row, also host-side (sliced
-        from the actor's pre-submit packed scratch). LSTM state slices
-        come from the inference reply already on host.
+        decoder batch on host. ``packed_parent`` is the matching
+        multi-row :class:`PackedTextBatch` for the whole actor tick,
+        host-side and already cloned upstream. LSTM state slices come
+        from the inference reply already on host.
 
-        All tensor data is cloned so the actor can recycle its scratch on
-        the next encode tick. Cloning host int32 tensors is a memcpy with
-        no GPU dispatch cost.
+        Per-row PackedTextBatch slices are NOT built here. We carry
+        ``(packed_parent, row_index)`` instead; commit-time slicing is
+        free because ``_write_packed_encoded_row`` already takes a batch
+        index.
         """
 
         n = len(env_indices)
         if int(host_decoder.decision_type.shape[0]) != n:
             raise ValueError("host_decoder row count must match env_indices length")
-        if len(packed_rows) != n:
-            raise ValueError("packed_rows length must match env_indices length")
+        if int(packed_parent.seq_lengths.shape[0]) != n:
+            raise ValueError("packed_parent row count must match env_indices length")
         if len(perspective_player_indices) != n:
             raise ValueError("perspective length must match env_indices length")
 
-        # Pre-slice the host decoder into single-row clones outside the
-        # lock so each env-step is independent of the actor's reusable
-        # scratch tensors.
-        per_row: list[NativeTextDecoderBatch] = []
-        for i in range(n):
-            per_row.append(
-                NativeTextDecoderBatch(
-                    decision_type=host_decoder.decision_type[i : i + 1].clone(),
-                    output_token_ids=host_decoder.output_token_ids[i : i + 1].clone(),
-                    output_pointer_pos=host_decoder.output_pointer_pos[i : i + 1].clone(),
-                    output_pointer_subjects=host_decoder.output_pointer_subjects[i : i + 1].clone(),
-                    output_is_pointer=host_decoder.output_is_pointer[i : i + 1].clone(),
-                    output_lens=host_decoder.output_lens[i : i + 1].clone(),
-                    pointer_anchor_handles=host_decoder.pointer_anchor_handles[i : i + 1].clone(),
-                    pointer_anchor_count=host_decoder.pointer_anchor_count[i : i + 1].clone(),
-                    log_probs=host_decoder.log_probs[i : i + 1].clone(),
-                    value=host_decoder.value[i : i + 1].clone(),
-                    output_pad_mask=host_decoder.output_pad_mask[i : i + 1].clone(),
-                    vocab_mask=host_decoder.vocab_mask[i : i + 1].clone(),
-                    pointer_mask=host_decoder.pointer_mask[i : i + 1].clone(),
-                )
-            )
+        # Clone the whole batch once, then take cheap [i:i+1] views per row.
+        # Previously we did 13 small clones per row; at 200+ rows per batch
+        # the Python overhead dominated actor_stage. The cloned batch tensor
+        # stays alive until every view-holding _StagedDecoderRow is committed,
+        # which is fine — the alternative was N×13 small allocations anyway.
+        hd_clone = NativeTextDecoderBatch(
+            decision_type=host_decoder.decision_type.clone(),
+            output_token_ids=host_decoder.output_token_ids.clone(),
+            output_pointer_pos=host_decoder.output_pointer_pos.clone(),
+            output_pointer_subjects=host_decoder.output_pointer_subjects.clone(),
+            output_is_pointer=host_decoder.output_is_pointer.clone(),
+            output_lens=host_decoder.output_lens.clone(),
+            pointer_anchor_handles=host_decoder.pointer_anchor_handles.clone(),
+            pointer_anchor_count=host_decoder.pointer_anchor_count.clone(),
+            log_probs=host_decoder.log_probs.clone(),
+            value=host_decoder.value.clone(),
+            output_pad_mask=host_decoder.output_pad_mask.clone(),
+            vocab_mask=host_decoder.vocab_mask.clone(),
+            pointer_mask=host_decoder.pointer_mask.clone(),
+        )
+        h_clone = lstm_h_in.clone() if lstm_h_in is not None else None
+        c_clone = lstm_c_in.clone() if lstm_c_in is not None else None
+        seq_lengths_host = packed_parent.seq_lengths_host or tuple(
+            int(x) for x in packed_parent.seq_lengths.tolist()
+        )
 
         with self._lock:
             for i, env_idx in enumerate(env_indices):
@@ -512,13 +520,17 @@ class NativeTextTrajectoryBuffer:
                 if self.validate and len(self._rows[env_i]) >= self.max_steps:
                     raise RuntimeError(f"native text staging buffer is full for env {env_i}")
                 # Replay writer wants [layers, hidden] per row; the source
-                # tensor is [layers, n, hidden] so squeeze the per-row dim.
-                h_slice = lstm_h_in[:, i].clone().contiguous() if lstm_h_in is not None else None
-                c_slice = lstm_c_in[:, i].clone().contiguous() if lstm_c_in is not None else None
+                # tensor is [layers, n, hidden] so slice along the env dim.
+                # Views into the cloned batch tensor are fine — torch.stack
+                # at commit time handles non-contiguous strides.
+                h_slice = h_clone[:, i] if h_clone is not None else None
+                c_slice = c_clone[:, i] if c_clone is not None else None
                 self._rows[env_i].append(
                     _StagedDecoderRow(
-                        decoder=per_row[i],
-                        packed_row=packed_rows[i],
+                        decoder=hd_clone[i : i + 1],
+                        packed_parent=packed_parent,
+                        packed_index=i,
+                        n_tokens=int(seq_lengths_host[i]),
                         perspective_player_idx=int(perspective_player_indices[i]),
                         lstm_h_in=h_slice,
                         lstm_c_in=c_slice,
@@ -617,7 +629,7 @@ class NativeTextTrajectoryBuffer:
         # (decoder-pipeline rows don't use the inline-blank decision arrays).
         from magic_ai.text_encoder.batch import PackedTextBatch  # local import
 
-        token_count = sum(int(row.packed_row.token_ids.shape[0]) for row in staged)
+        token_count = sum(row.n_tokens for row in staged)
         reservation = replay_buffer.reserve_append(
             row_count=total,
             token_count=token_count,
@@ -633,13 +645,14 @@ class NativeTextTrajectoryBuffer:
             row_cursor = row_start
             token_cursor = int(reservation.token_start)
             for row in staged:
-                packed = cast(PackedTextBatch, row.packed_row)
-                token_width = int(packed.token_ids.shape[0])
                 replay_buffer._write_packed_encoded_row(
-                    row_cursor, token_cursor, packed, batch_index=0
+                    row_cursor,
+                    token_cursor,
+                    cast(PackedTextBatch, row.packed_parent),
+                    batch_index=row.packed_index,
                 )
                 row_cursor += 1
-                token_cursor += token_width
+                token_cursor += row.n_tokens
             # Common fields, all host-to-host now that staging + storage
             # are both on host.
             core = replay_buffer.core
@@ -732,7 +745,7 @@ class NativeTextTrajectoryBuffer:
                 rows = self._rows[int(e)]
                 total_rows += len(rows)
                 for row in rows:
-                    total_tokens += int(row.packed_row.token_ids.shape[0])
+                    total_tokens += row.n_tokens
         if total_rows == 0:
             return True
         return replay_buffer.can_reserve(

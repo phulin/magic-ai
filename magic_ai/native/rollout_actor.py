@@ -345,35 +345,40 @@ class TextRolloutActor:
         try:
             start = time.perf_counter()
             host = reply.host_decoder
-            # Slice the actor's pre-submit host packed batch into per-row
-            # length-1 PackedTextBatch views, one per env-step. These get
-            # cloned inside ``stage_batch`` so the actor can recycle its
-            # encoder scratch on the next tick.
-            from magic_ai.native.inference_server import (  # noqa: PLC0415
-                _slice_packed_text_batch,
-            )
+            # Clone the actor's pre-submit packed batch once; staging stores
+            # (packed_parent, row_index) per env-step and defers row slicing
+            # to commit time. No per-row Python-side PackedTextBatch
+            # construction in the hot path.
+            from magic_ai.text_encoder.batch import PackedTextBatch  # noqa: PLC0415
 
-            packed = batch.packed
-            seq_lengths_host = packed.seq_lengths_host or tuple(
-                int(x) for x in packed.seq_lengths.tolist()
+            packed_src = batch.packed
+            packed = PackedTextBatch(
+                token_ids=packed_src.token_ids.clone(),
+                seq_id=packed_src.seq_id.clone(),
+                pos_in_seq=packed_src.pos_in_seq.clone(),
+                cu_seqlens=packed_src.cu_seqlens.clone(),
+                seq_lengths=packed_src.seq_lengths.clone(),
+                state_positions=packed_src.state_positions.clone(),
+                card_ref_positions=packed_src.card_ref_positions.clone(),
+                spec_lens=packed_src.spec_lens.clone(),
+                decision_type=packed_src.decision_type.clone(),
+                pointer_anchor_positions=packed_src.pointer_anchor_positions.clone(),
+                pointer_anchor_kinds=packed_src.pointer_anchor_kinds.clone(),
+                pointer_anchor_subjects=packed_src.pointer_anchor_subjects.clone(),
+                pointer_anchor_handles=packed_src.pointer_anchor_handles.clone(),
+                legal_edge_bitmap=(
+                    packed_src.legal_edge_bitmap.clone()
+                    if packed_src.legal_edge_bitmap is not None
+                    else None
+                ),
+                total_tokens=packed_src.total_tokens,
+                seq_lengths_host=packed_src.seq_lengths_host,
+                max_seqlen=packed_src.max_seqlen,
             )
-            host_packed_rows: list[Any] = []
-            tcur = 0
-            for i, n_tokens in enumerate(seq_lengths_host):
-                host_packed_rows.append(
-                    _slice_packed_text_batch(
-                        packed,
-                        row_start=i,
-                        row_end=i + 1,
-                        token_start=tcur,
-                        token_end=tcur + int(n_tokens),
-                    )
-                )
-                tcur += int(n_tokens)
             self.staging_buffer.stage_batch(
                 batch.ready_env_indices,
                 host,
-                packed_rows=host_packed_rows,
+                packed_parent=packed,
                 perspective_player_indices=reply.perspective_player_indices,
                 lstm_h_in=reply.lstm_h_in,
                 lstm_c_in=reply.lstm_c_in,
