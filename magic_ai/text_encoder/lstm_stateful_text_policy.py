@@ -9,6 +9,7 @@ replay scoring delegate to the module-level helpers in
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -73,7 +74,13 @@ class LSTMStatefulTextPolicy(nn.Module):
         env, so per-env caches don't apply. See
         :class:`magic_ai.training_interfaces.RNaDTrainablePolicy.clone_for_rnad`.
         """
-        clone = LSTMStatefulTextPolicy(self.policy.cfg)
+        # Skip HF warm-init: load_state_dict below overwrites the encoder
+        # weights, so re-downloading the Ettin checkpoint would just be thrown
+        # away (and prints a misleading second "Loading weights" report).
+        cfg = self.policy.cfg
+        if cfg.encoder.hf_model_name is not None:
+            cfg = replace(cfg, encoder=replace(cfg.encoder, hf_model_name=None))
+        clone = LSTMStatefulTextPolicy(cfg)
         clone.load_state_dict(self.state_dict())
         clone.to(self.device)
         clone.rollout_buffer = self.rollout_buffer
