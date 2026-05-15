@@ -2034,9 +2034,10 @@ def main() -> None:
             )
         else:
             optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate)
-        if run_mlm_now and getattr(args, "post_mlm_checkpoint", None) is not None:
+        if run_mlm_now and not args.no_post_mlm_checkpoint:
+            post_mlm_path = args.post_mlm_checkpoint or (run_artifact_dir / "post_mlm.pt")
             save_checkpoint(
-                args.post_mlm_checkpoint,
+                post_mlm_path,
                 policy,
                 optimizer,
                 args,
@@ -2050,8 +2051,8 @@ def main() -> None:
                 post_mlm=True,
             )
             print(
-                f"[policy-value] saved post-pretrain checkpoint -> {args.post_mlm_checkpoint} "
-                f"(resume RL with --checkpoint {args.post_mlm_checkpoint})"
+                f"[policy-value] saved post-pretrain checkpoint -> {post_mlm_path} "
+                f"(resume RL with --checkpoint {post_mlm_path})"
             )
         # Linear LR warmup over the first N RL updates to absorb the
         # pretrained-encoder × random-RL-heads mismatch. AdamW's first step
@@ -2393,10 +2394,16 @@ def parse_args() -> argparse.Namespace:
         "--post-mlm-checkpoint",
         type=Path,
         default=None,
-        help="if set, after policy/value pretraining completes, save a checkpoint with "
-        "post-pretrain weights (and a `post_mlm` metadata flag) to this path before "
-        "starting RL. Pass this path back as --checkpoint to skip pretraining; "
-        "opponent pool will start empty.",
+        help="path to save the post-pretrain checkpoint (policy weights + "
+        "`post_mlm` metadata flag) once policy/value pretraining completes. "
+        "Defaults to <run_artifact_dir>/post_mlm.pt. Pass this path back as "
+        "--checkpoint to skip pretraining (opponent pool starts empty). "
+        "Use --no-post-mlm-checkpoint to disable.",
+    )
+    parser.add_argument(
+        "--no-post-mlm-checkpoint",
+        action="store_true",
+        help="disable the automatic post-pretrain checkpoint save.",
     )
     parser.add_argument("--pretrain-mlm-batch-size", type=int, default=64)
     parser.add_argument("--pretrain-mlm-lr", type=float, default=2e-4)
