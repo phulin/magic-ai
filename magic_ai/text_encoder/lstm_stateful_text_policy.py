@@ -445,16 +445,19 @@ class LSTMStatefulTextPolicy(nn.Module):
         device = vocab_mask.device
 
         # ----- Decision groups: one per active decoder step -----
-        # Active cell -> linear group id. ``masked_select`` over a unique
-        # row-major counter gives a sync-free dense mapping.
+        # True-counts of the three masks were computed on host inside
+        # ``TextReplayBuffer.gather`` (replay_buffer.py:gather), so we can
+        # use ``torch.nonzero_static(mask, size=N)`` with the exact size
+        # and avoid the data-dependent shape sync on every call. Three
+        # syncs/call × four policies/update was ~48% of train wall time.
         b, l_max = pad_mask.shape
         group_active = pad_mask  # [B, L] bool
         # Per-(b,t) integer id (0..G-1) for active cells, -1 elsewhere.
         active_long = group_active.to(dtype=torch.long)
         group_ids_dense = active_long.view(-1).cumsum(0) - 1
         group_ids = group_ids_dense.view(b, l_max)
-        # Flat index list of active (b, t) pairs (one sync via nonzero).
-        active_pos = group_active.nonzero(as_tuple=False)  # [G, 2]
+        # Flat index list of active (b, t) pairs — no sync.
+        active_pos = torch.nonzero_static(group_active, size=batch.n_active_steps)  # [G, 2]
         g_b = active_pos[:, 0]
         g_t = active_pos[:, 1]
         step_for_decision_group = g_b  # batch-step id (0..B-1)
@@ -466,7 +469,7 @@ class LSTMStatefulTextPolicy(nn.Module):
         vocab_cell_active = (
             pad_mask.unsqueeze(-1) & (~is_pointer_step).unsqueeze(-1) & vocab_mask
         )  # [B, L, V]
-        vocab_cells = vocab_cell_active.nonzero(as_tuple=False)  # [Nv, 3]
+        vocab_cells = torch.nonzero_static(vocab_cell_active, size=batch.n_vocab_cells)  # [Nv, 3]
         v_b = vocab_cells[:, 0]
         v_t = vocab_cells[:, 1]
         v_c = vocab_cells[:, 2]
@@ -477,7 +480,7 @@ class LSTMStatefulTextPolicy(nn.Module):
 
         # ----- Pointer cells: active & is_pointer & pointer_mask -----
         ptr_cell_active = pad_mask.unsqueeze(-1) & is_pointer_step.unsqueeze(-1) & pointer_mask
-        ptr_cells = ptr_cell_active.nonzero(as_tuple=False)
+        ptr_cells = torch.nonzero_static(ptr_cell_active, size=batch.n_ptr_cells)
         p_b = ptr_cells[:, 0]
         p_t = ptr_cells[:, 1]
         p_c = ptr_cells[:, 2]
@@ -491,7 +494,11 @@ class LSTMStatefulTextPolicy(nn.Module):
         decision_group_id_flat = torch.cat([v_group, p_group], dim=0)
         is_sampled_flat = torch.cat([v_sampled, p_sampled], dim=0)
         choice_cols = torch.cat([v_c, p_c], dim=0)
-        group_idx = step_for_decision_group[decision_group_id_flat]
+        # ``step_for_decision_group[group_id] == g_b[group_id]`` and
+        # ``decision_group_id_flat[cell]``'s b-coord equals the cell's own
+        # b-coord by construction, so ``group_idx`` is just the concat of
+        # the cells' b-coords — skip the indirect index.
+        group_idx = torch.cat([v_b, p_b], dim=0)
 
         # Decoder has no "may" Bernoulli head; zero everything so
         # may_neurd_loss masks itself out via ``may_is_active=False``.

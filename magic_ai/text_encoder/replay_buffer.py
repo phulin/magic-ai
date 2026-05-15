@@ -131,6 +131,13 @@ class TextReplayBatch:
     lstm_h_in: Tensor | None
     lstm_c_in: Tensor | None
     decoder: DecoderGatherOutput
+    # True-counts of the three grammar masks, computed on CPU at gather
+    # time. Let ``evaluate_replay_batch_per_choice`` use
+    # ``torch.nonzero_static(mask, size=N)`` instead of ``mask.nonzero()``
+    # so the per-choice path doesn't sync on data-dependent output shape.
+    n_active_steps: int
+    n_vocab_cells: int
+    n_ptr_cells: int
 
     def to(self, device: torch.device | str) -> TextReplayBatch:
         """Move every tensor field to ``device``. Used to H→D a CPU-resident
@@ -166,6 +173,9 @@ class TextReplayBatch:
             lstm_h_in=_mv(self.lstm_h_in),
             lstm_c_in=_mv(self.lstm_c_in),
             decoder=self.decoder.to(target),
+            n_active_steps=self.n_active_steps,
+            n_vocab_cells=self.n_vocab_cells,
+            n_ptr_cells=self.n_ptr_cells,
         )
 
 
@@ -1812,6 +1822,21 @@ class TextReplayBuffer:
             max_seqlen=max_seqlen,
         )
         decoder = self.gather_decoder(idx)
+        # Bool-sum the three grammar masks on host *before* H→D so the
+        # per-choice training path can use ``torch.nonzero_static(size=N)``
+        # — eliminates three data-dependent shape syncs per RNaD policy.
+        # Reduce along the choice axis first so the [B, L, V] / [B, L, T]
+        # AND tensors never get materialized; we only need scalar totals,
+        # not the rasterized intermediate masks themselves.
+        pad_mask_bool = decoder.output_pad_mask.to(dtype=torch.bool)
+        is_ptr_bool = decoder.output_is_pointer.to(dtype=torch.bool)
+        vocab_active_step = pad_mask_bool & ~is_ptr_bool  # [B, L]
+        ptr_active_step = pad_mask_bool & is_ptr_bool  # [B, L]
+        vocab_legal_per_step = decoder.vocab_mask.sum(dim=-1)  # [B, L] int
+        ptr_legal_per_step = decoder.pointer_mask.sum(dim=-1)  # [B, L] int
+        n_active_steps = int(pad_mask_bool.sum().item())
+        n_vocab_cells = int((vocab_active_step * vocab_legal_per_step).sum().item())
+        n_ptr_cells = int((ptr_active_step * ptr_legal_per_step).sum().item())
         return TextReplayBatch(
             encoded=encoded,
             trace_kind_id=common.trace_kind_id,
@@ -1831,6 +1856,9 @@ class TextReplayBuffer:
             lstm_h_in=common.lstm_h_in,
             lstm_c_in=common.lstm_c_in,
             decoder=decoder,
+            n_active_steps=n_active_steps,
+            n_vocab_cells=n_vocab_cells,
+            n_ptr_cells=n_ptr_cells,
         )
 
     def write_projected_state(self, rows: Tensor, projected: Tensor) -> None:
