@@ -479,6 +479,9 @@ def encode_tokens_packed(
             },
         )
     spec_out = outputs._spec_out_cffi
+    # Reset overflow flag every call: the struct is cached across calls, and
+    # we can't rely on the native side to zero it on entry.
+    spec_out.spec_overflow = 0
 
     buffers = scratch.buffers
     assert buffers is not None
@@ -523,33 +526,63 @@ def encode_tokens_packed(
 
         t_spec_max = int(outputs.spec_tokens.shape[1])
         n_anchors_max = int(outputs.pointer_anchor_positions.shape[1])
+        n_blockers_max = int(outputs.legal_edge_bitmap.shape[1])
+        n_attackers_max = int(outputs.legal_edge_bitmap.shape[2])
         spec_lens = outputs.spec_lens[:batch_size].tolist()
         anchor_counts = outputs.pointer_anchor_counts[:batch_size].tolist()
         decision_types = outputs.decision_type[:batch_size].tolist()
+        n_blockers = outputs.legal_edge_n_blockers[:batch_size].tolist()
+        n_attackers = outputs.legal_edge_n_attackers[:batch_size].tolist()
+
         # The native side may either record the attempted length (>cap) or
         # clamp to the cap on overflow; treat ``>=`` as suspect either way.
-        offenders = [
+        def _at_cap(i: int) -> bool:
+            return (
+                int(spec_lens[i]) >= t_spec_max
+                or int(anchor_counts[i]) >= n_anchors_max
+                or int(n_blockers[i]) >= n_blockers_max
+                or int(n_attackers[i]) >= n_attackers_max
+            )
+
+        per_row = [
             {
                 "row": i,
                 "decision_type": int(decision_types[i]),
                 "spec_len": int(spec_lens[i]),
                 "anchor_count": int(anchor_counts[i]),
+                "n_blockers": int(n_blockers[i]),
+                "n_attackers": int(n_attackers[i]),
                 "spec_at_cap": int(spec_lens[i]) >= t_spec_max,
                 "anchors_at_cap": int(anchor_counts[i]) >= n_anchors_max,
+                "blockers_at_cap": int(n_blockers[i]) >= n_blockers_max,
+                "attackers_at_cap": int(n_attackers[i]) >= n_attackers_max,
             }
             for i in range(batch_size)
-            if int(spec_lens[i]) >= t_spec_max or int(anchor_counts[i]) >= n_anchors_max
         ]
-        max_spec_len = max((o["spec_len"] for o in offenders), default=0)
-        max_anchor_count = max((o["anchor_count"] for o in offenders), default=0)
-        # Cap the offender list so the message stays readable on big batches.
-        sample = offenders[:8]
-        more = f" (+{len(offenders) - len(sample)} more)" if len(offenders) > len(sample) else ""
+        offenders = [r for r in per_row if _at_cap(r["row"])]
+        max_spec_len = max((int(s) for s in spec_lens), default=0)
+        max_anchor_count = max((int(a) for a in anchor_counts), default=0)
+        max_n_blockers = max((int(b) for b in n_blockers), default=0)
+        max_n_attackers = max((int(a) for a in n_attackers), default=0)
+        # Cap the row lists so the message stays readable on big batches.
+        sample_offenders = offenders[:8]
+        more_off = (
+            f" (+{len(offenders) - len(sample_offenders)} more)"
+            if len(offenders) > len(sample_offenders)
+            else ""
+        )
+        sample_rows = per_row[:8]
+        more_rows = (
+            f" (+{len(per_row) - len(sample_rows)} more)" if len(per_row) > len(sample_rows) else ""
+        )
         raise NativeEncodingError(
             f"MageEncodeDecisionSpec spec_overflow=1: "
             f"T_spec_max={t_spec_max} (observed max spec_len={max_spec_len}), "
-            f"N_anchors_max={n_anchors_max} (observed max anchor_count={max_anchor_count}); "
-            f"{len(offenders)} offending row(s){more}: {sample}"
+            f"N_anchors_max={n_anchors_max} (observed max anchor_count={max_anchor_count}), "
+            f"N_blockers_max={n_blockers_max} (observed max n_blockers={max_n_blockers}), "
+            f"N_attackers_max={n_attackers_max} (observed max n_attackers={max_n_attackers}); "
+            f"{len(offenders)} offending row(s){more_off}: {sample_offenders}; "
+            f"first rows{more_rows}: {sample_rows}"
         )
 
     # Third pass: rewrite the packed token stream so each row's spec tokens
