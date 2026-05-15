@@ -11,7 +11,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-import torch
 import torch.nn as nn
 from torch import Tensor
 from transformers import PreTrainedTokenizerFast
@@ -136,14 +135,19 @@ class TextPolicy(nn.Module):
         ``batch.token_ids`` is the combined ``[state, spec]`` stream produced
         by :func:`collate`. Returns
         ``(vocab_logits [B, L, V_grammar], pointer_logits [B, L, T_enc])``.
+
+        The encoder runs through the packed ``flash_attn_varlen`` path to
+        avoid per-shape ``flex_attention`` recompiles; we then scatter the
+        packed hidden back to ``[B, T_enc, D]`` for the decoder cross-attn.
+        Inference, replay scoring, and pretrain all funnel through this
+        same convention so there's a single padded↔packed seam.
         """
 
-        encoded = self.encoder(batch, hist_emb=hist_emb)
-        return self.grammar_decoder.forward_teacher_forced(
-            target_tokens,
-            encoded,
-            batch.attention_mask.to(dtype=torch.bool),
-        )
+        from magic_ai.text_encoder.batch import scatter_packed_to_padded
+
+        encoded_snaps = self.encode_only(batch, hist_emb=hist_emb)
+        encoded, attn_mask = scatter_packed_to_padded(encoded_snaps.encoded, encoded_snaps.packed)
+        return self.grammar_decoder.forward_teacher_forced(target_tokens, encoded, attn_mask)
 
     @staticmethod
     def encode_snapshots(
