@@ -200,15 +200,16 @@ def _attacker_subject_indices(
 
 def translate_attackers(pending: PendingState, observed: dict[str, Any]) -> DecoderTarget | None:
     options = pending["options"]
+    no_attack = bool(observed.get("no_attack"))
     chosen = _attacker_subject_indices(options, observed)
-    if not chosen:
+    if not chosen and not no_attack:
         return None
     # v1 spec emits two DEFENDER anchors for player_idx 0/1; the attacker
     # always attacks the opponent (subject_index = 1 in the perspective-
     # rotated snapshot, where index 0 is "self").
     defender_subject = 1
     steps: list[tuple[int, int, bool]] = [_vocab_step(GrammarVocab.DECLARE_ATTACKERS_OPEN)]
-    for atk in chosen:
+    for atk in chosen or []:
         steps.append(_vocab_step(GrammarVocab.ATTACK))
         steps.append(_pointer_step(atk))
         steps.append(_vocab_step(GrammarVocab.DEFENDER))
@@ -304,11 +305,12 @@ def _blocker_assignments(
 
 
 def translate_blockers(pending: PendingState, observed: dict[str, Any]) -> DecoderTarget | None:
+    no_block = bool(observed.get("no_block"))
     pairs = _blocker_assignments(pending, observed)
-    if not pairs:
+    if not pairs and not no_block:
         return None
     steps: list[tuple[int, int, bool]] = [_vocab_step(GrammarVocab.DECLARE_BLOCKERS_OPEN)]
-    for blk, atk in pairs:
+    for blk, atk in pairs or []:
         steps.append(_vocab_step(GrammarVocab.BLOCK))
         steps.append(_pointer_step(blk))
         steps.append(_vocab_step(GrammarVocab.ATTACKER))

@@ -234,6 +234,53 @@ def test_attackers_translates_new_format_by_id_prefix() -> None:
     _assert_grammar_legal(spec, target)
 
 
+def test_attackers_translates_no_attack() -> None:
+    """observed.no_attack=True yields the empty OPEN-then-END target."""
+
+    options = [
+        _opt(
+            id="3c792cf2-befb-4440-a7d7-f3a26a680b61",
+            kind="attacker",
+            card_name="Grizzly Bears",
+            permanent_id="3c792cf2-befb-4440-a7d7-f3a26a680b61",
+        ),
+    ]
+    pending = _pending("attackers", options)
+    observed = {
+        "raw": "PlayerA declares no attackers",
+        "actor_name": "PlayerA",
+        "attackers": [],
+        "no_attack": True,
+    }
+    target = translate_attackers(pending, observed)
+    assert target is not None
+    assert target.output_token_ids == [
+        int(GrammarVocab.DECLARE_ATTACKERS_OPEN),
+        int(GrammarVocab.END),
+    ]
+    spec = DecisionSpec(
+        decision_type=DecisionType.DECLARE_ATTACKERS,
+        anchors=(
+            [
+                PointerAnchor(
+                    kind=AnchorKind.LEGAL_ATTACKER,
+                    token_position=10,
+                    subject_index=0,
+                )
+            ]
+            + [
+                PointerAnchor(
+                    kind=AnchorKind.DEFENDER,
+                    token_position=20 + i,
+                    subject_index=i,
+                )
+                for i in range(2)
+            ]
+        ),
+    )
+    _assert_grammar_legal(spec, target)
+
+
 # --------------------------------------------------------------------------- #
 # DECLARE_BLOCKERS                                                            #
 # --------------------------------------------------------------------------- #
@@ -352,6 +399,58 @@ def test_blockers_translates_new_format_by_id_prefix() -> None:
                     subject_index=i,
                 )
                 for i in range(2)
+            ]
+            + [
+                PointerAnchor(
+                    kind=AnchorKind.LEGAL_ATTACKER,
+                    token_position=30,
+                    subject_index=0,
+                )
+            ]
+        ),
+        legal_edge_bitmap=bitmap,
+    )
+    _assert_grammar_legal(spec, target)
+
+
+def test_blockers_translates_no_block() -> None:
+    """observed.no_block=True yields the empty OPEN-then-END target."""
+
+    attacker_id = "c828901c-42b5-4359-baa2-b6f6f7ae183f"
+    blocker_id = "df484445-d419-4485-a2f3-f8b2e2892dd5"
+    options = [
+        _opt(
+            id=blocker_id,
+            kind="block",
+            card_name="Wall of Wood",
+            permanent_id=blocker_id,
+            valid_targets=[{"id": attacker_id, "label": "Craw Wurm"}],
+        ),
+    ]
+    pending = _pending("blockers", options)
+    observed = {
+        "raw": "no blocks declared",
+        "actor_name": "PlayerB",
+        "attackers": [{"name": "Craw Wurm", "id_prefix": "c82"}],
+        "assignments": [],
+        "no_block": True,
+    }
+    target = translate_blockers(pending, observed)
+    assert target is not None
+    assert target.output_token_ids == [
+        int(GrammarVocab.DECLARE_BLOCKERS_OPEN),
+        int(GrammarVocab.END),
+    ]
+    bitmap = np.ones((1, 1), dtype=np.bool_)
+    spec = DecisionSpec(
+        decision_type=DecisionType.DECLARE_BLOCKERS,
+        anchors=(
+            [
+                PointerAnchor(
+                    kind=AnchorKind.LEGAL_BLOCKER,
+                    token_position=10,
+                    subject_index=0,
+                )
             ]
             + [
                 PointerAnchor(
