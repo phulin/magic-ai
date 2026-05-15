@@ -451,6 +451,10 @@ class NativeTextTrajectoryBuffer:
         self._lock = threading.Lock()
         self.timing_stats: Any | None = None
         self._rows: list[list[_StagedDecoderRow]] = [[] for _ in range(self.num_envs)]
+        # Per-env aggregate token counts, kept in sync with ``_rows`` so the
+        # learner's admission check (``can_append_envs_to_replay``) is O(1)
+        # per env instead of re-walking each row's ``n_tokens``.
+        self._token_counts: list[int] = [0 for _ in range(self.num_envs)]
         # Public host mirror for compatibility with the slot-buffer surface.
         self.step_count_host: list[int] = [0 for _ in range(self.num_envs)]
 
@@ -525,23 +529,26 @@ class NativeTextTrajectoryBuffer:
                 # at commit time handles non-contiguous strides.
                 h_slice = h_clone[:, i] if h_clone is not None else None
                 c_slice = c_clone[:, i] if c_clone is not None else None
+                n_tokens_i = int(seq_lengths_host[i])
                 self._rows[env_i].append(
                     _StagedDecoderRow(
                         decoder=hd_clone[i : i + 1],
                         packed_parent=packed_parent,
                         packed_index=i,
-                        n_tokens=int(seq_lengths_host[i]),
+                        n_tokens=n_tokens_i,
                         perspective_player_idx=int(perspective_player_indices[i]),
                         lstm_h_in=h_slice,
                         lstm_c_in=c_slice,
                     )
                 )
+                self._token_counts[env_i] += n_tokens_i
                 self.step_count_host[env_i] = len(self._rows[env_i])
 
     def reset_env(self, env_idx: int) -> None:
         with self._lock:
             env_i = int(env_idx)
             self._rows[env_i] = []
+            self._token_counts[env_i] = 0
             self.step_count_host[env_i] = 0
 
     def active_step_count(self, env_idx: int) -> int:
@@ -572,9 +579,11 @@ class NativeTextTrajectoryBuffer:
                 return torch.zeros(0, dtype=torch.long, device=device), counts_t
             staged: list[_StagedDecoderRow] = []
             for e in env_indices:
-                staged.extend(self._rows[int(e)])
-                self._rows[int(e)] = []
-                self.step_count_host[int(e)] = 0
+                env_i = int(e)
+                staged.extend(self._rows[env_i])
+                self._rows[env_i] = []
+                self._token_counts[env_i] = 0
+                self.step_count_host[env_i] = 0
 
         # Build the merged decoder batch (concat across rows).
         merged_decoder = NativeTextDecoderBatch.concat([row.decoder for row in staged])
@@ -742,10 +751,9 @@ class NativeTextTrajectoryBuffer:
             total_rows = 0
             total_tokens = 0
             for e in env_indices:
-                rows = self._rows[int(e)]
-                total_rows += len(rows)
-                for row in rows:
-                    total_tokens += row.n_tokens
+                env_i = int(e)
+                total_rows += len(self._rows[env_i])
+                total_tokens += self._token_counts[env_i]
         if total_rows == 0:
             return True
         return replay_buffer.can_reserve(

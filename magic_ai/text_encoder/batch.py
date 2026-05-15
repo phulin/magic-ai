@@ -143,25 +143,35 @@ class PackedTextBatch:
             self.pointer_anchor_handles = torch.full((b, 0), -1, dtype=torch.int32, device=device)
 
     def to(self, device: torch.device | str) -> PackedTextBatch:
-        """Return a copy with every tensor field moved to ``device``."""
+        """Return a copy with every tensor field moved to ``device``.
+
+        Host buffers feeding this batch are pinned (see ``native_assembler``
+        and the inference-server host arena), so ``non_blocking=True`` lets
+        the 13+ field transfers pipeline on the CUDA copy stream instead of
+        each call waiting for the previous one to land.
+        """
 
         def _mv(t: Tensor | None) -> Tensor | None:
-            return t.to(device=device) if t is not None else None
+            return t.to(device=device, non_blocking=True) if t is not None else None
 
         return PackedTextBatch(
-            token_ids=self.token_ids.to(device=device),
-            seq_id=self.seq_id.to(device=device),
-            pos_in_seq=self.pos_in_seq.to(device=device),
-            cu_seqlens=self.cu_seqlens.to(device=device),
-            seq_lengths=self.seq_lengths.to(device=device),
-            state_positions=self.state_positions.to(device=device),
-            card_ref_positions=self.card_ref_positions.to(device=device),
-            spec_lens=self.spec_lens.to(device=device),
-            decision_type=self.decision_type.to(device=device),
-            pointer_anchor_positions=self.pointer_anchor_positions.to(device=device),
-            pointer_anchor_kinds=self.pointer_anchor_kinds.to(device=device),
-            pointer_anchor_subjects=self.pointer_anchor_subjects.to(device=device),
-            pointer_anchor_handles=self.pointer_anchor_handles.to(device=device),
+            token_ids=self.token_ids.to(device=device, non_blocking=True),
+            seq_id=self.seq_id.to(device=device, non_blocking=True),
+            pos_in_seq=self.pos_in_seq.to(device=device, non_blocking=True),
+            cu_seqlens=self.cu_seqlens.to(device=device, non_blocking=True),
+            seq_lengths=self.seq_lengths.to(device=device, non_blocking=True),
+            state_positions=self.state_positions.to(device=device, non_blocking=True),
+            card_ref_positions=self.card_ref_positions.to(device=device, non_blocking=True),
+            spec_lens=self.spec_lens.to(device=device, non_blocking=True),
+            decision_type=self.decision_type.to(device=device, non_blocking=True),
+            pointer_anchor_positions=self.pointer_anchor_positions.to(
+                device=device, non_blocking=True
+            ),
+            pointer_anchor_kinds=self.pointer_anchor_kinds.to(device=device, non_blocking=True),
+            pointer_anchor_subjects=self.pointer_anchor_subjects.to(
+                device=device, non_blocking=True
+            ),
+            pointer_anchor_handles=self.pointer_anchor_handles.to(device=device, non_blocking=True),
             legal_edge_bitmap=_mv(self.legal_edge_bitmap),
             total_tokens=self.total_tokens,
             seq_lengths_host=self.seq_lengths_host,
