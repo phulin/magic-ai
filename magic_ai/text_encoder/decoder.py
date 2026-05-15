@@ -106,28 +106,58 @@ class _CausalSelfAttention(nn.Module):
         x: Tensor,
         cos: Tensor,
         sin: Tensor,
-        cache_k: Tensor | None,
-        cache_v: Tensor | None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> Tensor:
+        """Teacher-forced (uncached) self-attention over a full sequence."""
         b, t, _ = x.shape
         qkv = self.qkv(x).view(b, t, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
         q = q.transpose(1, 2)  # [B, H, T, D]
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        # RoPE positions advance from the cache length so streaming-decode
-        # positions stay aligned with the teacher-forced positions.
-        offset = 0 if cache_k is None else cache_k.shape[-2]
-        cos_t = cos[offset : offset + t]
-        sin_t = sin[offset : offset + t]
+        cos_t = cos[:t]
+        sin_t = sin[:t]
         q = _apply_rope(q, cos_t, sin_t)
         k = _apply_rope(k, cos_t, sin_t)
-        if cache_k is not None and cache_v is not None:
-            k = torch.cat([cache_k, k], dim=-2)
-            v = torch.cat([cache_v, v], dim=-2)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=cache_k is None and t > 1)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=t > 1)
         out = out.transpose(1, 2).contiguous().view(b, t, self.n_heads * self.head_dim)
-        return self.proj(out), k, v
+        return self.proj(out)
+
+    def step(
+        self,
+        x: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        cache_k: Tensor,
+        cache_v: Tensor,
+        step_idx: Tensor,
+    ) -> Tensor:
+        """Single-token cached step.
+
+        ``cache_k`` / ``cache_v`` are pre-allocated ``[B, H, L, Dh]`` buffers
+        owned by the caller; the slot at ``step_idx`` is filled in place each
+        call. An attention mask masks out positions ``> step_idx``. Shapes
+        stay constant across steps so dynamo doesn't recompile on cache
+        growth.
+        """
+        b, _, _ = x.shape
+        L = cache_k.shape[-2]
+        qkv = self.qkv(x).view(b, 1, 3, self.n_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)  # [B, H, 1, Dh]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        idx_1d = step_idx.view(1)
+        cos_t = cos.index_select(0, idx_1d)
+        sin_t = sin.index_select(0, idx_1d)
+        q = _apply_rope(q, cos_t, sin_t)
+        k = _apply_rope(k, cos_t, sin_t)
+        cache_k.index_copy_(2, idx_1d, k)
+        cache_v.index_copy_(2, idx_1d, v)
+        pos = torch.arange(L, device=q.device)
+        attn_mask = (pos <= step_idx).view(1, 1, 1, L)
+        out = F.scaled_dot_product_attention(q, cache_k, cache_v, attn_mask=attn_mask)
+        out = out.transpose(1, 2).contiguous().view(b, 1, self.n_heads * self.head_dim)
+        return self.proj(out)
 
 
 class _CrossAttention(nn.Module):
@@ -181,29 +211,45 @@ class _DecoderLayer(nn.Module):
         cross_k: Tensor,
         cross_v: Tensor,
         encoder_attention_mask: Tensor,
-        cache_k: Tensor | None,
-        cache_v: Tensor | None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        h, new_k, new_v = self.self_attn(self.norm1(x), cos, sin, cache_k, cache_v)
-        x = x + h
+    ) -> Tensor:
+        x = x + self.self_attn(self.norm1(x), cos, sin)
         x = x + self.cross_attn(self.norm2(x), cross_k, cross_v, encoder_attention_mask)
         x = x + self.ffn(self.norm3(x))
-        return x, new_k, new_v
+        return x
+
+    def step(
+        self,
+        x: Tensor,
+        cos: Tensor,
+        sin: Tensor,
+        cross_k: Tensor,
+        cross_v: Tensor,
+        encoder_attention_mask: Tensor,
+        cache_k: Tensor,
+        cache_v: Tensor,
+        step_idx: Tensor,
+    ) -> Tensor:
+        x = x + self.self_attn.step(self.norm1(x), cos, sin, cache_k, cache_v, step_idx)
+        x = x + self.cross_attn(self.norm2(x), cross_k, cross_v, encoder_attention_mask)
+        x = x + self.ffn(self.norm3(x))
+        return x
 
 
 @dataclass
 class DecoderState:
     """Per-layer KV cache plus once-projected cross-attn K/V.
 
-    ``self_k`` / ``self_v`` are lists indexed by layer, each tensor
-    ``[B, H, T_so_far, Dh]``. ``cross_k`` / ``cross_v`` are projected
-    once on the first ``step`` and reused unchanged thereafter.
+    ``self_k`` / ``self_v`` are pre-allocated to the max decode length
+    ``[B, H, L, Dh]``; each step writes one slot in place. ``step_idx``
+    is a 0-D long tensor pointing at the next slot to fill. Fixed shapes
+    keep the compiled step body from recompiling on cache growth.
     """
 
-    self_k: list[Tensor | None] = field(default_factory=list)
-    self_v: list[Tensor | None] = field(default_factory=list)
+    self_k: list[Tensor] = field(default_factory=list)
+    self_v: list[Tensor] = field(default_factory=list)
     cross_k: list[Tensor] = field(default_factory=list)
     cross_v: list[Tensor] = field(default_factory=list)
+    step_idx: Tensor | None = None
 
 
 class GrammarDecoder(nn.Module):
@@ -254,26 +300,43 @@ class GrammarDecoder(nn.Module):
         for raw_layer in self.layers:
             layer = cast(_DecoderLayer, raw_layer)
             cross_k, cross_v = layer.cross_attn.project_kv(encoded)
-            x, _, _ = layer(x, cos, sin, cross_k, cross_v, encoder_attention_mask, None, None)
+            x = layer(x, cos, sin, cross_k, cross_v, encoder_attention_mask)
         x = self.final_norm(x)
         return self._heads(x, encoded)
 
-    def init_state(self, encoded: Tensor) -> DecoderState:
-        """Pre-project cross-attn K/V once per batch.
+    def init_state(self, encoded: Tensor, max_decode_len: int | None = None) -> DecoderState:
+        """Pre-project cross-attn K/V and pre-allocate self-attn KV cache.
 
-        Self-attn caches start empty. Pulled out of :meth:`step` so the
-        compiled step body never branches on ``state is None`` — that
-        branch would force a separate dynamo specialization for the first
-        step vs all later steps.
+        Self-attn cache is shaped ``[B, H, L, Dh]`` once up front so the
+        compiled step body sees constant tensor shapes — no recompile on
+        cache growth. Each step writes one slot in place via
+        ``index_copy_`` and masks out unfilled positions.
         """
-        state = DecoderState()
+        L = int(max_decode_len if max_decode_len is not None else self.cfg.max_decode_len)
+        b = int(encoded.shape[0])
+        head_dim = self.cfg.d_model // self.cfg.n_heads
+        state = DecoderState(
+            step_idx=torch.zeros((), dtype=torch.long, device=encoded.device),
+        )
         for raw_layer in self.layers:
             layer = cast(_DecoderLayer, raw_layer)
             k, v = layer.cross_attn.project_kv(encoded)
             state.cross_k.append(k)
             state.cross_v.append(v)
-            state.self_k.append(None)
-            state.self_v.append(None)
+            state.self_k.append(
+                torch.zeros(
+                    (b, self.cfg.n_heads, L, head_dim),
+                    dtype=encoded.dtype,
+                    device=encoded.device,
+                )
+            )
+            state.self_v.append(
+                torch.zeros(
+                    (b, self.cfg.n_heads, L, head_dim),
+                    dtype=encoded.dtype,
+                    device=encoded.device,
+                )
+            )
         return state
 
     def step(
@@ -301,31 +364,30 @@ class GrammarDecoder(nn.Module):
         x = self.tok_emb(prev_token).unsqueeze(1)  # [B, 1, D]
         cos = cast(Tensor, self.rope_cos).to(dtype=x.dtype, device=x.device)
         sin = cast(Tensor, self.rope_sin).to(dtype=x.dtype, device=x.device)
-        new_self_k: list[Tensor | None] = []
-        new_self_v: list[Tensor | None] = []
+        step_idx = cast(Tensor, state.step_idx)
         for i, raw_layer in enumerate(self.layers):
             layer = cast(_DecoderLayer, raw_layer)
-            cache_k = state.self_k[i]
-            cache_v = state.self_v[i]
-            x, nk, nv = layer(
+            x = layer.step(
                 x,
                 cos,
                 sin,
                 state.cross_k[i],
                 state.cross_v[i],
                 encoder_attention_mask,
-                cache_k,
-                cache_v,
+                state.self_k[i],
+                state.self_v[i],
+                step_idx,
             )
-            new_self_k.append(nk)
-            new_self_v.append(nv)
         x = self.final_norm(x)
         vocab_logits, pointer_logits = self._heads(x, encoded)
+        # Self-attn caches are mutated in place by `_CausalSelfAttention.step`;
+        # only step_idx is replaced (a new 0-D tensor with the next position).
         new_state = DecoderState(
-            self_k=new_self_k,
-            self_v=new_self_v,
+            self_k=state.self_k,
+            self_v=state.self_v,
             cross_k=state.cross_k,
             cross_v=state.cross_v,
+            step_idx=step_idx + 1,
         )
         return vocab_logits.squeeze(1), pointer_logits.squeeze(1), new_state
 

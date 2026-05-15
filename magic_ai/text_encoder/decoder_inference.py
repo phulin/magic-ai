@@ -180,10 +180,11 @@ def decoder_sample(
 
     pos_to_subject_map = state.pos_to_subj  # [B, T_enc] long, -1 fill
 
-    # Eager cross-KV projection so the per-step compiled body never sees a
-    # ``None`` state — that branch would force a separate dynamo specialization
-    # for the first step.
-    decoder_state = grammar_decoder.init_state(encoded)
+    # Pre-allocate the KV cache to the full decode length so the compiled
+    # step body sees constant shapes every iteration. init_state also does
+    # the cross-KV projection so the step body never branches on
+    # ``state is None``.
+    decoder_state = grammar_decoder.init_state(encoded, max_decode_len=L)
     prev_token = torch.full((b,), int(GrammarVocab.PAD), dtype=torch.long, device=device)
     prev_pointer_pos = torch.full((b,), -1, dtype=torch.long, device=device)
 

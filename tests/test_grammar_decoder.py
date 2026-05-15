@@ -44,7 +44,7 @@ def test_teacher_forced_step_parity() -> None:
 
     with torch.no_grad():
         tf_vocab, tf_pointer = decoder.forward_teacher_forced(target_tokens, encoded, enc_mask)
-        state = decoder.init_state(encoded)
+        state = decoder.init_state(encoded, max_decode_len=seq_len)
         step_vocab = []
         step_pointer = []
         for i in range(seq_len):
@@ -84,21 +84,25 @@ def test_kv_cache_shape_growth() -> None:
     b, t_enc, d = 2, 5, decoder.cfg.d_model
     encoded = torch.randn(b, t_enc, d)
     enc_mask = torch.ones(b, t_enc, dtype=torch.bool)
-    state = decoder.init_state(encoded)
+    L = 4
+    state = decoder.init_state(encoded, max_decode_len=L)
     head_dim = decoder.cfg.d_model // decoder.cfg.n_heads
     h = decoder.cfg.n_heads
+    # Cache is pre-allocated to a fixed [B, H, L, Dh] so the compiled step
+    # body sees constant shapes; only step_idx changes from step to step.
+    for layer_idx in range(decoder.cfg.n_layers):
+        assert state.self_k[layer_idx].shape == (b, h, L, head_dim)
+        assert state.self_v[layer_idx].shape == (b, h, L, head_dim)
     for step_idx in range(3):
         prev = torch.randint(0, GRAMMAR_VOCAB_SIZE, (b,))
         _, _, state = decoder.step(
             prev, torch.full((b,), -1, dtype=torch.long), encoded, enc_mask, state
         )
-        assert state is not None
+        assert state.step_idx is not None
+        assert int(state.step_idx) == step_idx + 1
         for layer_idx in range(decoder.cfg.n_layers):
-            sk = state.self_k[layer_idx]
-            sv = state.self_v[layer_idx]
-            assert sk is not None and sv is not None
-            assert sk.shape == (b, h, step_idx + 1, head_dim)
-            assert sv.shape == (b, h, step_idx + 1, head_dim)
+            assert state.self_k[layer_idx].shape == (b, h, L, head_dim)
+            assert state.self_v[layer_idx].shape == (b, h, L, head_dim)
             assert state.cross_k[layer_idx].shape == (b, h, t_enc, head_dim)
             assert state.cross_v[layer_idx].shape == (b, h, t_enc, head_dim)
 
