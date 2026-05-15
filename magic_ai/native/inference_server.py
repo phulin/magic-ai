@@ -168,20 +168,18 @@ class RolloutTimingStats:
         return out
 
 
-class _HostPackedArena:
-    """Pre-allocated (pinned where available) host buffers for the merged
-    packed batch.
+class _HostPackedArenaSlot:
+    """One slot of pinned host buffers for the merged packed batch.
 
-    Replaces ``_concat_packed_text_batches``'s per-merge ``torch.cat`` +
-    ``torch.full`` allocation pattern with a single set of long-lived
-    buffers that the merge writes into in place. Buffers grow on demand
-    (doubling) and are kept across merges so steady-state inference
-    allocates nothing.
+    Owns the long-lived buffers written by ``merge_into`` and read by the
+    downstream ``host_packed.to(device, non_blocking=True)``. Buffers grow
+    on demand (doubling) and are kept across merges so steady-state
+    inference allocates nothing.
 
-    The arena holds buffers for the *next* H→D's input. The server does
-    a blocking ``host.to(device)`` after the merge so reuse on the next
-    merge is safe; Phase C will switch to ``non_blocking=True`` and a
-    second slot to keep the H→D async.
+    Each slot also carries an ``h2d_event``: a CUDA event recorded after
+    the slot's H→D copy is issued. The arena waits on that event before
+    reusing the slot, so a non-blocking H→D cannot race with the next
+    merge overwriting the same host memory.
     """
 
     def __init__(self, *, use_pinned: bool) -> None:
@@ -192,6 +190,9 @@ class _HostPackedArena:
         self._max_blockers = 0
         self._max_attackers = 0
         self._has_bitmap = False
+        # Signaled when the slot's most recent H→D copy has landed on the
+        # device. ``None`` means the slot is free to write into.
+        self.h2d_event: Any | None = None
         # Allocated lazily on first merge.
         self.token_ids: torch.Tensor | None = None
         self.seq_id: torch.Tensor | None = None
@@ -468,6 +469,47 @@ class _HostPackedArena:
             seq_lengths_host=tuple(seq_lengths_host),
             max_seqlen=max(seq_lengths_host, default=0),
         )
+
+
+class _HostPackedArena:
+    """Double-buffered host arena for the merged packed batch.
+
+    Wraps two ``_HostPackedArenaSlot`` instances and rotates between them
+    so the downstream ``host_packed.to(device, non_blocking=True)`` can
+    overlap with the next batch's host-side merge: while the GPU is still
+    reading slot A via the async H→D, the next merge writes into slot B.
+
+    The caller is expected to invoke ``record_h2d_event(slot_idx, event)``
+    after issuing the non-blocking H→D copy for the slot. The next time
+    that slot rotates back to be written, ``merge`` synchronizes on the
+    recorded event first so the copy is guaranteed to have landed before
+    its source memory is overwritten. In steady state the event is
+    already signaled (forward+sample is far longer than merge), so the
+    wait is free.
+    """
+
+    def __init__(self, *, use_pinned: bool, num_slots: int = 2) -> None:
+        if num_slots < 1:
+            raise ValueError("_HostPackedArena requires at least one slot")
+        self._slots: list[_HostPackedArenaSlot] = [
+            _HostPackedArenaSlot(use_pinned=use_pinned) for _ in range(num_slots)
+        ]
+        self._next_idx = 0
+
+    def merge(self, batches: list[PackedTextBatch]) -> tuple[PackedTextBatch, int]:
+        idx = self._next_idx
+        self._next_idx = (idx + 1) % len(self._slots)
+        slot = self._slots[idx]
+        if slot.h2d_event is not None:
+            slot.h2d_event.synchronize()
+            slot.h2d_event = None
+        return slot.merge(batches), idx
+
+    def record_h2d_event(self, slot_idx: int, event: Any) -> None:
+        """Register the CUDA event signaling slot ``slot_idx``'s H→D
+        copy completion. ``merge`` will wait on it before reusing the
+        slot's host buffers."""
+        self._slots[slot_idx].h2d_event = event
 
 
 def _concat_packed_text_batches(batches: list[PackedTextBatch]) -> PackedTextBatch:
@@ -1087,7 +1129,7 @@ class TextInferenceServer:
         start = time.perf_counter()
         # Merge actor batches on host first via the long-lived arena (no
         # per-merge allocs), then a single H→D transfer feeds the forward.
-        host_packed = self._arena.merge([it.request.packed_batch for it in items])
+        host_packed, arena_slot_idx = self._arena.merge([it.request.packed_batch for it in items])
         env_indices: list[int] = [i for it in items for i in it.env_indices]
         perspective: list[int] = [p for it in items for p in it.perspective_player_indices]
         if self._timing is not None:
@@ -1120,6 +1162,16 @@ class TextInferenceServer:
                 decoder_batch, h_in_replay, c_in_replay = self._sample_decoder(
                     self._policy, host_packed, env_indices, perspective
                 )
+        # All ``host_packed`` views have now been read by the pipeline (the
+        # per-field ``host.to(device, non_blocking=True)`` copies were
+        # issued inside ``_sample_decoder``). Record an event on the
+        # current CUDA stream so the arena knows when the H→D copies have
+        # actually landed — until that event signals, the slot's host
+        # buffers must not be overwritten by the next ``merge``.
+        if self._device.type == "cuda":
+            h2d_event = torch.cuda.Event()
+            h2d_event.record(torch.cuda.current_stream(self._device))
+            self._arena.record_h2d_event(arena_slot_idx, h2d_event)
         if self._timing is not None:
             self._timing.add("server_sample", time.perf_counter() - start)
 

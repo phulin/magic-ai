@@ -270,6 +270,14 @@ class TextRolloutActor:
         ready_games = [env.game for env in ready_envs]
         ready_env_indices = [int(env.slot_idx) for env in ready_envs]
 
+        # Drain BEFORE encode: ``_finish_inference`` clones from
+        # ``batch.packed``, which is a view into this actor's reusable
+        # encoder arena. If a queued ``_InferenceDone`` is processed after
+        # the next ``_encode_packed`` overwrites the arena, the clone reads
+        # stale data. Draining here keeps the clone reading the values that
+        # were live when its batch was submitted.
+        self._drain_completed_inference()
+
         start = time.perf_counter()
         _, nat_outputs = self._encode_packed(ready_games, ready_players)
         self._record_timing("actor_encode", start)
@@ -288,7 +296,11 @@ class TextRolloutActor:
         self._record_timing("actor_tick", tick_start)
 
     def _submit_batch(self, batch: _SubmitBatch) -> None:
-        self._drain_completed_inference()
+        # ``_drain_completed_inference`` runs in ``_poll_and_submit`` *before*
+        # ``_encode_packed`` overwrites the per-actor arena, so a queued
+        # ``_InferenceDone``'s clone-from-view path sees correct data. Don't
+        # drain again here — a drain after encode would re-introduce the race
+        # for any item that arrived between the pre-encode drain and now.
         start = time.perf_counter()
         request = TextInferenceRequest(
             packed_batch=batch.packed,
