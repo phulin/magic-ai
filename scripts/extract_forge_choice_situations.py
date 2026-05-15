@@ -233,10 +233,15 @@ def _step(raw: str | None) -> str:
 
 
 _FORGE_KIND_TO_OPTION_KIND: dict[str, str] = {
+    # Legacy zip schema (`snapshot.playableActions[].kind`).
     "PLAY_LAND": "play",
     "CAST_SPELL": "cast",
     "ACTIVATE": "activate",
     "ACTIVATE_MANA": "activate",
+    # Current Forge schema (`snapshot.playableActions[].type`).
+    "LAND": "play",
+    "SPELL": "cast",
+    "ACTIVATED": "activate",
 }
 
 
@@ -259,7 +264,10 @@ def _priority_pending_from_playable_actions(
     for i, act in enumerate(actions):
         if not isinstance(act, dict):
             continue
-        forge_kind = str(act.get("kind") or "")
+        forge_kind = str(act.get("type") or act.get("kind") or "")
+        if forge_kind == "PASS":
+            # Pass is appended unconditionally below; skip the duplicate entry.
+            continue
         opt_kind = _FORGE_KIND_TO_OPTION_KIND.get(forge_kind)
         if opt_kind is None:
             continue
