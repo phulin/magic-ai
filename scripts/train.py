@@ -1690,6 +1690,82 @@ def rl_lr_warmup_step(optimizer: torch.optim.Optimizer) -> None:
         state.step()
 
 
+def _maybe_log_and_eval(
+    *,
+    sequenced: bool,
+    stats: dict[str, float],
+    epoch: int,
+    global_step: int,
+    log_now: bool,
+    eval_ds: Any,
+    eval_every: int,
+    trainer: Any,
+    eval_rng: Any,
+    device: torch.device,
+    amp_ctx: Any,
+    args: argparse.Namespace,
+) -> None:
+    if log_now:
+        if sequenced:
+            print(
+                f"[policy-value] epoch={epoch} step={global_step:6d} "
+                f"loss={stats['loss']:.4f} policy={stats['policy_loss']:.4f} "
+                f"value={stats['value_loss']:.4f} "
+                f"value_sign={stats['value_sign_accuracy']:.3f} "
+                f"v_corr={stats['v_corr']:+.3f} "
+                f"v_pred={stats['v_pred_mean']:+.3f}±{stats['v_pred_std']:.3f} "
+                f"v_targ={stats['v_targ_mean']:+.3f}±{stats['v_targ_std']:.3f} "
+                f"v_head_gn={stats['v_head_grad_norm']:.4f} "
+                f"lstm_gn={stats['lstm_grad_norm']:.3f} "
+                f"n_loss={stats['n_loss_cells']} "
+                f"grad_norm={stats['grad_norm']:.3f}"
+            )
+        else:
+            print(
+                f"[policy-value] epoch={epoch} step={global_step:6d} "
+                f"loss={stats['loss']:.4f} policy={stats['policy_loss']:.4f} "
+                f"value={stats['value_loss']:.4f} "
+                f"step_acc={stats['decoder_step_accuracy']:.3f} "
+                f"value_sign={stats['value_sign_accuracy']:.3f} "
+                f"v_corr={stats['v_corr']:+.3f} "
+                f"v_pred={stats['v_pred_mean']:+.3f}±{stats['v_pred_std']:.3f} "
+                f"v_targ={stats['v_targ_mean']:+.3f}±{stats['v_targ_std']:.3f} "
+                f"v_head_gn={stats['v_head_grad_norm']:.4f} "
+                f"grad_norm={stats['grad_norm']:.3f}"
+            )
+        if not args.no_wandb and wandb.run is not None:
+            wandb.log(
+                {
+                    **{f"pretrain_policy_value/{k}": v for k, v in stats.items()},
+                    "pretrain_policy_value/step": global_step,
+                }
+            )
+    if eval_ds is not None and eval_every > 0 and global_step > 0 and global_step % eval_every == 0:
+        with amp_ctx:
+            if sequenced:
+                eval_stats = trainer.evaluate_sequenced(eval_ds, eval_rng, device=device)
+            else:
+                eval_stats = trainer.evaluate(eval_ds, eval_rng, device=device)
+        train_v = stats.get("value_loss", 0.0)
+        eval_v = eval_stats.get("eval_value_loss", 0.0)
+        print(
+            f"[policy-value] eval step={global_step} "
+            f"policy={eval_stats.get('eval_policy_loss', 0.0):.4f} "
+            f"value={eval_v:.4f} "
+            f"value_sign={eval_stats.get('eval_value_sign_accuracy', 0.0):.3f} "
+            f"train-eval value gap={train_v - eval_v:+.4f} "
+            f"batches={int(eval_stats['eval_batches'])}"
+        )
+        if not args.no_wandb and wandb.run is not None:
+            wandb.log(
+                {
+                    **{f"pretrain_policy_value/{k}": v for k, v in eval_stats.items()},
+                    "pretrain_policy_value/train_minus_eval_value": train_v - eval_v,
+                    "pretrain_policy_value/step": global_step,
+                }
+            )
+
+
 def run_mlm_pretrain(
     args: argparse.Namespace,
     text_backend: TextTrainingBackend,
@@ -1720,6 +1796,10 @@ def run_mlm_pretrain(
         value_loss_weight=args.pretrain_mlm_value_loss_weight,
         policy_loss_weight=args.pretrain_mlm_policy_loss_weight,
         pad_token_id=pad_id,
+        sequence_mode=args.pretrain_mlm_sequence_mode,
+        games_per_batch=args.pretrain_mlm_games_per_batch,
+        loss_positions_per_game=args.pretrain_mlm_loss_positions_per_game,
+        max_decisions_per_game=args.pretrain_mlm_max_decisions_per_game,
     )
     train_ds = ForgeChoiceDataset(
         cfg,
@@ -1779,56 +1859,71 @@ def run_mlm_pretrain(
     if not args.no_wandb and wandb.run is not None:
         wandb.define_metric("pretrain_policy_value/step")
         wandb.define_metric("pretrain_policy_value/*", step_metric="pretrain_policy_value/step")
+    sequenced = cfg.sequence_mode == "full"
+    grad_accum = max(1, int(args.pretrain_mlm_grad_accum))
+    if sequenced:
+        from magic_ai.text_encoder.policy_value_pretrain import (
+            _sequenced_batch_to_device,
+        )
     global_step = 0
     for epoch in range(args.pretrain_mlm_epochs):
-        for host_batch in train_ds.iter_epoch(cfg.batch_size, np_rng):
-            batch = _batch_to_device(host_batch, device)
-            log_now = global_step % log_every == 0
-            with amp_ctx:
-                stats = trainer.step(batch, compute_stats=log_now)
-            if log_now:
-                print(
-                    f"[policy-value] epoch={epoch} step={global_step:6d} "
-                    f"loss={stats['loss']:.4f} policy={stats['policy_loss']:.4f} "
-                    f"value={stats['value_loss']:.4f} "
-                    f"pri_acc={stats['priority_accuracy']:.3f} "
-                    f"blank_acc={stats['per_blank_accuracy']:.3f} "
-                    f"value_sign={stats['value_sign_accuracy']:.3f} "
-                    f"grad_norm={stats['grad_norm']:.3f}"
+        if sequenced:
+            iterator = train_ds.iter_epoch_games(
+                cfg.games_per_batch, cfg.loss_positions_per_game, np_rng
+            )
+            accum_buf: list[Any] = []
+            for host_seq_batch in iterator:
+                accum_buf.append(host_seq_batch)
+                if len(accum_buf) < grad_accum:
+                    continue
+                log_now = global_step % log_every == 0
+                last_stats: dict[str, float] = {}
+                for accum_idx, micro_host in enumerate(accum_buf):
+                    micro = _sequenced_batch_to_device(micro_host, device)
+                    with amp_ctx:
+                        last_stats = trainer.sequenced_step(
+                            micro,
+                            compute_stats=log_now and accum_idx == grad_accum - 1,
+                            accum_index=accum_idx,
+                            accum_total=grad_accum,
+                        )
+                accum_buf = []
+                _maybe_log_and_eval(
+                    sequenced=True,
+                    stats=last_stats,
+                    epoch=epoch,
+                    global_step=global_step,
+                    log_now=log_now,
+                    eval_ds=eval_ds,
+                    eval_every=eval_every,
+                    trainer=trainer,
+                    eval_rng=eval_rng,
+                    device=device,
+                    amp_ctx=amp_ctx,
+                    args=args,
                 )
-                if not args.no_wandb and wandb.run is not None:
-                    wandb.log(
-                        {
-                            **{f"pretrain_policy_value/{k}": v for k, v in stats.items()},
-                            "pretrain_policy_value/step": global_step,
-                        }
-                    )
-            if (
-                eval_ds is not None
-                and eval_every > 0
-                and global_step > 0
-                and global_step % eval_every == 0
-            ):
+                global_step += 1
+        else:
+            for host_iid_batch in train_ds.iter_epoch(cfg.batch_size, np_rng):
+                iid_batch = _batch_to_device(host_iid_batch, device)
+                log_now = global_step % log_every == 0
                 with amp_ctx:
-                    eval_stats = trainer.evaluate(
-                        eval_ds,
-                        eval_rng,
-                        device=device,
-                    )
-                print(
-                    f"[policy-value] eval step={global_step} "
-                    f"policy={eval_stats.get('eval_policy_loss', 0.0):.4f} "
-                    f"value={eval_stats.get('eval_value_loss', 0.0):.4f} "
-                    f"batches={int(eval_stats['eval_batches'])}"
+                    stats = trainer.step(iid_batch, compute_stats=log_now)
+                _maybe_log_and_eval(
+                    sequenced=False,
+                    stats=stats,
+                    epoch=epoch,
+                    global_step=global_step,
+                    log_now=log_now,
+                    eval_ds=eval_ds,
+                    eval_every=eval_every,
+                    trainer=trainer,
+                    eval_rng=eval_rng,
+                    device=device,
+                    amp_ctx=amp_ctx,
+                    args=args,
                 )
-                if not args.no_wandb and wandb.run is not None:
-                    wandb.log(
-                        {
-                            **{f"pretrain_policy_value/{k}": v for k, v in eval_stats.items()},
-                            "pretrain_policy_value/step": global_step,
-                        }
-                    )
-            global_step += 1
+                global_step += 1
     print(f"[policy-value] finished epochs={args.pretrain_mlm_epochs} steps={global_step}")
 
 
@@ -2327,7 +2422,44 @@ def parse_args() -> argparse.Namespace:
         help="runtime value target semantics for Forge outcomes; with one extracted "
         "choice per game, gae/vtrace use a discounted terminal sign proxy.",
     )
-    parser.add_argument("--pretrain-mlm-value-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--pretrain-mlm-sequence-mode",
+        choices=("none", "full"),
+        default="full",
+        help="full: replay each game through the LSTM in temporal order; loss "
+        "fires on a sampled subset of cells. none: legacy IID per-record path "
+        "that bypasses the LSTM.",
+    )
+    parser.add_argument(
+        "--pretrain-mlm-games-per-batch",
+        type=int,
+        default=2,
+        help="number of complete games per *micro*-batch in sequenced pretrain "
+        "mode (one encoder forward). Effective batch is "
+        "games_per_batch × pretrain_mlm_grad_accum.",
+    )
+    parser.add_argument(
+        "--pretrain-mlm-grad-accum",
+        type=int,
+        default=1,
+        help="number of micro-batches per optimizer step in sequenced pretrain "
+        "mode. Lets you scale effective batch above what fits in GPU memory.",
+    )
+    parser.add_argument(
+        "--pretrain-mlm-loss-positions-per-game",
+        type=int,
+        default=16,
+        help="cells per game that count toward decoder + value losses in "
+        "sequenced pretrain mode (sampled uniformly without replacement).",
+    )
+    parser.add_argument(
+        "--pretrain-mlm-max-decisions-per-game",
+        type=int,
+        default=64,
+        help="hard cap on decision points per game in sequenced pretrain "
+        "mode; longer games are truncated to the first N decisions.",
+    )
+    parser.add_argument("--pretrain-mlm-value-loss-weight", type=float, default=10.0)
     parser.add_argument("--pretrain-mlm-policy-loss-weight", type=float, default=1.0)
     parser.add_argument(
         "--pretrain-mlm-decoder",

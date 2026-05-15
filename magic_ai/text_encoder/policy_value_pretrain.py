@@ -73,6 +73,15 @@ class ForgePolicyValueConfig:
     value_loss_weight: float = 1.0
     policy_loss_weight: float = 1.0
     pad_token_id: int = 0
+    # Sequenced pretraining: when ``sequence_mode == "full"``, each batch
+    # element is a whole game replayed through the LSTM in temporal order;
+    # losses fire on a random sample of ``loss_positions_per_game`` cells.
+    # In ``"none"`` mode the trainer falls back to per-record IID batches
+    # (the legacy path that bypasses the LSTM entirely).
+    sequence_mode: Literal["none", "full"] = "full"
+    games_per_batch: int = 2
+    loss_positions_per_game: int = 16
+    max_decisions_per_game: int = 64
 
 
 @dataclass(frozen=True)
@@ -92,6 +101,29 @@ class ForgeDecoderBatch:
     pointer_mask: Tensor
     decision_type_per_row: Tensor
     value_targets: Tensor
+
+
+@dataclass(frozen=True)
+class ForgeSequencedBatch:
+    """Sequenced pretrain batch: ``B`` games × ``L_max`` decisions, flattened.
+
+    The flat dimension ``N = sum_b L_b`` carries every valid (game, position)
+    cell. ``cell_game_idx`` and ``cell_pos_idx`` say which (b, l) each flat
+    row belongs to, so the trainer can scatter per-cell encoder outputs back
+    into ``[B, L_max, D]`` for the LSTM scan over the L axis.
+
+    ``loss_mask`` (shape ``[N]``) marks which cells contribute to the
+    decoder + value losses — typically ``loss_positions_per_game`` per
+    game, sampled uniformly without replacement.
+    """
+
+    decoder: ForgeDecoderBatch
+    cell_game_idx: Tensor  # [N]
+    cell_pos_idx: Tensor  # [N]
+    loss_mask: Tensor  # [N] bool
+    game_lengths: Tensor  # [B] int — number of valid cells in each game
+    n_games: int
+    l_max: int
 
 
 @dataclass(frozen=True)
@@ -161,6 +193,11 @@ class ForgeChoiceDataset:
         self._spec_renderer = DecisionSpecRenderer(tokenizer)
         bucket = 0 if cfg.eval_fraction <= 0 else max(2, int(round(1.0 / cfg.eval_fraction)))
         self.records: list[dict[str, Any]] = []
+        # Group records by game_id while preserving input order (the sharder
+        # is game-atomic so records arrive grouped).
+        self.games: list[list[dict[str, Any]]] = []
+        current_game: list[dict[str, Any]] | None = None
+        current_game_id: str | None = None
         for record in _iter_records(cfg.data_path):
             game_id = str(record.get("game_id") or "")
             if bucket > 0 and split != "all":
@@ -170,12 +207,27 @@ class ForgeChoiceDataset:
                 if split == "eval" and not in_eval:
                     continue
             self.records.append(record)
+            if current_game_id is None or game_id != current_game_id:
+                current_game = []
+                self.games.append(current_game)
+                current_game_id = game_id
+            assert current_game is not None
+            current_game.append(record)
+        # Within each game, sort by source_seq to guarantee temporal order
+        # even if upstream shuffled (defense in depth — the rust extractor
+        # already emits sorted, and game-atomic shards preserve that).
+        for game in self.games:
+            game.sort(key=lambda r: int((r.get("choice") or {}).get("source_seq") or 0))
         if not self.records:
             raise ValueError(f"no Forge choice records loaded from {cfg.data_path} split={split}")
 
     @property
     def n_examples(self) -> int:
         return len(self.records)
+
+    @property
+    def n_games(self) -> int:
+        return len(self.games)
 
     def kind_counts(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -242,6 +294,11 @@ class ForgeChoiceDataset:
                 prepared.append(item)
         if not prepared:
             raise ValueError("no renderable Forge decoder examples in selected batch")
+        return self._batch_from_prepared(prepared)
+
+    def _batch_from_prepared(self, prepared: list[_PreparedDecoderExample]) -> ForgeDecoderBatch:
+        if not prepared:
+            raise ValueError("_batch_from_prepared got empty list")
 
         encoded = collate(
             [p.encoded for p in prepared],
@@ -353,6 +410,101 @@ class ForgeChoiceDataset:
         indices = rng.integers(0, len(self.records), size=batch_size)
         return self._batch_from_indices([int(i) for i in indices])
 
+    def iter_epoch_games(
+        self,
+        games_per_batch: int,
+        loss_positions_per_game: int,
+        rng: np.random.Generator,
+    ) -> Iterator[ForgeSequencedBatch]:
+        order = rng.permutation(self.n_games)
+        end = (len(order) // games_per_batch) * games_per_batch
+        for off in range(0, end, games_per_batch):
+            batch = self._sequenced_batch_from_games(
+                [int(i) for i in order[off : off + games_per_batch]],
+                loss_positions_per_game,
+                rng,
+            )
+            if batch is not None:
+                yield batch
+
+    def sample_sequenced_batch(
+        self,
+        games_per_batch: int,
+        loss_positions_per_game: int,
+        rng: np.random.Generator,
+    ) -> ForgeSequencedBatch:
+        # Eval-side sampler. Skip degenerate batches (e.g. a draw of games
+        # that all fail to render any cell) by retrying.
+        for _ in range(8):
+            indices = rng.integers(0, self.n_games, size=games_per_batch).tolist()
+            batch = self._sequenced_batch_from_games(
+                [int(i) for i in indices], loss_positions_per_game, rng
+            )
+            if batch is not None:
+                return batch
+        raise RuntimeError("could not sample a non-empty sequenced batch in 8 tries")
+
+    def _sequenced_batch_from_games(
+        self,
+        game_indices: Sequence[int],
+        loss_positions_per_game: int,
+        rng: np.random.Generator,
+    ) -> ForgeSequencedBatch | None:
+        """Prepare a batch where each row is a complete game's decision sequence.
+
+        Records that fail to render or to translate to a decoder target are
+        dropped from their game's sequence (silently — same behavior as the
+        IID path), which can shrink ``L_b`` below the original game length.
+        Each game then has ``min(L_b, loss_positions_per_game)`` cells
+        sampled uniformly to count toward decoder + value losses.
+        """
+
+        prepared_per_game: list[list[_PreparedDecoderExample]] = []
+        for gi in game_indices:
+            game_records = self.games[gi]
+            prepared_game: list[_PreparedDecoderExample] = []
+            cap = self.cfg.max_decisions_per_game
+            for record in game_records[:cap]:
+                item = self._prepare_decoder(record)
+                if item is not None:
+                    prepared_game.append(item)
+            if prepared_game:
+                prepared_per_game.append(prepared_game)
+        if not prepared_per_game:
+            return None
+
+        l_per_game = [len(g) for g in prepared_per_game]
+        l_max = max(l_per_game)
+        n_games = len(prepared_per_game)
+
+        # Flatten cells in (game-major, position-major) order so the trainer
+        # can scatter encoder outputs back into [B, L_max] via the indices.
+        flat: list[_PreparedDecoderExample] = []
+        cell_game_idx: list[int] = []
+        cell_pos_idx: list[int] = []
+        loss_mask_list: list[bool] = []
+        for b, game in enumerate(prepared_per_game):
+            k = min(loss_positions_per_game, len(game))
+            chosen = set(rng.choice(len(game), size=k, replace=False).tolist())
+            for pos, item in enumerate(game):
+                flat.append(item)
+                cell_game_idx.append(b)
+                cell_pos_idx.append(pos)
+                loss_mask_list.append(pos in chosen)
+
+        # Build the underlying ForgeDecoderBatch from the flat cell list.
+        decoder_batch = self._batch_from_prepared(flat)
+
+        return ForgeSequencedBatch(
+            decoder=decoder_batch,
+            cell_game_idx=torch.tensor(cell_game_idx, dtype=torch.long),
+            cell_pos_idx=torch.tensor(cell_pos_idx, dtype=torch.long),
+            loss_mask=torch.tensor(loss_mask_list, dtype=torch.bool),
+            game_lengths=torch.tensor(l_per_game, dtype=torch.long),
+            n_games=n_games,
+            l_max=l_max,
+        )
+
 
 def _expected_pointer_kind(
     spec: DecisionSpec, target: DecoderTarget, step_index: int
@@ -390,6 +542,196 @@ class ForgePolicyValueTrainer:
     def step(self, batch: ForgeDecoderBatch, *, compute_stats: bool = True) -> dict[str, float]:
         return self._decoder_step(batch, compute_stats=compute_stats)
 
+    def sequenced_step(
+        self,
+        batch: ForgeSequencedBatch,
+        *,
+        compute_stats: bool = True,
+        accum_index: int = 0,
+        accum_total: int = 1,
+    ) -> dict[str, float]:
+        return self._sequenced_step(
+            batch,
+            compute_stats=compute_stats,
+            accum_index=accum_index,
+            accum_total=accum_total,
+        )
+
+    def _sequenced_step(
+        self,
+        batch: ForgeSequencedBatch,
+        *,
+        compute_stats: bool,
+        accum_index: int = 0,
+        accum_total: int = 1,
+    ) -> dict[str, float]:
+        """Sequenced pretrain: replay each game through the LSTM in temporal
+        order; decoder + value losses fire on a sampled subset of cells.
+
+        The LSTM scan over [B, L_max] gives the value head proper history-
+        aggregated state. Per-cell padded LSTM updates beyond ``game_lengths``
+        are unused (loss is masked off there), so we don't pay the cost of
+        ``pack_padded_sequence``.
+        """
+        self.policy.train()
+        if accum_index == 0:
+            self.optimizer.zero_grad(set_to_none=True)
+        text_policy = self.policy.text_policy
+        if text_policy.grammar_decoder is None:
+            raise RuntimeError("decoder pipeline requires TextPolicy with a grammar_decoder")
+        device = next(text_policy.parameters()).device
+
+        decoder_batch = batch.decoder
+        cell_game_idx = batch.cell_game_idx.to(device)
+        cell_pos_idx = batch.cell_pos_idx.to(device)
+        loss_mask_flat = batch.loss_mask.to(device)
+        n_games = batch.n_games
+        l_max = batch.l_max
+
+        # One encoder forward feeds both decoder cross-attn and the value
+        # head. Use the packed varlen path (`encode_only` packs internally)
+        # to avoid `flex_attention` recompiles, then scatter back to
+        # [N, T_enc, D] for the decoder cross-attn — same convention as the
+        # rationalized `forward_decoder_teacher_forced`, but inlined here so
+        # the encoder isn't re-run for the value head.
+        from magic_ai.text_encoder.batch import scatter_packed_to_padded
+
+        encoded_snaps = text_policy.encode_only(decoder_batch.encoded)
+        encoded_hidden, attn_mask = scatter_packed_to_padded(
+            encoded_snaps.encoded, encoded_snaps.packed
+        )
+        state_vec = encoded_snaps.state_vector  # [N, D]
+        target_tokens = decoder_batch.output_token_ids.to(device)
+        vocab_logits, pointer_logits = text_policy.grammar_decoder.forward_teacher_forced(
+            target_tokens, encoded_hidden, attn_mask
+        )
+        # Apply loss mask by zeroing the per-row pad mask on non-loss cells —
+        # the existing decoder_cross_entropy_loss reduces over True entries
+        # in output_pad_mask.
+        out_pad_mask = decoder_batch.output_pad_mask.to(device) & loss_mask_flat.unsqueeze(-1)
+        decoder_loss = decoder_cross_entropy_loss(
+            vocab_logits,
+            pointer_logits,
+            target_tokens,
+            decoder_batch.output_pointer_pos.to(device),
+            decoder_batch.output_is_pointer.to(device),
+            decoder_batch.vocab_mask.to(device),
+            decoder_batch.pointer_mask.to(device),
+            out_pad_mask,
+        )
+
+        # Value path: scatter per-cell state_vec into [B, L_max, D], run the
+        # LSTM scan with zero init state, decode every position, mask losses.
+        d_model = state_vec.shape[-1]
+        state_vec_seq = torch.zeros((n_games, l_max, d_model), dtype=state_vec.dtype, device=device)
+        state_vec_seq[cell_game_idx, cell_pos_idx] = state_vec
+
+        lstm_input_seq = self.policy.in_proj(state_vec_seq)  # [B, L, lstm_hidden]
+        h0 = torch.zeros(
+            self.policy.lstm_layers,
+            n_games,
+            self.policy.lstm_hidden,
+            dtype=lstm_input_seq.dtype,
+            device=device,
+        )
+        c0 = torch.zeros_like(h0)
+        lstm_out_seq, _ = self.policy.lstm(lstm_input_seq, (h0, c0))
+        # out_proj projects back to d_model (the value head's input space).
+        state_for_heads_seq = self.policy.out_proj(lstm_out_seq)  # [B, L, D]
+        values_seq = text_policy.value_head(state_for_heads_seq)  # [B, L]
+
+        # Gather per-cell predictions back into flat-cell space and apply
+        # loss mask for MSE.
+        values_flat = values_seq[cell_game_idx, cell_pos_idx]  # [N]
+        value_targets_flat = decoder_batch.value_targets.to(device)
+        v_loss_per_cell = (values_flat.float() - value_targets_flat) ** 2
+        # Reduce only over loss_mask cells; clamp denominator to avoid /0.
+        loss_count = loss_mask_flat.float().sum().clamp(min=1.0)
+        v_loss = (v_loss_per_cell * loss_mask_flat.float()).sum() / loss_count
+
+        loss = self.cfg.policy_loss_weight * decoder_loss + self.cfg.value_loss_weight * v_loss
+        # Scale loss by accum_total so the accumulated gradient matches the
+        # average loss across micro-batches (rather than the sum).
+        (loss / accum_total).backward()
+        is_last_micro = accum_index + 1 == accum_total
+        if is_last_micro:
+            if self.grad_clip is not None:
+                grad_norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.grad_clip)
+            else:
+                grad_norm = torch.tensor(0.0, device=loss.device)
+            self.optimizer.step()
+        else:
+            grad_norm = torch.tensor(0.0, device=loss.device)
+        if not compute_stats:
+            return {}
+
+        with torch.no_grad():
+            v_pred_loss = values_flat.float()[loss_mask_flat]
+            v_targ_loss = value_targets_flat[loss_mask_flat]
+            v_pred_mean = float(v_pred_loss.mean()) if v_pred_loss.numel() > 0 else 0.0
+            v_pred_std = float(v_pred_loss.std()) if v_pred_loss.numel() > 1 else 0.0
+            v_targ_mean = float(v_targ_loss.mean()) if v_targ_loss.numel() > 0 else 0.0
+            v_targ_std = float(v_targ_loss.std()) if v_targ_loss.numel() > 1 else 0.0
+            denom = float(v_pred_loss.std() * v_targ_loss.std()) if v_pred_loss.numel() > 1 else 0.0
+            if denom > 1e-8:
+                centered = (v_pred_loss - v_pred_loss.mean()) * (v_targ_loss - v_targ_loss.mean())
+                v_corr = float(centered.mean() / denom)
+            else:
+                v_corr = 0.0
+            non_draw = v_targ_loss.abs() > 1e-6
+            sign_acc = (
+                float(
+                    (torch.sign(v_pred_loss[non_draw]) == torch.sign(v_targ_loss[non_draw]))
+                    .float()
+                    .mean()
+                )
+                if non_draw.any()
+                else 0.0
+            )
+            value_head = self.policy.text_policy.value_head
+            v_grad_norm = float(
+                torch.norm(
+                    torch.stack(
+                        [
+                            p.grad.detach().norm()
+                            for p in value_head.parameters()
+                            if p.grad is not None
+                        ]
+                    )
+                )
+                if any(p.grad is not None for p in value_head.parameters())
+                else 0.0
+            )
+            lstm_grad_norm = float(
+                torch.norm(
+                    torch.stack(
+                        [
+                            p.grad.detach().norm()
+                            for p in self.policy.lstm.parameters()
+                            if p.grad is not None
+                        ]
+                    )
+                )
+                if any(p.grad is not None for p in self.policy.lstm.parameters())
+                else 0.0
+            )
+
+        return {
+            "loss": float(loss.detach()),
+            "policy_loss": float(decoder_loss.detach()),
+            "value_loss": float(v_loss.detach()),
+            "v_pred_mean": v_pred_mean,
+            "v_pred_std": v_pred_std,
+            "v_targ_mean": v_targ_mean,
+            "v_targ_std": v_targ_std,
+            "v_corr": v_corr,
+            "value_sign_accuracy": sign_acc,
+            "v_head_grad_norm": v_grad_norm,
+            "lstm_grad_norm": lstm_grad_norm,
+            "grad_norm": float(grad_norm.detach()),
+            "n_loss_cells": int(loss_count.detach()),
+        }
+
     def _decoder_step(self, batch: ForgeDecoderBatch, *, compute_stats: bool) -> dict[str, float]:
         self.policy.train()
         self.optimizer.zero_grad(set_to_none=True)
@@ -399,10 +741,24 @@ class ForgePolicyValueTrainer:
         device = next(text_policy.parameters()).device
         encoded = batch.encoded
         target_tokens = batch.output_token_ids.to(device)
-        vocab_logits, pointer_logits = text_policy.forward_decoder_teacher_forced(
-            encoded, target_tokens
+        # One packed encoder forward, used for both the decoder cross-attn
+        # (after re-padding) and the value head's per-cell state vector.
+        # Pretrain runs without rollout history, so feeding the value head
+        # through the LSTM (always with h=c=0) collapses every batch to a
+        # near-constant prediction (the LSTM's recurrent weights never see
+        # gradient when h_prev is always 0). Read the value head directly
+        # off the encoder's state_vector during pretrain — RL rollouts can
+        # still use the LSTM path because they carry real history.
+        from magic_ai.text_encoder.batch import scatter_packed_to_padded
+
+        encoded_snaps = text_policy.encode_only(encoded)
+        encoded_padded, attn_mask = scatter_packed_to_padded(
+            encoded_snaps.encoded, encoded_snaps.packed
         )
-        out, _ = self.policy(encoded, h_in=None, c_in=None)
+        vocab_logits, pointer_logits = text_policy.grammar_decoder.forward_teacher_forced(
+            target_tokens, encoded_padded, attn_mask
+        )
+        values = text_policy.value_head(encoded_snaps.state_vector)
 
         decoder_loss = decoder_cross_entropy_loss(
             vocab_logits,
@@ -414,7 +770,7 @@ class ForgePolicyValueTrainer:
             batch.pointer_mask.to(device),
             batch.output_pad_mask.to(device),
         )
-        v_loss = value_loss(out.values.float(), batch.value_targets.to(out.values.device))
+        v_loss = value_loss(values.float(), batch.value_targets.to(values.device))
         loss = self.cfg.policy_loss_weight * decoder_loss + self.cfg.value_loss_weight * v_loss
         loss.backward()
         if self.grad_clip is not None:
@@ -454,13 +810,44 @@ class ForgePolicyValueTrainer:
                 if combat_total > 0
                 else 0.0
             )
-            pred_sign = torch.sign(out.values.float())
-            target = batch.value_targets.to(out.values.device)
+            pred_sign = torch.sign(values.float())
+            target = batch.value_targets.to(values.device)
             non_draw = target.abs() > 1e-6
             sign_acc = (
                 (pred_sign[non_draw] == torch.sign(target[non_draw])).float().mean()
                 if non_draw.any()
                 else torch.tensor(0.0, device=loss.device)
+            )
+        with torch.no_grad():
+            v_pred_f = values.float()
+            v_targ_f = batch.value_targets.to(v_pred_f.device)
+            v_pred_mean = float(v_pred_f.mean())
+            v_pred_std = float(v_pred_f.std())
+            v_targ_mean = float(v_targ_f.mean())
+            v_targ_std = float(v_targ_f.std())
+            # Pearson correlation between predictions and targets — best
+            # diagnostic for "is the head learning anything useful at all?"
+            denom = float(v_pred_f.std() * v_targ_f.std())
+            v_corr = (
+                float(((v_pred_f - v_pred_f.mean()) * (v_targ_f - v_targ_f.mean())).mean() / denom)
+                if denom > 1e-8
+                else 0.0
+            )
+            # Gradient norm of just the value head, to confirm gradients are
+            # actually reaching it.
+            value_head = self.policy.text_policy.value_head
+            v_grad_norm = float(
+                torch.norm(
+                    torch.stack(
+                        [
+                            p.grad.detach().norm()
+                            for p in value_head.parameters()
+                            if p.grad is not None
+                        ]
+                    )
+                )
+                if any(p.grad is not None for p in value_head.parameters())
+                else 0.0
             )
         return {
             "loss": float(loss.detach()),
@@ -470,6 +857,12 @@ class ForgePolicyValueTrainer:
             "decoder_combat_exact_match": float(combat_exact),
             "value_sign_accuracy": float(sign_acc.detach()),
             "grad_norm": float(grad_norm.detach()),
+            "v_pred_mean": v_pred_mean,
+            "v_pred_std": v_pred_std,
+            "v_targ_mean": v_targ_mean,
+            "v_targ_std": v_targ_std,
+            "v_corr": v_corr,
+            "v_head_grad_norm": v_grad_norm,
         }
 
     @torch.no_grad()
@@ -490,10 +883,16 @@ class ForgePolicyValueTrainer:
             text_policy = self.policy.text_policy
             if text_policy.grammar_decoder is None:
                 continue
-            vocab_logits, pointer_logits = text_policy.forward_decoder_teacher_forced(
-                batch.encoded, batch.output_token_ids
+            from magic_ai.text_encoder.batch import scatter_packed_to_padded
+
+            encoded_snaps = text_policy.encode_only(batch.encoded)
+            encoded_padded, attn_mask = scatter_packed_to_padded(
+                encoded_snaps.encoded, encoded_snaps.packed
             )
-            out, _ = self.policy(batch.encoded, h_in=None, c_in=None)
+            vocab_logits, pointer_logits = text_policy.grammar_decoder.forward_teacher_forced(
+                batch.output_token_ids, encoded_padded, attn_mask
+            )
+            values = text_policy.value_head(encoded_snaps.state_vector)
             policy_l = decoder_cross_entropy_loss(
                 vocab_logits,
                 pointer_logits,
@@ -504,10 +903,96 @@ class ForgePolicyValueTrainer:
                 batch.pointer_mask,
                 batch.output_pad_mask,
             )
-            v_loss = value_loss(out.values.float(), batch.value_targets)
+            v_loss = value_loss(values.float(), batch.value_targets)
             stats = {
                 "eval_policy_loss": float(policy_l.detach()),
                 "eval_value_loss": float(v_loss.detach()),
+            }
+            for key, value in stats.items():
+                totals[key] = totals.get(key, 0.0) + value
+            count += 1
+        denom = max(1, count)
+        return {key: value / denom for key, value in totals.items()} | {
+            "eval_batches": float(count)
+        }
+
+    @torch.no_grad()
+    def evaluate_sequenced(
+        self,
+        dataset: ForgeChoiceDataset,
+        rng: np.random.Generator,
+        *,
+        batches: int = 8,
+        device: torch.device,
+    ) -> dict[str, float]:
+        self.policy.eval()
+        totals: dict[str, float] = {}
+        count = 0
+        for _ in range(batches):
+            batch = dataset.sample_sequenced_batch(
+                self.cfg.games_per_batch, self.cfg.loss_positions_per_game, rng
+            )
+            batch = _sequenced_batch_to_device(batch, device)
+            text_policy = self.policy.text_policy
+            if text_policy.grammar_decoder is None:
+                continue
+            decoder_batch = batch.decoder
+            from magic_ai.text_encoder.batch import scatter_packed_to_padded
+
+            encoded_snaps = text_policy.encode_only(decoder_batch.encoded)
+            encoded_hidden, attn_mask = scatter_packed_to_padded(
+                encoded_snaps.encoded, encoded_snaps.packed
+            )
+            state_vec = encoded_snaps.state_vector
+            target_tokens = decoder_batch.output_token_ids
+            vocab_logits, pointer_logits = text_policy.grammar_decoder.forward_teacher_forced(
+                target_tokens, encoded_hidden, attn_mask
+            )
+            out_pad_mask = decoder_batch.output_pad_mask & batch.loss_mask.unsqueeze(-1)
+            policy_l = decoder_cross_entropy_loss(
+                vocab_logits,
+                pointer_logits,
+                target_tokens,
+                decoder_batch.output_pointer_pos,
+                decoder_batch.output_is_pointer,
+                decoder_batch.vocab_mask,
+                decoder_batch.pointer_mask,
+                out_pad_mask,
+            )
+            d_model = state_vec.shape[-1]
+            state_vec_seq = torch.zeros(
+                (batch.n_games, batch.l_max, d_model),
+                dtype=state_vec.dtype,
+                device=device,
+            )
+            state_vec_seq[batch.cell_game_idx, batch.cell_pos_idx] = state_vec
+            lstm_input_seq = self.policy.in_proj(state_vec_seq)
+            h0 = torch.zeros(
+                self.policy.lstm_layers,
+                batch.n_games,
+                self.policy.lstm_hidden,
+                dtype=lstm_input_seq.dtype,
+                device=device,
+            )
+            c0 = torch.zeros_like(h0)
+            lstm_out_seq, _ = self.policy.lstm(lstm_input_seq, (h0, c0))
+            state_for_heads_seq = self.policy.out_proj(lstm_out_seq)
+            values_seq = text_policy.value_head(state_for_heads_seq)
+            values_flat = values_seq[batch.cell_game_idx, batch.cell_pos_idx]
+            v_pred = values_flat.float()[batch.loss_mask]
+            v_targ = decoder_batch.value_targets[batch.loss_mask]
+            v_loss = ((v_pred - v_targ) ** 2).mean() if v_pred.numel() > 0 else torch.tensor(0.0)
+            non_draw = v_targ.abs() > 1e-6
+            sign_acc = (
+                float((torch.sign(v_pred[non_draw]) == torch.sign(v_targ[non_draw])).float().mean())
+                if non_draw.any()
+                else 0.0
+            )
+            stats = {
+                "eval_policy_loss": float(policy_l.detach()),
+                "eval_value_loss": float(v_loss.detach()),
+                "eval_value_sign_accuracy": sign_acc,
+                "eval_v_pred_std": float(v_pred.std()) if v_pred.numel() > 1 else 0.0,
             }
             for key, value in stats.items():
                 totals[key] = totals.get(key, 0.0) + value
@@ -578,6 +1063,20 @@ def _batch_to_device(batch: ForgeDecoderBatch, device: torch.device) -> ForgeDec
     )
 
 
+def _sequenced_batch_to_device(
+    batch: ForgeSequencedBatch, device: torch.device
+) -> ForgeSequencedBatch:
+    return ForgeSequencedBatch(
+        decoder=_batch_to_device(batch.decoder, device),
+        cell_game_idx=batch.cell_game_idx.to(device),
+        cell_pos_idx=batch.cell_pos_idx.to(device),
+        loss_mask=batch.loss_mask.to(device),
+        game_lengths=batch.game_lengths.to(device),
+        n_games=batch.n_games,
+        l_max=batch.l_max,
+    )
+
+
 def batches_per_epoch(n_examples: int, batch_size: int) -> int:
     return int(math.floor(n_examples / batch_size))
 
@@ -585,9 +1084,11 @@ def batches_per_epoch(n_examples: int, batch_size: int) -> int:
 __all__ = [
     "ForgeChoiceDataset",
     "ForgeDecoderBatch",
+    "ForgeSequencedBatch",
     "ForgePolicyValueConfig",
     "ForgePolicyValueTrainer",
     "ValueTargetMode",
     "batches_per_epoch",
     "_batch_to_device",
+    "_sequenced_batch_to_device",
 ]
