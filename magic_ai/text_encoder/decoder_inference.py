@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -29,7 +29,7 @@ from magic_ai.text_encoder.policy import TextPolicy
 def _decoder_step_body(
     grammar_decoder: Any,
     state: GrammarMaskState,
-    decoder_state: DecoderState | None,
+    decoder_state: DecoderState,
     prev_token: Tensor,
     prev_pointer_pos: Tensor,
     encoded: Tensor,
@@ -95,7 +95,7 @@ def _decoder_step_body(
         is_pointer_step,
         valid_step,
         step_log_prob,
-        cast(DecoderState, decoder_state),
+        decoder_state,
     )
 
 
@@ -180,7 +180,10 @@ def decoder_sample(
 
     pos_to_subject_map = state.pos_to_subj  # [B, T_enc] long, -1 fill
 
-    decoder_state: DecoderState | None = None
+    # Eager cross-KV projection so the per-step compiled body never sees a
+    # ``None`` state — that branch would force a separate dynamo specialization
+    # for the first step.
+    decoder_state = grammar_decoder.init_state(encoded)
     prev_token = torch.full((b,), int(GrammarVocab.PAD), dtype=torch.long, device=device)
     prev_pointer_pos = torch.full((b,), -1, dtype=torch.long, device=device)
 

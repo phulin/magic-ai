@@ -5,7 +5,6 @@ from __future__ import annotations
 import torch
 from magic_ai.text_encoder.decoder import (
     GRAMMAR_VOCAB_SIZE,
-    DecoderState,
     GrammarDecoder,
     GrammarDecoderConfig,
     combined_sample,
@@ -45,7 +44,7 @@ def test_teacher_forced_step_parity() -> None:
 
     with torch.no_grad():
         tf_vocab, tf_pointer = decoder.forward_teacher_forced(target_tokens, encoded, enc_mask)
-        state: DecoderState | None = None
+        state = decoder.init_state(encoded)
         step_vocab = []
         step_pointer = []
         for i in range(seq_len):
@@ -85,7 +84,7 @@ def test_kv_cache_shape_growth() -> None:
     b, t_enc, d = 2, 5, decoder.cfg.d_model
     encoded = torch.randn(b, t_enc, d)
     enc_mask = torch.ones(b, t_enc, dtype=torch.bool)
-    state: DecoderState | None = None
+    state = decoder.init_state(encoded)
     head_dim = decoder.cfg.d_model // decoder.cfg.n_heads
     h = decoder.cfg.n_heads
     for step_idx in range(3):

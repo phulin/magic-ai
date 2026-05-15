@@ -258,17 +258,38 @@ class GrammarDecoder(nn.Module):
         x = self.final_norm(x)
         return self._heads(x, encoded)
 
+    def init_state(self, encoded: Tensor) -> DecoderState:
+        """Pre-project cross-attn K/V once per batch.
+
+        Self-attn caches start empty. Pulled out of :meth:`step` so the
+        compiled step body never branches on ``state is None`` — that
+        branch would force a separate dynamo specialization for the first
+        step vs all later steps.
+        """
+        state = DecoderState()
+        for raw_layer in self.layers:
+            layer = cast(_DecoderLayer, raw_layer)
+            k, v = layer.cross_attn.project_kv(encoded)
+            state.cross_k.append(k)
+            state.cross_v.append(v)
+            state.self_k.append(None)
+            state.self_v.append(None)
+        return state
+
     def step(
         self,
         prev_token: Tensor,
         prev_pointer_pos: Tensor,
         encoded: Tensor,
         encoder_attention_mask: Tensor,
-        state: DecoderState | None,
+        state: DecoderState,
     ) -> tuple[Tensor, Tensor, DecoderState]:
         """One autoregressive step. Caller is responsible for the host-sync
         that turns logits into a chosen token before the engine mask
         callback can consume the prefix.
+
+        ``state`` must be created via :meth:`init_state` before the first
+        step — this method does not handle a ``None`` state.
 
         ``prev_pointer_pos`` is currently unused — the decoder embeds the
         previously chosen *grammar token* (pointer steps embed the same
@@ -280,15 +301,6 @@ class GrammarDecoder(nn.Module):
         x = self.tok_emb(prev_token).unsqueeze(1)  # [B, 1, D]
         cos = cast(Tensor, self.rope_cos).to(dtype=x.dtype, device=x.device)
         sin = cast(Tensor, self.rope_sin).to(dtype=x.dtype, device=x.device)
-        if state is None:
-            state = DecoderState()
-            for raw_layer in self.layers:
-                layer = cast(_DecoderLayer, raw_layer)
-                k, v = layer.cross_attn.project_kv(encoded)
-                state.cross_k.append(k)
-                state.cross_v.append(v)
-                state.self_k.append(None)
-                state.self_v.append(None)
         new_self_k: list[Tensor | None] = []
         new_self_v: list[Tensor | None] = []
         for i, raw_layer in enumerate(self.layers):
