@@ -6,6 +6,7 @@
 //! pre-choice snapshot, and writes one JSONL record per selected situation.
 //! A separate Python pass is responsible for tokenization + torch sharding.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
@@ -22,6 +23,7 @@ use flate2::Compression;
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use zip::ZipArchive;
 
@@ -162,7 +164,7 @@ fn main() -> Result<()> {
         };
         let n = games_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
-        let candidates = extract_candidates(member, &meta, &rows, &enabled_kinds, args.trajectory);
+        let candidates = extract_candidates(&rows, &enabled_kinds, args.trajectory);
         candidates_seen.fetch_add(candidates.len(), std::sync::atomic::Ordering::Relaxed);
         if candidates.is_empty() {
             return Ok(());
@@ -172,7 +174,7 @@ fn main() -> Result<()> {
             candidates
         } else {
             match selection {
-                Selection::Hash => stable_choices(candidates, args.choices_per_game),
+                Selection::Hash => stable_choices(candidates, args.choices_per_game, meta.game_id),
                 Selection::Priority => priority_choices(
                     candidates,
                     &kind_priority,
@@ -185,12 +187,11 @@ fn main() -> Result<()> {
         }
 
         let mut batch: Vec<Vec<u8>> = Vec::with_capacity(selected.len());
-        let candidate_count = selected[0].candidate_count;
         for c in selected {
             let kind_idx = CHOICE_KINDS.iter().position(|k| *k == c.kind).unwrap();
             kind_counts[kind_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let rec = build_record(&c, &meta, candidate_count);
-            batch.push(serde_json::to_vec(&rec)?);
+            let rec = build_record(&c, &meta, member);
+            batch.push(sonic_rs::to_vec(&rec)?);
         }
         games_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tx.send(batch).map_err(|e| anyhow!("writer dropped: {e}"))?;
@@ -229,7 +230,7 @@ fn main() -> Result<()> {
         "records_written": writer_stats.records,
         "kinds": kind_summary,
     });
-    println!("{}", serde_json::to_string_pretty(&summary)?);
+    println!("{}", sonic_rs::to_string_pretty(&summary)?);
     Ok(())
 }
 
@@ -242,6 +243,69 @@ enum Selection {
 struct WriterStats {
     records: u64,
 }
+
+#[derive(Debug, Deserialize)]
+struct Row {
+    #[serde(default)]
+    record: Option<String>,
+    #[serde(rename = "type", default)]
+    row_type: Option<String>,
+    #[serde(default)]
+    seq: Option<i64>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    snapshot: Option<Value>,
+    #[serde(rename = "gameId", default)]
+    game_id: Option<String>,
+    #[serde(rename = "winnerId", default)]
+    winner_id: Option<String>,
+    #[serde(rename = "winnerName", default)]
+    winner_name: Option<String>,
+    #[serde(default)]
+    players: Option<Vec<Value>>,
+    #[serde(default)]
+    extras: Option<Value>,
+}
+
+impl Row {
+    fn record(&self) -> &str {
+        self.record.as_deref().unwrap_or("")
+    }
+
+    fn row_type(&self) -> &str {
+        self.row_type.as_deref().unwrap_or("")
+    }
+
+    fn seq(&self) -> i64 {
+        self.seq.unwrap_or(0)
+    }
+
+    fn description(&self) -> &str {
+        self.description.as_deref().unwrap_or("")
+    }
+
+    fn snapshot(&self) -> Option<&Value> {
+        self.snapshot.as_ref()
+    }
+
+    fn snapshot_or_null(&self) -> &Value {
+        self.snapshot.as_ref().unwrap_or(&Value::Null)
+    }
+
+    fn snapshot_step(&self) -> &str {
+        self.snapshot()
+            .and_then(|s| s.get("step"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    }
+
+    fn has_object_snapshot(&self) -> bool {
+        self.snapshot.as_ref().map(Value::is_object).unwrap_or(false)
+    }
+}
+
+type NormalizedSnapshotCache = HashMap<(i64, String), Value>;
 
 fn parse_kinds(raw: &str) -> Result<Vec<String>> {
     if raw == "all" {
@@ -281,7 +345,7 @@ fn parse_kind_priority(raw: &str) -> Result<Vec<String>> {
 
 // --- IO ---------------------------------------------------------------------
 
-fn read_jsonl_member<R: std::io::Read>(reader: R) -> Result<Vec<Value>> {
+fn read_jsonl_member<R: std::io::Read>(reader: R) -> Result<Vec<Row>> {
     // gzip + jsonl. Filter to META and EVENTs that carry a snapshot (matches python).
     let gz = MultiGzDecoder::new(reader);
     let buf = BufReader::new(gz);
@@ -291,18 +355,17 @@ fn read_jsonl_member<R: std::io::Read>(reader: R) -> Result<Vec<Value>> {
         if line.trim().is_empty() {
             continue;
         }
-        let v: Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
+        let row: Row = match sonic_rs::from_str(&line) {
+            Ok(row) => row,
             Err(_) => continue, // skip malformed lines defensively
         };
-        let record = v.get("record").and_then(Value::as_str).unwrap_or("");
-        let keep = match record {
+        let keep = match row.record() {
             "META" => true,
-            "EVENT" => v.get("snapshot").map(|s| s.is_object()).unwrap_or(false),
+            "EVENT" => row.has_object_snapshot(),
             _ => false,
         };
         if keep {
-            rows.push(v);
+            rows.push(row);
         }
     }
     Ok(rows)
@@ -310,39 +373,24 @@ fn read_jsonl_member<R: std::io::Read>(reader: R) -> Result<Vec<Value>> {
 
 // --- Meta -------------------------------------------------------------------
 
-#[derive(Clone)]
-struct Meta {
-    game_id: String,
-    winner_id: Option<String>,
-    winner_name: Option<String>,
-    players: Vec<Value>,
-    extras: Value,
+struct Meta<'a> {
+    game_id: &'a str,
+    winner_id: Option<&'a str>,
+    winner_name: Option<&'a str>,
+    players: Option<&'a [Value]>,
+    extras: Option<&'a Value>,
 }
 
-fn meta_from_rows(rows: &[Value]) -> Option<Meta> {
+fn meta_from_rows(rows: &[Row]) -> Option<Meta<'_>> {
     for row in rows {
-        if row.get("record").and_then(Value::as_str) != Some("META") {
+        if row.record() != "META" {
             continue;
         }
-        let game_id = row
-            .get("gameId")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let winner_id = row
-            .get("winnerId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let winner_name = row
-            .get("winnerName")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let players = row
-            .get("players")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let extras = row.get("extras").cloned().unwrap_or(json!({}));
+        let game_id = row.game_id.as_deref().unwrap_or("");
+        let winner_id = row.winner_id.as_deref();
+        let winner_name = row.winner_name.as_deref();
+        let players = row.players.as_deref();
+        let extras = row.extras.as_ref();
         return Some(Meta {
             game_id,
             winner_id,
@@ -765,46 +813,38 @@ fn blockers_pending(
 
 // --- helpers on raw snapshot ------------------------------------------------
 
-fn raw_player_id_by_name(snapshot: &Value, name: &str) -> String {
+fn raw_player_id_by_name<'a>(snapshot: &'a Value, name: &str) -> &'a str {
     if let Some(arr) = snapshot.get("players").and_then(Value::as_array) {
         for p in arr {
             if p.get("name").and_then(Value::as_str) == Some(name) {
-                return p
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                return p.get("id").and_then(Value::as_str).unwrap_or("");
             }
         }
     }
-    String::new()
+    ""
 }
 
-fn raw_player_name_by_id(snapshot: &Value, id: &str) -> String {
+fn raw_player_name_by_id<'a>(snapshot: &'a Value, id: &str) -> &'a str {
     if let Some(arr) = snapshot.get("players").and_then(Value::as_array) {
         for p in arr {
             if p.get("id").and_then(Value::as_str) == Some(id) {
-                return p
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                return p.get("name").and_then(Value::as_str).unwrap_or("");
             }
         }
     }
-    String::new()
+    ""
 }
 
-fn raw_opponent_id(snapshot: &Value, pid: &str) -> String {
+fn raw_opponent_id<'a>(snapshot: &'a Value, pid: &str) -> &'a str {
     if let Some(arr) = snapshot.get("players").and_then(Value::as_array) {
         for p in arr {
             let candidate = p.get("id").and_then(Value::as_str).unwrap_or("");
             if !candidate.is_empty() && candidate != pid {
-                return candidate.to_string();
+                return candidate;
             }
         }
     }
-    String::new()
+    ""
 }
 
 // --- regexes / label parsing ------------------------------------------------
@@ -960,41 +1000,37 @@ fn parse_didnt_block(desc: &str) -> Option<(String, CombatCardRef)> {
     Some((cap["player"].to_string(), attackers.remove(0)))
 }
 
-fn has_assigned_attack_log(row: &Value) -> bool {
-    if row.get("type").and_then(Value::as_str) != Some("LOG") {
+fn has_assigned_attack_log(row: &Row) -> bool {
+    if row.row_type() != "LOG" {
         return false;
     }
-    row.get("description")
-        .and_then(Value::as_str)
-        .map(|desc| desc.lines().any(|line| parse_assigned_attack(line).is_some()))
-        .unwrap_or(false)
+    row.description()
+        .lines()
+        .any(|line| parse_assigned_attack(line).is_some())
 }
 
-fn has_new_block_log(row: &Value) -> bool {
-    if row.get("type").and_then(Value::as_str) != Some("LOG") {
+fn has_new_block_log(row: &Row) -> bool {
+    if row.row_type() != "LOG" {
         return false;
     }
-    row.get("description")
-        .and_then(Value::as_str)
-        .map(|desc| {
-            desc.lines().any(|line| {
-                parse_assigned_block(line).is_some() || parse_didnt_block(line).is_some()
-            })
+    row.description()
+        .lines()
+        .any(|line| {
+            parse_assigned_block(line).is_some() || parse_didnt_block(line).is_some()
         })
-        .unwrap_or(false)
 }
 
-fn assigned_attack_observed(window: &[&Value]) -> Option<Value> {
+fn assigned_attack_observed(window: &[&Row]) -> Option<Value> {
     let mut actor_name = String::new();
     let mut defender_name = String::new();
     let mut attackers: Vec<CombatCardRef> = Vec::new();
     let mut raw_lines: Vec<String> = Vec::new();
 
     for row in window {
-        if row.get("type").and_then(Value::as_str) != Some("LOG") {
+        if row.row_type() != "LOG" {
             continue;
         }
-        let desc = row.get("description").and_then(Value::as_str).unwrap_or("");
+        let desc = row.description();
         for line in desc.lines() {
             let Some((actor, defender, cards)) = parse_assigned_attack(line) else {
                 continue;
@@ -1022,17 +1058,17 @@ fn assigned_attack_observed(window: &[&Value]) -> Option<Value> {
     }))
 }
 
-fn assigned_block_observed(window: &[&Value]) -> Option<Value> {
+fn assigned_block_observed(window: &[&Row]) -> Option<Value> {
     let mut actor_name = String::new();
     let mut attackers: Vec<CombatCardRef> = Vec::new();
     let mut assignments: Vec<Value> = Vec::new();
     let mut raw_lines: Vec<String> = Vec::new();
 
     for row in window {
-        if row.get("type").and_then(Value::as_str) != Some("LOG") {
+        if row.row_type() != "LOG" {
             continue;
         }
-        let desc = row.get("description").and_then(Value::as_str).unwrap_or("");
+        let desc = row.description();
         for line in desc.lines() {
             if let Some((actor, blockers, attacker)) = parse_assigned_block(line) {
                 if actor_name.is_empty() {
@@ -1063,11 +1099,7 @@ fn assigned_block_observed(window: &[&Value]) -> Option<Value> {
         return None;
     }
 
-    let snap = window
-        .first()
-        .and_then(|r| r.get("snapshot"))
-        .cloned()
-        .unwrap_or(json!({}));
+    let snap = window.first().map(|r| r.snapshot_or_null()).unwrap_or(&Value::Null);
     let active = snap
         .get("activePlayerId")
         .and_then(Value::as_str)
@@ -1075,7 +1107,7 @@ fn assigned_block_observed(window: &[&Value]) -> Option<Value> {
     Some(json!({
         "raw": raw_lines.join("\n"),
         "actor_name": actor_name,
-        "attacker_player": raw_player_name_by_id(&snap, active),
+        "attacker_player": raw_player_name_by_id(snap, active),
         "attackers": attackers.iter().map(combat_ref_json).collect::<Vec<_>>(),
         "assignments": assignments,
         "no_block": assignments.is_empty(),
@@ -1275,10 +1307,10 @@ fn choose_label(desc: &str) -> Option<Value> {
     Some(json!({"raw": desc, "actor_name": actor}))
 }
 
-fn may_label(rows: &[&Value], idx: usize) -> Option<Value> {
+fn may_label(rows: &[&Row], idx: usize) -> Option<Value> {
     let row = rows[idx];
-    let desc = row.get("description").and_then(Value::as_str).unwrap_or("");
-    let row_type = row.get("type").and_then(Value::as_str).unwrap_or("");
+    let desc = row.description();
+    let row_type = row.row_type();
     if row_type != "STACK_RESOLVE" || !desc.to_ascii_lowercase().contains("you may") {
         return None;
     }
@@ -1289,8 +1321,8 @@ fn may_label(rows: &[&Value], idx: usize) -> Option<Value> {
     let start = idx.saturating_sub(4);
     let mut effect_logs: Vec<String> = Vec::new();
     for r in &rows[start..=idx] {
-        if r.get("type").and_then(Value::as_str) == Some("LOG") {
-            let d = r.get("description").and_then(Value::as_str).unwrap_or("");
+        if r.row_type() == "LOG" {
+            let d = r.description();
             if !d.is_empty() {
                 effect_logs.push(d.to_string());
             }
@@ -1305,20 +1337,15 @@ fn may_label(rows: &[&Value], idx: usize) -> Option<Value> {
     }))
 }
 
-fn may_source_row<'a>(rows: &[&'a Value], idx: usize) -> &'a Value {
-    let desc = rows[idx]
-        .get("description")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+fn may_source_row<'a>(rows: &[&'a Row], idx: usize) -> &'a Row {
+    let desc = rows[idx].description();
     for j in (0..idx).rev() {
         let r = rows[j];
-        let t = r.get("type").and_then(Value::as_str).unwrap_or("");
+        let t = r.row_type();
         if t == "PRIORITY" {
             return r;
         }
-        if t == "STACK_PUSH"
-            && r.get("description").and_then(Value::as_str).unwrap_or("") == desc
-        {
+        if t == "STACK_PUSH" && r.description() == desc {
             return r;
         }
     }
@@ -1330,8 +1357,6 @@ fn may_source_row<'a>(rows: &[&'a Value], idx: usize) -> &'a Value {
 #[derive(Clone)]
 struct Candidate {
     kind: &'static str,
-    game_id: String,
-    archive_member: String,
     source_seq: i64,
     target_seq: i64,
     perspective_id: String,
@@ -1344,16 +1369,20 @@ struct Candidate {
 
 fn make_candidate(
     kind: &'static str,
-    archive_member: &str,
-    game_id: &str,
-    source: &Value,
-    target: &Value,
+    source: &Row,
+    target: &Row,
     perspective_id: &str,
     perspective_name: &str,
     observed: Value,
+    snapshot_cache: &mut NormalizedSnapshotCache,
 ) -> Option<Candidate> {
-    let raw_snapshot = source.get("snapshot")?;
-    let mut normalized = normalize_snapshot(raw_snapshot, perspective_id);
+    let raw_snapshot = source.snapshot()?;
+    let source_seq = source.seq();
+    let target_seq = target.seq();
+    let mut normalized = snapshot_cache
+        .entry((source_seq, perspective_id.to_string()))
+        .or_insert_with(|| normalize_snapshot(raw_snapshot, perspective_id))
+        .clone();
     let display_ids = display_ids_from_observed(raw_snapshot, perspective_id, kind, &observed);
 
     match kind {
@@ -1459,10 +1488,8 @@ fn make_candidate(
 
     Some(Candidate {
         kind,
-        game_id: game_id.to_string(),
-        archive_member: archive_member.to_string(),
-        source_seq: source.get("seq").and_then(Value::as_i64).unwrap_or(0),
-        target_seq: target.get("seq").and_then(Value::as_i64).unwrap_or(0),
+        source_seq,
+        target_seq,
         perspective_id: perspective_id.to_string(),
         perspective_name: perspective_name.to_string(),
         snapshot: normalized,
@@ -1474,27 +1501,24 @@ fn make_candidate(
 
 // --- main extraction --------------------------------------------------------
 
-fn event_rows(rows: &[Value]) -> Vec<&Value> {
+fn event_rows(rows: &[Row]) -> Vec<&Row> {
     rows.iter()
-        .filter(|r| {
-            r.get("record").and_then(Value::as_str) == Some("EVENT")
-                && r.get("snapshot").map(|s| s.is_object()).unwrap_or(false)
-        })
+        .filter(|r| r.record() == "EVENT" && r.has_object_snapshot())
         .collect()
 }
 
-fn attack_observed(events: &[&Value], header_idx: usize, header: &AttacksHeader) -> Value {
+fn attack_observed(events: &[&Row], header_idx: usize, header: &AttacksHeader) -> Value {
     let mut attackers: Vec<Value> = Vec::new();
     for row in &events[header_idx + 1..] {
-        let snap = row.get("snapshot").cloned().unwrap_or(json!({}));
+        let snap = row.snapshot_or_null();
         let step = snap.get("step").and_then(Value::as_str).unwrap_or("");
         if step != "DECLARE_ATTACKERS" && step != "DECLARE_BLOCKERS" {
             break;
         }
-        if row.get("type").and_then(Value::as_str) != Some("LOG") {
+        if row.row_type() != "LOG" {
             continue;
         }
-        let desc = row.get("description").and_then(Value::as_str).unwrap_or("");
+        let desc = row.description();
         if let Some(stripped) = desc.strip_prefix("Attacker:") {
             let _ = stripped;
             if let Some(parsed) = parse_attacker_line(desc) {
@@ -1513,19 +1537,19 @@ fn attack_observed(events: &[&Value], header_idx: usize, header: &AttacksHeader)
     })
 }
 
-fn block_observed(events: &[&Value], header_idx: usize, header: &AttacksHeader) -> Option<Value> {
+fn block_observed(events: &[&Row], header_idx: usize, header: &AttacksHeader) -> Option<Value> {
     let mut assignments: Vec<Value> = Vec::new();
     let mut seen_attackers: Vec<Value> = Vec::new();
     for row in &events[header_idx + 1..] {
-        let snap = row.get("snapshot").cloned().unwrap_or(json!({}));
+        let snap = row.snapshot_or_null();
         let step = snap.get("step").and_then(Value::as_str).unwrap_or("");
         if step != "DECLARE_ATTACKERS" && step != "DECLARE_BLOCKERS" {
             break;
         }
-        if row.get("type").and_then(Value::as_str) != Some("LOG") {
+        if row.row_type() != "LOG" {
             continue;
         }
-        let desc = row.get("description").and_then(Value::as_str).unwrap_or("");
+        let desc = row.description();
         if !desc.starts_with("Attacker:") {
             continue;
         }
@@ -1558,18 +1582,16 @@ fn block_observed(events: &[&Value], header_idx: usize, header: &AttacksHeader) 
 }
 
 fn extract_candidates(
-    archive_member: &str,
-    meta: &Meta,
-    rows: &[Value],
+    rows: &[Row],
     enabled: &[String],
     trajectory: bool,
 ) -> Vec<Candidate> {
     let events = event_rows(rows);
     let mut candidates: Vec<Candidate> = Vec::new();
-    let mut last_priority_by_player: indexmap::IndexMap<String, (usize, &Value)> =
+    let mut snapshot_cache = NormalizedSnapshotCache::new();
+    let mut last_priority_by_player: indexmap::IndexMap<&str, (usize, &Row)> =
         indexmap::IndexMap::new();
-    let mut consumed_priority_sources: std::collections::HashSet<(i64, String)> =
-        std::collections::HashSet::new();
+    let mut consumed_priority_sources: HashSet<(i64, &str)> = HashSet::new();
     let want_priority = enabled.iter().any(|k| k == "priority");
     let want_attack = enabled.iter().any(|k| k == "attack");
     let want_block = enabled.iter().any(|k| k == "block");
@@ -1577,41 +1599,35 @@ fn extract_candidates(
     let want_choose = enabled.iter().any(|k| k == "choose");
 
     for (idx, row) in events.iter().enumerate() {
-        let snap = row.get("snapshot").cloned().unwrap_or(json!({}));
-        let row_type = row.get("type").and_then(Value::as_str).unwrap_or("");
-        let desc = row.get("description").and_then(Value::as_str).unwrap_or("");
+        let snap = row.snapshot_or_null();
+        let row_type = row.row_type();
+        let desc = row.description();
         let priority_id = snap
             .get("priorityPlayerId")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+            .unwrap_or("");
         if row_type == "PRIORITY" && !priority_id.is_empty() {
-            last_priority_by_player.insert(priority_id.clone(), (idx, row));
+            last_priority_by_player.insert(priority_id, (idx, row));
         }
 
         if want_priority {
             if let Some(label) = priority_label(desc, row_type) {
-                let actor_id = priority_id.clone();
+                let actor_id = priority_id;
                 if let Some((_, source)) = last_priority_by_player.get(&actor_id).copied() {
-                    let source_key = (
-                        source.get("seq").and_then(Value::as_i64).unwrap_or(0),
-                        actor_id.clone(),
-                    );
-                    if consumed_priority_sources.contains(&source_key) {
-                        continue;
-                    }
-                    if let Some(c) = make_candidate(
-                        "priority",
-                        archive_member,
-                        &meta.game_id,
-                        source,
-                        row,
-                        &actor_id,
-                        &raw_player_name_by_id(&snap, &actor_id),
-                        label,
-                    ) {
-                        consumed_priority_sources.insert(source_key);
-                        candidates.push(c);
+                    let source_key = (source.seq(), actor_id);
+                    if !consumed_priority_sources.contains(&source_key) {
+                        if let Some(c) = make_candidate(
+                            "priority",
+                            source,
+                            row,
+                            actor_id,
+                            raw_player_name_by_id(snap, actor_id),
+                            label,
+                            &mut snapshot_cache,
+                        ) {
+                            consumed_priority_sources.insert(source_key);
+                            candidates.push(c);
+                        }
                     }
                 }
             }
@@ -1627,24 +1643,22 @@ fn extract_candidates(
                         .map(|a| a.is_empty())
                         .unwrap_or(true)
                     {
-                        let actor_id = raw_player_id_by_name(&snap, &header.attacker_player);
+                        let actor_id = raw_player_id_by_name(snap, &header.attacker_player);
                         let perspective = if !actor_id.is_empty() {
-                            actor_id.clone()
+                            actor_id
                         } else {
                             snap.get("activePlayerId")
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
-                                .to_string()
                         };
                         if let Some(c) = make_candidate(
                             "attack",
-                            archive_member,
-                            &meta.game_id,
                             row,
                             row,
-                            &perspective,
+                            perspective,
                             &header.attacker_player,
                             observed,
+                            &mut snapshot_cache,
                         ) {
                             candidates.push(c);
                         }
@@ -1653,23 +1667,21 @@ fn extract_candidates(
                 if want_block {
                     if let Some(observed) = block_observed(&events, idx, &header) {
                         let defender = header.defender_player.clone();
-                        let mut actor_id = raw_player_id_by_name(&snap, &defender);
+                        let mut actor_id = raw_player_id_by_name(snap, &defender);
                         if actor_id.is_empty() {
                             let active = snap
                                 .get("activePlayerId")
                                 .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            actor_id = raw_opponent_id(&snap, &active);
+                                .unwrap_or("");
+                            actor_id = raw_opponent_id(snap, active);
                         }
                         // Find first Attacker: row to use its snapshot as source.
-                        let mut block_source: &Value = row;
+                        let mut block_source: &Row = row;
                         for jrow in &events[idx + 1..] {
-                            if jrow.get("type").and_then(Value::as_str) != Some("LOG") {
+                            if jrow.row_type() != "LOG" {
                                 continue;
                             }
-                            let jdesc =
-                                jrow.get("description").and_then(Value::as_str).unwrap_or("");
+                            let jdesc = jrow.description();
                             if jdesc.starts_with("Attacker:") {
                                 block_source = jrow;
                                 break;
@@ -1677,13 +1689,12 @@ fn extract_candidates(
                         }
                         if let Some(c) = make_candidate(
                             "block",
-                            archive_member,
-                            &meta.game_id,
                             block_source,
                             block_source,
-                            &actor_id,
+                            actor_id,
                             &defender,
                             observed,
+                            &mut snapshot_cache,
                         ) {
                             candidates.push(c);
                         }
@@ -1699,22 +1710,21 @@ fn extract_candidates(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let actor_id = raw_player_id_by_name(&snap, &actor_name);
+                let actor_id = raw_player_id_by_name(snap, &actor_name);
                 let perspective = if actor_id.is_empty() {
-                    priority_id.clone()
+                    priority_id
                 } else {
                     actor_id
                 };
                 let source = may_source_row(&events, idx);
                 if let Some(c) = make_candidate(
                     "may",
-                    archive_member,
-                    &meta.game_id,
                     source,
                     row,
-                    &perspective,
+                    perspective,
                     &actor_name,
                     label,
+                    &mut snapshot_cache,
                 ) {
                     candidates.push(c);
                 }
@@ -1731,21 +1741,20 @@ fn extract_candidates(
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let actor_id = raw_player_id_by_name(&snap, &actor_name);
+                let actor_id = raw_player_id_by_name(snap, &actor_name);
                 let perspective = if actor_id.is_empty() {
-                    priority_id.clone()
+                    priority_id
                 } else {
                     actor_id
                 };
                 if let Some(c) = make_candidate(
                     "choose",
-                    archive_member,
-                    &meta.game_id,
                     row,
                     row,
-                    &perspective,
+                    perspective,
                     &actor_name,
                     label,
+                    &mut snapshot_cache,
                 ) {
                     candidates.push(c);
                 }
@@ -1756,19 +1765,17 @@ fn extract_candidates(
     if want_attack || want_block {
         synthesize_combat_passes(
             &events,
-            archive_member,
-            meta,
             want_attack,
             want_block,
+            &mut snapshot_cache,
             &mut candidates,
         );
     }
     if trajectory && want_priority {
         infer_priority_passes(
             &events,
-            archive_member,
-            meta,
             &consumed_priority_sources,
+            &mut snapshot_cache,
             &mut candidates,
         );
     }
@@ -1794,17 +1801,16 @@ fn kind_rank(kind: &str) -> u8 {
 }
 
 fn infer_priority_passes(
-    events: &[&Value],
-    archive_member: &str,
-    meta: &Meta,
-    consumed_priority_sources: &std::collections::HashSet<(i64, String)>,
+    events: &[&Row],
+    consumed_priority_sources: &HashSet<(i64, &str)>,
+    snapshot_cache: &mut NormalizedSnapshotCache,
     out: &mut Vec<Candidate>,
 ) {
     for (idx, row) in events.iter().enumerate() {
-        if row.get("type").and_then(Value::as_str) != Some("PRIORITY") {
+        if row.row_type() != "PRIORITY" {
             continue;
         }
-        let Some(snap) = row.get("snapshot") else {
+        let Some(snap) = row.snapshot() else {
             continue;
         };
         if !has_policy_relevant_non_pass_action(snap) {
@@ -1817,8 +1823,8 @@ fn infer_priority_passes(
         if actor_id.is_empty() {
             continue;
         }
-        let seq = row.get("seq").and_then(Value::as_i64).unwrap_or(0);
-        if consumed_priority_sources.contains(&(seq, actor_id.to_string())) {
+        let seq = row.seq();
+        if consumed_priority_sources.contains(&(seq, actor_id)) {
             continue;
         }
         let target = events.get(idx + 1).copied().unwrap_or(row);
@@ -1829,13 +1835,12 @@ fn infer_priority_passes(
         });
         if let Some(c) = make_candidate(
             "priority",
-            archive_member,
-            &meta.game_id,
             row,
             target,
             actor_id,
             &raw_player_name_by_id(snap, actor_id),
             observed,
+            snapshot_cache,
         ) {
             out.push(c);
         }
@@ -1848,21 +1853,15 @@ fn infer_priority_passes(
 /// positive action, synthesize an empty-attack / empty-block candidate so the
 /// policy sees "chose not to act" decisions.
 fn synthesize_combat_passes(
-    events: &[&Value],
-    archive_member: &str,
-    meta: &Meta,
+    events: &[&Row],
     want_attack: bool,
     want_block: bool,
+    snapshot_cache: &mut NormalizedSnapshotCache,
     out: &mut Vec<Candidate>,
 ) {
     let mut i = 0;
     while i < events.len() {
-        let step = events[i]
-            .get("snapshot")
-            .and_then(|s| s.get("step"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let step = events[i].snapshot_step().to_string();
         if step != "DECLARE_ATTACKERS" && step != "DECLARE_BLOCKERS" {
             i += 1;
             continue;
@@ -1870,11 +1869,7 @@ fn synthesize_combat_passes(
         let start = i;
         let mut end = i;
         while end < events.len() {
-            let s = events[end]
-                .get("snapshot")
-                .and_then(|s| s.get("step"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let s = events[end].snapshot_step();
             if s != step {
                 break;
             }
@@ -1884,16 +1879,12 @@ fn synthesize_combat_passes(
 
         if step == "DECLARE_ATTACKERS" && want_attack {
             let any_header = window.iter().any(|r| {
-                r.get("type").and_then(Value::as_str) == Some("LOG")
-                    && parse_attacks_header(
-                        r.get("description").and_then(Value::as_str).unwrap_or(""),
-                    )
-                    .is_some()
+                r.row_type() == "LOG" && parse_attacks_header(r.description()).is_some()
             });
             if !any_header {
                 let source = window[0];
                 if let Some(observed) = assigned_attack_observed(window) {
-                    if let Some(snap) = source.get("snapshot") {
+                    if let Some(snap) = source.snapshot() {
                         let actor_name = observed
                             .get("actor_name")
                             .and_then(Value::as_str)
@@ -1904,8 +1895,7 @@ fn synthesize_combat_passes(
                             actor_id = snap
                                 .get("activePlayerId")
                                 .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
+                                .unwrap_or("");
                         }
                         let target = window
                             .iter()
@@ -1915,13 +1905,12 @@ fn synthesize_combat_passes(
                         if !actor_id.is_empty() {
                             if let Some(c) = make_candidate(
                                 "attack",
-                                archive_member,
-                                &meta.game_id,
                                 source,
                                 target,
-                                &actor_id,
+                                actor_id,
                                 &actor_name,
                                 observed,
+                                snapshot_cache,
                             ) {
                                 out.push(c);
                             }
@@ -1930,14 +1919,13 @@ fn synthesize_combat_passes(
                     i = end;
                     continue;
                 }
-                if let Some(snap) = source.get("snapshot") {
+                if let Some(snap) = source.snapshot() {
                     let active = snap
                         .get("activePlayerId")
                         .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                        .unwrap_or("");
                     if !active.is_empty() {
-                        let actor_name = raw_player_name_by_id(snap, &active);
+                        let actor_name = raw_player_name_by_id(snap, active);
                         let observed = json!({
                             "raw": format!("{} declares no attackers", actor_name),
                             "actor_name": actor_name,
@@ -1946,13 +1934,12 @@ fn synthesize_combat_passes(
                         });
                         if let Some(c) = make_candidate(
                             "attack",
-                            archive_member,
-                            &meta.game_id,
                             source,
                             source,
-                            &active,
-                            &actor_name,
+                            active,
+                            actor_name,
                             observed,
+                            snapshot_cache,
                         ) {
                             out.push(c);
                         }
@@ -1961,16 +1948,12 @@ fn synthesize_combat_passes(
             }
         } else if step == "DECLARE_BLOCKERS" && want_block {
             let any_attacker_line = window.iter().any(|r| {
-                r.get("type").and_then(Value::as_str) == Some("LOG")
-                    && r.get("description")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .starts_with("Attacker:")
+                r.row_type() == "LOG" && r.description().starts_with("Attacker:")
             });
             if !any_attacker_line {
                 if let Some(observed) = assigned_block_observed(window) {
                     let source = window[0];
-                    if let Some(snap) = source.get("snapshot") {
+                    if let Some(snap) = source.snapshot() {
                         let actor_name = observed
                             .get("actor_name")
                             .and_then(Value::as_str)
@@ -1981,9 +1964,8 @@ fn synthesize_combat_passes(
                             let active = snap
                                 .get("activePlayerId")
                                 .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            actor_id = raw_opponent_id(snap, &active);
+                                .unwrap_or("");
+                            actor_id = raw_opponent_id(snap, active);
                         }
                         let target = window
                             .iter()
@@ -1993,13 +1975,12 @@ fn synthesize_combat_passes(
                         if !actor_id.is_empty() {
                             if let Some(c) = make_candidate(
                                 "block",
-                                archive_member,
-                                &meta.game_id,
                                 source,
                                 target,
-                                &actor_id,
+                                actor_id,
                                 &actor_name,
                                 observed,
+                                snapshot_cache,
                             ) {
                                 out.push(c);
                             }
@@ -2010,10 +1991,10 @@ fn synthesize_combat_passes(
                 }
             }
             let any_block = window.iter().any(|r| {
-                if r.get("type").and_then(Value::as_str) != Some("LOG") {
+                if r.row_type() != "LOG" {
                     return false;
                 }
-                let d = r.get("description").and_then(Value::as_str).unwrap_or("");
+                let d = r.description();
                 d.starts_with("Attacker:")
                     && parse_attacker_line(d)
                         .map(|p| !p.blockers.is_empty())
@@ -2022,7 +2003,7 @@ fn synthesize_combat_passes(
             if !any_block {
                 let mut attacker_records: Vec<Value> = Vec::new();
                 for r in window {
-                    let d = r.get("description").and_then(Value::as_str).unwrap_or("");
+                    let d = r.description();
                     if !d.starts_with("Attacker:") {
                         continue;
                     }
@@ -2033,23 +2014,17 @@ fn synthesize_combat_passes(
                 if !attacker_records.is_empty() {
                     let source = window
                         .iter()
-                        .find(|r| {
-                            r.get("description")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .starts_with("Attacker:")
-                        })
+                        .find(|r| r.description().starts_with("Attacker:"))
                         .copied()
                         .unwrap_or(window[0]);
-                    if let Some(snap) = source.get("snapshot") {
+                    if let Some(snap) = source.snapshot() {
                         let active = snap
                             .get("activePlayerId")
                             .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        let defender = raw_opponent_id(snap, &active);
+                            .unwrap_or("");
+                        let defender = raw_opponent_id(snap, active);
                         if !defender.is_empty() {
-                            let defender_name = raw_player_name_by_id(snap, &defender);
+                            let defender_name = raw_player_name_by_id(snap, defender);
                             let observed = json!({
                                 "raw": "no blocks declared",
                                 "actor_name": defender_name,
@@ -2059,13 +2034,12 @@ fn synthesize_combat_passes(
                             });
                             if let Some(c) = make_candidate(
                                 "block",
-                                archive_member,
-                                &meta.game_id,
                                 source,
                                 source,
-                                &defender,
-                                &defender_name,
+                                defender,
+                                defender_name,
                                 observed,
+                                snapshot_cache,
                             ) {
                                 out.push(c);
                             }
@@ -2088,7 +2062,7 @@ fn blake2_8(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(out)
 }
 
-fn stable_choices(mut candidates: Vec<Candidate>, count: usize) -> Vec<Candidate> {
+fn stable_choices(mut candidates: Vec<Candidate>, count: usize, game_id: &str) -> Vec<Candidate> {
     if count == 0 {
         return Vec::new();
     }
@@ -2098,7 +2072,7 @@ fn stable_choices(mut candidates: Vec<Candidate>, count: usize) -> Vec<Candidate
     let mut keyed: Vec<(u64, Candidate)> = candidates
         .drain(..)
         .map(|c| {
-            let key = format!("{}:{}", c.game_id, c.candidate_index);
+            let key = format!("{}:{}", game_id, c.candidate_index);
             (blake2_8(key.as_bytes()), c)
         })
         .collect();
@@ -2150,6 +2124,10 @@ fn priority_choices(
 
 // --- record building --------------------------------------------------------
 
+const EMPTY_PLAYERS: &[Value] = &[];
+
+static EMPTY_EXTRAS: Lazy<Value> = Lazy::new(|| json!({}));
+
 fn terminal_sign(winner_id: Option<&str>, perspective_id: &str) -> f64 {
     match winner_id {
         Some(w) if !w.is_empty() && !perspective_id.is_empty() => {
@@ -2163,39 +2141,94 @@ fn terminal_sign(winner_id: Option<&str>, perspective_id: &str) -> f64 {
     }
 }
 
-fn build_record(c: &Candidate, meta: &Meta, candidate_count: usize) -> Value {
-    let _ = candidate_count;
-    json!({
-        "format": "forge_choice_situation",
-        "format_version": FORMAT_VERSION,
-        "game_id": c.game_id,
-        "archive_member": c.archive_member,
-        "choice": {
-            "kind": c.kind,
-            "candidate_index": c.candidate_index,
-            "candidate_count": c.candidate_count,
-            "source_seq": c.source_seq,
-            "target_seq": c.target_seq,
-            "perspective_id": c.perspective_id,
-            "perspective_name": c.perspective_name,
-            "observed": c.observed,
+#[derive(Serialize)]
+struct OutputRecord<'a> {
+    format: &'static str,
+    format_version: u32,
+    game_id: &'a str,
+    archive_member: &'a str,
+    choice: OutputChoice<'a>,
+    state: OutputState<'a>,
+    outcome: OutputOutcome<'a>,
+}
+
+#[derive(Serialize)]
+struct OutputChoice<'a> {
+    kind: &'static str,
+    candidate_index: usize,
+    candidate_count: usize,
+    source_seq: i64,
+    target_seq: i64,
+    perspective_id: &'a str,
+    perspective_name: &'a str,
+    observed: &'a Value,
+}
+
+#[derive(Serialize)]
+struct OutputState<'a> {
+    snapshot: &'a Value,
+}
+
+#[derive(Serialize)]
+struct OutputOutcome<'a> {
+    winner_id: Option<&'a str>,
+    winner_name: Option<&'a str>,
+    terminal_sign: f64,
+    players: &'a [Value],
+    extras: &'a Value,
+}
+
+fn build_record<'a>(
+    c: &'a Candidate,
+    meta: &'a Meta<'a>,
+    archive_member: &'a str,
+) -> OutputRecord<'a> {
+    OutputRecord {
+        format: "forge_choice_situation",
+        format_version: FORMAT_VERSION,
+        game_id: meta.game_id,
+        archive_member,
+        choice: OutputChoice {
+            kind: c.kind,
+            candidate_index: c.candidate_index,
+            candidate_count: c.candidate_count,
+            source_seq: c.source_seq,
+            target_seq: c.target_seq,
+            perspective_id: &c.perspective_id,
+            perspective_name: &c.perspective_name,
+            observed: &c.observed,
         },
-        "state": {
-            "snapshot": c.snapshot,
+        state: OutputState {
+            snapshot: &c.snapshot,
         },
-        "outcome": {
-            "winner_id": meta.winner_id,
-            "winner_name": meta.winner_name,
-            "terminal_sign": terminal_sign(meta.winner_id.as_deref(), &c.perspective_id),
-            "players": meta.players,
-            "extras": meta.extras,
+        outcome: OutputOutcome {
+            winner_id: meta.winner_id,
+            winner_name: meta.winner_name,
+            terminal_sign: terminal_sign(meta.winner_id, &c.perspective_id),
+            players: meta.players.unwrap_or(EMPTY_PLAYERS),
+            extras: meta.extras.unwrap_or(&EMPTY_EXTRAS),
         },
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event_row(row_type: &str, seq: i64, description: Option<&str>, snapshot: &Value) -> Row {
+        Row {
+            record: Some("EVENT".to_string()),
+            row_type: Some(row_type.to_string()),
+            seq: Some(seq),
+            description: description.map(str::to_string),
+            snapshot: Some(snapshot.clone()),
+            game_id: None,
+            winner_id: None,
+            winner_name: None,
+            players: None,
+            extras: None,
+        }
+    }
 
     #[test]
     fn parses_assigned_attack_list() {
@@ -2269,13 +2302,6 @@ mod tests {
 
     #[test]
     fn trajectory_uses_priority_source_once() {
-        let meta = Meta {
-            game_id: "game".to_string(),
-            winner_id: None,
-            winner_name: None,
-            players: vec![],
-            extras: json!({}),
-        };
         let snapshot = json!({
             "activePlayerId": "p2",
             "priorityPlayerId": "p2",
@@ -2290,35 +2316,17 @@ mod tests {
             ]
         });
         let rows = vec![
-            json!({
-                "record": "EVENT",
-                "type": "PRIORITY",
-                "seq": 11,
-                "snapshot": snapshot,
-            }),
-            json!({
-                "record": "EVENT",
-                "type": "LOG",
-                "seq": 12,
-                "description": "PlayerB played Island (97)",
-                "snapshot": snapshot,
-            }),
-            json!({
-                "record": "EVENT",
-                "type": "STACK_PUSH",
-                "seq": 13,
-                "description": "STACK_PUSH Ornithopter by PlayerB",
-                "snapshot": snapshot,
-            }),
+            event_row("PRIORITY", 11, None, &snapshot),
+            event_row("LOG", 12, Some("PlayerB played Island (97)"), &snapshot),
+            event_row(
+                "STACK_PUSH",
+                13,
+                Some("STACK_PUSH Ornithopter by PlayerB"),
+                &snapshot,
+            ),
         ];
 
-        let candidates = extract_candidates(
-            "game.jsonl.gz",
-            &meta,
-            &rows,
-            &["priority".to_string()],
-            true,
-        );
+        let candidates = extract_candidates(&rows, &["priority".to_string()], true);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].source_seq, 11);
