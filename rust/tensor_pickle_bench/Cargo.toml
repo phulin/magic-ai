@@ -1,0 +1,16 @@
+[package]
+name = "tensor_pickle_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[dependencies]
+anyhow = "1"
+pickled = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde-pickle = "1.2"
+serde_bytes = "0.11"

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
 use clap::Parser;
@@ -24,11 +24,10 @@ use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use sonic_rs::{json, JsonContainerTrait, JsonValueMutTrait, JsonValueTrait, Value};
 use zip::ZipArchive;
 
 const FORMAT_VERSION: u32 = 2;
-const MANA_COLORS: &[&str] = &["White", "Blue", "Black", "Red", "Green", "Colorless"];
 const CHOICE_KINDS: &[&str] = &["priority", "attack", "block", "may", "choose"];
 const DEFAULT_KIND_PRIORITY: &[&str] = &["may", "block", "attack", "choose", "priority"];
 
@@ -143,8 +142,7 @@ fn main() -> Result<()> {
     let games_seen = std::sync::atomic::AtomicUsize::new(0);
     let games_written = std::sync::atomic::AtomicUsize::new(0);
     let candidates_seen = std::sync::atomic::AtomicUsize::new(0);
-    let kind_counts: [std::sync::atomic::AtomicUsize; 5] =
-        Default::default();
+    let kind_counts: [std::sync::atomic::AtomicUsize; 5] = Default::default();
 
     members.par_iter().try_for_each_init(
         || -> Result<ZipArchive<BufReader<File>>> {
@@ -158,53 +156,53 @@ fn main() -> Result<()> {
             };
             let entry = zf.by_name(member)?;
             let rows = read_jsonl_member(entry)?;
-        let meta = match meta_from_rows(&rows) {
-            Some(m) if !m.game_id.is_empty() => m,
-            _ => return Ok(()),
-        };
-        let n = games_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let meta = match meta_from_rows(&rows) {
+                Some(m) if !m.game_id.is_empty() => m,
+                _ => return Ok(()),
+            };
+            let n = games_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
-        let candidates = extract_candidates(&rows, &enabled_kinds, args.trajectory);
-        candidates_seen.fetch_add(candidates.len(), std::sync::atomic::Ordering::Relaxed);
-        if candidates.is_empty() {
-            return Ok(());
-        }
-
-        let selected: Vec<Candidate> = if args.trajectory {
-            candidates
-        } else {
-            match selection {
-                Selection::Hash => stable_choices(candidates, args.choices_per_game, meta.game_id),
-                Selection::Priority => priority_choices(
-                    candidates,
-                    &kind_priority,
-                    args.choices_per_game,
-                ),
+            let candidates = extract_candidates(&rows, &enabled_kinds, args.trajectory);
+            candidates_seen.fetch_add(candidates.len(), std::sync::atomic::Ordering::Relaxed);
+            if candidates.is_empty() {
+                return Ok(());
             }
-        };
-        if selected.is_empty() {
-            return Ok(());
-        }
 
-        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(selected.len());
-        for c in selected {
-            let kind_idx = CHOICE_KINDS.iter().position(|k| *k == c.kind).unwrap();
-            kind_counts[kind_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let rec = build_record(&c, &meta, member);
-            batch.push(sonic_rs::to_vec(&rec)?);
-        }
-        games_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tx.send(batch).map_err(|e| anyhow!("writer dropped: {e}"))?;
+            let selected: Vec<Candidate> = if args.trajectory {
+                candidates
+            } else {
+                match selection {
+                    Selection::Hash => {
+                        stable_choices(candidates, args.choices_per_game, meta.game_id)
+                    }
+                    Selection::Priority => {
+                        priority_choices(candidates, &kind_priority, args.choices_per_game)
+                    }
+                }
+            };
+            if selected.is_empty() {
+                return Ok(());
+            }
 
-        if progress_every > 0 && n % progress_every == 0 {
-            eprintln!(
-                "{{\"games_seen\":{}, \"games_written\":{}, \"candidates_seen\":{}}}",
-                n,
-                games_written.load(std::sync::atomic::Ordering::Relaxed),
-                candidates_seen.load(std::sync::atomic::Ordering::Relaxed),
-            );
-        }
-        Ok(())
+            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(selected.len());
+            for c in selected {
+                let kind_idx = choice_kind_index(c.kind).unwrap();
+                kind_counts[kind_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rec = build_record(&c, &meta, member);
+                batch.push(sonic_rs::to_vec(&rec)?);
+            }
+            games_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tx.send(batch).map_err(|e| anyhow!("writer dropped: {e}"))?;
+
+            if progress_every > 0 && n % progress_every == 0 {
+                eprintln!(
+                    "{{\"games_seen\":{}, \"games_written\":{}, \"candidates_seen\":{}}}",
+                    n,
+                    games_written.load(std::sync::atomic::Ordering::Relaxed),
+                    candidates_seen.load(std::sync::atomic::Ordering::Relaxed),
+                );
+            }
+            Ok(())
         },
     )?;
     drop(tx);
@@ -213,16 +211,13 @@ fn main() -> Result<()> {
         .join()
         .map_err(|_| anyhow!("writer thread panicked"))??;
 
-    let kind_summary: Map<String, Value> = CHOICE_KINDS
-        .iter()
-        .enumerate()
-        .map(|(i, k)| {
-            (
-                format!("written_{}", k),
-                Value::from(kind_counts[i].load(std::sync::atomic::Ordering::Relaxed)),
-            )
-        })
-        .collect();
+    let kind_summary = json!({
+        "written_priority": kind_counts[0].load(std::sync::atomic::Ordering::Relaxed),
+        "written_attack": kind_counts[1].load(std::sync::atomic::Ordering::Relaxed),
+        "written_block": kind_counts[2].load(std::sync::atomic::Ordering::Relaxed),
+        "written_may": kind_counts[3].load(std::sync::atomic::Ordering::Relaxed),
+        "written_choose": kind_counts[4].load(std::sync::atomic::Ordering::Relaxed),
+    });
     let summary = json!({
         "games_seen": games_seen.load(std::sync::atomic::Ordering::Relaxed),
         "games_written": games_written.load(std::sync::atomic::Ordering::Relaxed),
@@ -290,7 +285,7 @@ impl Row {
     }
 
     fn snapshot_or_null(&self) -> &Value {
-        self.snapshot.as_ref().unwrap_or(&Value::Null)
+        self.snapshot.as_ref().unwrap_or(&NULL_VALUE)
     }
 
     fn snapshot_step(&self) -> &str {
@@ -301,11 +296,25 @@ impl Row {
     }
 
     fn has_object_snapshot(&self) -> bool {
-        self.snapshot.as_ref().map(Value::is_object).unwrap_or(false)
+        self.snapshot
+            .as_ref()
+            .map(Value::is_object)
+            .unwrap_or(false)
     }
 }
 
 type NormalizedSnapshotCache = HashMap<(i64, String), Value>;
+
+fn choice_kind_index(kind: &str) -> Option<usize> {
+    match kind {
+        "priority" => Some(0),
+        "attack" => Some(1),
+        "block" => Some(2),
+        "may" => Some(3),
+        "choose" => Some(4),
+        _ => None,
+    }
+}
 
 fn parse_kinds(raw: &str) -> Result<Vec<String>> {
     if raw == "all" {
@@ -338,7 +347,10 @@ fn parse_kind_priority(raw: &str) -> Result<Vec<String>> {
         out.push(k.to_string());
     }
     if out.is_empty() {
-        out = DEFAULT_KIND_PRIORITY.iter().map(|s| s.to_string()).collect();
+        out = DEFAULT_KIND_PRIORITY
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
     }
     Ok(out)
 }
@@ -431,27 +443,28 @@ fn step_label_or_passthrough(raw: &str) -> String {
     }
 }
 
-fn mana_pool(raw: &str) -> Map<String, Value> {
-    let mut m: Map<String, Value> = MANA_COLORS
-        .iter()
-        .map(|c| (c.to_string(), Value::from(0u32)))
-        .collect();
+fn mana_pool(raw: &str) -> Value {
+    let mut counts = [0u32; 6];
     for ch in raw.chars() {
-        let key = match ch.to_ascii_uppercase() {
-            'W' => "White",
-            'U' => "Blue",
-            'B' => "Black",
-            'R' => "Red",
-            'G' => "Green",
-            'C' => "Colorless",
+        let idx = match ch.to_ascii_uppercase() {
+            'W' => 0,
+            'U' => 1,
+            'B' => 2,
+            'R' => 3,
+            'G' => 4,
+            'C' => 5,
             _ => continue,
         };
-        if let Some(Value::Number(n)) = m.get_mut(key) {
-            let v = n.as_u64().unwrap_or(0) + 1;
-            *n = serde_json::Number::from(v);
-        }
+        counts[idx] += 1;
     }
-    m
+    json!({
+        "White": counts[0],
+        "Blue": counts[1],
+        "Black": counts[2],
+        "Red": counts[3],
+        "Green": counts[4],
+        "Colorless": counts[5],
+    })
 }
 
 fn zone_card(raw: &Value, owner_id: &str, zone: &str, index: usize) -> Value {
@@ -463,25 +476,27 @@ fn zone_card(raw: &Value, owner_id: &str, zone: &str, index: usize) -> Value {
     }
     if let Some(obj) = raw.as_object() {
         let name = obj
-            .get("name")
+            .get(&"name")
             .and_then(Value::as_str)
-            .or_else(|| obj.get("Name").and_then(Value::as_str))
+            .or_else(|| obj.get(&"Name").and_then(Value::as_str))
             .unwrap_or("");
         let cid = obj
-            .get("id")
+            .get(&"id")
             .and_then(Value::as_str)
-            .or_else(|| obj.get("ID").and_then(Value::as_str))
+            .or_else(|| obj.get(&"ID").and_then(Value::as_str))
             .map(str::to_string)
             .unwrap_or_else(|| format!("{owner_id}:{zone}:{index}:{name}"));
-        let mut out = Map::new();
-        out.insert("ID".into(), Value::from(cid));
-        out.insert("Name".into(), Value::from(name.to_string()));
-        if let Some(t) = obj.get("tapped") {
-            out.insert("Tapped".into(), Value::from(t.as_bool().unwrap_or(false)));
-        } else if let Some(t) = obj.get("Tapped") {
-            out.insert("Tapped".into(), Value::from(t.as_bool().unwrap_or(false)));
+        if let Some(t) = obj.get(&"tapped").or_else(|| obj.get(&"Tapped")) {
+            return json!({
+                "ID": cid,
+                "Name": name,
+                "Tapped": t.as_bool().unwrap_or(false),
+            });
         }
-        return Value::Object(out);
+        return json!({
+            "ID": cid,
+            "Name": name,
+        });
     }
     json!({
         "ID": format!("{owner_id}:{zone}:{index}:unknown"),
@@ -490,31 +505,44 @@ fn zone_card(raw: &Value, owner_id: &str, zone: &str, index: usize) -> Value {
 }
 
 fn player(raw: &Value) -> Value {
-    let obj = raw.as_object().cloned().unwrap_or_default();
+    let Some(obj) = raw.as_object() else {
+        return json!({
+            "ID": "",
+            "Name": "",
+            "Life": 0,
+            "HandCount": 0,
+            "GraveyardCount": 0,
+            "LibraryCount": 0,
+            "Hand": [],
+            "Graveyard": [],
+            "Exile": [],
+            "ManaPool": mana_pool(""),
+        });
+    };
     let pid = obj
-        .get("id")
+        .get(&"id")
         .and_then(Value::as_str)
-        .or_else(|| obj.get("ID").and_then(Value::as_str))
+        .or_else(|| obj.get(&"ID").and_then(Value::as_str))
         .unwrap_or("")
         .to_string();
     let name = obj
-        .get("name")
+        .get(&"name")
         .and_then(Value::as_str)
-        .or_else(|| obj.get("Name").and_then(Value::as_str))
+        .or_else(|| obj.get(&"Name").and_then(Value::as_str))
         .unwrap_or("")
         .to_string();
     let life = obj
-        .get("life")
-        .or_else(|| obj.get("Life"))
+        .get(&"life")
+        .or_else(|| obj.get(&"Life"))
         .and_then(Value::as_i64)
         .unwrap_or(0);
     let library_count = obj
-        .get("librarySize")
-        .or_else(|| obj.get("LibraryCount"))
+        .get(&"librarySize")
+        .or_else(|| obj.get(&"LibraryCount"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let hand: Vec<Value> = obj
-        .get("hand")
+        .get(&"hand")
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -524,7 +552,7 @@ fn player(raw: &Value) -> Value {
         })
         .unwrap_or_default();
     let graveyard: Vec<Value> = obj
-        .get("graveyard")
+        .get(&"graveyard")
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -534,7 +562,7 @@ fn player(raw: &Value) -> Value {
         })
         .unwrap_or_default();
     let exile: Vec<Value> = obj
-        .get("exile")
+        .get(&"exile")
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -544,10 +572,10 @@ fn player(raw: &Value) -> Value {
         })
         .unwrap_or_default();
     let hand_count = obj
-        .get("handSize")
+        .get(&"handSize")
         .and_then(Value::as_u64)
         .unwrap_or(hand.len() as u64);
-    let mp_raw = obj.get("manaPool").and_then(Value::as_str).unwrap_or("");
+    let mp_raw = obj.get(&"manaPool").and_then(Value::as_str).unwrap_or("");
 
     json!({
         "ID": pid,
@@ -567,12 +595,12 @@ fn normalize_snapshot(raw: &Value, perspective_id: &str) -> Value {
     let players_in: Vec<Value> = raw
         .get("players")
         .and_then(Value::as_array)
-        .cloned()
+        .map(|arr| arr.iter().cloned().collect())
         .unwrap_or_default();
     let mut players: Vec<Value> = players_in.iter().map(player).collect();
 
     // Group battlefield by controller.
-    let mut bf_by_player: indexmap::IndexMap<String, Vec<Value>> = indexmap::IndexMap::new();
+    let mut bf_by_player: HashMap<String, Vec<Value>> = HashMap::new();
     for p in &players {
         if let Some(id) = p.get("ID").and_then(Value::as_str) {
             bf_by_player.entry(id.to_string()).or_default();
@@ -599,7 +627,7 @@ fn normalize_snapshot(raw: &Value, perspective_id: &str) -> Value {
             .to_string();
         let bf = bf_by_player.get(&id).cloned().unwrap_or_default();
         if let Some(obj) = p.as_object_mut() {
-            obj.insert("Battlefield".into(), Value::from(bf));
+            obj.insert(&"Battlefield", bf);
         }
     }
 
@@ -629,9 +657,9 @@ fn normalize_snapshot(raw: &Value, perspective_id: &str) -> Value {
                 .enumerate()
                 .map(|(i, obj)| {
                     let name = if let Some(o) = obj.as_object() {
-                        o.get("name")
+                        o.get(&"name")
                             .and_then(Value::as_str)
-                            .or_else(|| o.get("description").and_then(Value::as_str))
+                            .or_else(|| o.get(&"description").and_then(Value::as_str))
                             .unwrap_or("")
                             .to_string()
                     } else {
@@ -672,14 +700,16 @@ fn forge_kind_to_option_kind(kind: &str) -> Option<&'static str> {
 }
 
 fn priority_pending(raw_snapshot: &Value, _perspective_id: &str) -> Option<Value> {
-    let actions = raw_snapshot.get("playableActions").and_then(Value::as_array)?;
+    let actions = raw_snapshot
+        .get("playableActions")
+        .and_then(Value::as_array)?;
     let mut options: Vec<Value> = Vec::with_capacity(actions.len() + 1);
     for (i, act) in actions.iter().enumerate() {
         let Some(obj) = act.as_object() else { continue };
         let kind = obj
-            .get("type")
+            .get(&"type")
             .and_then(Value::as_str)
-            .or_else(|| obj.get("kind").and_then(Value::as_str))
+            .or_else(|| obj.get(&"kind").and_then(Value::as_str))
             .unwrap_or("");
         if kind == "PASS" {
             // Pass is appended unconditionally below.
@@ -689,12 +719,19 @@ fn priority_pending(raw_snapshot: &Value, _perspective_id: &str) -> Option<Value
             Some(k) => k,
             None => continue,
         };
-        let ability_id = obj.get("abilityId").and_then(Value::as_str).unwrap_or("");
-        let source_id = obj.get("sourceId").and_then(Value::as_str).unwrap_or("");
-        let source_name = obj.get("sourceName").and_then(Value::as_str).unwrap_or("");
-        let description = obj.get("description").and_then(Value::as_str).unwrap_or("");
-        let label = if description.is_empty() { source_name } else { description };
-        let cost = obj.get("cost").and_then(Value::as_str).unwrap_or("");
+        let ability_id = obj.get(&"abilityId").and_then(Value::as_str).unwrap_or("");
+        let source_id = obj.get(&"sourceId").and_then(Value::as_str).unwrap_or("");
+        let source_name = obj.get(&"sourceName").and_then(Value::as_str).unwrap_or("");
+        let description = obj
+            .get(&"description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let label = if description.is_empty() {
+            source_name
+        } else {
+            description
+        };
+        let cost = obj.get(&"cost").and_then(Value::as_str).unwrap_or("");
         let id = if ability_id.is_empty() {
             format!("opt:{i}")
         } else {
@@ -725,18 +762,24 @@ fn attackers_pending(
 ) -> Option<Value> {
     let bf = raw_snapshot.get("battlefield").and_then(Value::as_array)?;
     let mut options: Vec<Value> = Vec::new();
-    let mut display_usage = indexmap::IndexMap::new();
+    let mut display_usage = HashMap::new();
     for card in bf {
-        let Some(obj) = card.as_object() else { continue };
-        if obj.get("controllerId").and_then(Value::as_str) != Some(perspective_id) {
+        let Some(obj) = card.as_object() else {
+            continue;
+        };
+        if obj.get(&"controllerId").and_then(Value::as_str) != Some(perspective_id) {
             continue;
         }
-        let power = obj.get("power").and_then(Value::as_i64).unwrap_or(0);
+        let power = obj.get(&"power").and_then(Value::as_i64).unwrap_or(0);
         if power <= 0 {
             continue;
         }
         let id = card_handle(card, display_ids, &mut display_usage);
-        let name = obj.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let name = obj
+            .get(&"name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         options.push(json!({
             "id": id,
             "kind": "attacker",
@@ -767,10 +810,12 @@ fn blockers_pending(
             continue;
         }
         for card in bf {
-            let Some(obj) = card.as_object() else { continue };
-            let cid = obj.get("id").and_then(Value::as_str).unwrap_or("");
+            let Some(obj) = card.as_object() else {
+                continue;
+            };
+            let cid = obj.get(&"id").and_then(Value::as_str).unwrap_or("");
             if cid.starts_with(prefix.as_str()) {
-                let name = obj.get("name").and_then(Value::as_str).unwrap_or("");
+                let name = obj.get(&"name").and_then(Value::as_str).unwrap_or("");
                 attacker_targets.push(json!({"id": cid, "label": name}));
                 break;
             }
@@ -780,21 +825,27 @@ fn blockers_pending(
         return None;
     }
     let mut options: Vec<Value> = Vec::new();
-    let mut display_usage = indexmap::IndexMap::new();
+    let mut display_usage = HashMap::new();
     for card in bf {
-        let Some(obj) = card.as_object() else { continue };
-        if obj.get("controllerId").and_then(Value::as_str) != Some(perspective_id) {
+        let Some(obj) = card.as_object() else {
+            continue;
+        };
+        if obj.get(&"controllerId").and_then(Value::as_str) != Some(perspective_id) {
             continue;
         }
-        let power = obj.get("power").and_then(Value::as_i64).unwrap_or(0);
+        let power = obj.get(&"power").and_then(Value::as_i64).unwrap_or(0);
         if power <= 0 {
             continue;
         }
-        if obj.get("tapped").and_then(Value::as_bool).unwrap_or(false) {
+        if obj.get(&"tapped").and_then(Value::as_bool).unwrap_or(false) {
             continue;
         }
         let id = card_handle(card, display_ids, &mut display_usage);
-        let name = obj.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let name = obj
+            .get(&"name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         options.push(json!({
             "id": id,
             "kind": "block",
@@ -853,11 +904,13 @@ static ATTACKS_HEADER_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(?P<attacker_player>.+?) attacks (?P<defender_player>.+?) with (?P<count>\d+) creatures?$").unwrap()
 });
 static ATTACKER_LINE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^Attacker:\s+(?P<name>.+?)\s+\[(?P<id>[0-9a-f]+)\]\s+\((?P<pt>[^)]+)\)\s+(?P<rest>.+)$").unwrap()
+    Regex::new(
+        r"^Attacker:\s+(?P<name>.+?)\s+\[(?P<id>[0-9a-f]+)\]\s+\((?P<pt>[^)]+)\)\s+(?P<rest>.+)$",
+    )
+    .unwrap()
 });
-static BLOCKER_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?P<name>.+?)\s+\[(?P<id>[0-9a-f]+)\]\s+\((?P<pt>[^)]+)\)").unwrap()
-});
+static BLOCKER_TOKEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?P<name>.+?)\s+\[(?P<id>[0-9a-f]+)\]\s+\((?P<pt>[^)]+)\)").unwrap());
 static PLAYER_PREFIX_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(?P<player>Player[A-Z0-9_ -]+)").unwrap());
 static STACK_PUSH_NAME_RE: Lazy<Regex> =
@@ -879,7 +932,7 @@ static ASSIGNED_BLOCK_RE: Lazy<Regex> = Lazy::new(|| {
 static DIDNT_BLOCK_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(?P<player>.+?) didn't block (?P<attacker>.+?)\.$").unwrap());
 
-type DisplayIdIndex = indexmap::IndexMap<String, Vec<String>>;
+type DisplayIdIndex = HashMap<String, Vec<String>>;
 
 #[derive(Clone)]
 struct CombatCardRef {
@@ -1015,9 +1068,7 @@ fn has_new_block_log(row: &Row) -> bool {
     }
     row.description()
         .lines()
-        .any(|line| {
-            parse_assigned_block(line).is_some() || parse_didnt_block(line).is_some()
-        })
+        .any(|line| parse_assigned_block(line).is_some() || parse_didnt_block(line).is_some())
 }
 
 fn assigned_attack_observed(window: &[&Row]) -> Option<Value> {
@@ -1099,7 +1150,10 @@ fn assigned_block_observed(window: &[&Row]) -> Option<Value> {
         return None;
     }
 
-    let snap = window.first().map(|r| r.snapshot_or_null()).unwrap_or(&Value::Null);
+    let snap = window
+        .first()
+        .map(|r| r.snapshot_or_null())
+        .unwrap_or(&NULL_VALUE);
     let active = snap
         .get("activePlayerId")
         .and_then(Value::as_str)
@@ -1204,9 +1258,12 @@ fn display_ids_from_observed(
 fn card_handle(
     card: &Value,
     display_ids: &DisplayIdIndex,
-    display_usage: &mut indexmap::IndexMap<String, usize>,
+    display_usage: &mut HashMap<String, usize>,
 ) -> String {
-    let controller = card.get("controllerId").and_then(Value::as_str).unwrap_or("");
+    let controller = card
+        .get("controllerId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let name = card.get("name").and_then(Value::as_str).unwrap_or("");
     let key = display_key(controller, name);
     if let Some(ids) = display_ids.get(&key) {
@@ -1391,7 +1448,7 @@ fn make_candidate(
                 normalized
                     .as_object_mut()
                     .unwrap()
-                    .insert("pending".into(), pending);
+                    .insert(&"pending", pending);
             }
         }
         "attack" => {
@@ -1420,7 +1477,7 @@ fn make_candidate(
                 .map(|arr| {
                     arr.iter()
                         .map(|o| {
-                            o.get("permanent_id")
+                            o.get(&"permanent_id")
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
                                 .to_string()
@@ -1436,7 +1493,7 @@ fn make_candidate(
             normalized
                 .as_object_mut()
                 .unwrap()
-                .insert("pending".into(), pending);
+                .insert(&"pending", pending);
         }
         "block" => {
             let attacker_refs: Vec<(String, String)> = observed
@@ -1452,14 +1509,15 @@ fn make_candidate(
                         .collect()
                 })
                 .unwrap_or_default();
-            let pending = blockers_pending(raw_snapshot, perspective_id, &attacker_refs, &display_ids)?;
+            let pending =
+                blockers_pending(raw_snapshot, perspective_id, &attacker_refs, &display_ids)?;
             let opt_ids: Vec<String> = pending
                 .get("options")
                 .and_then(Value::as_array)
                 .map(|arr| {
                     arr.iter()
                         .map(|o| {
-                            o.get("permanent_id")
+                            o.get(&"permanent_id")
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
                                 .to_string()
@@ -1481,7 +1539,7 @@ fn make_candidate(
             normalized
                 .as_object_mut()
                 .unwrap()
-                .insert("pending".into(), pending);
+                .insert(&"pending", pending);
         }
         _ => {}
     }
@@ -1581,16 +1639,11 @@ fn block_observed(events: &[&Row], header_idx: usize, header: &AttacksHeader) ->
     }))
 }
 
-fn extract_candidates(
-    rows: &[Row],
-    enabled: &[String],
-    trajectory: bool,
-) -> Vec<Candidate> {
+fn extract_candidates(rows: &[Row], enabled: &[String], trajectory: bool) -> Vec<Candidate> {
     let events = event_rows(rows);
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut snapshot_cache = NormalizedSnapshotCache::new();
-    let mut last_priority_by_player: indexmap::IndexMap<&str, (usize, &Row)> =
-        indexmap::IndexMap::new();
+    let mut last_priority_by_player: HashMap<&str, (usize, &Row)> = HashMap::new();
     let mut consumed_priority_sources: HashSet<(i64, &str)> = HashSet::new();
     let want_priority = enabled.iter().any(|k| k == "priority");
     let want_attack = enabled.iter().any(|k| k == "attack");
@@ -1731,10 +1784,7 @@ fn extract_candidates(
             }
         }
 
-        if want_choose
-            && row_type == "LOG"
-            && desc.to_ascii_lowercase().contains("choose")
-        {
+        if want_choose && row_type == "LOG" && desc.to_ascii_lowercase().contains("choose") {
             if let Some(label) = choose_label(desc) {
                 let actor_name = label
                     .get("actor_name")
@@ -1878,9 +1928,9 @@ fn synthesize_combat_passes(
         let window = &events[start..end];
 
         if step == "DECLARE_ATTACKERS" && want_attack {
-            let any_header = window.iter().any(|r| {
-                r.row_type() == "LOG" && parse_attacks_header(r.description()).is_some()
-            });
+            let any_header = window
+                .iter()
+                .any(|r| r.row_type() == "LOG" && parse_attacks_header(r.description()).is_some());
             if !any_header {
                 let source = window[0];
                 if let Some(observed) = assigned_attack_observed(window) {
@@ -1947,9 +1997,9 @@ fn synthesize_combat_passes(
                 }
             }
         } else if step == "DECLARE_BLOCKERS" && want_block {
-            let any_attacker_line = window.iter().any(|r| {
-                r.row_type() == "LOG" && r.description().starts_with("Attacker:")
-            });
+            let any_attacker_line = window
+                .iter()
+                .any(|r| r.row_type() == "LOG" && r.description().starts_with("Attacker:"));
             if !any_attacker_line {
                 if let Some(observed) = assigned_block_observed(window) {
                     let source = window[0];
@@ -2088,17 +2138,17 @@ fn priority_choices(
     if count == 0 {
         return Vec::new();
     }
-    let mut by_kind: indexmap::IndexMap<&str, Vec<Candidate>> = indexmap::IndexMap::new();
-    for k in CHOICE_KINDS {
-        by_kind.insert(*k, Vec::new());
-    }
+    let mut by_kind: Vec<Vec<Candidate>> = (0..CHOICE_KINDS.len()).map(|_| Vec::new()).collect();
     for c in candidates.into_iter() {
-        by_kind.entry(c.kind).or_default().push(c);
+        if let Some(idx) = choice_kind_index(c.kind) {
+            by_kind[idx].push(c);
+        }
     }
     let mut selected: Vec<Candidate> = Vec::new();
     let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for kind in kind_priority {
-        if let Some(bucket) = by_kind.get_mut(kind.as_str()) {
+        if let Some(kind_idx) = choice_kind_index(kind) {
+            let bucket = &mut by_kind[kind_idx];
             for c in bucket.drain(..) {
                 if seen.insert(c.candidate_index) {
                     selected.push(c);
@@ -2109,7 +2159,7 @@ fn priority_choices(
             }
         }
     }
-    for (_, bucket) in by_kind {
+    for bucket in by_kind {
         for c in bucket {
             if seen.insert(c.candidate_index) {
                 selected.push(c);
@@ -2127,6 +2177,7 @@ fn priority_choices(
 const EMPTY_PLAYERS: &[Value] = &[];
 
 static EMPTY_EXTRAS: Lazy<Value> = Lazy::new(|| json!({}));
+static NULL_VALUE: Lazy<Value> = Lazy::new(|| json!(null));
 
 fn terminal_sign(winner_id: Option<&str>, perspective_id: &str) -> f64 {
     match winner_id {
@@ -2239,7 +2290,10 @@ mod tests {
 
         assert_eq!(defender, "PlayerA");
         assert_eq!(
-            attackers.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            attackers
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["Dancing Scimitar", "Zephyr Falcon", "Zephyr Falcon"]
         );
         assert_eq!(
