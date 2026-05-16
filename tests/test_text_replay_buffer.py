@@ -325,6 +325,41 @@ class ReservationLifecycleTests(unittest.TestCase):
         self.assertEqual((w2.row_start, w2.row_end), (0, 2))
         buffer.release_train_window(w2)
 
+    def test_wrapped_ring_does_not_reserve_across_live_start(self) -> None:
+        """When cursor < start, only cursor..start is contiguous free space."""
+
+        buffer = _buffer(capacity=32)
+
+        initial = buffer.reserve_append(row_count=28, token_count=0, decision_count=0)
+        self.assertEqual((initial.row_start, initial.row_end), (0, 28))
+        buffer.commit(initial)
+        buffer.write_episode_metadata(
+            torch.arange(0, 28, dtype=torch.long),
+            episode_id=0,
+            terminal_reward_p0=0.0,
+            zero_sum=True,
+        )
+
+        head = buffer.claim_train_window(min_rows=16, max_rows=16)
+        assert head is not None
+        self.assertEqual((head.row_start, head.row_end), (0, 16))
+        buffer.release_train_window(head)
+
+        wrapped = buffer.reserve_append(row_count=11, token_count=0, decision_count=0)
+        self.assertEqual((wrapped.row_start, wrapped.row_end), (0, 11))
+        buffer.commit(wrapped)
+        buffer.write_episode_metadata(
+            torch.arange(0, 11, dtype=torch.long),
+            episode_id=1,
+            terminal_reward_p0=0.0,
+            zero_sum=True,
+        )
+
+        # Total free rows is 9, but only rows 11..15 are contiguous at the
+        # cursor. Reserving 8 rows would overlap live rows 16..18.
+        self.assertFalse(buffer.can_reserve(row_count=8, token_count=0, decision_count=0))
+        self.assertTrue(buffer.can_reserve(row_count=5, token_count=0, decision_count=0))
+
 
 if __name__ == "__main__":
     unittest.main()

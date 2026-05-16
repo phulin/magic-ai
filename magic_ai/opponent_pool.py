@@ -20,6 +20,7 @@ from magic_ai.native.sharded import (
     ShardedNativeRolloutDriver,
 )
 from magic_ai.slot_encoder.model import PPOPolicy
+from magic_ai.text_encoder.native_assembler import DEFAULT_T_SPEC_MAX
 
 if TYPE_CHECKING:
     from magic_ai.text_encoder.lstm_stateful_text_policy import LSTMStatefulTextPolicy
@@ -504,7 +505,8 @@ def run_eval_matches(
             _, nat_outputs = native_encoder.encode_tokens_packed(
                 games,
                 perspective_player_indices=players,
-                max_tokens=text_max_tokens,
+                max_tokens=text_max_tokens + DEFAULT_T_SPEC_MAX,
+                max_state_tokens=text_max_tokens,
                 max_options=max_options,
                 max_targets=max_targets_per_option,
                 max_card_refs=256,

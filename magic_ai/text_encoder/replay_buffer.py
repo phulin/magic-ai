@@ -337,7 +337,9 @@ class _RingTracker:
         if self.used == 0:
             return True
         c = self.cursor % self.capacity
-        return c + count <= self.capacity or count <= self.start
+        if c >= self.start:
+            return c + count <= self.capacity or count <= self.start
+        return c + count <= self.start
 
     def reserve(self, count: int) -> tuple[int, int]:
         c = self.cursor % self.capacity
@@ -345,10 +347,15 @@ class _RingTracker:
             return c, c
         if self.used == 0 and c + count > self.capacity:
             s, e = 0, count
-        elif c + count <= self.capacity:
+        elif c >= self.start:
+            if c + count <= self.capacity:
+                s, e = c, c + count
+            elif count <= self.start:
+                s, e = 0, count
+            else:
+                raise RuntimeError("ring span does not fit")
+        elif c + count <= self.start:
             s, e = c, c + count
-        elif count <= self.start:
-            s, e = 0, count
         else:
             raise RuntimeError("ring span does not fit")
         self.cursor = e % self.capacity

@@ -190,11 +190,11 @@ class ShardedNativeBatchEncoder:
         self._shard_packed_tokens = bool(shard_packed_tokens)
         self.is_available = encoders[0].is_available
         self._packed_token_outputs: Any | None = None
-        self._packed_token_outputs_spec: tuple[int, int, int, int, int] | None = None
+        self._packed_token_outputs_spec: tuple[int, int, int, int, int, int] | None = None
         self._packed_token_shard_outputs: list[Any | None] = [None] * len(encoders)
-        self._packed_token_shard_specs: list[tuple[int, int, int, int, int] | None] = [None] * len(
-            encoders
-        )
+        self._packed_token_shard_specs: list[tuple[int, int, int, int, int, int] | None] = [
+            None
+        ] * len(encoders)
 
     @property
     def encoders(self) -> list[NativeBatchEncoder]:
@@ -323,6 +323,7 @@ class ShardedNativeBatchEncoder:
         *,
         perspective_player_indices: list[int],
         max_tokens: int,
+        max_state_tokens: int | None = None,
         max_options: int,
         max_targets: int,
         max_card_refs: int,
@@ -337,13 +338,21 @@ class ShardedNativeBatchEncoder:
         batch_size = len(games)
         if batch_size == 0:
             raise ValueError("encode_tokens_packed requires at least one game")
+        state_token_cap = int(max_tokens if max_state_tokens is None else max_state_tokens)
         if (
             not self._shard_packed_tokens
             or self._pool is None
             or batch_size <= 1
             or len(self._encoders) == 1
         ):
-            spec = (batch_size, max_tokens, max_options, max_targets, max_card_refs)
+            spec = (
+                batch_size,
+                max_tokens,
+                state_token_cap,
+                max_options,
+                max_targets,
+                max_card_refs,
+            )
             if (
                 self._packed_token_outputs is None
                 or self._packed_token_outputs_spec is None
@@ -366,6 +375,7 @@ class ShardedNativeBatchEncoder:
                 self._packed_token_outputs_spec = (
                     capacity,
                     max_tokens,
+                    state_token_cap,
                     max_options,
                     max_targets,
                     max_card_refs,
@@ -376,6 +386,7 @@ class ShardedNativeBatchEncoder:
                 games,
                 perspective_player_indices=perspective_player_indices,
                 max_tokens=max_tokens,
+                max_state_tokens=state_token_cap,
                 max_options=max_options,
                 max_targets=max_targets,
                 max_card_refs=max_card_refs,
@@ -384,7 +395,14 @@ class ShardedNativeBatchEncoder:
             )
 
         shards = _shard_ranges(batch_size, len(self._encoders))
-        merged_spec = (batch_size, max_tokens, max_options, max_targets, max_card_refs)
+        merged_spec = (
+            batch_size,
+            max_tokens,
+            state_token_cap,
+            max_options,
+            max_targets,
+            max_card_refs,
+        )
         if (
             self._packed_token_outputs is None
             or self._packed_token_outputs_spec is None
@@ -405,13 +423,21 @@ class ShardedNativeBatchEncoder:
             self._packed_token_outputs_spec = (
                 capacity,
                 max_tokens,
+                state_token_cap,
                 max_options,
                 max_targets,
                 max_card_refs,
             )
 
         def shard_outputs(idx: int, shard_n: int) -> Any:
-            spec = (shard_n, max_tokens, max_options, max_targets, max_card_refs)
+            spec = (
+                shard_n,
+                max_tokens,
+                state_token_cap,
+                max_options,
+                max_targets,
+                max_card_refs,
+            )
             current = self._packed_token_shard_outputs[idx]
             current_spec = self._packed_token_shard_specs[idx]
             if (
@@ -428,7 +454,14 @@ class ShardedNativeBatchEncoder:
                     max_targets=max_targets,
                     max_card_refs=max_card_refs,
                 )
-                current_spec = (capacity, max_tokens, max_options, max_targets, max_card_refs)
+                current_spec = (
+                    capacity,
+                    max_tokens,
+                    state_token_cap,
+                    max_options,
+                    max_targets,
+                    max_card_refs,
+                )
                 self._packed_token_shard_outputs[idx] = current
                 self._packed_token_shard_specs[idx] = current_spec
             return current
@@ -442,6 +475,7 @@ class ShardedNativeBatchEncoder:
                 games[a:b],
                 perspective_player_indices=perspective_player_indices[a:b],
                 max_tokens=max_tokens,
+                max_state_tokens=state_token_cap,
                 max_options=max_options,
                 max_targets=max_targets,
                 max_card_refs=max_card_refs,

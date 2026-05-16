@@ -288,7 +288,8 @@ def allocate_packed_outputs(
     The ``max_options`` / ``max_targets`` parameters are accepted for caller
     compatibility but only ``max_tokens`` and ``max_card_refs`` size the
     packed-token buffers; option/target anchors live inside the encoder's
-    own scratch and aren't surfaced here.
+    own scratch and aren't surfaced here. ``max_tokens`` is the combined
+    state+spec token capacity per row.
     """
 
     _ = max_options, max_targets
@@ -347,6 +348,7 @@ def encode_tokens_packed(
     *,
     perspective_player_indices: list[int],
     max_tokens: int,
+    max_state_tokens: int | None = None,
     max_options: int,
     max_targets: int,
     max_card_refs: int,
@@ -384,6 +386,7 @@ def encode_tokens_packed(
         raise ValueError("encode_tokens_packed requires at least one game")
     if len(perspective_player_indices) != batch_size:
         raise ValueError("perspective_player_indices length mismatch")
+    state_token_cap = int(max_tokens if max_state_tokens is None else max_state_tokens)
 
     if outputs is None:
         outputs = allocate_packed_outputs(
@@ -440,6 +443,10 @@ def encode_tokens_packed(
             },
         )
     tok_cfg = outputs._tok_cfg_cffi
+    tok_cfg.max_tokens = state_token_cap
+    tok_cfg.max_options = max_options
+    tok_cfg.max_targets = max_targets
+    tok_cfg.max_card_refs = max_card_refs
     packed_out = outputs._packed_out_cffi
 
     if outputs._spec_out_cffi is None:

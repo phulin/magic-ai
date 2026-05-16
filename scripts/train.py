@@ -4972,7 +4972,8 @@ def train_text_native_batched_envs(
         snapshot_rollout = ShardedNativeRolloutDriver([drivers_pool[num_actors]], pool=None)
 
         encode_cfg = ActorEncodeConfig(
-            text_max_tokens=int(args.text_max_tokens),
+            max_tokens=int(backend.replay_buffer.max_tokens),
+            max_state_tokens=int(args.text_max_tokens),
             max_options=int(args.max_options),
             max_targets_per_option=int(args.max_targets_per_option),
             max_card_refs=256,

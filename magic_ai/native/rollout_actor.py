@@ -46,7 +46,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class ActorEncodeConfig:
-    text_max_tokens: int
+    max_tokens: int
+    max_state_tokens: int
     max_options: int
     max_targets_per_option: int
     max_card_refs: int = 256
@@ -491,7 +492,8 @@ class TextRolloutActor:
             self.encoder,
             games,
             perspective_player_indices=perspectives,
-            max_tokens=self.encode_cfg.text_max_tokens,
+            max_tokens=self.encode_cfg.max_tokens,
+            max_state_tokens=self.encode_cfg.max_state_tokens,
             max_options=self.encode_cfg.max_options,
             max_targets=self.encode_cfg.max_targets_per_option,
             max_card_refs=self.encode_cfg.max_card_refs,
