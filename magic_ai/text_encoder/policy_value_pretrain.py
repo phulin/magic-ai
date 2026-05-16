@@ -32,6 +32,7 @@ from typing import Any, Literal, cast
 import numpy as np
 import orjson
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.ipc as pa_ipc
 import torch
 import torch.nn as nn
@@ -88,6 +89,19 @@ _ARROW_EXTRACTED_COLUMNS = (
     "outcome_players_json",
     "outcome_extras_json",
 )
+
+
+@dataclass(frozen=True)
+class _ArrowGameSpanCache:
+    shard_paths: tuple[Path, ...]
+    game_ids: tuple[str, ...]
+    game_shards: array[int]
+    game_batches: array[int]
+    game_starts: array[int]
+    game_lengths: array[int]
+
+
+_ARROW_GAME_SPAN_CACHE: dict[str, _ArrowGameSpanCache] = {}
 
 
 @dataclass(frozen=True)
@@ -152,6 +166,11 @@ class ForgeSequencedBatch:
     game_lengths: Tensor  # [B] int — number of valid cells in each game
     n_games: int
     l_max: int
+    cell_indices_by_timestep: tuple[Tensor, ...]  # len L_max; flat cell rows active at t
+    cell_indices_by_timestep_host: tuple[tuple[int, ...], ...]  # CPU mirror for shape metadata
+    game_indices_by_timestep: tuple[Tensor, ...]  # len L_max; game row for each active cell
+    loss_cell_indices_by_timestep: tuple[Tensor, ...]  # len L_max; flat loss-cell rows at t
+    loss_active_pos_by_timestep: tuple[Tensor, ...]  # len L_max; positions inside active rows
 
 
 @dataclass(frozen=True)
@@ -164,6 +183,16 @@ class _PreparedDecoderExample:
     value_target: float
     # subject_index → encoder_position, by anchor kind, for fast pointer lookup.
     anchor_pos_by_kind: dict[int, list[int]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _SequencedForwardOutput:
+    loss: Tensor
+    policy_loss: Tensor
+    value_loss: Tensor
+    value_predictions: Tensor
+    value_targets: Tensor
+    n_loss_cells: Tensor
 
 
 def _stable_eval_bucket(game_id: str, bucket: int) -> int:
@@ -311,6 +340,66 @@ class _ArrowBatchCache:
         return batch
 
 
+def _arrow_game_starts(game_ids: pa.Array) -> list[int]:
+    if len(game_ids) == 0:
+        return []
+    if len(game_ids) == 1:
+        return [0, 1]
+    changed = pc.call_function(
+        "not_equal", [game_ids.slice(1), game_ids.slice(0, len(game_ids) - 1)]
+    )
+    start_offsets = cast(pa.Array, pc.call_function("indices_nonzero", [changed]))
+    starts_arr = start_offsets.to_numpy(zero_copy_only=False)
+    starts = [0, *[int(i) + 1 for i in starts_arr]]
+    starts.append(len(game_ids))
+    return starts
+
+
+def _cached_arrow_game_spans(path: Path, shard_paths: Sequence[Path]) -> _ArrowGameSpanCache:
+    cache_key = str(path.resolve())
+    cached = _ARROW_GAME_SPAN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    game_ids_out: list[str] = []
+    game_shards: array[int] = array("I")
+    game_batches: array[int] = array("I")
+    game_starts: array[int] = array("I")
+    game_lengths: array[int] = array("I")
+    progress_stride = max(1, len(shard_paths) // 10)
+    for shard_idx, shard_path in enumerate(shard_paths):
+        if shard_idx % progress_stride == 0:
+            print(
+                f"[policy-value] indexing Arrow games shard={shard_idx + 1}/{len(shard_paths)}",
+                flush=True,
+            )
+        with pa.memory_map(str(shard_path), "r") as source:
+            reader = pa_ipc.RecordBatchFileReader(source)
+            _validate_arrow_schema(reader.schema, shard_path)
+            for batch_idx in range(reader.num_record_batches):
+                batch = reader.get_batch(batch_idx)
+                game_ids = batch.column("game_id")
+                starts = _arrow_game_starts(game_ids)
+                for start, end in zip(starts[:-1], starts[1:], strict=True):
+                    game_ids_out.append(str(game_ids[start].as_py()))
+                    game_shards.append(shard_idx)
+                    game_batches.append(batch_idx)
+                    game_starts.append(start)
+                    game_lengths.append(end - start)
+
+    out = _ArrowGameSpanCache(
+        shard_paths=tuple(shard_paths),
+        game_ids=tuple(game_ids_out),
+        game_shards=game_shards,
+        game_batches=game_batches,
+        game_starts=game_starts,
+        game_lengths=game_lengths,
+    )
+    _ARROW_GAME_SPAN_CACHE[cache_key] = out
+    print(f"[policy-value] indexed Arrow games games={len(game_ids_out)}", flush=True)
+    return out
+
+
 class _ArrowCorpusIndex:
     """Compact lazy index for large Rust-emitted Arrow corpora.
 
@@ -349,9 +438,38 @@ class _ArrowCorpusIndex:
         *,
         split: str,
         eval_fraction: float,
+        include_records: bool = True,
     ) -> _ArrowCorpusIndex:
         shard_paths = _arrow_shard_paths(path)
         bucket = 0 if eval_fraction <= 0 else max(2, int(round(1.0 / eval_fraction)))
+
+        if not include_records:
+            span_cache = _cached_arrow_game_spans(path, shard_paths)
+            game_shards: array[int] = array("I")
+            game_batches: array[int] = array("I")
+            game_starts: array[int] = array("I")
+            game_lengths: array[int] = array("I")
+            for i, game_id in enumerate(span_cache.game_ids):
+                include = True
+                if bucket > 0 and split != "all":
+                    in_eval = _stable_eval_bucket(game_id, bucket) == 0
+                    include = (split == "eval" and in_eval) or (split == "train" and not in_eval)
+                if include:
+                    game_shards.append(span_cache.game_shards[i])
+                    game_batches.append(span_cache.game_batches[i])
+                    game_starts.append(span_cache.game_starts[i])
+                    game_lengths.append(span_cache.game_lengths[i])
+            return cls(
+                shard_paths=span_cache.shard_paths,
+                record_shards=array("I"),
+                record_batches=array("I"),
+                record_rows=array("I"),
+                game_shards=game_shards,
+                game_batches=game_batches,
+                game_starts=game_starts,
+                game_lengths=game_lengths,
+                kind_counts={},
+            )
 
         record_shards: array[int] = array("I")
         record_batches: array[int] = array("I")
@@ -361,21 +479,23 @@ class _ArrowCorpusIndex:
         game_starts: array[int] = array("I")
         game_lengths: array[int] = array("I")
         kind_counts = dict.fromkeys(_ARROW_KIND_NAMES, 0)
-
         for shard_idx, shard_path in enumerate(shard_paths):
             with pa.memory_map(str(shard_path), "r") as source:
                 reader = pa_ipc.RecordBatchFileReader(source)
                 _validate_arrow_schema(reader.schema, shard_path)
                 for batch_idx in range(reader.num_record_batches):
                     batch = reader.get_batch(batch_idx)
-                    game_ids = batch.column("game_id").to_pylist()
-                    kind_ids = batch.column("kind_id").to_numpy(zero_copy_only=False)
-                    row = 0
-                    while row < batch.num_rows:
-                        game_id = str(game_ids[row])
-                        end = row + 1
-                        while end < batch.num_rows and game_ids[end] == game_id:
-                            end += 1
+                    if batch.num_rows == 0:
+                        continue
+                    game_ids = batch.column("game_id")
+                    starts = _arrow_game_starts(game_ids)
+                    kind_ids = (
+                        batch.column("kind_id").to_numpy(zero_copy_only=False)
+                        if include_records
+                        else None
+                    )
+                    for start, end in zip(starts[:-1], starts[1:], strict=True):
+                        game_id = str(game_ids[start].as_py())
                         include = True
                         if bucket > 0 and split != "all":
                             in_eval = _stable_eval_bucket(game_id, bucket) == 0
@@ -385,17 +505,21 @@ class _ArrowCorpusIndex:
                         if include:
                             game_shards.append(shard_idx)
                             game_batches.append(batch_idx)
-                            game_starts.append(row)
-                            game_lengths.append(end - row)
-                            for record_row in range(row, end):
-                                record_shards.append(shard_idx)
-                                record_batches.append(batch_idx)
-                                record_rows.append(record_row)
-                                kind_id = int(kind_ids[record_row])
-                                if 0 <= kind_id < len(_ARROW_KIND_NAMES):
-                                    kind = _ARROW_KIND_NAMES[kind_id]
-                                    kind_counts[kind] = kind_counts.get(kind, 0) + 1
-                        row = end
+                            game_starts.append(start)
+                            game_lengths.append(end - start)
+                            if include_records:
+                                if kind_ids is None:
+                                    raise RuntimeError(
+                                        "kind_ids must be loaded when include_records=True"
+                                    )
+                                for record_row in range(start, end):
+                                    record_shards.append(shard_idx)
+                                    record_batches.append(batch_idx)
+                                    record_rows.append(record_row)
+                                    kind_id = int(kind_ids[record_row])
+                                    if 0 <= kind_id < len(_ARROW_KIND_NAMES):
+                                        kind = _ARROW_KIND_NAMES[kind_id]
+                                        kind_counts[kind] = kind_counts.get(kind, 0) + 1
 
         return cls(
             shard_paths=shard_paths,
@@ -411,13 +535,17 @@ class _ArrowCorpusIndex:
 
     @property
     def n_records(self) -> int:
-        return int(self.record_rows.shape[0])
+        if self.record_rows.shape[0] > 0:
+            return int(self.record_rows.shape[0])
+        return int(self.game_lengths.sum())
 
     @property
     def n_games(self) -> int:
         return int(self.game_lengths.shape[0])
 
     def record(self, index: int) -> dict[str, Any]:
+        if self.record_rows.shape[0] == 0:
+            raise RuntimeError("Arrow index was built without per-record rows")
         batch = self._cache.get(int(self.record_shards[index]), int(self.record_batches[index]))
         return _arrow_record_from_batch(batch, int(self.record_rows[index]))
 
@@ -513,6 +641,7 @@ class ForgeChoiceDataset:
                 cfg.data_path,
                 split=split,
                 eval_fraction=cfg.eval_fraction,
+                include_records=cfg.sequence_mode != "full",
             )
         else:
             bucket = 0 if cfg.eval_fraction <= 0 else max(2, int(round(1.0 / cfg.eval_fraction)))
@@ -830,14 +959,26 @@ class ForgeChoiceDataset:
         cell_game_idx: list[int] = []
         cell_pos_idx: list[int] = []
         loss_mask_list: list[bool] = []
+        cell_indices_by_timestep: list[list[int]] = [[] for _ in range(l_max)]
+        game_indices_by_timestep: list[list[int]] = [[] for _ in range(l_max)]
+        loss_cell_indices_by_timestep: list[list[int]] = [[] for _ in range(l_max)]
+        loss_active_pos_by_timestep: list[list[int]] = [[] for _ in range(l_max)]
         for b, game in enumerate(prepared_per_game):
             k = min(loss_positions_per_game, len(game))
             chosen = set(rng.choice(len(game), size=k, replace=False).tolist())
             for pos, item in enumerate(game):
+                flat_idx = len(flat)
                 flat.append(item)
                 cell_game_idx.append(b)
                 cell_pos_idx.append(pos)
-                loss_mask_list.append(pos in chosen)
+                contributes_loss = pos in chosen
+                loss_mask_list.append(contributes_loss)
+                active_pos = len(cell_indices_by_timestep[pos])
+                cell_indices_by_timestep[pos].append(flat_idx)
+                game_indices_by_timestep[pos].append(b)
+                if contributes_loss:
+                    loss_cell_indices_by_timestep[pos].append(flat_idx)
+                    loss_active_pos_by_timestep[pos].append(active_pos)
 
         # Build the underlying ForgeDecoderBatch from the flat cell list.
         decoder_batch = self._batch_from_prepared(flat)
@@ -850,6 +991,19 @@ class ForgeChoiceDataset:
             game_lengths=torch.tensor(l_per_game, dtype=torch.long),
             n_games=n_games,
             l_max=l_max,
+            cell_indices_by_timestep=tuple(
+                torch.tensor(xs, dtype=torch.long) for xs in cell_indices_by_timestep
+            ),
+            cell_indices_by_timestep_host=tuple(tuple(xs) for xs in cell_indices_by_timestep),
+            game_indices_by_timestep=tuple(
+                torch.tensor(xs, dtype=torch.long) for xs in game_indices_by_timestep
+            ),
+            loss_cell_indices_by_timestep=tuple(
+                torch.tensor(xs, dtype=torch.long) for xs in loss_cell_indices_by_timestep
+            ),
+            loss_active_pos_by_timestep=tuple(
+                torch.tensor(xs, dtype=torch.long) for xs in loss_active_pos_by_timestep
+            ),
         )
 
 
@@ -870,6 +1024,39 @@ def _expected_pointer_kind(
         body_off = step_index - 1
         return AnchorKind.LEGAL_BLOCKER if body_off % 4 == 1 else AnchorKind.LEGAL_ATTACKER
     raise ValueError(f"decision type {dt} has no pointer steps")
+
+
+def _index_text_encoded_batch(
+    batch: TextEncodedBatch, rows: Tensor, rows_host: Sequence[int]
+) -> TextEncodedBatch:
+    seq_lengths = batch.seq_lengths.index_select(0, rows)
+    source_lengths = batch.seq_lengths_host
+    if source_lengths is None:
+        seq_lengths_host = tuple(int(x) for x in seq_lengths.detach().cpu().tolist())
+    else:
+        seq_lengths_host = tuple(int(source_lengths[i]) for i in rows_host)
+    max_tokens = max(seq_lengths_host, default=0)
+    legal_edge_bitmap = (
+        batch.legal_edge_bitmap.index_select(0, rows)
+        if batch.legal_edge_bitmap is not None
+        else None
+    )
+    return TextEncodedBatch(
+        token_ids=batch.token_ids.index_select(0, rows)[:, :max_tokens].contiguous(),
+        attention_mask=batch.attention_mask.index_select(0, rows)[:, :max_tokens].contiguous(),
+        card_ref_positions=batch.card_ref_positions.index_select(0, rows).contiguous(),
+        seq_lengths=seq_lengths,
+        spec_tokens=batch.spec_tokens.index_select(0, rows).contiguous(),
+        spec_lens=batch.spec_lens.index_select(0, rows).contiguous(),
+        decision_type=batch.decision_type.index_select(0, rows).contiguous(),
+        pointer_anchor_positions=batch.pointer_anchor_positions.index_select(0, rows).contiguous(),
+        pointer_anchor_kinds=batch.pointer_anchor_kinds.index_select(0, rows).contiguous(),
+        pointer_anchor_subjects=batch.pointer_anchor_subjects.index_select(0, rows).contiguous(),
+        pointer_anchor_handles=batch.pointer_anchor_handles.index_select(0, rows).contiguous(),
+        legal_edge_bitmap=legal_edge_bitmap,
+        total_tokens=sum(seq_lengths_host),
+        seq_lengths_host=seq_lengths_host,
+    )
 
 
 class ForgePolicyValueTrainer:
@@ -904,6 +1091,115 @@ class ForgePolicyValueTrainer:
             accum_total=accum_total,
         )
 
+    def _sequenced_forward(self, batch: ForgeSequencedBatch) -> _SequencedForwardOutput:
+        """Run the RL-style recurrent forward over a sequenced pretrain batch.
+
+        This mirrors rollout/replay semantics: each timestep encodes the
+        current snapshot with ``hist_proj(h_in[-1])`` injected into the encoder,
+        scores decoder/value heads from that history-conditioned encoding, and
+        only then advances ``h/c`` for the next timestep. Losses are evaluated
+        only on the sampled cells, but every active cell updates recurrence.
+        """
+
+        text_policy = self.policy.text_policy
+        if text_policy.grammar_decoder is None:
+            raise RuntimeError("decoder pipeline requires TextPolicy with a grammar_decoder")
+        device = next(text_policy.parameters()).device
+        dtype = next(self.policy.lstm.parameters()).dtype
+        h = torch.zeros(
+            self.policy.lstm_layers,
+            batch.n_games,
+            self.policy.lstm_hidden,
+            dtype=dtype,
+            device=device,
+        )
+        c = torch.zeros_like(h)
+        policy_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+        policy_count = torch.zeros((), dtype=torch.float32, device=device)
+        value_loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+        value_count = torch.zeros((), dtype=torch.float32, device=device)
+        value_predictions: list[Tensor] = []
+        value_targets: list[Tensor] = []
+
+        from magic_ai.text_encoder.batch import scatter_packed_to_padded
+
+        for t in range(batch.l_max):
+            active_cells = batch.cell_indices_by_timestep[t]
+            if int(active_cells.numel()) == 0:
+                continue
+            active_games = batch.game_indices_by_timestep[t]
+            timestep_encoded = _index_text_encoded_batch(
+                batch.decoder.encoded, active_cells, batch.cell_indices_by_timestep_host[t]
+            )
+            h_in = h.index_select(1, active_games)
+            c_in = c.index_select(1, active_games)
+            encoded_snaps, h_out, c_out = self.policy.encode_with_history(
+                timestep_encoded,
+                h_in=h_in,
+                c_in=c_in,
+            )
+            h = h.index_copy(1, active_games, h_out)
+            c = c.index_copy(1, active_games, c_out)
+
+            loss_active_pos = batch.loss_active_pos_by_timestep[t]
+            if int(loss_active_pos.numel()) == 0:
+                continue
+            loss_cells = batch.loss_cell_indices_by_timestep[t]
+            encoded_hidden, attn_mask = scatter_packed_to_padded(
+                encoded_snaps.encoded, encoded_snaps.packed
+            )
+            enc_width = int(encoded_hidden.shape[1])
+            encoded_loss = encoded_hidden.index_select(0, loss_active_pos)
+            attn_loss = attn_mask.index_select(0, loss_active_pos)
+            target_tokens = batch.decoder.output_token_ids.index_select(0, loss_cells).to(device)
+            vocab_logits, pointer_logits = text_policy.grammar_decoder.forward_teacher_forced(
+                target_tokens,
+                encoded_loss,
+                attn_loss,
+            )
+            out_pad_mask = batch.decoder.output_pad_mask.index_select(0, loss_cells).to(device)
+            step_count = out_pad_mask.sum().to(dtype=torch.float32)
+            policy_l = decoder_cross_entropy_loss(
+                vocab_logits,
+                pointer_logits,
+                target_tokens,
+                batch.decoder.output_pointer_pos.index_select(0, loss_cells).to(device),
+                batch.decoder.output_is_pointer.index_select(0, loss_cells).to(device),
+                batch.decoder.vocab_mask.index_select(0, loss_cells).to(device),
+                batch.decoder.pointer_mask.index_select(0, loss_cells)[:, :, :enc_width].to(device),
+                out_pad_mask,
+            )
+            policy_loss_sum = policy_loss_sum + policy_l.float() * step_count
+            policy_count = policy_count + step_count
+
+            state_vec_loss = encoded_snaps.state_vector.index_select(0, loss_active_pos)
+            values = text_policy.run_heads(encoded_snaps, state_vec=state_vec_loss)
+            targets = batch.decoder.value_targets.index_select(0, loss_cells).to(device)
+            value_loss_sum = value_loss_sum + (values.float() - targets.float()).pow(2).sum()
+            value_count = value_count + float(targets.numel())
+            value_predictions.append(values)
+            value_targets.append(targets)
+
+        policy_loss = policy_loss_sum / policy_count.clamp(min=1.0)
+        value_loss_out = value_loss_sum / value_count.clamp(min=1.0)
+        loss = (
+            self.cfg.policy_loss_weight * policy_loss + self.cfg.value_loss_weight * value_loss_out
+        )
+        if value_predictions:
+            pred = torch.cat(value_predictions, dim=0)
+            targ = torch.cat(value_targets, dim=0)
+        else:
+            pred = torch.empty((0,), dtype=torch.float32, device=device)
+            targ = torch.empty((0,), dtype=torch.float32, device=device)
+        return _SequencedForwardOutput(
+            loss=loss,
+            policy_loss=policy_loss,
+            value_loss=value_loss_out,
+            value_predictions=pred,
+            value_targets=targ,
+            n_loss_cells=value_count,
+        )
+
     def _sequenced_step(
         self,
         batch: ForgeSequencedBatch,
@@ -912,91 +1208,12 @@ class ForgePolicyValueTrainer:
         accum_index: int = 0,
         accum_total: int = 1,
     ) -> dict[str, float]:
-        """Sequenced pretrain: replay each game through the LSTM in temporal
-        order; decoder + value losses fire on a sampled subset of cells.
-
-        The LSTM scan over [B, L_max] gives the value head proper history-
-        aggregated state. Per-cell padded LSTM updates beyond ``game_lengths``
-        are unused (loss is masked off there), so we don't pay the cost of
-        ``pack_padded_sequence``.
-        """
+        """Sequenced pretrain: replay each game through the LSTM in temporal order."""
         self.policy.train()
         if accum_index == 0:
             self.optimizer.zero_grad(set_to_none=True)
-        text_policy = self.policy.text_policy
-        if text_policy.grammar_decoder is None:
-            raise RuntimeError("decoder pipeline requires TextPolicy with a grammar_decoder")
-        device = next(text_policy.parameters()).device
-
-        decoder_batch = batch.decoder
-        cell_game_idx = batch.cell_game_idx.to(device)
-        cell_pos_idx = batch.cell_pos_idx.to(device)
-        loss_mask_flat = batch.loss_mask.to(device)
-        n_games = batch.n_games
-        l_max = batch.l_max
-
-        # One encoder forward feeds both decoder cross-attn and the value
-        # head. Use the packed varlen path (`encode_only` packs internally)
-        # to avoid `flex_attention` recompiles, then scatter back to
-        # [N, T_enc, D] for the decoder cross-attn — same convention as the
-        # rationalized `forward_decoder_teacher_forced`, but inlined here so
-        # the encoder isn't re-run for the value head.
-        from magic_ai.text_encoder.batch import scatter_packed_to_padded
-
-        encoded_snaps = text_policy.encode_only(decoder_batch.encoded)
-        encoded_hidden, attn_mask = scatter_packed_to_padded(
-            encoded_snaps.encoded, encoded_snaps.packed
-        )
-        state_vec = encoded_snaps.state_vector  # [N, D]
-        target_tokens = decoder_batch.output_token_ids.to(device)
-        vocab_logits, pointer_logits = text_policy.grammar_decoder.forward_teacher_forced(
-            target_tokens, encoded_hidden, attn_mask
-        )
-        # Apply loss mask by zeroing the per-row pad mask on non-loss cells —
-        # the existing decoder_cross_entropy_loss reduces over True entries
-        # in output_pad_mask.
-        out_pad_mask = decoder_batch.output_pad_mask.to(device) & loss_mask_flat.unsqueeze(-1)
-        decoder_loss = decoder_cross_entropy_loss(
-            vocab_logits,
-            pointer_logits,
-            target_tokens,
-            decoder_batch.output_pointer_pos.to(device),
-            decoder_batch.output_is_pointer.to(device),
-            decoder_batch.vocab_mask.to(device),
-            decoder_batch.pointer_mask.to(device),
-            out_pad_mask,
-        )
-
-        # Value path: scatter per-cell state_vec into [B, L_max, D], run the
-        # LSTM scan with zero init state, decode every position, mask losses.
-        d_model = state_vec.shape[-1]
-        state_vec_seq = torch.zeros((n_games, l_max, d_model), dtype=state_vec.dtype, device=device)
-        state_vec_seq[cell_game_idx, cell_pos_idx] = state_vec
-
-        lstm_input_seq = self.policy.in_proj(state_vec_seq)  # [B, L, lstm_hidden]
-        h0 = torch.zeros(
-            self.policy.lstm_layers,
-            n_games,
-            self.policy.lstm_hidden,
-            dtype=lstm_input_seq.dtype,
-            device=device,
-        )
-        c0 = torch.zeros_like(h0)
-        lstm_out_seq, _ = self.policy.lstm(lstm_input_seq, (h0, c0))
-        # out_proj projects back to d_model (the value head's input space).
-        state_for_heads_seq = self.policy.out_proj(lstm_out_seq)  # [B, L, D]
-        values_seq = text_policy.value_head(state_for_heads_seq)  # [B, L]
-
-        # Gather per-cell predictions back into flat-cell space and apply
-        # loss mask for MSE.
-        values_flat = values_seq[cell_game_idx, cell_pos_idx]  # [N]
-        value_targets_flat = decoder_batch.value_targets.to(device)
-        v_loss_per_cell = (values_flat.float() - value_targets_flat) ** 2
-        # Reduce only over loss_mask cells; clamp denominator to avoid /0.
-        loss_count = loss_mask_flat.float().sum().clamp(min=1.0)
-        v_loss = (v_loss_per_cell * loss_mask_flat.float()).sum() / loss_count
-
-        loss = self.cfg.policy_loss_weight * decoder_loss + self.cfg.value_loss_weight * v_loss
+        out = self._sequenced_forward(batch)
+        loss = out.loss
         # Scale loss by accum_total so the accumulated gradient matches the
         # average loss across micro-batches (rather than the sum).
         (loss / accum_total).backward()
@@ -1013,8 +1230,8 @@ class ForgePolicyValueTrainer:
             return {}
 
         with torch.no_grad():
-            v_pred_loss = values_flat.float()[loss_mask_flat]
-            v_targ_loss = value_targets_flat[loss_mask_flat]
+            v_pred_loss = out.value_predictions.float()
+            v_targ_loss = out.value_targets.float()
             v_pred_mean = float(v_pred_loss.mean()) if v_pred_loss.numel() > 0 else 0.0
             v_pred_std = float(v_pred_loss.std()) if v_pred_loss.numel() > 1 else 0.0
             v_targ_mean = float(v_targ_loss.mean()) if v_targ_loss.numel() > 0 else 0.0
@@ -1065,8 +1282,8 @@ class ForgePolicyValueTrainer:
 
         return {
             "loss": float(loss.detach()),
-            "policy_loss": float(decoder_loss.detach()),
-            "value_loss": float(v_loss.detach()),
+            "policy_loss": float(out.policy_loss.detach()),
+            "value_loss": float(out.value_loss.detach()),
             "v_pred_mean": v_pred_mean,
             "v_pred_std": v_pred_std,
             "v_targ_mean": v_targ_mean,
@@ -1076,7 +1293,7 @@ class ForgePolicyValueTrainer:
             "v_head_grad_norm": v_grad_norm,
             "lstm_grad_norm": lstm_grad_norm,
             "grad_norm": float(grad_norm.detach()),
-            "n_loss_cells": int(loss_count.detach()),
+            "n_loss_cells": int(out.n_loss_cells.detach()),
         }
 
     def _decoder_step(self, batch: ForgeDecoderBatch, *, compute_stats: bool) -> dict[str, float]:
@@ -1280,55 +1497,11 @@ class ForgePolicyValueTrainer:
                 self.cfg.games_per_batch, self.cfg.loss_positions_per_game, rng
             )
             batch = _sequenced_batch_to_device(batch, device)
-            text_policy = self.policy.text_policy
-            if text_policy.grammar_decoder is None:
+            if self.policy.text_policy.grammar_decoder is None:
                 continue
-            decoder_batch = batch.decoder
-            from magic_ai.text_encoder.batch import scatter_packed_to_padded
-
-            encoded_snaps = text_policy.encode_only(decoder_batch.encoded)
-            encoded_hidden, attn_mask = scatter_packed_to_padded(
-                encoded_snaps.encoded, encoded_snaps.packed
-            )
-            state_vec = encoded_snaps.state_vector
-            target_tokens = decoder_batch.output_token_ids
-            vocab_logits, pointer_logits = text_policy.grammar_decoder.forward_teacher_forced(
-                target_tokens, encoded_hidden, attn_mask
-            )
-            out_pad_mask = decoder_batch.output_pad_mask & batch.loss_mask.unsqueeze(-1)
-            policy_l = decoder_cross_entropy_loss(
-                vocab_logits,
-                pointer_logits,
-                target_tokens,
-                decoder_batch.output_pointer_pos,
-                decoder_batch.output_is_pointer,
-                decoder_batch.vocab_mask,
-                decoder_batch.pointer_mask,
-                out_pad_mask,
-            )
-            d_model = state_vec.shape[-1]
-            state_vec_seq = torch.zeros(
-                (batch.n_games, batch.l_max, d_model),
-                dtype=state_vec.dtype,
-                device=device,
-            )
-            state_vec_seq[batch.cell_game_idx, batch.cell_pos_idx] = state_vec
-            lstm_input_seq = self.policy.in_proj(state_vec_seq)
-            h0 = torch.zeros(
-                self.policy.lstm_layers,
-                batch.n_games,
-                self.policy.lstm_hidden,
-                dtype=lstm_input_seq.dtype,
-                device=device,
-            )
-            c0 = torch.zeros_like(h0)
-            lstm_out_seq, _ = self.policy.lstm(lstm_input_seq, (h0, c0))
-            state_for_heads_seq = self.policy.out_proj(lstm_out_seq)
-            values_seq = text_policy.value_head(state_for_heads_seq)
-            values_flat = values_seq[batch.cell_game_idx, batch.cell_pos_idx]
-            v_pred = values_flat.float()[batch.loss_mask]
-            v_targ = decoder_batch.value_targets[batch.loss_mask]
-            v_loss = ((v_pred - v_targ) ** 2).mean() if v_pred.numel() > 0 else torch.tensor(0.0)
+            out = self._sequenced_forward(batch)
+            v_pred = out.value_predictions.float()
+            v_targ = out.value_targets.float()
             non_draw = v_targ.abs() > 1e-6
             sign_acc = (
                 float((torch.sign(v_pred[non_draw]) == torch.sign(v_targ[non_draw])).float().mean())
@@ -1336,8 +1509,8 @@ class ForgePolicyValueTrainer:
                 else 0.0
             )
             stats = {
-                "eval_policy_loss": float(policy_l.detach()),
-                "eval_value_loss": float(v_loss.detach()),
+                "eval_policy_loss": float(out.policy_loss.detach()),
+                "eval_value_loss": float(out.value_loss.detach()),
                 "eval_value_sign_accuracy": sign_acc,
                 "eval_v_pred_std": float(v_pred.std()) if v_pred.numel() > 1 else 0.0,
             }
@@ -1421,6 +1594,13 @@ def _sequenced_batch_to_device(
         game_lengths=batch.game_lengths.to(device),
         n_games=batch.n_games,
         l_max=batch.l_max,
+        cell_indices_by_timestep=tuple(x.to(device) for x in batch.cell_indices_by_timestep),
+        cell_indices_by_timestep_host=batch.cell_indices_by_timestep_host,
+        game_indices_by_timestep=tuple(x.to(device) for x in batch.game_indices_by_timestep),
+        loss_cell_indices_by_timestep=tuple(
+            x.to(device) for x in batch.loss_cell_indices_by_timestep
+        ),
+        loss_active_pos_by_timestep=tuple(x.to(device) for x in batch.loss_active_pos_by_timestep),
     )
 
 

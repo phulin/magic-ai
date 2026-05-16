@@ -13,7 +13,7 @@ Comprehensive test suite covering text encoding (rendering, tokenization, assemb
 - `test_native_rollout.py` — Tests for native rollout driver library availability checks.
 - `test_native_token_tables.py` — Phase 3 round-trip parity test: TokenTables via Go FFI and echo back.
 - `test_opponent_pool.py` — Tests for opponent snapshot state filtering and runtime-buffer-safe weight loading.
-- `test_policy_value_pretrain_arrow.py` — Tests Forge policy/value pretraining input loading for spec-shaped Arrow IPC corpora.
+- `test_policy_value_pretrain_arrow.py` — Tests Forge policy/value pretraining Arrow input loading and sequenced LSTM semantics.
 - `test_ppo.py` — Unit tests for PPO replay minibatch construction and token-capped batching.
 - `test_recurrent_text_policy.py` — Smoke tests for v1 history adapter with LSTM around state vector.
 - `test_replay_buffer.py` — Unit tests for backend-neutral ReplayCore row, decision, PPO target, and common metadata storage.
