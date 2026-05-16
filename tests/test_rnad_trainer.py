@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 
 import torch
@@ -14,6 +15,7 @@ from magic_ai.rnad_trainer import (
     _alpha_for_step,
     _delta_m_for_outer_iteration,
     build_trainer_state,
+    prepare_rnad_update_from_replay_window,
     resume_from_snapshot_dir,
 )
 from magic_ai.slot_encoder.game_state import GameStateEncoder
@@ -110,6 +112,46 @@ class TrainerStateTests(unittest.TestCase):
             # reg_cur should now equal target.
             self.assertTrue(torch.allclose(reg_cur.value_head.weight, torch.tensor(0.75)))
             self.assertTrue((Path(tmp) / "reg_m001.pt").exists())
+
+    def test_prepare_rnad_update_from_replay_window_groups_complete_episodes(self) -> None:
+        replay = SimpleNamespace(
+            device=torch.device("cpu"),
+            episode_meta=SimpleNamespace(
+                episode_id=torch.tensor([2, 2, 5], dtype=torch.long),
+                step_idx=torch.tensor([1, 0, 0], dtype=torch.long),
+                terminal_reward_p0=torch.tensor([0.25, 0.25, -1.0]),
+                zero_sum=torch.tensor([True, True, False]),
+                is_terminal=torch.tensor([True, False, True]),
+            ),
+            perspective_player_idx=torch.tensor([1, 0, 1], dtype=torch.long),
+            old_log_prob=torch.tensor([-0.2, -0.1, -0.3]),
+        )
+
+        prepared = prepare_rnad_update_from_replay_window(replay, [1, 0, 2])
+
+        self.assertEqual(prepared.replay_rows, [[1, 0], [2]])
+        self.assertEqual(prepared.perspective, [[0, 1], [1]])
+        self.assertEqual(prepared.terminal_reward_p0, [0.25, -1.0])
+        self.assertEqual(prepared.zero_sum, [True, False])
+        torch.testing.assert_close(prepared.logp_mu[0], torch.tensor([-0.1, -0.2]))
+        torch.testing.assert_close(prepared.logp_mu[1], torch.tensor([-0.3]))
+
+    def test_prepare_rnad_update_from_replay_window_rejects_split_episode(self) -> None:
+        replay = SimpleNamespace(
+            device=torch.device("cpu"),
+            episode_meta=SimpleNamespace(
+                episode_id=torch.tensor([2, 2], dtype=torch.long),
+                step_idx=torch.tensor([0, 1], dtype=torch.long),
+                terminal_reward_p0=torch.tensor([1.0, 1.0]),
+                zero_sum=torch.tensor([True, True]),
+                is_terminal=torch.tensor([False, True]),
+            ),
+            perspective_player_idx=torch.tensor([0, 1], dtype=torch.long),
+            old_log_prob=torch.tensor([-0.1, -0.2]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "split episode"):
+            prepare_rnad_update_from_replay_window(replay, [0])
 
     def test_resume_loads_snapshots(self) -> None:
         policy = _make_policy()

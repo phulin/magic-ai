@@ -33,7 +33,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -64,6 +64,17 @@ class EpisodeBatch:
     steps: list[RolloutStep]
     terminal_reward_p0: float
     zero_sum: bool
+
+
+@dataclass(frozen=True)
+class PreparedRNaDUpdateBatch:
+    """Trajectory metadata in the shape consumed by the batched R-NaD loss."""
+
+    replay_rows: list[list[int]]
+    perspective: list[list[int]]
+    logp_mu: list[torch.Tensor]
+    terminal_reward_p0: list[float]
+    zero_sum: list[bool]
 
 
 @dataclass
@@ -179,41 +190,12 @@ def _advance_outer_iteration(state: RNaDTrainerState) -> None:
         state.is_finetuning = True
 
 
-def run_rnad_update(
-    policy: RNaDTrainablePolicy,
-    optimizer: torch.optim.Optimizer,
-    state: RNaDTrainerState,
+def _prepare_rnad_update_from_episodes(
     episodes: Sequence[EpisodeBatch],
-    *,
-    entropy_coef: float = 0.0,
-) -> TrainerStats:
-    """Run R-NaD on a batch of freshly-finished episodes.
-
-    Each episode becomes one :func:`rnad_trajectory_loss` call; the resulting
-    sums/counts are aggregated and a single backward + Adam + Polyak step is
-    taken (issue 7 — paper-faithful 1/t_effective normalization, where
-    ``t_effective`` is the total own-turn step / per-choice-action count
-    across the batch, not the episode count).
-
-    ``entropy_coef`` is unused for R-NaD (the reward transform already
-    injects an entropy bonus) but kept in the signature for parity with
-    :func:`magic_ai.ppo.ppo_update`.
-    """
-
-    del entropy_coef  # parity-only arg
-
-    if not episodes:
-        raise ValueError("run_rnad_update requires at least one episode")
-
-    current_delta_m = _delta_m_for_outer_iteration(
-        state.outer_iteration,
-        state.config.delta_m,
-    )
-    alpha = _alpha_for_step(state.gradient_step, current_delta_m)
-
+) -> PreparedRNaDUpdateBatch:
     per_episode_replay_rows: list[list[int]] = []
     per_episode_perspective: list[list[int]] = []
-    per_episode_logp_mu: list[list[float]] = []
+    per_episode_logp_mu: list[torch.Tensor] = []
     per_episode_terminal_reward_p0: list[float] = []
     per_episode_zero_sum: list[bool] = []
     for episode in episodes:
@@ -230,26 +212,49 @@ def run_rnad_update(
             lp.append(float(step.old_log_prob))
         per_episode_replay_rows.append(rows)
         per_episode_perspective.append(persp)
-        per_episode_logp_mu.append(lp)
+        per_episode_logp_mu.append(torch.tensor(lp, dtype=torch.float32))
         per_episode_terminal_reward_p0.append(float(episode.terminal_reward_p0))
         per_episode_zero_sum.append(bool(episode.zero_sum))
 
-    if not per_episode_replay_rows:
-        raise ValueError("no non-empty episodes to update on")
+    return PreparedRNaDUpdateBatch(
+        replay_rows=per_episode_replay_rows,
+        perspective=per_episode_perspective,
+        logp_mu=per_episode_logp_mu,
+        terminal_reward_p0=per_episode_terminal_reward_p0,
+        zero_sum=per_episode_zero_sum,
+    )
+
+
+def _run_rnad_update_prepared(
+    policy: RNaDTrainablePolicy,
+    optimizer: torch.optim.Optimizer,
+    state: RNaDTrainerState,
+    batch: PreparedRNaDUpdateBatch,
+    *,
+    entropy_coef: float = 0.0,
+) -> TrainerStats:
+    del entropy_coef  # parity-only arg
+
+    if not batch.replay_rows:
+        raise ValueError("run_rnad_update requires at least one episode")
+
+    current_delta_m = _delta_m_for_outer_iteration(
+        state.outer_iteration,
+        state.config.delta_m,
+    )
+    alpha = _alpha_for_step(state.gradient_step, current_delta_m)
 
     with torch.profiler.record_function("run_rnad_update/count_active_replay_steps"):
         cl_count_total, pl_count_total = policy.count_active_replay_steps(
-            per_episode_replay_rows,
+            batch.replay_rows,
         )
-
-    episodes_logp_mu = [torch.tensor(lp, dtype=torch.float32) for lp in per_episode_logp_mu]
 
     vshare_every = state.config.diagnostic_v_target_reg_share_every
     compute_v_target_reg_share = vshare_every > 0 and (state.gradient_step % vshare_every == 0)
     drift_every = state.config.diagnostic_policy_drift_every
     compute_policy_drift_diagnostics = drift_every > 0 and (state.gradient_step % drift_every == 0)
 
-    n_episodes = len(per_episode_replay_rows)
+    n_episodes = len(batch.replay_rows)
     step_budget = state.config.step_minibatch_size
     if step_budget <= 0:
         chunks = [(0, n_episodes)]
@@ -259,7 +264,7 @@ def run_rnad_update(
         chunks = []
         lo = 0
         cum = 0
-        for i, ep in enumerate(per_episode_replay_rows):
+        for i, ep in enumerate(batch.replay_rows):
             ep_len = len(ep)
             if cum > 0 and cum + ep_len > step_budget:
                 chunks.append((lo, i))
@@ -275,11 +280,11 @@ def run_rnad_update(
                 target=state.target,
                 reg_cur=state.reg_cur,
                 reg_prev=state.reg_prev,
-                episodes_replay_rows=per_episode_replay_rows[lo:hi],
-                episodes_perspective=per_episode_perspective[lo:hi],
-                episodes_terminal_reward_p0=per_episode_terminal_reward_p0[lo:hi],
-                episodes_zero_sum=per_episode_zero_sum[lo:hi],
-                episodes_logp_mu=episodes_logp_mu[lo:hi],
+                episodes_replay_rows=batch.replay_rows[lo:hi],
+                episodes_perspective=batch.perspective[lo:hi],
+                episodes_terminal_reward_p0=batch.terminal_reward_p0[lo:hi],
+                episodes_zero_sum=batch.zero_sum[lo:hi],
+                episodes_logp_mu=batch.logp_mu[lo:hi],
                 config=state.config,
                 alpha=alpha,
                 compute_v_target_reg_share=compute_v_target_reg_share,
@@ -563,6 +568,146 @@ def run_rnad_update(
         approx_kl=0.0,
         clip_fraction=q_clip_fraction,
         spr_loss=0.0,
+    )
+
+
+def prepare_rnad_update_from_replay_window(
+    replay_buffer: Any,
+    replay_rows: torch.Tensor | Sequence[int],
+) -> PreparedRNaDUpdateBatch:
+    """Build complete-episode R-NaD metadata directly from replay storage.
+
+    This is the native text learner's fast path. It avoids recreating
+    ``EpisodeBatch`` / ``RolloutStep`` objects from replay tensors only for
+    :func:`run_rnad_update` to flatten them again.
+    """
+
+    if isinstance(replay_rows, torch.Tensor):
+        if int(replay_rows.numel()) == 0:
+            raise ValueError("run_rnad_update requires at least one replay row")
+        rows_h = [int(x) for x in replay_rows.detach().to(device="cpu", dtype=torch.long).tolist()]
+    else:
+        rows_h = [int(r) for r in replay_rows]
+        if not rows_h:
+            raise ValueError("run_rnad_update requires at least one replay row")
+
+    storage_device = torch.device(getattr(replay_buffer, "device", "cpu"))
+    idx = torch.tensor(rows_h, dtype=torch.long, device=storage_device)
+    episode_meta = replay_buffer.episode_meta
+    episode_h = episode_meta.episode_id[idx].detach().cpu().tolist()
+    step_h = episode_meta.step_idx[idx].detach().cpu().tolist()
+    terminal_h = episode_meta.terminal_reward_p0[idx].detach().cpu().tolist()
+    zero_h = episode_meta.zero_sum[idx].detach().cpu().tolist()
+    is_terminal_h = episode_meta.is_terminal[idx].detach().cpu().tolist()
+    perspective_h = replay_buffer.perspective_player_idx[idx].detach().cpu().tolist()
+    old_logp_h = replay_buffer.old_log_prob[idx].detach().cpu().tolist()
+
+    grouped: dict[int, list[tuple[int, int, int, float, float, bool, bool]]] = {}
+    order: list[int] = []
+    for row, episode, step, player, logp, terminal, zero_sum, is_terminal in zip(
+        rows_h,
+        episode_h,
+        step_h,
+        perspective_h,
+        old_logp_h,
+        terminal_h,
+        zero_h,
+        is_terminal_h,
+        strict=True,
+    ):
+        episode_i = int(episode)
+        if episode_i < 0:
+            raise ValueError(f"replay row {row} is missing episode metadata")
+        if episode_i not in grouped:
+            grouped[episode_i] = []
+            order.append(episode_i)
+        grouped[episode_i].append(
+            (
+                int(step),
+                int(row),
+                int(player),
+                float(logp),
+                float(terminal),
+                bool(zero_sum),
+                bool(is_terminal),
+            )
+        )
+
+    per_episode_replay_rows: list[list[int]] = []
+    per_episode_perspective: list[list[int]] = []
+    per_episode_logp_mu: list[torch.Tensor] = []
+    per_episode_terminal_reward_p0: list[float] = []
+    per_episode_zero_sum: list[bool] = []
+    for episode_id in order:
+        items = sorted(grouped[episode_id])
+        if not items:
+            continue
+        if not items[-1][6]:
+            raise ValueError(
+                f"R-NaD replay window split episode {episode_id}; "
+                "claim windows with require_terminal_boundary=True"
+            )
+        per_episode_replay_rows.append([item[1] for item in items])
+        per_episode_perspective.append([item[2] for item in items])
+        per_episode_logp_mu.append(torch.tensor([item[3] for item in items], dtype=torch.float32))
+        per_episode_terminal_reward_p0.append(float(items[-1][4]))
+        per_episode_zero_sum.append(bool(items[-1][5]))
+
+    if not per_episode_replay_rows:
+        raise ValueError("no non-empty episodes to update on")
+
+    return PreparedRNaDUpdateBatch(
+        replay_rows=per_episode_replay_rows,
+        perspective=per_episode_perspective,
+        logp_mu=per_episode_logp_mu,
+        terminal_reward_p0=per_episode_terminal_reward_p0,
+        zero_sum=per_episode_zero_sum,
+    )
+
+
+def run_rnad_update_from_replay_window(
+    policy: RNaDTrainablePolicy,
+    optimizer: torch.optim.Optimizer,
+    state: RNaDTrainerState,
+    replay_buffer: Any,
+    replay_rows: torch.Tensor | Sequence[int],
+    *,
+    entropy_coef: float = 0.0,
+) -> TrainerStats:
+    prepared = prepare_rnad_update_from_replay_window(replay_buffer, replay_rows)
+    return _run_rnad_update_prepared(
+        policy,
+        optimizer,
+        state,
+        prepared,
+        entropy_coef=entropy_coef,
+    )
+
+
+def run_rnad_update(
+    policy: RNaDTrainablePolicy,
+    optimizer: torch.optim.Optimizer,
+    state: RNaDTrainerState,
+    episodes: Sequence[EpisodeBatch],
+    *,
+    entropy_coef: float = 0.0,
+) -> TrainerStats:
+    """Run R-NaD on a batch of freshly-finished episodes.
+
+    Each episode becomes one trajectory in the batched loss; the resulting
+    sums/counts are aggregated and a single backward + Adam + Polyak step is
+    taken. ``entropy_coef`` is unused for R-NaD but kept for parity with PPO.
+    """
+
+    if not episodes:
+        raise ValueError("run_rnad_update requires at least one episode")
+    prepared = _prepare_rnad_update_from_episodes(episodes)
+    return _run_rnad_update_prepared(
+        policy,
+        optimizer,
+        state,
+        prepared,
+        entropy_coef=entropy_coef,
     )
 
 

@@ -786,6 +786,7 @@ class TextReplayBuffer:
         max_rows: int,
         target_rows: int | None = None,
         allow_partial: bool = False,
+        require_terminal_boundary: bool = False,
     ) -> TextReplayTrainWindow | None:
         if min_rows < 1:
             raise ValueError("min_rows must be at least 1")
@@ -806,6 +807,16 @@ class TextReplayBuffer:
             if not allow_partial and available < target:
                 return None
             row_end = row_start + min(available, int(max_rows))
+            if require_terminal_boundary:
+                aligned_end = self._terminal_aligned_window_end_locked(
+                    row_start=row_start,
+                    preferred_end=row_end,
+                    claimable_limit=claimable_limit,
+                )
+                if aligned_end <= row_start:
+                    return None
+                else:
+                    row_end = aligned_end
             self._consume_committed_prefix_locked(row_end)
             self._claimed_windows.append((row_start, row_end))
         return TextReplayTrainWindow(
@@ -1276,6 +1287,40 @@ class TextReplayBuffer:
             row += 1
             offset += 1
         return row
+
+    def _terminal_aligned_window_end_locked(
+        self,
+        *,
+        row_start: int,
+        preferred_end: int,
+        claimable_limit: int,
+    ) -> int:
+        """Return an end row that does not split an episode.
+
+        R-NaD consumes complete trajectories. The steady-state learner is
+        row-window based, so without this alignment a large committed prefix
+        can be claimed through the middle of a long episode and then trained
+        as if that fragment were terminal. Prefer the largest terminal row
+        within the requested size; if the first episode is longer than
+        ``max_rows``, extend to that first terminal instead of deadlocking.
+        """
+
+        if claimable_limit <= row_start:
+            return row_start
+        preferred_end = min(int(preferred_end), int(claimable_limit))
+        best_end = row_start
+        row = int(row_start)
+        while row < preferred_end:
+            if bool(self.episode_meta.is_terminal[row % self.capacity].item()):
+                best_end = row + 1
+            row += 1
+        if best_end > row_start:
+            return best_end
+        while row < int(claimable_limit):
+            if bool(self.episode_meta.is_terminal[row % self.capacity].item()):
+                return row + 1
+            row += 1
+        return row_start
 
     def _window_prefix_locked(self, end_finder: Callable[[int, int], int]) -> tuple[int, int]:
         if not self._committed_windows:

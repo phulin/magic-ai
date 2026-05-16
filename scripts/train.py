@@ -93,6 +93,7 @@ from magic_ai.rnad_trainer import (  # noqa: E402
     RNaDTrainerState,
     build_trainer_state,
     run_rnad_update,
+    run_rnad_update_from_replay_window,
 )
 from magic_ai.rollout import (  # noqa: E402
     PPOStats,
@@ -4855,89 +4856,23 @@ def train_text_native_batched_envs(
                 flush=True,
             )
             torch.cuda.memory._record_memory_history(max_entries=100_000)
-        if rnad_state is not None and replay_rows_tensor is not None and not update_episodes:
-            rows_h = rollout_replay_rows.detach().cpu().tolist()
-            ep_h = (
-                backend.replay_buffer.episode_meta.episode_id[rollout_replay_rows]
-                .detach()
-                .cpu()
-                .tolist()
-            )
-            step_h = (
-                backend.replay_buffer.episode_meta.step_idx[rollout_replay_rows]
-                .detach()
-                .cpu()
-                .tolist()
-            )
-            player_h = (
-                backend.replay_buffer.perspective_player_idx[rollout_replay_rows]
-                .detach()
-                .cpu()
-                .tolist()
-            )
-            old_lp_h = (
-                backend.replay_buffer.old_log_prob[rollout_replay_rows].detach().cpu().tolist()
-            )
-            value_h = backend.replay_buffer.value[rollout_replay_rows].detach().cpu().tolist()
-            terminal_h = (
-                backend.replay_buffer.episode_meta.terminal_reward_p0[rollout_replay_rows]
-                .detach()
-                .cpu()
-                .tolist()
-            )
-            zero_h = (
-                backend.replay_buffer.episode_meta.zero_sum[rollout_replay_rows]
-                .detach()
-                .cpu()
-                .tolist()
-            )
-            grouped_rnad: dict[int, list[tuple[int, int, int, float, float, float, bool]]] = {}
-            cursor = 0
-            while cursor < len(rows_h):
-                grouped_rnad.setdefault(int(ep_h[cursor]), []).append(
-                    (
-                        int(step_h[cursor]),
-                        int(rows_h[cursor]),
-                        int(player_h[cursor]),
-                        float(old_lp_h[cursor]),
-                        float(value_h[cursor]),
-                        float(terminal_h[cursor]),
-                        bool(zero_h[cursor]),
-                    )
-                )
-                cursor += 1
-            update_episodes = []
-            grouped_items = list(sorted(grouped_rnad.items()))
-            group_cursor = 0
-            while group_cursor < len(grouped_items):
-                _episode_id, items = grouped_items[group_cursor]
-                sorted_items = sorted(items)
-                update_episodes.append(
-                    EpisodeBatch(
-                        steps=list(
-                            map(
-                                lambda item: RolloutStep(
-                                    perspective_player_idx=item[2],
-                                    old_log_prob=item[3],
-                                    value=item[4],
-                                    replay_idx=item[1],
-                                ),
-                                sorted_items,
-                            )
-                        ),
-                        terminal_reward_p0=float(sorted_items[-1][5]),
-                        zero_sum=bool(sorted_items[-1][6]),
-                    )
-                )
-                group_cursor += 1
-        if rnad_state is not None and update_episodes:
+        if rnad_state is not None and (update_episodes or replay_rows_tensor is not None):
             try:
-                stats = run_rnad_update(
-                    backend.policy,
-                    optimizer,
-                    rnad_state,
-                    update_episodes,
-                )
+                if replay_rows_tensor is not None and not update_episodes:
+                    stats = run_rnad_update_from_replay_window(
+                        backend.policy,
+                        optimizer,
+                        rnad_state,
+                        backend.replay_buffer,
+                        rollout_replay_rows,
+                    )
+                else:
+                    stats = run_rnad_update(
+                        backend.policy,
+                        optimizer,
+                        rnad_state,
+                        update_episodes,
+                    )
             except torch.OutOfMemoryError:
                 if snapshot_armed:
                     path = Path(args.cuda_memory_snapshot)
@@ -5433,6 +5368,7 @@ def train_text_native_batched_envs(
                         max_rows=int(args.learner_max_rows),
                         target_rows=target_rows,
                         allow_partial=draining or force_partial,
+                        require_terminal_boundary=rnad_state is not None,
                     )
                     if window is None:
                         if draining:

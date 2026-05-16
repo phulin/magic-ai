@@ -268,6 +268,45 @@ class ReservationLifecycleTests(unittest.TestCase):
         torch.testing.assert_close(window.rows, torch.tensor([0, 1], dtype=torch.long))
         buffer.release_train_window(window)
 
+    def test_terminal_boundary_train_window_does_not_split_episodes(self) -> None:
+        buffer = _buffer(capacity=8)
+        reservation = buffer.reserve_append(row_count=5, token_count=0, decision_count=0)
+        buffer.commit(reservation)
+        buffer.write_episode_metadata(
+            torch.tensor([0, 1, 2]),
+            episode_id=10,
+            terminal_reward_p0=1.0,
+            zero_sum=True,
+        )
+        buffer.write_episode_metadata(
+            torch.tensor([3, 4]),
+            episode_id=11,
+            terminal_reward_p0=-1.0,
+            zero_sum=True,
+        )
+
+        first = buffer.claim_train_window(
+            min_rows=1,
+            max_rows=4,
+            target_rows=1,
+            require_terminal_boundary=True,
+        )
+        assert first is not None
+        self.assertEqual((first.row_start, first.row_end), (0, 3))
+        buffer.release_train_window(first)
+
+        # The next complete episode is longer than max_rows=1 from the new
+        # head; R-NaD should extend to the terminal row instead of splitting.
+        second = buffer.claim_train_window(
+            min_rows=1,
+            max_rows=1,
+            target_rows=1,
+            require_terminal_boundary=True,
+        )
+        assert second is not None
+        self.assertEqual((second.row_start, second.row_end), (3, 5))
+        buffer.release_train_window(second)
+
     def test_wraparound_reservation_survives_claim_release_cycle(self) -> None:
         """Repro: claim spans a contiguous chain, then a wrap-around reservation
         sits behind it; the next claim/release of the wrap-around window must not
