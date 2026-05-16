@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from argparse import Namespace
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -26,6 +27,7 @@ from scripts.train import (
     _build_opponent_schedules,
     _checkpoint_has_policy,
     _current_transcript_snapshot,
+    _prefetch_iter,
     _prune_pool_to_schedule,
     _restore_opponent_pool,
     _should_run_mlm_pretrain,
@@ -109,6 +111,18 @@ class TrainPPOTests(unittest.TestCase):
         checkpoint = {"policy": {}, "metadata": {"encoder": "text"}}
 
         self.assertFalse(_should_run_mlm_pretrain(args, checkpoint))
+
+    def test_prefetch_iter_preserves_order_and_exceptions(self) -> None:
+        self.assertEqual(list(_prefetch_iter(iter([1, 2, 3]), 2)), [1, 2, 3])
+
+        def failing_iter() -> Iterator[int]:
+            yield 1
+            raise RuntimeError("boom")
+
+        prefetched = _prefetch_iter(failing_iter(), 1)
+        self.assertEqual(next(prefetched), 1)
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            next(prefetched)
 
     def test_pretrain_gates_run_without_policy_checkpoint(self) -> None:
         args = Namespace(pretrain_mlm_dir=Path("choices"))

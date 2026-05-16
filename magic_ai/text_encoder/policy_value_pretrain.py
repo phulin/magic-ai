@@ -22,6 +22,8 @@ from __future__ import annotations
 import gzip
 import hashlib
 import math
+from array import array
+from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -179,7 +181,7 @@ def _arrow_manifest_path(path: Path) -> Path | None:
     return manifest_path if manifest.get("format") == ARROW_CORPUS_FORMAT else None
 
 
-def _iter_arrow_records(path: Path) -> Iterator[dict[str, Any]]:
+def _arrow_shard_paths(path: Path) -> list[Path]:
     manifest_path = _arrow_manifest_path(path)
     if manifest_path is None:
         raise ValueError(f"{path} is not a {ARROW_CORPUS_FORMAT} corpus")
@@ -208,63 +210,226 @@ def _iter_arrow_records(path: Path) -> Iterator[dict[str, Any]]:
         shard_paths = sorted(root.glob("part-*.arrow"))
     if not shard_paths:
         raise ValueError(f"Arrow corpus {root} contains no part-*.arrow shards")
+    return shard_paths
 
+
+def _iter_arrow_records(path: Path) -> Iterator[dict[str, Any]]:
+    shard_paths = _arrow_shard_paths(path)
     for shard_path in shard_paths:
         yield from _iter_arrow_shard_records(shard_path)
+
+
+def _validate_arrow_schema(schema: pa.Schema, path: Path) -> None:
+    metadata = schema.metadata or {}
+    schema_format = metadata.get(b"format")
+    if schema_format is not None and schema_format.decode() != ARROW_CORPUS_FORMAT:
+        raise ValueError(f"unsupported Arrow shard format metadata in {path}")
+    schema_stage = metadata.get(b"stage")
+    if schema_stage is not None and schema_stage.decode() != ARROW_EXTRACTED_STAGE:
+        raise ValueError(f"unsupported Arrow shard stage metadata in {path}")
+    missing = [name for name in _ARROW_EXTRACTED_COLUMNS if schema.get_field_index(name) < 0]
+    if missing:
+        raise ValueError(f"Arrow shard {path} missing required columns: {', '.join(missing)}")
 
 
 def _iter_arrow_shard_records(path: Path) -> Iterator[dict[str, Any]]:
     with pa.memory_map(str(path), "r") as source:
         reader = pa_ipc.RecordBatchFileReader(source)
-        schema = reader.schema
-        metadata = schema.metadata or {}
-        schema_format = metadata.get(b"format")
-        if schema_format is not None and schema_format.decode() != ARROW_CORPUS_FORMAT:
-            raise ValueError(f"unsupported Arrow shard format metadata in {path}")
-        schema_stage = metadata.get(b"stage")
-        if schema_stage is not None and schema_stage.decode() != ARROW_EXTRACTED_STAGE:
-            raise ValueError(f"unsupported Arrow shard stage metadata in {path}")
-        missing = [name for name in _ARROW_EXTRACTED_COLUMNS if schema.get_field_index(name) < 0]
-        if missing:
-            raise ValueError(f"Arrow shard {path} missing required columns: {', '.join(missing)}")
+        _validate_arrow_schema(reader.schema, path)
         for batch_index in range(reader.num_record_batches):
             yield from _iter_arrow_batch_records(reader.get_batch(batch_index))
 
 
 def _iter_arrow_batch_records(batch: pa.RecordBatch) -> Iterator[dict[str, Any]]:
-    cols = {name: batch.column(name).to_pylist() for name in _ARROW_EXTRACTED_COLUMNS}
     for i in range(batch.num_rows):
-        kind_id = int(cols["kind_id"][i])
-        try:
-            kind = _ARROW_KIND_NAMES[kind_id]
-        except IndexError as exc:
-            raise ValueError(f"unknown Arrow choice kind_id={kind_id}") from exc
-        yield {
-            "format": "forge_choice_situation",
-            "format_version": int(cols["format_version"][i]),
-            "game_id": str(cols["game_id"][i]),
-            "archive_member": str(cols["archive_member"][i]),
-            "choice": {
-                "kind": kind,
-                "candidate_index": int(cols["candidate_index"][i]),
-                "candidate_count": int(cols["candidate_count"][i]),
-                "source_seq": int(cols["source_seq"][i]),
-                "target_seq": int(cols["target_seq"][i]),
-                "perspective_id": str(cols["perspective_id"][i]),
-                "perspective_name": str(cols["perspective_name"][i]),
-                "observed": orjson.loads(cols["observed_json"][i]),
-            },
-            "state": {
-                "snapshot": orjson.loads(cols["snapshot_json"][i]),
-            },
-            "outcome": {
-                "winner_id": cols["winner_id"][i],
-                "winner_name": cols["winner_name"][i],
-                "terminal_sign": float(cols["terminal_sign"][i]),
-                "players": orjson.loads(cols["outcome_players_json"][i]),
-                "extras": orjson.loads(cols["outcome_extras_json"][i]),
-            },
-        }
+        yield _arrow_record_from_batch(batch, i)
+
+
+def _arrow_scalar(batch: pa.RecordBatch, column: str, row: int) -> Any:
+    return batch.column(column)[row].as_py()
+
+
+def _arrow_json(batch: pa.RecordBatch, column: str, row: int) -> Any:
+    return orjson.loads(cast(str, _arrow_scalar(batch, column, row)))
+
+
+def _arrow_record_from_batch(batch: pa.RecordBatch, row: int) -> dict[str, Any]:
+    kind_id = int(_arrow_scalar(batch, "kind_id", row))
+    try:
+        kind = _ARROW_KIND_NAMES[kind_id]
+    except IndexError as exc:
+        raise ValueError(f"unknown Arrow choice kind_id={kind_id}") from exc
+    return {
+        "format": "forge_choice_situation",
+        "format_version": int(_arrow_scalar(batch, "format_version", row)),
+        "game_id": str(_arrow_scalar(batch, "game_id", row)),
+        "archive_member": str(_arrow_scalar(batch, "archive_member", row)),
+        "choice": {
+            "kind": kind,
+            "candidate_index": int(_arrow_scalar(batch, "candidate_index", row)),
+            "candidate_count": int(_arrow_scalar(batch, "candidate_count", row)),
+            "source_seq": int(_arrow_scalar(batch, "source_seq", row)),
+            "target_seq": int(_arrow_scalar(batch, "target_seq", row)),
+            "perspective_id": str(_arrow_scalar(batch, "perspective_id", row)),
+            "perspective_name": str(_arrow_scalar(batch, "perspective_name", row)),
+            "observed": _arrow_json(batch, "observed_json", row),
+        },
+        "state": {
+            "snapshot": _arrow_json(batch, "snapshot_json", row),
+        },
+        "outcome": {
+            "winner_id": _arrow_scalar(batch, "winner_id", row),
+            "winner_name": _arrow_scalar(batch, "winner_name", row),
+            "terminal_sign": float(_arrow_scalar(batch, "terminal_sign", row)),
+            "players": _arrow_json(batch, "outcome_players_json", row),
+            "extras": _arrow_json(batch, "outcome_extras_json", row),
+        },
+    }
+
+
+class _ArrowBatchCache:
+    def __init__(self, shard_paths: Sequence[Path], *, max_batches: int = 8) -> None:
+        self._shard_paths = list(shard_paths)
+        self._max_batches = max_batches
+        self._batches: OrderedDict[tuple[int, int], pa.RecordBatch] = OrderedDict()
+
+    def get(self, shard_idx: int, batch_idx: int) -> pa.RecordBatch:
+        key = (shard_idx, batch_idx)
+        batch = self._batches.get(key)
+        if batch is not None:
+            self._batches.move_to_end(key)
+            return batch
+
+        path = self._shard_paths[shard_idx]
+        with pa.memory_map(str(path), "r") as source:
+            reader = pa_ipc.RecordBatchFileReader(source)
+            _validate_arrow_schema(reader.schema, path)
+            batch = reader.get_batch(batch_idx)
+        self._batches[key] = batch
+        if len(self._batches) > self._max_batches:
+            self._batches.popitem(last=False)
+        return batch
+
+
+class _ArrowCorpusIndex:
+    """Compact lazy index for large Rust-emitted Arrow corpora.
+
+    The index stores only primitive row references plus game spans. Full JSON
+    payloads are decoded from Arrow on demand when a batch needs them.
+    """
+
+    def __init__(
+        self,
+        *,
+        shard_paths: Sequence[Path],
+        record_shards: array[int],
+        record_batches: array[int],
+        record_rows: array[int],
+        game_shards: array[int],
+        game_batches: array[int],
+        game_starts: array[int],
+        game_lengths: array[int],
+        kind_counts: dict[str, int],
+    ) -> None:
+        self.shard_paths = list(shard_paths)
+        self.record_shards = np.frombuffer(record_shards, dtype=np.uint32)
+        self.record_batches = np.frombuffer(record_batches, dtype=np.uint32)
+        self.record_rows = np.frombuffer(record_rows, dtype=np.uint32)
+        self.game_shards = np.frombuffer(game_shards, dtype=np.uint32)
+        self.game_batches = np.frombuffer(game_batches, dtype=np.uint32)
+        self.game_starts = np.frombuffer(game_starts, dtype=np.uint32)
+        self.game_lengths = np.frombuffer(game_lengths, dtype=np.uint32)
+        self.kind_counts = kind_counts
+        self._cache = _ArrowBatchCache(self.shard_paths)
+
+    @classmethod
+    def build(
+        cls,
+        path: Path,
+        *,
+        split: str,
+        eval_fraction: float,
+    ) -> _ArrowCorpusIndex:
+        shard_paths = _arrow_shard_paths(path)
+        bucket = 0 if eval_fraction <= 0 else max(2, int(round(1.0 / eval_fraction)))
+
+        record_shards: array[int] = array("I")
+        record_batches: array[int] = array("I")
+        record_rows: array[int] = array("I")
+        game_shards: array[int] = array("I")
+        game_batches: array[int] = array("I")
+        game_starts: array[int] = array("I")
+        game_lengths: array[int] = array("I")
+        kind_counts = dict.fromkeys(_ARROW_KIND_NAMES, 0)
+
+        for shard_idx, shard_path in enumerate(shard_paths):
+            with pa.memory_map(str(shard_path), "r") as source:
+                reader = pa_ipc.RecordBatchFileReader(source)
+                _validate_arrow_schema(reader.schema, shard_path)
+                for batch_idx in range(reader.num_record_batches):
+                    batch = reader.get_batch(batch_idx)
+                    game_ids = batch.column("game_id").to_pylist()
+                    kind_ids = batch.column("kind_id").to_numpy(zero_copy_only=False)
+                    row = 0
+                    while row < batch.num_rows:
+                        game_id = str(game_ids[row])
+                        end = row + 1
+                        while end < batch.num_rows and game_ids[end] == game_id:
+                            end += 1
+                        include = True
+                        if bucket > 0 and split != "all":
+                            in_eval = _stable_eval_bucket(game_id, bucket) == 0
+                            include = (split == "eval" and in_eval) or (
+                                split == "train" and not in_eval
+                            )
+                        if include:
+                            game_shards.append(shard_idx)
+                            game_batches.append(batch_idx)
+                            game_starts.append(row)
+                            game_lengths.append(end - row)
+                            for record_row in range(row, end):
+                                record_shards.append(shard_idx)
+                                record_batches.append(batch_idx)
+                                record_rows.append(record_row)
+                                kind_id = int(kind_ids[record_row])
+                                if 0 <= kind_id < len(_ARROW_KIND_NAMES):
+                                    kind = _ARROW_KIND_NAMES[kind_id]
+                                    kind_counts[kind] = kind_counts.get(kind, 0) + 1
+                        row = end
+
+        return cls(
+            shard_paths=shard_paths,
+            record_shards=record_shards,
+            record_batches=record_batches,
+            record_rows=record_rows,
+            game_shards=game_shards,
+            game_batches=game_batches,
+            game_starts=game_starts,
+            game_lengths=game_lengths,
+            kind_counts={k: v for k, v in kind_counts.items() if v},
+        )
+
+    @property
+    def n_records(self) -> int:
+        return int(self.record_rows.shape[0])
+
+    @property
+    def n_games(self) -> int:
+        return int(self.game_lengths.shape[0])
+
+    def record(self, index: int) -> dict[str, Any]:
+        batch = self._cache.get(int(self.record_shards[index]), int(self.record_batches[index]))
+        return _arrow_record_from_batch(batch, int(self.record_rows[index]))
+
+    def game_records(self, index: int, *, cap: int) -> list[dict[str, Any]]:
+        shard_idx = int(self.game_shards[index])
+        batch_idx = int(self.game_batches[index])
+        start = int(self.game_starts[index])
+        length = min(int(self.game_lengths[index]), cap)
+        batch = self._cache.get(shard_idx, batch_idx)
+        records = [_arrow_record_from_batch(batch, row) for row in range(start, start + length)]
+        records.sort(key=lambda r: int((r.get("choice") or {}).get("source_seq") or 0))
+        return records
 
 
 def _iter_records(path: Path) -> Iterator[dict[str, Any]]:
@@ -338,50 +503,74 @@ class ForgeChoiceDataset:
         self.tokenizer = tokenizer
         self.oracle = oracle
         self._spec_renderer = DecisionSpecRenderer(tokenizer)
-        bucket = 0 if cfg.eval_fraction <= 0 else max(2, int(round(1.0 / cfg.eval_fraction)))
+        self._arrow_index: _ArrowCorpusIndex | None = None
         self.records: list[dict[str, Any]] = []
         # Group records by game_id while preserving input order (the sharder
         # is game-atomic so records arrive grouped).
         self.games: list[list[dict[str, Any]]] = []
-        current_game: list[dict[str, Any]] | None = None
-        current_game_id: str | None = None
-        for record in _iter_records(cfg.data_path):
-            game_id = str(record.get("game_id") or "")
-            if bucket > 0 and split != "all":
-                in_eval = _stable_eval_bucket(game_id, bucket) == 0
-                if split == "train" and in_eval:
-                    continue
-                if split == "eval" and not in_eval:
-                    continue
-            self.records.append(record)
-            if current_game_id is None or game_id != current_game_id:
-                current_game = []
-                self.games.append(current_game)
-                current_game_id = game_id
-            assert current_game is not None
-            current_game.append(record)
-        # Within each game, sort by source_seq to guarantee temporal order
-        # even if upstream shuffled (defense in depth — the rust extractor
-        # already emits sorted, and game-atomic shards preserve that).
-        for game in self.games:
-            game.sort(key=lambda r: int((r.get("choice") or {}).get("source_seq") or 0))
-        if not self.records:
+        if _arrow_manifest_path(cfg.data_path) is not None:
+            self._arrow_index = _ArrowCorpusIndex.build(
+                cfg.data_path,
+                split=split,
+                eval_fraction=cfg.eval_fraction,
+            )
+        else:
+            bucket = 0 if cfg.eval_fraction <= 0 else max(2, int(round(1.0 / cfg.eval_fraction)))
+            current_game: list[dict[str, Any]] | None = None
+            current_game_id: str | None = None
+            for record in _iter_records(cfg.data_path):
+                game_id = str(record.get("game_id") or "")
+                if bucket > 0 and split != "all":
+                    in_eval = _stable_eval_bucket(game_id, bucket) == 0
+                    if split == "train" and in_eval:
+                        continue
+                    if split == "eval" and not in_eval:
+                        continue
+                self.records.append(record)
+                if current_game_id is None or game_id != current_game_id:
+                    current_game = []
+                    self.games.append(current_game)
+                    current_game_id = game_id
+                assert current_game is not None
+                current_game.append(record)
+            # Within each game, sort by source_seq to guarantee temporal order
+            # even if upstream shuffled (defense in depth — the rust extractor
+            # already emits sorted, and game-atomic shards preserve that).
+            for game in self.games:
+                game.sort(key=lambda r: int((r.get("choice") or {}).get("source_seq") or 0))
+        if self.n_examples == 0:
             raise ValueError(f"no Forge choice records loaded from {cfg.data_path} split={split}")
 
     @property
     def n_examples(self) -> int:
+        if self._arrow_index is not None:
+            return self._arrow_index.n_records
         return len(self.records)
 
     @property
     def n_games(self) -> int:
+        if self._arrow_index is not None:
+            return self._arrow_index.n_games
         return len(self.games)
 
     def kind_counts(self) -> dict[str, int]:
+        if self._arrow_index is not None:
+            return dict(self._arrow_index.kind_counts)
         out: dict[str, int] = {}
         for record in self.records:
             kind = str((record.get("choice") or {}).get("kind") or "unknown")
             out[kind] = out.get(kind, 0) + 1
         return out
+
+    def _record_at(self, index: int) -> dict[str, Any]:
+        if self._arrow_index is not None:
+            return self._arrow_index.record(index)
+        return self.records[index]
+
+    def _game_records(self, index: int) -> list[dict[str, Any]]:
+        if self._arrow_index is not None:
+            return self._arrow_index.game_records(index, cap=self.cfg.max_decisions_per_game)
+        return self.games[index][: self.cfg.max_decisions_per_game]
 
     def _prepare_decoder(self, record: dict[str, Any]) -> _PreparedDecoderExample | None:
         choice = record.get("choice") or {}
@@ -435,7 +624,7 @@ class ForgeChoiceDataset:
         prepared: list[_PreparedDecoderExample] = []
         cursor = 0
         while len(prepared) < len(indices) and cursor < len(indices) * 4:
-            item = self._prepare_decoder(self.records[int(indices[cursor % len(indices)])])
+            item = self._prepare_decoder(self._record_at(int(indices[cursor % len(indices)])))
             cursor += 1
             if item is not None:
                 prepared.append(item)
@@ -548,13 +737,17 @@ class ForgeChoiceDataset:
         )
 
     def iter_epoch(self, batch_size: int, rng: np.random.Generator) -> Iterator[ForgeDecoderBatch]:
+        if self._arrow_index is not None:
+            for _ in range(self.n_examples // batch_size):
+                yield self.sample_batch(batch_size, rng)
+            return
         order = rng.permutation(len(self.records))
         end = (len(order) // batch_size) * batch_size
         for off in range(0, end, batch_size):
             yield self._batch_from_indices([int(i) for i in order[off : off + batch_size]])
 
     def sample_batch(self, batch_size: int, rng: np.random.Generator) -> ForgeDecoderBatch:
-        indices = rng.integers(0, len(self.records), size=batch_size)
+        indices = rng.integers(0, self.n_examples, size=batch_size)
         return self._batch_from_indices([int(i) for i in indices])
 
     def iter_epoch_games(
@@ -563,6 +756,14 @@ class ForgeChoiceDataset:
         loss_positions_per_game: int,
         rng: np.random.Generator,
     ) -> Iterator[ForgeSequencedBatch]:
+        if self._arrow_index is not None:
+            for _ in range(self.n_games // games_per_batch):
+                yield self.sample_sequenced_batch(
+                    games_per_batch,
+                    loss_positions_per_game,
+                    rng,
+                )
+            return
         order = rng.permutation(self.n_games)
         end = (len(order) // games_per_batch) * games_per_batch
         for off in range(0, end, games_per_batch):
@@ -608,10 +809,9 @@ class ForgeChoiceDataset:
 
         prepared_per_game: list[list[_PreparedDecoderExample]] = []
         for gi in game_indices:
-            game_records = self.games[gi]
+            game_records = self._game_records(gi)
             prepared_game: list[_PreparedDecoderExample] = []
-            cap = self.cfg.max_decisions_per_game
-            for record in game_records[:cap]:
+            for record in game_records:
                 item = self._prepare_decoder(record)
                 if item is not None:
                     prepared_game.append(item)

@@ -17,7 +17,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -172,6 +172,36 @@ from magic_ai.text_encoder.tokenizer import (  # noqa: E402
 # constant. Keep a local upper bound for the few legacy rollout helpers in
 # this script that haven't been ported to the decoder yet.
 MAX_NUM = 64
+_PREFETCH_DONE = object()
+
+
+def _prefetch_iter(iterator: Iterator[Any], max_prefetch: int) -> Iterator[Any]:
+    if max_prefetch <= 0:
+        yield from iterator
+        return
+
+    q: Queue[Any] = Queue(maxsize=max_prefetch)
+
+    def worker() -> None:
+        try:
+            for item in iterator:
+                q.put(item)
+        except BaseException as exc:
+            q.put(exc)
+        finally:
+            q.put(_PREFETCH_DONE)
+
+    thread = threading.Thread(target=worker, name="pretrain-prefetch", daemon=True)
+    thread.start()
+    while True:
+        item = q.get()
+        if item is _PREFETCH_DONE:
+            break
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+    thread.join()
+
 
 DEFAULT_DECK = {
     "name": "bolt-mountain",
@@ -2130,6 +2160,7 @@ def run_mlm_pretrain(
         wandb.define_metric("pretrain_policy_value/*", step_metric="pretrain_policy_value/step")
     sequenced = cfg.sequence_mode == "full"
     grad_accum = max(1, int(args.pretrain_mlm_grad_accum))
+    prefetch_batches = max(0, int(args.pretrain_mlm_prefetch_batches))
     if sequenced:
         from magic_ai.text_encoder.policy_value_pretrain import (
             _sequenced_batch_to_device,
@@ -2140,6 +2171,7 @@ def run_mlm_pretrain(
             iterator = train_ds.iter_epoch_games(
                 cfg.games_per_batch, cfg.loss_positions_per_game, np_rng
             )
+            iterator = _prefetch_iter(iterator, prefetch_batches)
             accum_buf: list[Any] = []
             for host_seq_batch in iterator:
                 accum_buf.append(host_seq_batch)
@@ -2173,7 +2205,8 @@ def run_mlm_pretrain(
                 )
                 global_step += 1
         else:
-            for host_iid_batch in train_ds.iter_epoch(cfg.batch_size, np_rng):
+            iterator = _prefetch_iter(train_ds.iter_epoch(cfg.batch_size, np_rng), prefetch_batches)
+            for host_iid_batch in iterator:
                 iid_batch = _batch_to_device(host_iid_batch, device)
                 log_now = global_step % log_every == 0
                 with amp_ctx:
@@ -2710,6 +2743,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrain-mlm-lr", type=float, default=2e-4)
     parser.add_argument("--pretrain-mlm-grad-clip", type=float, default=1.0)
     parser.add_argument("--pretrain-mlm-log-every", type=int, default=50)
+    parser.add_argument(
+        "--pretrain-mlm-prefetch-batches",
+        type=int,
+        default=2,
+        help="number of host pretraining batches to prepare ahead on a background "
+        "thread while the current batch trains; 0 disables prefetch",
+    )
     parser.add_argument(
         "--pretrain-mlm-eval-every",
         type=int,
