@@ -1,9 +1,9 @@
 """Policy + value pretraining on extracted Forge choice situations.
 
-Consumes the sharded torch or gzip JSONL artifact produced by
-``scripts/extract_forge_choice_situations.py``. Each record stores a
-pre-choice snapshot, the action text Forge actually took, and the
-terminal outcome.
+Consumes the sharded torch, gzip JSONL, or Arrow artifact produced by
+``scripts/extract_forge_choice_situations.py`` / ``rust/forge_extract``.
+Each record stores a pre-choice snapshot, the action text Forge actually
+took, and the terminal outcome.
 
 The pipeline trains the autoregressive grammar decoder: it renders the
 decision spec via :class:`DecisionSpecRenderer`, translates the observed
@@ -29,6 +29,8 @@ from typing import Any, Literal, cast
 
 import numpy as np
 import orjson
+import pyarrow as pa
+import pyarrow.ipc as pa_ipc
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -60,6 +62,30 @@ from magic_ai.text_encoder.training import (
 )
 
 ValueTargetMode = Literal["terminal", "gae", "vtrace"]
+
+ARROW_CORPUS_FORMAT = "forge_pretrain_decision_arrow"
+ARROW_CORPUS_FORMAT_VERSION = 1
+ARROW_EXTRACTED_STAGE = "extracted"
+_ARROW_KIND_NAMES = ("priority", "attack", "block", "may", "choose")
+_ARROW_EXTRACTED_COLUMNS = (
+    "format_version",
+    "game_id",
+    "archive_member",
+    "kind_id",
+    "candidate_index",
+    "candidate_count",
+    "source_seq",
+    "target_seq",
+    "perspective_id",
+    "perspective_name",
+    "winner_id",
+    "winner_name",
+    "terminal_sign",
+    "snapshot_json",
+    "observed_json",
+    "outcome_players_json",
+    "outcome_extras_json",
+)
 
 
 @dataclass(frozen=True)
@@ -143,13 +169,134 @@ def _stable_eval_bucket(game_id: str, bucket: int) -> int:
     return int.from_bytes(digest, byteorder="big", signed=False) % bucket
 
 
+def _arrow_manifest_path(path: Path) -> Path | None:
+    manifest_path = path / "manifest.json" if path.is_dir() else path.with_name("manifest.json")
+    if not manifest_path.exists():
+        return None
+    manifest = orjson.loads(manifest_path.read_bytes())
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Arrow manifest {manifest_path} must be a JSON object")
+    return manifest_path if manifest.get("format") == ARROW_CORPUS_FORMAT else None
+
+
+def _iter_arrow_records(path: Path) -> Iterator[dict[str, Any]]:
+    manifest_path = _arrow_manifest_path(path)
+    if manifest_path is None:
+        raise ValueError(f"{path} is not a {ARROW_CORPUS_FORMAT} corpus")
+    manifest = orjson.loads(manifest_path.read_bytes())
+    version = int(manifest.get("format_version") or -1)
+    if version != ARROW_CORPUS_FORMAT_VERSION:
+        raise ValueError(
+            f"unsupported Arrow corpus format_version={version}; "
+            f"expected {ARROW_CORPUS_FORMAT_VERSION}"
+        )
+    stage = str(manifest.get("stage") or "")
+    if stage != ARROW_EXTRACTED_STAGE:
+        raise ValueError(
+            f"unsupported Arrow corpus stage={stage!r}; "
+            "ForgeChoiceDataset currently consumes the extracted schema"
+        )
+
+    root = manifest_path.parent
+    shard_count = int(manifest.get("shards") or 0)
+    if shard_count > 0:
+        shard_paths = [root / f"part-{i:06d}.arrow" for i in range(shard_count)]
+        missing = [p for p in shard_paths if not p.exists()]
+        if missing:
+            raise FileNotFoundError(f"Arrow corpus is missing shard {missing[0]}")
+    else:
+        shard_paths = sorted(root.glob("part-*.arrow"))
+    if not shard_paths:
+        raise ValueError(f"Arrow corpus {root} contains no part-*.arrow shards")
+
+    for shard_path in shard_paths:
+        yield from _iter_arrow_shard_records(shard_path)
+
+
+def _iter_arrow_shard_records(path: Path) -> Iterator[dict[str, Any]]:
+    with pa.memory_map(str(path), "r") as source:
+        reader = pa_ipc.RecordBatchFileReader(source)
+        schema = reader.schema
+        metadata = schema.metadata or {}
+        schema_format = metadata.get(b"format")
+        if schema_format is not None and schema_format.decode() != ARROW_CORPUS_FORMAT:
+            raise ValueError(f"unsupported Arrow shard format metadata in {path}")
+        schema_stage = metadata.get(b"stage")
+        if schema_stage is not None and schema_stage.decode() != ARROW_EXTRACTED_STAGE:
+            raise ValueError(f"unsupported Arrow shard stage metadata in {path}")
+        missing = [name for name in _ARROW_EXTRACTED_COLUMNS if schema.get_field_index(name) < 0]
+        if missing:
+            raise ValueError(f"Arrow shard {path} missing required columns: {', '.join(missing)}")
+        for batch_index in range(reader.num_record_batches):
+            yield from _iter_arrow_batch_records(reader.get_batch(batch_index))
+
+
+def _iter_arrow_batch_records(batch: pa.RecordBatch) -> Iterator[dict[str, Any]]:
+    cols = {name: batch.column(name).to_pylist() for name in _ARROW_EXTRACTED_COLUMNS}
+    for i in range(batch.num_rows):
+        kind_id = int(cols["kind_id"][i])
+        try:
+            kind = _ARROW_KIND_NAMES[kind_id]
+        except IndexError as exc:
+            raise ValueError(f"unknown Arrow choice kind_id={kind_id}") from exc
+        yield {
+            "format": "forge_choice_situation",
+            "format_version": int(cols["format_version"][i]),
+            "game_id": str(cols["game_id"][i]),
+            "archive_member": str(cols["archive_member"][i]),
+            "choice": {
+                "kind": kind,
+                "candidate_index": int(cols["candidate_index"][i]),
+                "candidate_count": int(cols["candidate_count"][i]),
+                "source_seq": int(cols["source_seq"][i]),
+                "target_seq": int(cols["target_seq"][i]),
+                "perspective_id": str(cols["perspective_id"][i]),
+                "perspective_name": str(cols["perspective_name"][i]),
+                "observed": orjson.loads(cols["observed_json"][i]),
+            },
+            "state": {
+                "snapshot": orjson.loads(cols["snapshot_json"][i]),
+            },
+            "outcome": {
+                "winner_id": cols["winner_id"][i],
+                "winner_name": cols["winner_name"][i],
+                "terminal_sign": float(cols["terminal_sign"][i]),
+                "players": orjson.loads(cols["outcome_players_json"][i]),
+                "extras": orjson.loads(cols["outcome_extras_json"][i]),
+            },
+        }
+
+
 def _iter_records(path: Path) -> Iterator[dict[str, Any]]:
+    if _arrow_manifest_path(path) is not None:
+        yield from _iter_arrow_records(path)
+        return
     paths = (
-        sorted([*path.rglob("*.pt"), *path.rglob("*.pth"), *path.rglob("*.jsonl.gz")])
+        sorted(
+            [
+                *path.rglob("*.pt"),
+                *path.rglob("*.pth"),
+                *path.rglob("*.pt.gz"),
+                *path.rglob("*.pth.gz"),
+                *path.rglob("*.jsonl.gz"),
+                *path.rglob("*.arrow"),
+            ]
+        )
         if path.is_dir()
         else [path]
     )
     for item in paths:
+        if item.suffix == ".arrow":
+            yield from _iter_arrow_records(item)
+            continue
+        if item.name.endswith((".pt.gz", ".pth.gz")):
+            with gzip.open(item, "rb") as fh:
+                payload = torch.load(cast(Any, fh), map_location="cpu", weights_only=False)
+            records = payload.get("records") if isinstance(payload, dict) else payload
+            if not isinstance(records, list):
+                raise ValueError(f"torch choice artifact {item} does not contain a records list")
+            yield from cast(list[dict[str, Any]], records)
+            continue
         if item.suffix in (".pt", ".pth"):
             payload = torch.load(item, map_location="cpu", weights_only=False)
             records = payload.get("records") if isinstance(payload, dict) else payload

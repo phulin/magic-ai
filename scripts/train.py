@@ -2043,13 +2043,12 @@ def run_mlm_pretrain(
 ) -> None:
     """Pretrain the text policy/value heads on extracted Forge choices.
 
-    ``--pretrain-mlm-dir`` now points at the JSONL/JSONL.GZ artifact produced
-    by ``scripts/extract_forge_choice_situations.py``. The historical flag name
-    is kept so checkpoint and launch scripts do not need a second pretrain
-    phase; the objective is no longer MLM. Each row reconstructs conservative
-    inline blanks for the observed choice and trains both the taken-action
-    policy target and a runtime-selected value target derived from the game
-    result.
+    ``--pretrain-mlm-dir`` now points at a sharded torch, JSONL/JSONL.GZ, or
+    Arrow artifact produced by ``scripts/extract_forge_choice_situations.py``
+    / ``rust/forge_extract``. The historical flag name is kept so checkpoint
+    and launch scripts do not need a second pretrain phase; the objective is no
+    longer MLM. Each row trains the grammar-decoder target for the observed
+    choice and a runtime-selected value target derived from the game result.
     """
 
     tokenizer = text_backend.tokenizer
@@ -2672,9 +2671,10 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="if set, run joint policy/value pretraining over the Forge choice "
-        "sharded torch snapshot directory or JSONL.GZ artifact produced by "
-        "scripts/extract_forge_choice_situations.py before starting RL training. "
-        "Historical flag name retained. Requires --encoder text.",
+        "sharded torch snapshot directory, JSONL.GZ artifact, or Arrow corpus "
+        "produced by scripts/extract_forge_choice_situations.py / rust/forge_extract "
+        "before starting RL training. Historical flag name retained. Requires "
+        "--encoder text.",
     )
     parser.add_argument(
         "--pretrain-mlm-epochs",

@@ -2809,4 +2809,219 @@ mod tests {
 
         std::fs::remove_dir_all(out_dir).ok();
     }
+
+    #[test]
+    fn jsonl_gz_fixture_extracts_to_arrow_and_reloads() {
+        let root = std::env::temp_dir().join(format!(
+            "forge_extract_jsonl_to_arrow_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture_path = root.join("fixture.jsonl.gz");
+        let arrow_dir = root.join("arrow");
+
+        let snapshot = json!({
+            "turn": 3,
+            "step": "PRECOMBAT_MAIN",
+            "activePlayerId": "p1",
+            "priorityPlayerId": "p1",
+            "players": [
+                {
+                    "id": "p1",
+                    "name": "PlayerA",
+                    "life": 20,
+                    "handSize": 2,
+                    "librarySize": 41,
+                    "manaPool": "G"
+                },
+                {
+                    "id": "p2",
+                    "name": "PlayerB",
+                    "life": 17,
+                    "handSize": 3,
+                    "librarySize": 39,
+                    "manaPool": ""
+                }
+            ],
+            "battlefield": [],
+            "playableActions": [
+                {
+                    "type": "LAND",
+                    "sourceId": "hand:forest",
+                    "sourceName": "Forest",
+                    "description": "Play Forest"
+                },
+                {"type": "PASS", "description": "Pass priority"}
+            ]
+        });
+        let rows = [
+            json!({
+                "record": "META",
+                "gameId": "game-fixture-1",
+                "winnerId": "p1",
+                "winnerName": "PlayerA",
+                "players": [
+                    {"id": "p1", "name": "PlayerA", "hasWon": true},
+                    {"id": "p2", "name": "PlayerB", "hasLost": true}
+                ],
+                "extras": {"turns": 3}
+            }),
+            json!({
+                "record": "EVENT",
+                "type": "PRIORITY",
+                "seq": 10,
+                "snapshot": snapshot
+            }),
+            json!({
+                "record": "EVENT",
+                "type": "LOG",
+                "seq": 11,
+                "description": "PlayerA played Forest (42)",
+                "snapshot": snapshot
+            }),
+        ];
+        {
+            let file = File::create(&fixture_path).unwrap();
+            let mut gz = GzEncoder::new(file, Compression::new(1));
+            for row in rows {
+                gz.write_all(sonic_rs::to_string(&row).unwrap().as_bytes())
+                    .unwrap();
+                gz.write_all(b"\n").unwrap();
+            }
+            gz.finish().unwrap();
+        }
+
+        let parsed_rows = read_jsonl_member(File::open(&fixture_path).unwrap()).unwrap();
+        assert_eq!(parsed_rows.len(), 3);
+        let meta = meta_from_rows(&parsed_rows).unwrap();
+        let candidates = extract_candidates(&parsed_rows, &["priority".to_string()], false);
+        let selected = stable_choices(candidates, 1, meta.game_id);
+        assert_eq!(selected.len(), 1);
+
+        let arrow_rows = selected
+            .iter()
+            .map(|candidate| {
+                let record = build_record(candidate, &meta, "fixture.jsonl.gz");
+                ArrowDecisionRow::from_record(&record).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(WriterBatch::ArrowRows(arrow_rows)).unwrap();
+        drop(tx);
+
+        let stats = write_arrow_dir(rx, arrow_dir.clone(), 16).unwrap();
+        write_arrow_manifest(
+            &arrow_dir,
+            &ArrowManifestStats {
+                shards: stats.shards,
+                records_written: stats.records,
+                shard_target_rows: 16,
+                games_seen: 1,
+                games_written: 1,
+                candidates_seen: 1,
+                kind_counts: [1, 0, 0, 0, 0],
+            },
+        )
+        .unwrap();
+        assert_eq!(stats.records, 1);
+        assert_eq!(stats.shards, 1);
+        assert!(arrow_dir.join("manifest.json").exists());
+
+        let file = File::open(arrow_dir.join("part-000000.arrow")).unwrap();
+        let mut reader = arrow_ipc::reader::FileReader::try_new(file, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+
+        let game_id = batch
+            .column_by_name("game_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let archive_member = batch
+            .column_by_name("archive_member")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let kind_id = batch
+            .column_by_name("kind_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
+        let candidate_index = batch
+            .column_by_name("candidate_index")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        let source_seq = batch
+            .column_by_name("source_seq")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let target_seq = batch
+            .column_by_name("target_seq")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let terminal_sign = batch
+            .column_by_name("terminal_sign")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        let observed_json = batch
+            .column_by_name("observed_json")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+        let snapshot_json = batch
+            .column_by_name("snapshot_json")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .unwrap();
+
+        assert_eq!(game_id.value(0), "game-fixture-1");
+        assert_eq!(archive_member.value(0), "fixture.jsonl.gz");
+        assert_eq!(kind_id.value(0), 0);
+        assert_eq!(candidate_index.value(0), 0);
+        assert_eq!(source_seq.value(0), 10);
+        assert_eq!(target_seq.value(0), 11);
+        assert_eq!(terminal_sign.value(0), 1.0);
+
+        let observed: Value = sonic_rs::from_str(observed_json.value(0)).unwrap();
+        assert_eq!(
+            observed.get("raw").and_then(Value::as_str),
+            Some("PlayerA played Forest (42)")
+        );
+        let snapshot: Value = sonic_rs::from_str(snapshot_json.value(0)).unwrap();
+        assert_eq!(
+            snapshot
+                .get("pending")
+                .and_then(|p| p.get("kind"))
+                .and_then(Value::as_str),
+            Some("priority")
+        );
+        assert_eq!(
+            snapshot
+                .get("players")
+                .and_then(Value::as_array)
+                .and_then(|players| players.first())
+                .and_then(|player| player.get("ID"))
+                .and_then(Value::as_str),
+            Some("p1")
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
 }

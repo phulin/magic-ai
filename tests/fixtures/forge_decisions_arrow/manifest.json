@@ -1,0 +1,19 @@
+{
+  "stats": {
+    "games_seen": 1,
+    "candidates_seen": 1,
+    "written_priority": 1,
+    "written_choose": 0,
+    "games_written": 1,
+    "written_block": 0,
+    "written_may": 0,
+    "written_attack": 0
+  },
+  "records_written": 1,
+  "format_version": 1,
+  "compression": "zstd",
+  "stage": "extracted",
+  "shards": 1,
+  "format": "forge_pretrain_decision_arrow",
+  "shard_target_rows": 16
+}
