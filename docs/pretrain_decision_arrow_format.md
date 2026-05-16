@@ -21,6 +21,7 @@ An Arrow corpus is a directory:
 ```text
 data/forge_decisions_arrow/
   manifest.json
+  game_index.arrow
   part-000000.arrow
   part-000001.arrow
   ...
@@ -30,6 +31,11 @@ Each `part-*.arrow` file is an Arrow IPC file. Writers should use Arrow IPC
 buffer compression with Zstd when available. Shards must be game-atomic: all
 records for a game are written to the same shard, and records for that game
 remain in source order.
+
+`game_index.arrow` is an Arrow IPC file with one row per written game. It lets
+sequenced pretraining load game spans without scanning all data shards at
+startup. Consumers may build and persist it on first use when reading an older
+corpus, but new writers should emit it directly.
 
 The Rust extractor currently writes the `extracted` schema below. A tokenizer
 pass should read that schema and write the `tokenized` schema once state/spec
@@ -45,6 +51,7 @@ rendering and decoder target construction are materialized.
   "format_version": 1,
   "stage": "extracted",
   "compression": "zstd",
+  "game_index": "game_index.arrow",
   "shards": 12,
   "records_written": 123456,
   "shard_target_rows": 262144,
@@ -63,6 +70,25 @@ rendering and decoder target construction are materialized.
 
 Consumers should reject unknown `format` values and unsupported
 `format_version` values.
+
+## Game Index Schema
+
+`game_index.arrow` has schema metadata:
+
+```json
+{
+  "format": "forge_pretrain_game_index_arrow",
+  "format_version": "1"
+}
+```
+
+| Column | Arrow type | Nullable | Description |
+| --- | --- | --- | --- |
+| `game_id` | `utf8` | no | Forge game id. |
+| `shard_idx` | `uint32` | no | Zero-based `part-*.arrow` shard number. |
+| `batch_idx` | `uint32` | no | Record batch number inside the shard; the Rust extractor currently writes one batch per shard. |
+| `row_start` | `uint32` | no | First row for the game within that record batch. |
+| `row_count` | `uint32` | no | Number of decision rows for the game. |
 
 ## Extracted Schema
 

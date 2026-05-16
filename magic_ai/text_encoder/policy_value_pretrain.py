@@ -69,6 +69,9 @@ ValueTargetMode = Literal["terminal", "gae", "vtrace"]
 ARROW_CORPUS_FORMAT = "forge_pretrain_decision_arrow"
 ARROW_CORPUS_FORMAT_VERSION = 1
 ARROW_EXTRACTED_STAGE = "extracted"
+ARROW_GAME_INDEX_FILENAME = "game_index.arrow"
+ARROW_GAME_INDEX_FORMAT = "forge_pretrain_game_index_arrow"
+ARROW_GAME_INDEX_FORMAT_VERSION = 1
 _ARROW_KIND_NAMES = ("priority", "attack", "block", "may", "choose")
 _ARROW_EXTRACTED_COLUMNS = (
     "format_version",
@@ -208,6 +211,11 @@ def _arrow_manifest_path(path: Path) -> Path | None:
     if not isinstance(manifest, dict):
         raise ValueError(f"Arrow manifest {manifest_path} must be a JSON object")
     return manifest_path if manifest.get("format") == ARROW_CORPUS_FORMAT else None
+
+
+def _arrow_game_index_path(path: Path) -> Path:
+    root = path if path.is_dir() else path.parent
+    return root / ARROW_GAME_INDEX_FILENAME
 
 
 def _arrow_shard_paths(path: Path) -> list[Path]:
@@ -355,11 +363,98 @@ def _arrow_game_starts(game_ids: pa.Array) -> list[int]:
     return starts
 
 
+def _arrow_game_index_schema() -> pa.Schema:
+    metadata = {
+        "format": ARROW_GAME_INDEX_FORMAT,
+        "format_version": str(ARROW_GAME_INDEX_FORMAT_VERSION),
+    }
+    return pa.schema(
+        [
+            pa.field("game_id", pa.utf8(), nullable=False),
+            pa.field("shard_idx", pa.uint32(), nullable=False),
+            pa.field("batch_idx", pa.uint32(), nullable=False),
+            pa.field("row_start", pa.uint32(), nullable=False),
+            pa.field("row_count", pa.uint32(), nullable=False),
+        ],
+        metadata=metadata,
+    )
+
+
+def _load_arrow_game_index(path: Path, shard_paths: Sequence[Path]) -> _ArrowGameSpanCache | None:
+    index_path = _arrow_game_index_path(path)
+    if not index_path.exists():
+        return None
+    with pa.memory_map(str(index_path), "r") as source:
+        reader = pa_ipc.RecordBatchFileReader(source)
+        metadata = reader.schema.metadata or {}
+        fmt = metadata.get(b"format", b"").decode("utf-8")
+        version = int(metadata.get(b"format_version", b"-1").decode("utf-8"))
+        if fmt != ARROW_GAME_INDEX_FORMAT or version != ARROW_GAME_INDEX_FORMAT_VERSION:
+            raise ValueError(
+                f"unsupported Arrow game index {index_path}: format={fmt!r} version={version}"
+            )
+        game_ids: list[str] = []
+        game_shards: array[int] = array("I")
+        game_batches: array[int] = array("I")
+        game_starts: array[int] = array("I")
+        game_lengths: array[int] = array("I")
+        for batch_idx in range(reader.num_record_batches):
+            batch = reader.get_batch(batch_idx)
+            game_ids.extend(str(x) for x in batch.column("game_id").to_pylist())
+            game_shards.extend(
+                int(x) for x in batch.column("shard_idx").to_numpy(zero_copy_only=False)
+            )
+            game_batches.extend(
+                int(x) for x in batch.column("batch_idx").to_numpy(zero_copy_only=False)
+            )
+            game_starts.extend(
+                int(x) for x in batch.column("row_start").to_numpy(zero_copy_only=False)
+            )
+            game_lengths.extend(
+                int(x) for x in batch.column("row_count").to_numpy(zero_copy_only=False)
+            )
+    out = _ArrowGameSpanCache(
+        shard_paths=tuple(shard_paths),
+        game_ids=tuple(game_ids),
+        game_shards=game_shards,
+        game_batches=game_batches,
+        game_starts=game_starts,
+        game_lengths=game_lengths,
+    )
+    print(f"[policy-value] loaded Arrow game index games={len(game_ids)}", flush=True)
+    return out
+
+
+def _write_arrow_game_index(path: Path, spans: _ArrowGameSpanCache) -> None:
+    index_path = _arrow_game_index_path(path)
+    batch = pa.record_batch(
+        [
+            pa.array(spans.game_ids, type=pa.utf8()),
+            pa.array(np.frombuffer(spans.game_shards, dtype=np.uint32), type=pa.uint32()),
+            pa.array(np.frombuffer(spans.game_batches, dtype=np.uint32), type=pa.uint32()),
+            pa.array(np.frombuffer(spans.game_starts, dtype=np.uint32), type=pa.uint32()),
+            pa.array(np.frombuffer(spans.game_lengths, dtype=np.uint32), type=pa.uint32()),
+        ],
+        schema=_arrow_game_index_schema(),
+    )
+    tmp = index_path.with_suffix(".arrow.tmp")
+    options = pa_ipc.IpcWriteOptions(compression="zstd")
+    with pa.OSFile(str(tmp), "wb") as sink:
+        with pa_ipc.new_file(sink, batch.schema, options=options) as writer:
+            writer.write_batch(batch)
+    tmp.replace(index_path)
+    print(f"[policy-value] wrote Arrow game index -> {index_path}", flush=True)
+
+
 def _cached_arrow_game_spans(path: Path, shard_paths: Sequence[Path]) -> _ArrowGameSpanCache:
     cache_key = str(path.resolve())
     cached = _ARROW_GAME_SPAN_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    cached_disk = _load_arrow_game_index(path, shard_paths)
+    if cached_disk is not None:
+        _ARROW_GAME_SPAN_CACHE[cache_key] = cached_disk
+        return cached_disk
 
     game_ids_out: list[str] = []
     game_shards: array[int] = array("I")
@@ -397,6 +492,7 @@ def _cached_arrow_game_spans(path: Path, shard_paths: Sequence[Path]) -> _ArrowG
     )
     _ARROW_GAME_SPAN_CACHE[cache_key] = out
     print(f"[policy-value] indexed Arrow games games={len(game_ids_out)}", flush=True)
+    _write_arrow_game_index(path, out)
     return out
 
 

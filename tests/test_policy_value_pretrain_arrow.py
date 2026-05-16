@@ -1,4 +1,5 @@
 import gzip
+from array import array
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,7 +15,10 @@ from magic_ai.text_encoder.policy_value_pretrain import (
     ForgePolicyValueConfig,
     ForgePolicyValueTrainer,
     ForgeSequencedBatch,
+    _ArrowGameSpanCache,
     _iter_records,
+    _load_arrow_game_index,
+    _write_arrow_game_index,
 )
 from magic_ai.text_encoder.tokenizer import load_tokenizer
 from torch import nn
@@ -198,6 +202,27 @@ def test_dataset_batches_pass_no_attack_and_no_block_targets(tmp_path: Path) -> 
         int(DecisionType.DECLARE_BLOCKERS),
     ]
     assert batch.output_pad_mask.sum(dim=1).tolist() == [3, 2, 2]
+
+
+def test_arrow_game_index_sidecar_round_trips(tmp_path: Path) -> None:
+    spans = _ArrowGameSpanCache(
+        shard_paths=(tmp_path / "part-000000.arrow",),
+        game_ids=("game-a", "game-b"),
+        game_shards=array("I", [0, 0]),
+        game_batches=array("I", [0, 0]),
+        game_starts=array("I", [0, 3]),
+        game_lengths=array("I", [3, 2]),
+    )
+
+    _write_arrow_game_index(tmp_path, spans)
+    loaded = _load_arrow_game_index(tmp_path, spans.shard_paths)
+
+    assert loaded is not None
+    assert loaded.game_ids == spans.game_ids
+    assert loaded.game_shards.tolist() == spans.game_shards.tolist()
+    assert loaded.game_batches.tolist() == spans.game_batches.tolist()
+    assert loaded.game_starts.tolist() == spans.game_starts.tolist()
+    assert loaded.game_lengths.tolist() == spans.game_lengths.tolist()
 
 
 class _FakeGrammarDecoder(nn.Module):

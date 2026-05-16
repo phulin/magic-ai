@@ -423,6 +423,7 @@ fn write_arrow_dir(
         shard_target_rows,
         shard_index: 0,
         pending: Vec::new(),
+        game_index: Vec::new(),
         records: 0,
     };
     for batch in rx {
@@ -440,7 +441,10 @@ fn ensure_arrow_output_dir_is_clean(out_dir: &PathBuf) -> Result<()> {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if name == "manifest.json" || (name.starts_with("part-") && name.ends_with(".arrow")) {
+        if name == "manifest.json"
+            || name == "game_index.arrow"
+            || (name.starts_with("part-") && name.ends_with(".arrow"))
+        {
             return Err(anyhow!(
                 "Arrow output directory {:?} already contains {name}; choose a new directory",
                 out_dir
@@ -456,11 +460,25 @@ struct ArrowShardWriter {
     shard_target_rows: usize,
     shard_index: u64,
     pending: Vec<ArrowDecisionRow>,
+    game_index: Vec<ArrowGameIndexRow>,
     records: u64,
 }
 
 impl ArrowShardWriter {
     fn push_game_batch(&mut self, rows: Vec<ArrowDecisionRow>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let row_start = u32::try_from(self.pending.len()).context("row_start does not fit u32")?;
+        let row_count = u32::try_from(rows.len()).context("row_count does not fit u32")?;
+        let shard_idx = u32::try_from(self.shard_index).context("shard_index does not fit u32")?;
+        self.game_index.push(ArrowGameIndexRow {
+            game_id: rows[0].game_id.clone(),
+            shard_idx,
+            batch_idx: 0,
+            row_start,
+            row_count,
+        });
         self.records += rows.len() as u64;
         self.pending.extend(rows);
         if self.pending.len() >= self.shard_target_rows {
@@ -471,6 +489,7 @@ impl ArrowShardWriter {
 
     fn finish(mut self) -> Result<WriterStats> {
         self.flush()?;
+        write_arrow_game_index(&self.out_dir, &self.game_index)?;
         Ok(WriterStats {
             records: self.records,
             shards: self.shard_index,
@@ -503,6 +522,72 @@ impl ArrowShardWriter {
         self.shard_index += 1;
         Ok(())
     }
+}
+
+struct ArrowGameIndexRow {
+    game_id: String,
+    shard_idx: u32,
+    batch_idx: u32,
+    row_start: u32,
+    row_count: u32,
+}
+
+fn arrow_game_index_schema() -> SchemaRef {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "format".to_string(),
+        "forge_pretrain_game_index_arrow".to_string(),
+    );
+    metadata.insert("format_version".to_string(), "1".to_string());
+    Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("game_id", DataType::Utf8, false),
+            Field::new("shard_idx", DataType::UInt32, false),
+            Field::new("batch_idx", DataType::UInt32, false),
+            Field::new("row_start", DataType::UInt32, false),
+            Field::new("row_count", DataType::UInt32, false),
+        ],
+        metadata,
+    ))
+}
+
+fn arrow_game_index_batch(schema: SchemaRef, rows: &[ArrowGameIndexRow]) -> Result<RecordBatch> {
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|r| r.game_id.as_str()),
+        )),
+        Arc::new(UInt32Array::from(
+            rows.iter().map(|r| r.shard_idx).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt32Array::from(
+            rows.iter().map(|r| r.batch_idx).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt32Array::from(
+            rows.iter().map(|r| r.row_start).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt32Array::from(
+            rows.iter().map(|r| r.row_count).collect::<Vec<_>>(),
+        )),
+    ];
+    RecordBatch::try_new(schema, columns).context("building Arrow game index batch")
+}
+
+fn write_arrow_game_index(out_dir: &PathBuf, rows: &[ArrowGameIndexRow]) -> Result<()> {
+    let schema = arrow_game_index_schema();
+    let batch = arrow_game_index_batch(schema.clone(), rows)?;
+    let path = out_dir.join("game_index.arrow");
+    let tmp = path.with_extension("arrow.tmp");
+    let f = File::create(&tmp).with_context(|| format!("creating {:?}", tmp))?;
+    let mut buf = BufWriter::new(f);
+    let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V5)?
+        .try_with_compression(Some(CompressionType::ZSTD))?;
+    {
+        let mut writer = FileWriter::try_new_with_options(&mut buf, schema.as_ref(), options)?;
+        writer.write(&batch)?;
+        writer.finish()?;
+    }
+    buf.flush()?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming {:?} to {:?}", tmp, path))
 }
 
 fn arrow_extracted_schema() -> SchemaRef {
@@ -610,6 +695,7 @@ fn write_arrow_manifest(out_dir: &PathBuf, stats: &ArrowManifestStats) -> Result
         "format_version": 1,
         "stage": "extracted",
         "compression": "zstd",
+        "game_index": "game_index.arrow",
         "shards": stats.shards,
         "records_written": stats.records_written,
         "shard_target_rows": stats.shard_target_rows,
@@ -2901,6 +2987,25 @@ mod tests {
         assert_eq!(game_id.value(0), "game-1");
         assert_eq!(kind_id.value(0), 0);
 
+        let file = File::open(out_dir.join("game_index.arrow")).unwrap();
+        let mut reader = arrow_ipc::reader::FileReader::try_new(file, None).unwrap();
+        let index_batch = reader.next().unwrap().unwrap();
+        assert_eq!(index_batch.num_rows(), 1);
+        let index_game_id = index_batch
+            .column_by_name("game_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let row_count = index_batch
+            .column_by_name("row_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(index_game_id.value(0), "game-1");
+        assert_eq!(row_count.value(0), 1);
+
         std::fs::remove_dir_all(out_dir).ok();
     }
 
@@ -3024,6 +3129,7 @@ mod tests {
         assert_eq!(stats.records, 1);
         assert_eq!(stats.shards, 1);
         assert!(arrow_dir.join("manifest.json").exists());
+        assert!(arrow_dir.join("game_index.arrow").exists());
 
         let file = File::open(arrow_dir.join("part-000000.arrow")).unwrap();
         let mut reader = arrow_ipc::reader::FileReader::try_new(file, None).unwrap();
