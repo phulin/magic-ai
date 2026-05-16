@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 import numpy as np
+import torch
+from torch import Tensor
 
 from magic_ai.text_encoder.decision_spec import (
     AnchorKind,
@@ -363,12 +365,6 @@ def batch_next_mask(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Vectorized next-mask over a batch of (spec, prefix) rows.
 
-    Called once per decoder step from ``actor_critic.step``; per-call
-    cost is ``O(B * prefix_len)``. Acceptable up to ``B≈256`` since the
-    per-row work is tiny (a handful of dict/list ops). For higher batch
-    sizes the native callback (step 9 of the decoder migration) replaces
-    this entirely.
-
     Args:
         specs: per-row ``DecisionSpec``; length B.
         prefix_tokens: ``[B, T_max]`` int array of grammar token ids.
@@ -385,25 +381,803 @@ def batch_next_mask(
     """
 
     b = len(specs)
-    vocab = np.zeros((b, GRAMMAR_VOCAB_SIZE), dtype=bool)
-    per_row_ptr: list[np.ndarray | None] = []
-    n_max = 0
-    for i, spec in enumerate(specs):
-        ln = int(prefix_lens[i])
-        prefix = prefix_tokens[i, :ln].tolist()
-        ptrs = prefix_pointers[i, :ln].tolist()
-        m = next_mask(spec, prefix, ptrs)
-        vocab[i] = m.vocab_mask
-        per_row_ptr.append(m.pointer_mask)
-        if m.pointer_mask is not None and m.pointer_mask.shape[0] > n_max:
-            n_max = m.pointer_mask.shape[0]
+    decision_type = np.fromiter((int(s.decision_type) for s in specs), dtype=np.int32, count=b)
+    max_value = np.fromiter((int(s.max_value) for s in specs), dtype=np.int32, count=b)
+    anchor_counts = _batched_anchor_counts(specs)
+    legal_edges = _batched_legal_edges(specs, anchor_counts)
+    return batch_next_mask_arrays(
+        decision_type,
+        anchor_counts,
+        max_value,
+        legal_edges,
+        prefix_tokens,
+        prefix_pointers,
+        prefix_lens,
+    )
 
-    pointer = np.zeros((b, n_max), dtype=bool)
-    for i, m in enumerate(per_row_ptr):
-        if m is None:
+
+def _batched_anchor_counts(specs: Sequence[DecisionSpec]) -> np.ndarray:
+    counts = np.zeros((len(specs), len(AnchorKind)), dtype=np.int32)
+    for row, spec in enumerate(specs):
+        if spec.anchors:
+            kinds = np.fromiter((int(a.kind) for a in spec.anchors), dtype=np.int32)
+            counts[row] = np.bincount(kinds, minlength=len(AnchorKind))[: len(AnchorKind)]
+    return counts
+
+
+def _batched_legal_edges(
+    specs: Sequence[DecisionSpec],
+    anchor_counts: np.ndarray,
+) -> np.ndarray | None:
+    n_blk_max = int(anchor_counts[:, int(AnchorKind.LEGAL_BLOCKER)].max(initial=0))
+    n_atk_max = int(anchor_counts[:, int(AnchorKind.LEGAL_ATTACKER)].max(initial=0))
+    if n_blk_max == 0 or n_atk_max == 0:
+        return None
+    edges = np.ones((len(specs), n_blk_max, n_atk_max), dtype=bool)
+    for row, spec in enumerate(specs):
+        if spec.legal_edge_bitmap is None:
             continue
-        pointer[i, : m.shape[0]] = m
+        n_blk, n_atk = spec.legal_edge_bitmap.shape
+        edges[row, :n_blk, :n_atk] = spec.legal_edge_bitmap
+    return edges
+
+
+def batch_next_mask_arrays(
+    decision_type: np.ndarray,
+    anchor_counts: np.ndarray,
+    max_value: np.ndarray,
+    legal_edge_bitmap: np.ndarray | None,
+    prefix_tokens: np.ndarray,
+    prefix_pointers: np.ndarray,
+    prefix_lens: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized next-mask over primitive arrays.
+
+    This is the hot implementation used by :func:`batch_next_mask`. It avoids
+    the per-row scalar grammar state machine; all prefix-state decisions are
+    computed with array masks over the whole batch.
+    """
+
+    b = int(decision_type.shape[0])
+    vocab = np.zeros((b, GRAMMAR_VOCAB_SIZE), dtype=bool)
+    desired_ptr_width = np.zeros((b,), dtype=np.int32)
+    rows = np.arange(b)
+    lens = prefix_lens.astype(np.int32, copy=False)
+    first_tok = np.where(lens > 0, prefix_tokens[:, 0], -1)
+
+    _mask_batch_priority(decision_type, anchor_counts, lens, first_tok, vocab, desired_ptr_width)
+    _mask_batch_choose_targets(
+        decision_type, anchor_counts, lens, first_tok, vocab, desired_ptr_width
+    )
+    _mask_batch_may(decision_type, lens, first_tok, prefix_tokens, vocab)
+    _mask_batch_choose_int(decision_type, max_value, lens, first_tok, prefix_tokens, vocab)
+    _mask_batch_attackers(
+        decision_type,
+        anchor_counts,
+        lens,
+        first_tok,
+        prefix_pointers,
+        vocab,
+        desired_ptr_width,
+    )
+    _mask_batch_blockers(
+        decision_type,
+        anchor_counts,
+        legal_edge_bitmap,
+        lens,
+        first_tok,
+        prefix_pointers,
+        vocab,
+        desired_ptr_width,
+    )
+
+    n_max = int(desired_ptr_width.max(initial=0))
+    pointer = np.zeros((b, n_max), dtype=bool)
+    if n_max == 0:
+        return vocab, pointer
+
+    subjects = np.arange(n_max, dtype=np.int32)
+    ptr_kind = _next_pointer_kind(decision_type, lens, first_tok, prefix_tokens)
+
+    _fill_count_pointer(
+        pointer,
+        ptr_kind == int(AnchorKind.LEGAL_ACTION),
+        subjects,
+        anchor_counts,
+        AnchorKind.LEGAL_ACTION,
+    )
+    _fill_count_pointer(
+        pointer,
+        ptr_kind == int(AnchorKind.LEGAL_TARGET),
+        subjects,
+        anchor_counts,
+        AnchorKind.LEGAL_TARGET,
+    )
+    _fill_count_pointer(
+        pointer, ptr_kind == int(AnchorKind.DEFENDER), subjects, anchor_counts, AnchorKind.DEFENDER
+    )
+
+    _fill_attacker_pointer(pointer, ptr_kind, subjects, anchor_counts, prefix_pointers, lens)
+    _fill_blocker_pointer(pointer, ptr_kind, subjects, anchor_counts, prefix_pointers, lens)
+    _fill_block_attack_target_pointer(
+        pointer,
+        ptr_kind,
+        subjects,
+        anchor_counts,
+        legal_edge_bitmap,
+        prefix_pointers,
+        lens,
+        rows,
+    )
     return vocab, pointer
+
+
+def batch_next_mask_torch(
+    decision_type: Tensor,
+    anchor_counts: Tensor,
+    max_value: Tensor,
+    legal_edge_bitmap: Tensor | None,
+    prefix_tokens: Tensor,
+    prefix_pointers: Tensor,
+    prefix_lens: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Torch-native batched next-mask over primitive tensors."""
+
+    device = prefix_tokens.device
+    b = int(decision_type.shape[0])
+    vocab = torch.zeros((b, GRAMMAR_VOCAB_SIZE), dtype=torch.bool, device=device)
+    desired_ptr_width = torch.zeros((b,), dtype=torch.long, device=device)
+    rows_idx = torch.arange(b, device=device)
+    lens = prefix_lens.to(device=device, dtype=torch.long)
+    decision_type = decision_type.to(device=device, dtype=torch.long)
+    anchor_counts = anchor_counts.to(device=device, dtype=torch.long)
+    max_value = max_value.to(device=device, dtype=torch.long)
+    first_tok = torch.where(lens > 0, prefix_tokens[:, 0].to(torch.long), -torch.ones_like(lens))
+
+    _mask_batch_priority_torch(
+        decision_type, anchor_counts, lens, first_tok, vocab, desired_ptr_width
+    )
+    _mask_batch_choose_targets_torch(
+        decision_type, anchor_counts, lens, first_tok, vocab, desired_ptr_width
+    )
+    _mask_batch_may_torch(decision_type, lens, first_tok, prefix_tokens, vocab)
+    _mask_batch_choose_int_torch(decision_type, max_value, lens, first_tok, prefix_tokens, vocab)
+    _mask_batch_attackers_torch(
+        decision_type,
+        anchor_counts,
+        lens,
+        first_tok,
+        prefix_pointers,
+        vocab,
+        desired_ptr_width,
+    )
+    _mask_batch_blockers_torch(
+        decision_type,
+        anchor_counts,
+        lens,
+        first_tok,
+        prefix_pointers,
+        vocab,
+        desired_ptr_width,
+    )
+
+    n_max = int(desired_ptr_width.max().item()) if desired_ptr_width.numel() else 0
+    pointer = torch.zeros((b, n_max), dtype=torch.bool, device=device)
+    if n_max == 0:
+        return vocab, pointer
+
+    subjects = torch.arange(n_max, dtype=torch.long, device=device)
+    ptr_kind = _next_pointer_kind_torch(decision_type, lens, first_tok)
+    _fill_count_pointer_torch(
+        pointer,
+        ptr_kind == int(AnchorKind.LEGAL_ACTION),
+        subjects,
+        anchor_counts,
+        AnchorKind.LEGAL_ACTION,
+    )
+    _fill_count_pointer_torch(
+        pointer,
+        ptr_kind == int(AnchorKind.LEGAL_TARGET),
+        subjects,
+        anchor_counts,
+        AnchorKind.LEGAL_TARGET,
+    )
+    _fill_count_pointer_torch(
+        pointer,
+        ptr_kind == int(AnchorKind.DEFENDER),
+        subjects,
+        anchor_counts,
+        AnchorKind.DEFENDER,
+    )
+    _fill_attacker_pointer_torch(pointer, ptr_kind, subjects, anchor_counts, prefix_pointers, lens)
+    _fill_blocker_pointer_torch(pointer, ptr_kind, subjects, anchor_counts, prefix_pointers, lens)
+    _fill_block_attack_target_pointer_torch(
+        pointer,
+        ptr_kind,
+        subjects,
+        anchor_counts,
+        legal_edge_bitmap,
+        prefix_pointers,
+        lens,
+        rows_idx,
+    )
+    return vocab, pointer
+
+
+def _mask_batch_priority_torch(
+    decision_type: Tensor,
+    anchor_counts: Tensor,
+    lens: Tensor,
+    first_tok: Tensor,
+    vocab: Tensor,
+    desired_ptr_width: Tensor,
+) -> None:
+    rows = decision_type == int(DecisionType.PRIORITY)
+    vocab[rows & (lens == 0), int(GrammarVocab.PRIORITY_OPEN)] = True
+    ptr_rows = rows & (lens == 1) & (first_tok == int(GrammarVocab.PRIORITY_OPEN))
+    desired_ptr_width[ptr_rows] = anchor_counts[ptr_rows, int(AnchorKind.LEGAL_ACTION)]
+    vocab[rows & (lens == 2), int(GrammarVocab.END)] = True
+
+
+def _mask_batch_choose_targets_torch(
+    decision_type: Tensor,
+    anchor_counts: Tensor,
+    lens: Tensor,
+    first_tok: Tensor,
+    vocab: Tensor,
+    desired_ptr_width: Tensor,
+) -> None:
+    rows = decision_type == int(DecisionType.CHOOSE_TARGETS)
+    vocab[rows & (lens == 0), int(GrammarVocab.CHOOSE_TARGETS_OPEN)] = True
+    ptr_rows = rows & (lens == 1) & (first_tok == int(GrammarVocab.CHOOSE_TARGETS_OPEN))
+    desired_ptr_width[ptr_rows] = anchor_counts[ptr_rows, int(AnchorKind.LEGAL_TARGET)]
+    vocab[rows & (lens == 2), int(GrammarVocab.END)] = True
+
+
+def _mask_batch_may_torch(
+    decision_type: Tensor,
+    lens: Tensor,
+    first_tok: Tensor,
+    prefix_tokens: Tensor,
+    vocab: Tensor,
+) -> None:
+    rows = decision_type == int(DecisionType.MAY)
+    vocab[rows & (lens == 0), int(GrammarVocab.MAY_OPEN)] = True
+    choose_rows = rows & (lens == 1) & (first_tok == int(GrammarVocab.MAY_OPEN))
+    vocab[choose_rows, int(GrammarVocab.YES)] = True
+    vocab[choose_rows, int(GrammarVocab.NO)] = True
+    end_rows = (
+        rows
+        & (lens == 2)
+        & (first_tok == int(GrammarVocab.MAY_OPEN))
+        & (
+            (prefix_tokens[:, 1] == int(GrammarVocab.YES))
+            | (prefix_tokens[:, 1] == int(GrammarVocab.NO))
+        )
+    )
+    vocab[end_rows, int(GrammarVocab.END)] = True
+
+
+def _mask_batch_choose_int_torch(
+    decision_type: Tensor,
+    max_value: Tensor,
+    lens: Tensor,
+    first_tok: Tensor,
+    prefix_tokens: Tensor,
+    vocab: Tensor,
+) -> None:
+    mode_rows = decision_type == int(DecisionType.CHOOSE_MODE)
+    x_rows = decision_type == int(DecisionType.CHOOSE_X)
+    vocab[mode_rows & (lens == 0), int(GrammarVocab.CHOOSE_MODE_OPEN)] = True
+    vocab[x_rows & (lens == 0), int(GrammarVocab.CHOOSE_X_OPEN)] = True
+    rows = (
+        (mode_rows & (first_tok == int(GrammarVocab.CHOOSE_MODE_OPEN)))
+        | (x_rows & (first_tok == int(GrammarVocab.CHOOSE_X_OPEN)))
+    ) & (lens > 0)
+    if not bool(rows.any()):
+        return
+
+    digit_len = (lens - 1).clamp_min(0)
+    digits = prefix_tokens[:, 1:].to(torch.long) - DIGIT_0_ID
+    valid_digit = (digits >= 0) & (digits <= 9)
+    cols = torch.arange(digits.shape[1], dtype=torch.long, device=prefix_tokens.device)
+    live = cols.unsqueeze(0) < digit_len.unsqueeze(1)
+    valid_prefix = rows & (max_value >= 0) & (valid_digit | ~live).all(dim=1)
+    exponents = (digit_len.unsqueeze(1) - cols.unsqueeze(0) - 1).clamp_min(0)
+    powers = torch.where(live, torch.pow(torch.full_like(exponents, 10), exponents), 0)
+    current = (digits.clamp(0, 9) * powers).sum(dim=1)
+    valid_prefix = valid_prefix & (current <= max_value)
+    base = current * 10
+    digit_ids = torch.arange(10, dtype=torch.long, device=prefix_tokens.device)
+    allowed_digits = valid_prefix.unsqueeze(1) & (
+        (base.unsqueeze(1) + digit_ids.unsqueeze(0)) <= max_value.unsqueeze(1)
+    )
+    vocab[:, DIGIT_0_ID : DIGIT_9_ID + 1] |= allowed_digits
+    vocab[valid_prefix & (digit_len > 0), int(GrammarVocab.END)] = True
+
+
+def _mask_batch_attackers_torch(
+    decision_type: Tensor,
+    anchor_counts: Tensor,
+    lens: Tensor,
+    first_tok: Tensor,
+    prefix_pointers: Tensor,
+    vocab: Tensor,
+    desired_ptr_width: Tensor,
+) -> None:
+    rows = decision_type == int(DecisionType.DECLARE_ATTACKERS)
+    vocab[rows & (lens == 0), int(GrammarVocab.DECLARE_ATTACKERS_OPEN)] = True
+    valid = rows & (first_tok == int(GrammarVocab.DECLARE_ATTACKERS_OPEN)) & (lens > 0)
+    rem = (lens - 1).clamp_min(0) % 4
+    completed_rows = valid & (rem == 0)
+    chosen = _chosen_count_torch(prefix_pointers, lens, first_pointer_col=2, stride=4)
+    can_continue = completed_rows & (chosen < anchor_counts[:, int(AnchorKind.LEGAL_ATTACKER)])
+    vocab[can_continue, int(GrammarVocab.ATTACK)] = True
+    vocab[completed_rows, int(GrammarVocab.END)] = True
+    ptr_attacker = valid & (rem == 1)
+    desired_ptr_width[ptr_attacker] = anchor_counts[ptr_attacker, int(AnchorKind.LEGAL_ATTACKER)]
+    vocab[valid & (rem == 2), int(GrammarVocab.DEFENDER)] = True
+    ptr_defender = valid & (rem == 3)
+    desired_ptr_width[ptr_defender] = anchor_counts[ptr_defender, int(AnchorKind.DEFENDER)]
+
+
+def _mask_batch_blockers_torch(
+    decision_type: Tensor,
+    anchor_counts: Tensor,
+    lens: Tensor,
+    first_tok: Tensor,
+    prefix_pointers: Tensor,
+    vocab: Tensor,
+    desired_ptr_width: Tensor,
+) -> None:
+    rows = decision_type == int(DecisionType.DECLARE_BLOCKERS)
+    vocab[rows & (lens == 0), int(GrammarVocab.DECLARE_BLOCKERS_OPEN)] = True
+    valid = rows & (first_tok == int(GrammarVocab.DECLARE_BLOCKERS_OPEN)) & (lens > 0)
+    rem = (lens - 1).clamp_min(0) % 4
+    completed_rows = valid & (rem == 0)
+    chosen = _chosen_count_torch(prefix_pointers, lens, first_pointer_col=2, stride=4)
+    can_continue = completed_rows & (chosen < anchor_counts[:, int(AnchorKind.LEGAL_BLOCKER)])
+    vocab[can_continue, int(GrammarVocab.BLOCK)] = True
+    vocab[completed_rows, int(GrammarVocab.END)] = True
+    ptr_blocker = valid & (rem == 1)
+    desired_ptr_width[ptr_blocker] = anchor_counts[ptr_blocker, int(AnchorKind.LEGAL_BLOCKER)]
+    vocab[valid & (rem == 2), int(GrammarVocab.ATTACKER)] = True
+    ptr_attacker = valid & (rem == 3)
+    desired_ptr_width[ptr_attacker] = anchor_counts[ptr_attacker, int(AnchorKind.LEGAL_ATTACKER)]
+
+
+def _chosen_count_torch(
+    prefix_pointers: Tensor,
+    lens: Tensor,
+    *,
+    first_pointer_col: int,
+    stride: int,
+) -> Tensor:
+    cols = torch.arange(prefix_pointers.shape[1], dtype=torch.long, device=prefix_pointers.device)
+    live = (cols.unsqueeze(0) < lens.unsqueeze(1)) & (cols.unsqueeze(0) >= first_pointer_col)
+    chosen_cols = live & (((cols.unsqueeze(0) - first_pointer_col) % stride) == 0)
+    return chosen_cols.sum(dim=1)
+
+
+def _next_pointer_kind_torch(decision_type: Tensor, lens: Tensor, first_tok: Tensor) -> Tensor:
+    out = torch.full_like(decision_type, -1)
+    priority = (
+        (decision_type == int(DecisionType.PRIORITY))
+        & (lens == 1)
+        & (first_tok == int(GrammarVocab.PRIORITY_OPEN))
+    )
+    out[priority] = int(AnchorKind.LEGAL_ACTION)
+    targets = (
+        (decision_type == int(DecisionType.CHOOSE_TARGETS))
+        & (lens == 1)
+        & (first_tok == int(GrammarVocab.CHOOSE_TARGETS_OPEN))
+    )
+    out[targets] = int(AnchorKind.LEGAL_TARGET)
+    attackers = (
+        (decision_type == int(DecisionType.DECLARE_ATTACKERS))
+        & (first_tok == int(GrammarVocab.DECLARE_ATTACKERS_OPEN))
+        & (lens > 0)
+    )
+    atk_rem = (lens - 1).clamp_min(0) % 4
+    out[attackers & (atk_rem == 1)] = int(AnchorKind.LEGAL_ATTACKER)
+    out[attackers & (atk_rem == 3)] = int(AnchorKind.DEFENDER)
+    blockers = (
+        (decision_type == int(DecisionType.DECLARE_BLOCKERS))
+        & (first_tok == int(GrammarVocab.DECLARE_BLOCKERS_OPEN))
+        & (lens > 0)
+    )
+    blk_rem = (lens - 1).clamp_min(0) % 4
+    out[blockers & (blk_rem == 1)] = int(AnchorKind.LEGAL_BLOCKER)
+    out[blockers & (blk_rem == 3)] = int(AnchorKind.LEGAL_ATTACKER)
+    return out
+
+
+def _fill_count_pointer_torch(
+    pointer: Tensor,
+    rows: Tensor,
+    subjects: Tensor,
+    anchor_counts: Tensor,
+    kind: AnchorKind,
+) -> None:
+    if not bool(rows.any()):
+        return
+    pointer[rows] = subjects.unsqueeze(0) < anchor_counts[rows, int(kind)].unsqueeze(1)
+
+
+def _fill_attacker_pointer_torch(
+    pointer: Tensor,
+    ptr_kind: Tensor,
+    subjects: Tensor,
+    anchor_counts: Tensor,
+    prefix_pointers: Tensor,
+    lens: Tensor,
+) -> None:
+    rows = ptr_kind == int(AnchorKind.LEGAL_ATTACKER)
+    if not bool(rows.any()):
+        return
+    allowed = subjects.unsqueeze(0) < anchor_counts[:, int(AnchorKind.LEGAL_ATTACKER)].unsqueeze(1)
+    blocker_rows = rows & _is_block_attack_target_step_torch(lens)
+    attack_rows = rows & ~blocker_rows
+    if bool(attack_rows.any()):
+        chosen = _chosen_subject_matrix_torch(prefix_pointers, lens, subjects, first_pointer_col=2)
+        pointer[attack_rows] = allowed[attack_rows] & ~chosen[attack_rows]
+
+
+def _fill_blocker_pointer_torch(
+    pointer: Tensor,
+    ptr_kind: Tensor,
+    subjects: Tensor,
+    anchor_counts: Tensor,
+    prefix_pointers: Tensor,
+    lens: Tensor,
+) -> None:
+    rows = ptr_kind == int(AnchorKind.LEGAL_BLOCKER)
+    if not bool(rows.any()):
+        return
+    allowed = subjects.unsqueeze(0) < anchor_counts[:, int(AnchorKind.LEGAL_BLOCKER)].unsqueeze(1)
+    chosen = _chosen_subject_matrix_torch(prefix_pointers, lens, subjects, first_pointer_col=2)
+    pointer[rows] = allowed[rows] & ~chosen[rows]
+
+
+def _fill_block_attack_target_pointer_torch(
+    pointer: Tensor,
+    ptr_kind: Tensor,
+    subjects: Tensor,
+    anchor_counts: Tensor,
+    legal_edge_bitmap: Tensor | None,
+    prefix_pointers: Tensor,
+    lens: Tensor,
+    rows_idx: Tensor,
+) -> None:
+    rows = (ptr_kind == int(AnchorKind.LEGAL_ATTACKER)) & _is_block_attack_target_step_torch(lens)
+    if not bool(rows.any()):
+        return
+    allowed = subjects.unsqueeze(0) < anchor_counts[:, int(AnchorKind.LEGAL_ATTACKER)].unsqueeze(1)
+    if legal_edge_bitmap is None:
+        pointer[rows] = allowed[rows]
+        return
+    edge = legal_edge_bitmap.to(device=pointer.device, dtype=torch.bool)
+    blocker_col = (lens - 2).clamp_min(0)
+    blocker = prefix_pointers[rows_idx, blocker_col].clamp(min=0, max=edge.shape[1] - 1)
+    edge_slice = edge[rows_idx, blocker]
+    edge_allowed = torch.zeros_like(pointer)
+    width = min(pointer.shape[1], edge_slice.shape[1])
+    edge_allowed[:, :width] = edge_slice[:, :width]
+    pointer[rows] = allowed[rows] & edge_allowed[rows]
+
+
+def _chosen_subject_matrix_torch(
+    prefix_pointers: Tensor,
+    lens: Tensor,
+    subjects: Tensor,
+    *,
+    first_pointer_col: int,
+) -> Tensor:
+    cols = torch.arange(prefix_pointers.shape[1], dtype=torch.long, device=prefix_pointers.device)
+    live = (cols.unsqueeze(0) < lens.unsqueeze(1)) & (cols.unsqueeze(0) >= first_pointer_col)
+    chosen_cols = live & (((cols.unsqueeze(0) - first_pointer_col) % 4) == 0)
+    chosen_values = torch.where(chosen_cols, prefix_pointers.to(torch.long), -2)
+    return (chosen_values.unsqueeze(2) == subjects.view(1, 1, -1)).any(dim=1)
+
+
+def _is_block_attack_target_step_torch(lens: Tensor) -> Tensor:
+    return ((lens - 1).clamp_min(0) % 4) == 3
+
+
+def _mask_batch_priority(
+    decision_type: np.ndarray,
+    anchor_counts: np.ndarray,
+    lens: np.ndarray,
+    first_tok: np.ndarray,
+    vocab: np.ndarray,
+    desired_ptr_width: np.ndarray,
+) -> None:
+    rows = decision_type == int(DecisionType.PRIORITY)
+    vocab[rows & (lens == 0), int(GrammarVocab.PRIORITY_OPEN)] = True
+    ptr_rows = rows & (lens == 1) & (first_tok == int(GrammarVocab.PRIORITY_OPEN))
+    desired_ptr_width[ptr_rows] = anchor_counts[ptr_rows, int(AnchorKind.LEGAL_ACTION)]
+    vocab[rows & (lens == 2), int(GrammarVocab.END)] = True
+
+
+def _mask_batch_choose_targets(
+    decision_type: np.ndarray,
+    anchor_counts: np.ndarray,
+    lens: np.ndarray,
+    first_tok: np.ndarray,
+    vocab: np.ndarray,
+    desired_ptr_width: np.ndarray,
+) -> None:
+    rows = decision_type == int(DecisionType.CHOOSE_TARGETS)
+    vocab[rows & (lens == 0), int(GrammarVocab.CHOOSE_TARGETS_OPEN)] = True
+    ptr_rows = rows & (lens == 1) & (first_tok == int(GrammarVocab.CHOOSE_TARGETS_OPEN))
+    desired_ptr_width[ptr_rows] = anchor_counts[ptr_rows, int(AnchorKind.LEGAL_TARGET)]
+    vocab[rows & (lens == 2), int(GrammarVocab.END)] = True
+
+
+def _mask_batch_may(
+    decision_type: np.ndarray,
+    lens: np.ndarray,
+    first_tok: np.ndarray,
+    prefix_tokens: np.ndarray,
+    vocab: np.ndarray,
+) -> None:
+    rows = decision_type == int(DecisionType.MAY)
+    vocab[rows & (lens == 0), int(GrammarVocab.MAY_OPEN)] = True
+    choose_rows = rows & (lens == 1) & (first_tok == int(GrammarVocab.MAY_OPEN))
+    vocab[choose_rows, int(GrammarVocab.YES)] = True
+    vocab[choose_rows, int(GrammarVocab.NO)] = True
+    end_rows = (
+        rows
+        & (lens == 2)
+        & (first_tok == int(GrammarVocab.MAY_OPEN))
+        & (
+            (prefix_tokens[:, 1] == int(GrammarVocab.YES))
+            | (prefix_tokens[:, 1] == int(GrammarVocab.NO))
+        )
+    )
+    vocab[end_rows, int(GrammarVocab.END)] = True
+
+
+def _mask_batch_choose_int(
+    decision_type: np.ndarray,
+    max_value: np.ndarray,
+    lens: np.ndarray,
+    first_tok: np.ndarray,
+    prefix_tokens: np.ndarray,
+    vocab: np.ndarray,
+) -> None:
+    mode_rows = decision_type == int(DecisionType.CHOOSE_MODE)
+    x_rows = decision_type == int(DecisionType.CHOOSE_X)
+    vocab[mode_rows & (lens == 0), int(GrammarVocab.CHOOSE_MODE_OPEN)] = True
+    vocab[x_rows & (lens == 0), int(GrammarVocab.CHOOSE_X_OPEN)] = True
+    rows = (
+        (mode_rows & (first_tok == int(GrammarVocab.CHOOSE_MODE_OPEN)))
+        | (x_rows & (first_tok == int(GrammarVocab.CHOOSE_X_OPEN)))
+    ) & (lens > 0)
+    if not rows.any():
+        return
+
+    digit_len = np.maximum(lens - 1, 0)
+    digits = prefix_tokens[:, 1:] - DIGIT_0_ID
+    valid_digit = (digits >= 0) & (digits <= 9)
+    cols = np.arange(digits.shape[1], dtype=np.int32)
+    live = cols[None, :] < digit_len[:, None]
+    valid_prefix = rows & (max_value >= 0) & (valid_digit | ~live).all(axis=1)
+    powers = np.where(
+        live,
+        np.power(10, np.maximum(digit_len[:, None] - cols[None, :] - 1, 0)),
+        0,
+    )
+    current = (np.clip(digits, 0, 9) * powers).sum(axis=1).astype(np.int64)
+    valid_prefix &= current <= max_value
+    base = current * 10
+    digit_ids = np.arange(10, dtype=np.int64)
+    allowed_digits = valid_prefix[:, None] & (
+        (base[:, None] + digit_ids[None, :]) <= max_value[:, None]
+    )
+    vocab[:, DIGIT_0_ID : DIGIT_9_ID + 1] |= allowed_digits
+    vocab[valid_prefix & (digit_len > 0), int(GrammarVocab.END)] = True
+
+
+def _mask_batch_attackers(
+    decision_type: np.ndarray,
+    anchor_counts: np.ndarray,
+    lens: np.ndarray,
+    first_tok: np.ndarray,
+    prefix_pointers: np.ndarray,
+    vocab: np.ndarray,
+    desired_ptr_width: np.ndarray,
+) -> None:
+    rows = decision_type == int(DecisionType.DECLARE_ATTACKERS)
+    vocab[rows & (lens == 0), int(GrammarVocab.DECLARE_ATTACKERS_OPEN)] = True
+    valid = rows & (first_tok == int(GrammarVocab.DECLARE_ATTACKERS_OPEN)) & (lens > 0)
+    body_len = np.maximum(lens - 1, 0)
+    rem = body_len % 4
+    completed_rows = valid & (rem == 0)
+    chosen = _chosen_count(prefix_pointers, lens, first_pointer_col=2, stride=4)
+    can_continue = completed_rows & (chosen < anchor_counts[:, int(AnchorKind.LEGAL_ATTACKER)])
+    vocab[can_continue, int(GrammarVocab.ATTACK)] = True
+    vocab[completed_rows, int(GrammarVocab.END)] = True
+    ptr_attacker = valid & (rem == 1)
+    desired_ptr_width[ptr_attacker] = anchor_counts[ptr_attacker, int(AnchorKind.LEGAL_ATTACKER)]
+    vocab[valid & (rem == 2), int(GrammarVocab.DEFENDER)] = True
+    ptr_defender = valid & (rem == 3)
+    desired_ptr_width[ptr_defender] = anchor_counts[ptr_defender, int(AnchorKind.DEFENDER)]
+
+
+def _mask_batch_blockers(
+    decision_type: np.ndarray,
+    anchor_counts: np.ndarray,
+    legal_edge_bitmap: np.ndarray | None,
+    lens: np.ndarray,
+    first_tok: np.ndarray,
+    prefix_pointers: np.ndarray,
+    vocab: np.ndarray,
+    desired_ptr_width: np.ndarray,
+) -> None:
+    del legal_edge_bitmap
+    rows = decision_type == int(DecisionType.DECLARE_BLOCKERS)
+    vocab[rows & (lens == 0), int(GrammarVocab.DECLARE_BLOCKERS_OPEN)] = True
+    valid = rows & (first_tok == int(GrammarVocab.DECLARE_BLOCKERS_OPEN)) & (lens > 0)
+    body_len = np.maximum(lens - 1, 0)
+    rem = body_len % 4
+    completed_rows = valid & (rem == 0)
+    chosen = _chosen_count(prefix_pointers, lens, first_pointer_col=2, stride=4)
+    can_continue = completed_rows & (chosen < anchor_counts[:, int(AnchorKind.LEGAL_BLOCKER)])
+    vocab[can_continue, int(GrammarVocab.BLOCK)] = True
+    vocab[completed_rows, int(GrammarVocab.END)] = True
+    ptr_blocker = valid & (rem == 1)
+    desired_ptr_width[ptr_blocker] = anchor_counts[ptr_blocker, int(AnchorKind.LEGAL_BLOCKER)]
+    vocab[valid & (rem == 2), int(GrammarVocab.ATTACKER)] = True
+    ptr_attacker = valid & (rem == 3)
+    desired_ptr_width[ptr_attacker] = anchor_counts[ptr_attacker, int(AnchorKind.LEGAL_ATTACKER)]
+
+
+def _chosen_count(
+    prefix_pointers: np.ndarray,
+    lens: np.ndarray,
+    *,
+    first_pointer_col: int,
+    stride: int,
+) -> np.ndarray:
+    cols = np.arange(prefix_pointers.shape[1], dtype=np.int32)
+    live = (cols[None, :] < lens[:, None]) & (cols[None, :] >= first_pointer_col)
+    chosen_cols = live & (((cols[None, :] - first_pointer_col) % stride) == 0)
+    return chosen_cols.sum(axis=1)
+
+
+def _next_pointer_kind(
+    decision_type: np.ndarray,
+    lens: np.ndarray,
+    first_tok: np.ndarray,
+    prefix_tokens: np.ndarray,
+) -> np.ndarray:
+    del prefix_tokens
+    out = np.full((decision_type.shape[0],), -1, dtype=np.int32)
+    priority = (
+        (decision_type == int(DecisionType.PRIORITY))
+        & (lens == 1)
+        & (first_tok == int(GrammarVocab.PRIORITY_OPEN))
+    )
+    out[priority] = int(AnchorKind.LEGAL_ACTION)
+    targets = (
+        (decision_type == int(DecisionType.CHOOSE_TARGETS))
+        & (lens == 1)
+        & (first_tok == int(GrammarVocab.CHOOSE_TARGETS_OPEN))
+    )
+    out[targets] = int(AnchorKind.LEGAL_TARGET)
+
+    attackers = (
+        (decision_type == int(DecisionType.DECLARE_ATTACKERS))
+        & (first_tok == int(GrammarVocab.DECLARE_ATTACKERS_OPEN))
+        & (lens > 0)
+    )
+    atk_rem = np.maximum(lens - 1, 0) % 4
+    out[attackers & (atk_rem == 1)] = int(AnchorKind.LEGAL_ATTACKER)
+    out[attackers & (atk_rem == 3)] = int(AnchorKind.DEFENDER)
+
+    blockers = (
+        (decision_type == int(DecisionType.DECLARE_BLOCKERS))
+        & (first_tok == int(GrammarVocab.DECLARE_BLOCKERS_OPEN))
+        & (lens > 0)
+    )
+    blk_rem = np.maximum(lens - 1, 0) % 4
+    out[blockers & (blk_rem == 1)] = int(AnchorKind.LEGAL_BLOCKER)
+    out[blockers & (blk_rem == 3)] = int(AnchorKind.LEGAL_ATTACKER)
+    return out
+
+
+def _fill_count_pointer(
+    pointer: np.ndarray,
+    rows: np.ndarray,
+    subjects: np.ndarray,
+    anchor_counts: np.ndarray,
+    kind: AnchorKind,
+) -> None:
+    if not rows.any():
+        return
+    pointer[rows] = subjects[None, :] < anchor_counts[rows, int(kind), None]
+
+
+def _fill_attacker_pointer(
+    pointer: np.ndarray,
+    ptr_kind: np.ndarray,
+    subjects: np.ndarray,
+    anchor_counts: np.ndarray,
+    prefix_pointers: np.ndarray,
+    lens: np.ndarray,
+) -> None:
+    rows = ptr_kind == int(AnchorKind.LEGAL_ATTACKER)
+    if not rows.any():
+        return
+    allowed = subjects[None, :] < anchor_counts[:, int(AnchorKind.LEGAL_ATTACKER), None]
+    blocker_rows = (ptr_kind == int(AnchorKind.LEGAL_ATTACKER)) & (
+        _is_block_attack_target_step(lens)
+    )
+    attack_rows = rows & ~blocker_rows
+    if attack_rows.any():
+        chosen = _chosen_subject_matrix(prefix_pointers, lens, subjects, first_pointer_col=2)
+        pointer[attack_rows] = allowed[attack_rows] & ~chosen[attack_rows]
+
+
+def _fill_blocker_pointer(
+    pointer: np.ndarray,
+    ptr_kind: np.ndarray,
+    subjects: np.ndarray,
+    anchor_counts: np.ndarray,
+    prefix_pointers: np.ndarray,
+    lens: np.ndarray,
+) -> None:
+    rows = ptr_kind == int(AnchorKind.LEGAL_BLOCKER)
+    if not rows.any():
+        return
+    allowed = subjects[None, :] < anchor_counts[:, int(AnchorKind.LEGAL_BLOCKER), None]
+    chosen = _chosen_subject_matrix(prefix_pointers, lens, subjects, first_pointer_col=2)
+    pointer[rows] = allowed[rows] & ~chosen[rows]
+
+
+def _fill_block_attack_target_pointer(
+    pointer: np.ndarray,
+    ptr_kind: np.ndarray,
+    subjects: np.ndarray,
+    anchor_counts: np.ndarray,
+    legal_edge_bitmap: np.ndarray | None,
+    prefix_pointers: np.ndarray,
+    lens: np.ndarray,
+    rows_idx: np.ndarray,
+) -> None:
+    rows = (ptr_kind == int(AnchorKind.LEGAL_ATTACKER)) & _is_block_attack_target_step(lens)
+    if not rows.any():
+        return
+    allowed = subjects[None, :] < anchor_counts[:, int(AnchorKind.LEGAL_ATTACKER), None]
+    if legal_edge_bitmap is None:
+        pointer[rows] = allowed[rows]
+        return
+    blocker_col = np.maximum(lens - 2, 0)
+    blocker = prefix_pointers[rows_idx, blocker_col].clip(min=0)
+    edge_slice = legal_edge_bitmap[rows_idx, blocker]
+    edge_allowed = np.zeros_like(pointer)
+    width = min(pointer.shape[1], edge_slice.shape[1])
+    edge_allowed[:, :width] = edge_slice[:, :width]
+    pointer[rows] = allowed[rows] & edge_allowed[rows]
+
+
+def _chosen_subject_matrix(
+    prefix_pointers: np.ndarray,
+    lens: np.ndarray,
+    subjects: np.ndarray,
+    *,
+    first_pointer_col: int,
+) -> np.ndarray:
+    cols = np.arange(prefix_pointers.shape[1], dtype=np.int32)
+    live = (cols[None, :] < lens[:, None]) & (cols[None, :] >= first_pointer_col)
+    chosen_cols = live & (((cols[None, :] - first_pointer_col) % 4) == 0)
+    chosen_values = np.where(chosen_cols, prefix_pointers, -2)
+    return (chosen_values[:, :, None] == subjects[None, None, :]).any(axis=1)
+
+
+def _is_block_attack_target_step(lens: np.ndarray) -> np.ndarray:
+    return (np.maximum(lens - 1, 0) % 4) == 3
 
 
 __all__ = [
@@ -413,6 +1187,7 @@ __all__ = [
     "GrammarVocab",
     "StepMask",
     "batch_next_mask",
+    "batch_next_mask_torch",
     "bpe_digit_str_to_grammar_ids",
     "next_mask",
 ]

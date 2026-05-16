@@ -19,9 +19,10 @@ from magic_ai.game_state import GameStateSnapshot
 from magic_ai.text_encoder.batch import (
     PackedTextBatch,
     TextEncodedBatch,
+    TokenizationContext,
     collate,
     pack_batch,
-    tokenize_snapshot,
+    tokenize_snapshots,
 )
 from magic_ai.text_encoder.decision_spec import DecisionSpec
 from magic_ai.text_encoder.decoder import GrammarDecoder, GrammarDecoderConfig
@@ -174,11 +175,11 @@ class TextPolicy(nn.Module):
             oracle=oracle,
             tokenizer=tokenizer,
         )
+        tokenize_ctx = TokenizationContext.from_tokenizer(tokenizer)
+        examples = tokenize_snapshots(rendered_list, tokenizer, context=tokenize_ctx)
         spec_renderer = DecisionSpecRenderer(tokenizer)
-        examples = []
         specs: list[DecisionSpec | None] = []
         for snap, rendered in zip(snapshots, rendered_list, strict=True):
-            examples.append(tokenize_snapshot(rendered, tokenizer))
             pending = snap.get("pending")
             if pending is None:
                 specs.append(None)

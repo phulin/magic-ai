@@ -328,6 +328,7 @@ class SnapshotRenderer:
         oracle: dict[str, OracleEntry] | None = None,
         *,
         max_card_refs: int = MAX_CARD_REFS,
+        record_char_anchors: bool = True,
         self_token_id: int | None = None,
         opp_token_id: int | None = None,
         mana_token_ids: Sequence[int] | None = None,
@@ -335,6 +336,8 @@ class SnapshotRenderer:
     ) -> None:
         self._oracle = oracle if oracle is not None else {}
         self._max_card_refs = max_card_refs
+        self._record_char_anchors = record_char_anchors
+        self._card_body_cache: dict[str, str] = {}
         self._self_token_id = self_token_id
         self._opp_token_id = opp_token_id
         self._mana_token_ids = tuple(int(tid) for tid in mana_token_ids or ())
@@ -464,28 +467,35 @@ class SnapshotRenderer:
         name = card.get("Name", "") or ""
         if ref_idx is not None:
             ref_token = card_ref_token(ref_idx)
-            char_start = sum(len(s) for s in buf)
             buf.append(ref_token)
-            char_end = sum(len(s) for s in buf)
-            result.card_ref_anchors.append(
-                CardRefAnchor(
-                    ref_index=ref_idx,
-                    engine_card_id=cid,
-                    name=name,
-                    char_start=char_start,
-                    char_end=char_end,
+            if self._record_char_anchors:
+                char_end = sum(len(s) for s in buf)
+                result.card_ref_anchors.append(
+                    CardRefAnchor(
+                        ref_index=ref_idx,
+                        engine_card_id=cid,
+                        name=name,
+                        char_start=char_end - len(ref_token),
+                        char_end=char_end,
+                    )
                 )
-            )
-        body = render_card_body(name, self._oracle.get(name))
-        closing = "</card>"
-        assert body.endswith(closing)
-        buf.append(body[: -len(closing)])
+        buf.append(self._card_body_without_closer(name))
         tapped = card.get("Tapped")
         if tapped is True:
             buf.append("<tapped>")
         elif tapped is False:
             buf.append("<untapped>")
-        buf.append(closing)
+        buf.append("</card>")
+
+    def _card_body_without_closer(self, name: str) -> str:
+        body = self._card_body_cache.get(name)
+        if body is None:
+            rendered = render_card_body(name, self._oracle.get(name))
+            closing = "</card>"
+            assert rendered.endswith(closing)
+            body = rendered[: -len(closing)]
+            self._card_body_cache[name] = body
+        return body
 
     def _render_stack_object(
         self,
@@ -505,6 +515,7 @@ def render_snapshot(
     *,
     oracle: dict[str, OracleEntry] | None = None,
     max_card_refs: int = MAX_CARD_REFS,
+    record_char_anchors: bool = True,
     self_token_id: int | None = None,
     opp_token_id: int | None = None,
     mana_token_ids: Sequence[int] | None = None,
@@ -520,6 +531,7 @@ def render_snapshot(
     return SnapshotRenderer(
         oracle,
         max_card_refs=max_card_refs,
+        record_char_anchors=record_char_anchors,
         self_token_id=self_token_id,
         opp_token_id=opp_token_id,
         mana_token_ids=mana_token_ids,

@@ -25,6 +25,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import cast
 
+import numpy as np
 import torch
 from torch import Tensor
 from transformers import PreTrainedTokenizerFast
@@ -50,6 +51,36 @@ class TextEncodedExample:
     attention_mask: list[int]
     card_ref_positions: dict[int, int]
     card_ref_engine_ids: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TokenizationContext:
+    """Per-tokenizer lookup tables for the Python tokenization path."""
+
+    card_ref_id_to_k: dict[int, int]
+    card_ref_token_ids: np.ndarray
+    card_ref_ks: np.ndarray
+
+    @classmethod
+    def from_tokenizer(cls, tokenizer: PreTrainedTokenizerFast) -> TokenizationContext:
+        def _single_id(token: str) -> int:
+            tid = tokenizer.convert_tokens_to_ids(token)
+            if isinstance(tid, list):
+                raise TypeError(f"convert_tokens_to_ids({token!r}) returned a list")
+            return int(tid)
+
+        unk = tokenizer.unk_token_id
+        card_ref_id_to_k: dict[int, int] = {}
+        for k in range(MAX_CARD_REFS):
+            tid = _single_id(f"<card-ref:{k}>")
+            if tid != unk:
+                card_ref_id_to_k[tid] = k
+        items = sorted(card_ref_id_to_k.items())
+        return cls(
+            card_ref_id_to_k=card_ref_id_to_k,
+            card_ref_token_ids=np.asarray([tid for tid, _k in items], dtype=np.int64),
+            card_ref_ks=np.asarray([k for _tid, k in items], dtype=np.int64),
+        )
 
 
 @dataclass
@@ -323,50 +354,93 @@ def pack_batch(padded: TextEncodedBatch) -> PackedTextBatch:
 def tokenize_snapshot(
     rendered: RenderedSnapshot,
     tokenizer: PreTrainedTokenizerFast,
+    *,
+    context: TokenizationContext | None = None,
+    validate_card_refs: bool = False,
 ) -> TextEncodedExample:
     """Tokenize ``rendered.text`` and recover anchor token positions."""
 
     encoding = tokenizer(
         rendered.text,
         add_special_tokens=False,
-        return_attention_mask=True,
+        return_attention_mask=False,
     )
     token_ids: list[int] = list(encoding["input_ids"])
-    attention_mask: list[int] = list(encoding["attention_mask"])
+    ctx = context if context is not None else TokenizationContext.from_tokenizer(tokenizer)
+    return _example_from_token_ids(
+        rendered,
+        tokenizer,
+        token_ids,
+        ctx,
+        validate_card_refs=validate_card_refs,
+    )
 
-    def _single_id(token: str) -> int:
-        tid = tokenizer.convert_tokens_to_ids(token)
-        if isinstance(tid, list):
-            raise TypeError(f"convert_tokens_to_ids({token!r}) returned a list")
-        return int(tid)
 
-    card_ref_id_to_k: dict[int, int] = {}
-    unk = tokenizer.unk_token_id
-    for k in range(MAX_CARD_REFS):
-        tid = _single_id(f"<card-ref:{k}>")
-        if tid == unk:
-            continue
-        card_ref_id_to_k[tid] = k
+def tokenize_snapshots(
+    rendered: Sequence[RenderedSnapshot],
+    tokenizer: PreTrainedTokenizerFast,
+    *,
+    context: TokenizationContext | None = None,
+    validate_card_refs: bool = False,
+) -> list[TextEncodedExample]:
+    """Batch-tokenize rendered snapshots and recover card-ref positions."""
+
+    if not rendered:
+        return []
+    ctx = context if context is not None else TokenizationContext.from_tokenizer(tokenizer)
+    encoding = tokenizer(
+        [r.text for r in rendered],
+        add_special_tokens=False,
+        return_attention_mask=False,
+    )
+    rows = cast(list[list[int]], encoding["input_ids"])
+    return [
+        _example_from_token_ids(
+            row_rendered,
+            tokenizer,
+            list(token_ids),
+            ctx,
+            validate_card_refs=validate_card_refs,
+        )
+        for row_rendered, token_ids in zip(rendered, rows, strict=True)
+    ]
+
+
+def _example_from_token_ids(
+    rendered: RenderedSnapshot,
+    tokenizer: PreTrainedTokenizerFast,
+    token_ids: list[int],
+    context: TokenizationContext,
+    *,
+    validate_card_refs: bool,
+) -> TextEncodedExample:
+    attention_mask: list[int] = [1] * len(token_ids)
 
     card_ref_positions: dict[int, int] = {}
-    for pos, tid in enumerate(token_ids):
-        k = card_ref_id_to_k.get(tid)
-        if k is None:
-            continue
-        if k not in card_ref_positions:
-            card_ref_positions[k] = pos
+    if context.card_ref_token_ids.size > 0 and token_ids:
+        ids_np = np.asarray(token_ids, dtype=np.int64)
+        hit_pos, hit_ref = np.nonzero(ids_np[:, None] == context.card_ref_token_ids[None, :])
+        if hit_pos.size > 0:
+            first_pos = np.full((context.card_ref_token_ids.shape[0],), ids_np.shape[0])
+            np.minimum.at(first_pos, hit_ref, hit_pos)
+            present = first_pos < ids_np.shape[0]
+            card_ref_positions = {
+                int(k): int(pos)
+                for k, pos in zip(context.card_ref_ks[present], first_pos[present], strict=True)
+            }
 
-    for pos, tid in enumerate(token_ids):
-        token_str = tokenizer.convert_ids_to_tokens(int(tid))
-        if not isinstance(token_str, str):
-            continue
-        match = _CARD_REF_RE.match(token_str)
-        if match is None:
-            continue
-        k_parsed = int(match.group(1))
-        assert card_ref_id_to_k.get(int(tid)) == k_parsed, (
-            f"card-ref id mismatch at pos={pos}: id={tid} parsed={k_parsed}"
-        )
+    if validate_card_refs:
+        for pos, tid in enumerate(token_ids):
+            token_str = tokenizer.convert_ids_to_tokens(int(tid))
+            if not isinstance(token_str, str):
+                continue
+            match = _CARD_REF_RE.match(token_str)
+            if match is None:
+                continue
+            k_parsed = int(match.group(1))
+            assert context.card_ref_id_to_k.get(int(tid)) == k_parsed, (
+                f"card-ref id mismatch at pos={pos}: id={tid} parsed={k_parsed}"
+            )
 
     card_ref_engine_ids: dict[int, str] = {}
     for engine_id, k in rendered.card_refs.items():
@@ -417,17 +491,17 @@ def collate(
     n_anchors = [len(s.anchors) if s is not None else 0 for s in specs]
     max_n_anchors = max(n_anchors) if n_anchors else 0
 
-    token_ids = torch.full((batch_size, max_t), pad_id, dtype=torch.int64)
-    attention_mask = torch.zeros((batch_size, max_t), dtype=torch.int64)
-    card_ref_positions = torch.full((batch_size, MAX_CARD_REFS), -1, dtype=torch.int64)
+    token_ids_np = np.full((batch_size, max_t), int(pad_id), dtype=np.int64)
+    attention_mask_np = np.zeros((batch_size, max_t), dtype=np.int64)
+    card_ref_positions_np = np.full((batch_size, MAX_CARD_REFS), -1, dtype=np.int64)
 
     max_t_spec = max(spec_lens) if spec_lens else 0
-    spec_tokens = torch.zeros((batch_size, max_t_spec), dtype=torch.int32)
-    decision_type_t = torch.full((batch_size,), -1, dtype=torch.int32)
-    pointer_positions = torch.full((batch_size, max_n_anchors), -1, dtype=torch.int32)
-    pointer_kinds = torch.full((batch_size, max_n_anchors), -1, dtype=torch.int32)
-    pointer_subjects = torch.full((batch_size, max_n_anchors), -1, dtype=torch.int32)
-    pointer_handles = torch.full((batch_size, max_n_anchors), -1, dtype=torch.int32)
+    spec_tokens_np = np.zeros((batch_size, max_t_spec), dtype=np.int32)
+    decision_type_np = np.full((batch_size,), -1, dtype=np.int32)
+    pointer_positions_np = np.full((batch_size, max_n_anchors), -1, dtype=np.int32)
+    pointer_kinds_np = np.full((batch_size, max_n_anchors), -1, dtype=np.int32)
+    pointer_subjects_np = np.full((batch_size, max_n_anchors), -1, dtype=np.int32)
+    pointer_handles_np = np.full((batch_size, max_n_anchors), -1, dtype=np.int32)
 
     max_blockers = 0
     max_attackers = 0
@@ -441,57 +515,57 @@ def collate(
             max_blockers = rows
         if cols > max_attackers:
             max_attackers = cols
-    legal_edge_bitmap: Tensor | None = (
-        torch.zeros((batch_size, max_blockers, max_attackers), dtype=torch.bool)
-        if has_edges
-        else None
+    legal_edge_bitmap_np: np.ndarray | None = (
+        np.zeros((batch_size, max_blockers, max_attackers), dtype=np.bool_) if has_edges else None
     )
 
     for b, ex in enumerate(examples):
         t_state = state_lens[b]
         t_spec = spec_lens[b]
         t_total = t_state + t_spec
-        token_ids[b, :t_state] = torch.as_tensor(ex.token_ids, dtype=torch.int64)
-        attention_mask[b, :t_total] = 1
+        token_ids_np[b, :t_state] = ex.token_ids
+        attention_mask_np[b, :t_total] = 1
         spec = specs[b]
         if spec is not None and t_spec > 0:
-            spec_int32 = torch.as_tensor(spec.spec_tokens, dtype=torch.int32)
-            token_ids[b, t_state:t_total] = spec_int32.to(torch.int64)
-            spec_tokens[b, :t_spec] = spec_int32
+            spec_tokens_np[b, :t_spec] = spec.spec_tokens
+            token_ids_np[b, t_state:t_total] = spec.spec_tokens
 
         for k, pos in ex.card_ref_positions.items():
             if 0 <= k < MAX_CARD_REFS:
-                card_ref_positions[b, k] = int(pos)
+                card_ref_positions_np[b, k] = int(pos)
 
         if spec is None:
             continue
-        decision_type_t[b] = int(spec.decision_type)
+        decision_type_np[b] = int(spec.decision_type)
         for a_idx, anchor in enumerate(spec.anchors):
-            pointer_positions[b, a_idx] = int(anchor.token_position) + t_state
-            pointer_kinds[b, a_idx] = int(anchor.kind)
-            pointer_subjects[b, a_idx] = int(anchor.subject_index)
-            pointer_handles[b, a_idx] = int(anchor.handle)
-        if legal_edge_bitmap is not None and spec.legal_edge_bitmap is not None:
+            pointer_positions_np[b, a_idx] = int(anchor.token_position) + t_state
+            pointer_kinds_np[b, a_idx] = int(anchor.kind)
+            pointer_subjects_np[b, a_idx] = int(anchor.subject_index)
+            pointer_handles_np[b, a_idx] = int(anchor.handle)
+        if legal_edge_bitmap_np is not None and spec.legal_edge_bitmap is not None:
             rows, cols = spec.legal_edge_bitmap.shape
-            legal_edge_bitmap[b, :rows, :cols] = torch.from_numpy(spec.legal_edge_bitmap)
+            legal_edge_bitmap_np[b, :rows, :cols] = spec.legal_edge_bitmap
 
     seq_lens_t = torch.as_tensor(seq_lengths, dtype=torch.int64)
     spec_lens_t = torch.as_tensor(spec_lens, dtype=torch.int32)
+    legal_edge_bitmap = (
+        torch.from_numpy(legal_edge_bitmap_np) if legal_edge_bitmap_np is not None else None
+    )
 
     return TextEncodedBatch(
-        token_ids=token_ids,
-        attention_mask=attention_mask,
-        card_ref_positions=card_ref_positions,
+        token_ids=torch.from_numpy(token_ids_np),
+        attention_mask=torch.from_numpy(attention_mask_np),
+        card_ref_positions=torch.from_numpy(card_ref_positions_np),
         seq_lengths=seq_lens_t,
         total_tokens=sum(seq_lengths),
         seq_lengths_host=tuple(seq_lengths),
-        spec_tokens=spec_tokens,
+        spec_tokens=torch.from_numpy(spec_tokens_np),
         spec_lens=spec_lens_t,
-        decision_type=decision_type_t,
-        pointer_anchor_positions=pointer_positions,
-        pointer_anchor_kinds=pointer_kinds,
-        pointer_anchor_subjects=pointer_subjects,
-        pointer_anchor_handles=pointer_handles,
+        decision_type=torch.from_numpy(decision_type_np),
+        pointer_anchor_positions=torch.from_numpy(pointer_positions_np),
+        pointer_anchor_kinds=torch.from_numpy(pointer_kinds_np),
+        pointer_anchor_subjects=torch.from_numpy(pointer_subjects_np),
+        pointer_anchor_handles=torch.from_numpy(pointer_handles_np),
         legal_edge_bitmap=legal_edge_bitmap,
     )
 
@@ -504,7 +578,9 @@ __all__ = [
     "TextEncodedExample",
     "TextEncodedBatch",
     "PackedTextBatch",
+    "TokenizationContext",
     "tokenize_snapshot",
+    "tokenize_snapshots",
     "collate",
     "pack_batch",
     "packed_sequence_layout",

@@ -53,7 +53,7 @@ from magic_ai.text_encoder.forge_target_encoding import (
 from magic_ai.text_encoder.forge_target_encoding import (
     translate as translate_observed_to_target,
 )
-from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE, batch_next_mask
+from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE, batch_next_mask_torch
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy
 from magic_ai.text_encoder.render import OracleEntry, RenderError, render_snapshot
 from magic_ai.text_encoder.render_spec import DecisionSpecRenderer
@@ -868,76 +868,111 @@ class ForgeChoiceDataset:
         )
 
         batch_size = len(prepared)
-        L = max(len(p.target.output_token_ids) for p in prepared)
+        target_lens = torch.as_tensor(
+            [len(p.target.output_token_ids) for p in prepared], dtype=torch.long
+        )
+        L = int(target_lens.max().item())
         T_enc = int(encoded.token_ids.shape[1])
 
-        out_tokens = torch.zeros((batch_size, L), dtype=torch.long)
-        # Sentinel -1 for unfilled pointer targets: CE/gather will fail loud
-        # if pad_mask has a hole that lets a padded slot reach the loss.
-        out_pointer_pos = torch.full((batch_size, L), -1, dtype=torch.long)
-        out_is_pointer = torch.zeros((batch_size, L), dtype=torch.bool)
-        out_pad_mask = torch.zeros((batch_size, L), dtype=torch.bool)
-        decision_type_per_row = torch.empty((batch_size,), dtype=torch.long)
-        values = torch.empty((batch_size,), dtype=torch.float32)
-
-        vocab_mask = torch.zeros((batch_size, L, GRAMMAR_VOCAB_SIZE), dtype=torch.bool)
-        pointer_mask = torch.zeros((batch_size, L, T_enc), dtype=torch.bool)
-
-        for b, item in enumerate(prepared):
-            decision_type_per_row[b] = int(item.target.decision_type)
-            values[b] = float(item.value_target)
-            tokens = item.target.output_token_ids
-            subjects = item.target.output_pointer_subjects
-            is_ptrs = item.target.output_is_pointer
-            n = len(tokens)
-            out_pad_mask[b, :n] = True
-            for i, (tok, subj, is_ptr) in enumerate(zip(tokens, subjects, is_ptrs, strict=True)):
-                out_tokens[b, i] = int(tok)
-                out_is_pointer[b, i] = bool(is_ptr)
-                if is_ptr:
-                    kind = _expected_pointer_kind(item.spec, item.target, i)
-                    positions = item.anchor_pos_by_kind.get(int(kind), [])
-                    if 0 <= subj < len(positions) and positions[subj] >= 0:
-                        out_pointer_pos[b, i] = positions[subj]
-                    else:
-                        out_pad_mask[b, i] = False
-
-        prefix_tokens_np = np.zeros((batch_size, L), dtype=np.int64)
-        prefix_subjects_np = np.full((batch_size, L), -1, dtype=np.int64)
-        prefix_lens_np = np.zeros((batch_size,), dtype=np.int64)
-        for b, item in enumerate(prepared):
-            for i, (tok, subj) in enumerate(
-                zip(item.target.output_token_ids, item.target.output_pointer_subjects, strict=True)
-            ):
-                prefix_tokens_np[b, i] = int(tok)
-                prefix_subjects_np[b, i] = int(subj)
-
-        specs = [p.spec for p in prepared]
-        per_row_max_prefix = np.array(
-            [max(0, len(p.target.output_token_ids) - 1) for p in prepared], dtype=np.int64
+        out_tokens = torch.nn.utils.rnn.pad_sequence(
+            [torch.as_tensor(p.target.output_token_ids, dtype=torch.long) for p in prepared],
+            batch_first=True,
+            padding_value=0,
         )
-        for step in range(L):
-            safe_prefix_lens = np.minimum(prefix_lens_np, per_row_max_prefix)
-            v_mask, _ptr_mask_subj = batch_next_mask(
-                specs,
-                prefix_tokens_np,
-                prefix_subjects_np,
-                safe_prefix_lens,
+        output_pointer_subjects = torch.nn.utils.rnn.pad_sequence(
+            [torch.as_tensor(p.target.output_pointer_subjects, dtype=torch.long) for p in prepared],
+            batch_first=True,
+            padding_value=-1,
+        )
+        out_is_pointer = torch.nn.utils.rnn.pad_sequence(
+            [torch.as_tensor(p.target.output_is_pointer, dtype=torch.bool) for p in prepared],
+            batch_first=True,
+            padding_value=False,
+        )
+        decision_type_per_row = torch.as_tensor(
+            [int(p.target.decision_type) for p in prepared], dtype=torch.long
+        )
+        values = torch.as_tensor([float(p.value_target) for p in prepared], dtype=torch.float32)
+
+        steps = torch.arange(L, dtype=torch.long)
+        out_pad_mask = steps.unsqueeze(0) < target_lens.unsqueeze(1)
+
+        anchor_positions = encoded.pointer_anchor_positions.to(torch.long)
+        anchor_kinds = encoded.pointer_anchor_kinds.to(torch.long)
+        anchor_subjects = encoded.pointer_anchor_subjects.to(torch.long)
+        expected_kinds = _expected_pointer_kind_matrix(decision_type_per_row, L)
+        valid_anchor_match = (
+            out_is_pointer.unsqueeze(2)
+            & (anchor_positions[:, None, :] >= 0)
+            & (anchor_positions[:, None, :] < T_enc)
+            & (anchor_kinds[:, None, :] == expected_kinds[:, :, None])
+            & (anchor_subjects[:, None, :] == output_pointer_subjects[:, :, None])
+        )
+        candidate_pointer_pos = torch.where(
+            valid_anchor_match,
+            anchor_positions[:, None, :],
+            torch.full_like(anchor_positions[:, None, :], T_enc),
+        )
+        min_pointer_pos = candidate_pointer_pos.min(dim=2).values
+        has_pointer_target = min_pointer_pos < T_enc
+        out_pointer_pos = torch.where(
+            out_is_pointer & has_pointer_target,
+            min_pointer_pos,
+            torch.full_like(min_pointer_pos, -1),
+        )
+        out_pad_mask = out_pad_mask & (~out_is_pointer | has_pointer_target)
+
+        anchor_counts = _anchor_counts_from_encoded(encoded.pointer_anchor_kinds)
+        max_values = torch.as_tensor([int(p.spec.max_value) for p in prepared], dtype=torch.long)
+        per_row_max_prefix = (target_lens - 1).clamp_min(0)
+        prefix_lens = torch.minimum(steps[:, None], per_row_max_prefix[None, :])
+        flat_prefix_tokens = out_tokens.unsqueeze(0).expand(L, -1, -1).reshape(L * batch_size, L)
+        flat_prefix_subjects = (
+            output_pointer_subjects.unsqueeze(0).expand(L, -1, -1).reshape(L * batch_size, L)
+        )
+        flat_prefix_lens = prefix_lens.reshape(L * batch_size)
+        flat_decision_type = decision_type_per_row.unsqueeze(0).expand(L, -1).reshape(-1)
+        flat_anchor_counts = (
+            anchor_counts.unsqueeze(0).expand(L, -1, -1).reshape(L * batch_size, -1)
+        )
+        flat_max_values = max_values.unsqueeze(0).expand(L, -1).reshape(-1)
+        flat_legal_edges = (
+            None
+            if encoded.legal_edge_bitmap is None
+            else encoded.legal_edge_bitmap.unsqueeze(0)
+            .expand(L, -1, -1, -1)
+            .reshape(L * batch_size, *encoded.legal_edge_bitmap.shape[1:])
+        )
+        flat_vocab_mask, flat_pointer_subject_mask = batch_next_mask_torch(
+            flat_decision_type,
+            flat_anchor_counts,
+            flat_max_values,
+            flat_legal_edges,
+            flat_prefix_tokens,
+            flat_prefix_subjects,
+            flat_prefix_lens,
+        )
+        vocab_mask = flat_vocab_mask.view(L, batch_size, GRAMMAR_VOCAB_SIZE).permute(1, 0, 2)
+        pointer_subject_mask = flat_pointer_subject_mask.view(L, batch_size, -1).permute(1, 0, 2)
+        pointer_mask = torch.zeros((batch_size, L, T_enc), dtype=torch.bool)
+        if pointer_subject_mask.shape[2] > 0:
+            safe_subjects = anchor_subjects.clamp(0, pointer_subject_mask.shape[2] - 1)
+            subject_allowed = pointer_subject_mask.gather(
+                2, safe_subjects[:, None, :].expand(-1, L, -1)
             )
-            vocab_mask[:, step, :] = torch.from_numpy(v_mask)
-            for b, item in enumerate(prepared):
-                if step >= len(item.target.output_token_ids):
-                    continue
-                if not item.target.output_is_pointer[step]:
-                    continue
-                kind = _expected_pointer_kind(item.spec, item.target, step)
-                positions = item.anchor_pos_by_kind.get(int(kind), [])
-                for pos in positions:
-                    if 0 <= pos < T_enc:
-                        pointer_mask[b, step, pos] = True
-            for b, item in enumerate(prepared):
-                if step < len(item.target.output_token_ids):
-                    prefix_lens_np[b] = step + 1
+            valid_pointer_anchor = (
+                (anchor_positions[:, None, :] >= 0)
+                & (anchor_positions[:, None, :] < T_enc)
+                & (anchor_kinds[:, None, :] == expected_kinds[:, :, None])
+                & subject_allowed
+            )
+            valid_rows, valid_steps, valid_anchor_cols = valid_pointer_anchor.nonzero(as_tuple=True)
+            if int(valid_rows.numel()) > 0:
+                pointer_mask[
+                    valid_rows,
+                    valid_steps,
+                    anchor_positions[valid_rows, valid_anchor_cols],
+                ] = True
 
         if (
             self.cfg.max_tokens is not None
@@ -1103,23 +1138,47 @@ class ForgeChoiceDataset:
         )
 
 
-def _expected_pointer_kind(
-    spec: DecisionSpec, target: DecoderTarget, step_index: int
-) -> AnchorKind:
-    """Anchor kind expected at ``target.output[step_index]`` (a pointer step)."""
+def _anchor_counts_from_encoded(pointer_anchor_kinds: Tensor) -> Tensor:
+    valid = pointer_anchor_kinds >= 0
+    safe_kinds = pointer_anchor_kinds.clamp(min=0).to(torch.long)
+    counts = torch.zeros(
+        (int(pointer_anchor_kinds.shape[0]), len(AnchorKind)),
+        dtype=torch.long,
+        device=pointer_anchor_kinds.device,
+    )
+    return counts.scatter_add(1, safe_kinds, valid.to(torch.long))
 
-    dt = DecisionType(target.decision_type)
-    if dt is DecisionType.PRIORITY:
-        return AnchorKind.LEGAL_ACTION
-    if dt is DecisionType.CHOOSE_TARGETS:
-        return AnchorKind.LEGAL_TARGET
-    if dt is DecisionType.DECLARE_ATTACKERS:
-        body_off = step_index - 1
-        return AnchorKind.LEGAL_ATTACKER if body_off % 4 == 1 else AnchorKind.DEFENDER
-    if dt is DecisionType.DECLARE_BLOCKERS:
-        body_off = step_index - 1
-        return AnchorKind.LEGAL_BLOCKER if body_off % 4 == 1 else AnchorKind.LEGAL_ATTACKER
-    raise ValueError(f"decision type {dt} has no pointer steps")
+
+def _expected_pointer_kind_matrix(decision_type: Tensor, max_len: int) -> Tensor:
+    steps = torch.arange(max_len, dtype=torch.long, device=decision_type.device)
+    body_off = steps - 1
+    out = torch.full(
+        (int(decision_type.shape[0]), max_len),
+        -1,
+        dtype=torch.long,
+        device=decision_type.device,
+    )
+    out[decision_type == int(DecisionType.PRIORITY), :] = int(AnchorKind.LEGAL_ACTION)
+    out[decision_type == int(DecisionType.CHOOSE_TARGETS), :] = int(AnchorKind.LEGAL_TARGET)
+
+    attackers = decision_type == int(DecisionType.DECLARE_ATTACKERS)
+    if bool(attackers.any()):
+        attacker_kind = torch.where(
+            body_off % 4 == 1,
+            int(AnchorKind.LEGAL_ATTACKER),
+            int(AnchorKind.DEFENDER),
+        )
+        out[attackers] = attacker_kind
+
+    blockers = decision_type == int(DecisionType.DECLARE_BLOCKERS)
+    if bool(blockers.any()):
+        blocker_kind = torch.where(
+            body_off % 4 == 1,
+            int(AnchorKind.LEGAL_BLOCKER),
+            int(AnchorKind.LEGAL_ATTACKER),
+        )
+        out[blockers] = blocker_kind
+    return out
 
 
 def _index_text_encoded_batch(
@@ -1234,6 +1293,8 @@ class ForgePolicyValueTrainer:
                 h_in=h_in,
                 c_in=c_in,
             )
+            h_out = h_out.to(dtype=h.dtype)
+            c_out = c_out.to(dtype=c.dtype)
             h = h.index_copy(1, active_games, h_out)
             c = c.index_copy(1, active_games, c_out)
 
@@ -1247,22 +1308,32 @@ class ForgePolicyValueTrainer:
             enc_width = int(encoded_hidden.shape[1])
             encoded_loss = encoded_hidden.index_select(0, loss_active_pos)
             attn_loss = attn_mask.index_select(0, loss_active_pos)
-            target_tokens = batch.decoder.output_token_ids.index_select(0, loss_cells).to(device)
+            target_tokens = batch.decoder.output_token_ids.index_select(0, loss_cells).to(
+                device, non_blocking=True
+            )
             vocab_logits, pointer_logits = text_policy.grammar_decoder.forward_teacher_forced(
                 target_tokens,
                 encoded_loss,
                 attn_loss,
             )
-            out_pad_mask = batch.decoder.output_pad_mask.index_select(0, loss_cells).to(device)
+            out_pad_mask = batch.decoder.output_pad_mask.index_select(0, loss_cells).to(
+                device, non_blocking=True
+            )
             step_count = out_pad_mask.sum().to(dtype=torch.float32)
             policy_l = decoder_cross_entropy_loss(
                 vocab_logits,
                 pointer_logits,
                 target_tokens,
-                batch.decoder.output_pointer_pos.index_select(0, loss_cells).to(device),
-                batch.decoder.output_is_pointer.index_select(0, loss_cells).to(device),
-                batch.decoder.vocab_mask.index_select(0, loss_cells).to(device),
-                batch.decoder.pointer_mask.index_select(0, loss_cells)[:, :, :enc_width].to(device),
+                batch.decoder.output_pointer_pos.index_select(0, loss_cells).to(
+                    device, non_blocking=True
+                ),
+                batch.decoder.output_is_pointer.index_select(0, loss_cells).to(
+                    device, non_blocking=True
+                ),
+                batch.decoder.vocab_mask.index_select(0, loss_cells).to(device, non_blocking=True),
+                batch.decoder.pointer_mask.index_select(0, loss_cells)[:, :, :enc_width].to(
+                    device, non_blocking=True
+                ),
                 out_pad_mask,
             )
             policy_loss_sum = policy_loss_sum + policy_l.float() * step_count
@@ -1270,7 +1341,9 @@ class ForgePolicyValueTrainer:
 
             state_vec_loss = encoded_snaps.state_vector.index_select(0, loss_active_pos)
             values = text_policy.run_heads(encoded_snaps, state_vec=state_vec_loss)
-            targets = batch.decoder.value_targets.index_select(0, loss_cells).to(device)
+            targets = batch.decoder.value_targets.index_select(0, loss_cells).to(
+                device, non_blocking=True
+            )
             value_loss_sum = value_loss_sum + (values.float() - targets.float()).pow(2).sum()
             value_count = value_count + float(targets.numel())
             value_predictions.append(values)
@@ -1621,30 +1694,33 @@ class ForgePolicyValueTrainer:
 
 def _encoded_to_device(batch: TextEncodedBatch, device: torch.device) -> TextEncodedBatch:
     return TextEncodedBatch(
-        token_ids=batch.token_ids.to(device),
-        attention_mask=batch.attention_mask.to(device),
-        card_ref_positions=batch.card_ref_positions.to(device),
-        seq_lengths=batch.seq_lengths.to(device),
+        token_ids=batch.token_ids.to(device, non_blocking=True),
+        attention_mask=batch.attention_mask.to(device, non_blocking=True),
+        card_ref_positions=batch.card_ref_positions.to(device, non_blocking=True),
+        seq_lengths=batch.seq_lengths.to(device, non_blocking=True),
         total_tokens=batch.total_tokens,
         seq_lengths_host=batch.seq_lengths_host,
-        spec_tokens=batch.spec_tokens.to(device),
-        spec_lens=batch.spec_lens.to(device),
-        decision_type=batch.decision_type.to(device),
-        pointer_anchor_positions=batch.pointer_anchor_positions.to(device),
-        pointer_anchor_kinds=batch.pointer_anchor_kinds.to(device),
-        pointer_anchor_subjects=batch.pointer_anchor_subjects.to(device),
-        pointer_anchor_handles=batch.pointer_anchor_handles.to(device),
+        spec_tokens=batch.spec_tokens.to(device, non_blocking=True),
+        spec_lens=batch.spec_lens.to(device, non_blocking=True),
+        decision_type=batch.decision_type.to(device, non_blocking=True),
+        pointer_anchor_positions=batch.pointer_anchor_positions.to(device, non_blocking=True),
+        pointer_anchor_kinds=batch.pointer_anchor_kinds.to(device, non_blocking=True),
+        pointer_anchor_subjects=batch.pointer_anchor_subjects.to(device, non_blocking=True),
+        pointer_anchor_handles=batch.pointer_anchor_handles.to(device, non_blocking=True),
         legal_edge_bitmap=(
-            batch.legal_edge_bitmap.to(device) if batch.legal_edge_bitmap is not None else None
+            batch.legal_edge_bitmap.to(device, non_blocking=True)
+            if batch.legal_edge_bitmap is not None
+            else None
         ),
     )
 
 
 def _truncate_encoded_batch(batch: TextEncodedBatch, *, max_tokens: int) -> TextEncodedBatch:
     seq_lengths = batch.seq_lengths.clamp(max=max_tokens)
-    attention_mask = batch.attention_mask[:, :max_tokens].clone()
-    for row, seq_len in enumerate(seq_lengths.tolist()):
-        attention_mask[row, int(seq_len) :] = 0
+    positions = torch.arange(max_tokens, device=batch.attention_mask.device)
+    attention_mask = (positions.unsqueeze(0) < seq_lengths.unsqueeze(1)).to(
+        dtype=batch.attention_mask.dtype
+    )
     card_ref_positions = batch.card_ref_positions.clone()
     card_ref_positions[card_ref_positions >= max_tokens] = -1
     return TextEncodedBatch(
@@ -1668,14 +1744,14 @@ def _truncate_encoded_batch(batch: TextEncodedBatch, *, max_tokens: int) -> Text
 def _batch_to_device(batch: ForgeDecoderBatch, device: torch.device) -> ForgeDecoderBatch:
     return ForgeDecoderBatch(
         encoded=_encoded_to_device(batch.encoded, device),
-        output_token_ids=batch.output_token_ids.to(device),
-        output_pointer_pos=batch.output_pointer_pos.to(device),
-        output_is_pointer=batch.output_is_pointer.to(device),
-        output_pad_mask=batch.output_pad_mask.to(device),
-        vocab_mask=batch.vocab_mask.to(device),
-        pointer_mask=batch.pointer_mask.to(device),
-        decision_type_per_row=batch.decision_type_per_row.to(device),
-        value_targets=batch.value_targets.to(device),
+        output_token_ids=batch.output_token_ids.to(device, non_blocking=True),
+        output_pointer_pos=batch.output_pointer_pos.to(device, non_blocking=True),
+        output_is_pointer=batch.output_is_pointer.to(device, non_blocking=True),
+        output_pad_mask=batch.output_pad_mask.to(device, non_blocking=True),
+        vocab_mask=batch.vocab_mask.to(device, non_blocking=True),
+        pointer_mask=batch.pointer_mask.to(device, non_blocking=True),
+        decision_type_per_row=batch.decision_type_per_row.to(device, non_blocking=True),
+        value_targets=batch.value_targets.to(device, non_blocking=True),
     )
 
 
@@ -1684,19 +1760,25 @@ def _sequenced_batch_to_device(
 ) -> ForgeSequencedBatch:
     return ForgeSequencedBatch(
         decoder=_batch_to_device(batch.decoder, device),
-        cell_game_idx=batch.cell_game_idx.to(device),
-        cell_pos_idx=batch.cell_pos_idx.to(device),
-        loss_mask=batch.loss_mask.to(device),
-        game_lengths=batch.game_lengths.to(device),
+        cell_game_idx=batch.cell_game_idx.to(device, non_blocking=True),
+        cell_pos_idx=batch.cell_pos_idx.to(device, non_blocking=True),
+        loss_mask=batch.loss_mask.to(device, non_blocking=True),
+        game_lengths=batch.game_lengths.to(device, non_blocking=True),
         n_games=batch.n_games,
         l_max=batch.l_max,
-        cell_indices_by_timestep=tuple(x.to(device) for x in batch.cell_indices_by_timestep),
-        cell_indices_by_timestep_host=batch.cell_indices_by_timestep_host,
-        game_indices_by_timestep=tuple(x.to(device) for x in batch.game_indices_by_timestep),
-        loss_cell_indices_by_timestep=tuple(
-            x.to(device) for x in batch.loss_cell_indices_by_timestep
+        cell_indices_by_timestep=tuple(
+            x.to(device, non_blocking=True) for x in batch.cell_indices_by_timestep
         ),
-        loss_active_pos_by_timestep=tuple(x.to(device) for x in batch.loss_active_pos_by_timestep),
+        cell_indices_by_timestep_host=batch.cell_indices_by_timestep_host,
+        game_indices_by_timestep=tuple(
+            x.to(device, non_blocking=True) for x in batch.game_indices_by_timestep
+        ),
+        loss_cell_indices_by_timestep=tuple(
+            x.to(device, non_blocking=True) for x in batch.loss_cell_indices_by_timestep
+        ),
+        loss_active_pos_by_timestep=tuple(
+            x.to(device, non_blocking=True) for x in batch.loss_active_pos_by_timestep
+        ),
     )
 
 
