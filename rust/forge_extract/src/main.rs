@@ -1638,11 +1638,13 @@ fn card_handle(
 }
 
 fn priority_label(desc: &str, event_type: &str) -> Option<Value> {
-    let lower = desc.to_ascii_lowercase();
-    if event_type == "STACK_PUSH" && (lower.contains(" cast ") || lower.contains(" activated ")) {
+    if event_type == "STACK_PUSH"
+        && (contains_ascii_case_insensitive(desc, " cast ")
+            || contains_ascii_case_insensitive(desc, " activated "))
+    {
         return Some(json!({"raw": desc, "event_type": event_type}));
     }
-    if lower.contains(" played ") {
+    if contains_ascii_case_insensitive(desc, " played ") {
         return Some(json!({"raw": desc, "event_type": event_type}));
     }
     if let Some(cap) = STACK_PUSH_NAME_RE.captures(desc) {
@@ -1710,8 +1712,22 @@ fn has_policy_relevant_non_pass_action(snapshot: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if haystack.contains(needle) {
+        return true;
+    }
+    let needle = needle.as_bytes();
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
 fn choose_label(desc: &str) -> Option<Value> {
-    if !desc.to_ascii_lowercase().contains("choose") {
+    if !contains_ascii_case_insensitive(desc, "choose") {
         return None;
     }
     let actor = PLAYER_PREFIX_RE
@@ -1725,7 +1741,7 @@ fn may_label(rows: &[&Row], idx: usize) -> Option<Value> {
     let row = rows[idx];
     let desc = row.description();
     let row_type = row.row_type();
-    if row_type != "STACK_RESOLVE" || !desc.to_ascii_lowercase().contains("you may") {
+    if row_type != "STACK_RESOLVE" || !contains_ascii_case_insensitive(desc, "you may") {
         return None;
     }
     let actor = PLAYER_PREFIX_RE
@@ -2141,7 +2157,7 @@ fn extract_candidates(rows: &[Row], enabled: &[String], trajectory: bool) -> Vec
             }
         }
 
-        if want_choose && row_type == "LOG" && desc.to_ascii_lowercase().contains("choose") {
+        if want_choose && row_type == "LOG" && contains_ascii_case_insensitive(desc, "choose") {
             if let Some(label) = choose_label(desc) {
                 let actor_name = label
                     .get("actor_name")
