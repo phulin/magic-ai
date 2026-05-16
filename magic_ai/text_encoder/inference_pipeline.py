@@ -7,15 +7,14 @@ policy as a per-call argument so the pipeline plays nicely with the
 inference server's policy-version manager (the live policy reference
 swaps under the server's feet on policy updates).
 
-Phase C adds optional shape bucketing + per-bucket ``torch.compile``
-with ``mode="reduce-overhead"``. When enabled, the pipeline:
+Phase C adds optional shape bucketing. When enabled, the pipeline:
 
 * Selects the smallest bucket ``(rows, tokens)`` that fits the merged
   batch.
 * Pads the host packed batch up to bucket shape with dummy rows holding
   PAD tokens. The dummy rows' encoder outputs are discarded.
-* Runs the compiled encoder forward — same shape every call, so
-  inductor's reduce-overhead path captures CUDA Graphs.
+* Runs the encoder on the padded shape, which bounds allocator churn and
+  downstream decoder shapes.
 
 The decoder autoregressive loop and value head stay eager: their Python
 control flow is hard to fold into a single graph. Phase F handles
@@ -40,8 +39,8 @@ from magic_ai.text_encoder.decoder_batch import (
     native_decoder_batch_from_sample,
 )
 from magic_ai.text_encoder.decoder_inference import (
+    _decoder_step_body,
     _decoder_step_body_multi_batch,
-    _decoder_step_body_single_batch,
     decoder_sample,
 )
 from magic_ai.text_encoder.policy import EncodedSnapshots
@@ -324,46 +323,15 @@ class TextInferencePipeline:
         self._deterministic = bool(deterministic)
         self._bucketed = bool(bucketed)
         self._buckets = tuple(sorted(buckets, key=lambda rt: (rt[0], rt[1])))
-        self._compiled_encoders: dict[tuple[int, int], Callable[..., Any]] = {}
         # Phase F: lazily compile decoder_sample with dynamic=True. Per-bucket
         # decoder bucketing would also need a fixed S_max (scatter_padded output)
         # — deferred. dynamic=True doesn't get CUDA Graphs but inductor can
         # still fuse the per-step ops, cutting per-iteration launches.
         self._compile_decoder = bool(compile_decoder)
         self._compiled_decoder_steps: tuple[Callable[..., Any], Callable[..., Any]] | None = None
-        # Track whether we've printed the timing line for each (bucket /
-        # decoder) compile so we don't keep printing on steady-state calls.
-        self._encoder_first_call_done: set[tuple[int, int]] = set()
+        # Track whether we've printed the timing line for decoder compile so
+        # we don't keep printing on steady-state calls.
         self._decoder_first_call_done: bool = False
-
-    # --- Bucketed encoder forward -------------------------------------
-
-    def _compiled_encoder_for_bucket(
-        self, recurrent_policy: Any, bucket: tuple[int, int]
-    ) -> Callable[..., Any]:
-        existing = self._compiled_encoders.get(bucket)
-        if existing is not None:
-            return existing
-        # mode="default" — inductor fusion without CUDA-Graph capture +
-        # autotuning. "reduce-overhead" gives the launch-overhead win but
-        # costs ~minutes per bucket of compile time; default mode finishes
-        # in seconds and is the right tradeoff while we iterate. Flip back
-        # to "reduce-overhead" once buckets + cache are stable.
-        #
-        # Note: torch.compile itself just wraps the fn; the actual compile
-        # work fires on the first call with new shapes. Time at call site
-        # instead — see ``_bucketed_encoder_forward``.
-        compiled = cast(
-            Callable[..., Any],
-            torch.compile(
-                recurrent_policy._encode_with_history_inference_impl,
-                mode="default",
-                dynamic=False,
-                fullgraph=False,
-            ),
-        )
-        self._compiled_encoders[bucket] = compiled
-        return compiled
 
     @staticmethod
     def _timed_first_call(label: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -421,19 +389,13 @@ class TextInferencePipeline:
         h_padded[:, :real_rows].copy_(h_in.to(device))
         c_padded[:, :real_rows].copy_(c_in.to(device))
 
-        first_call = bucket not in self._encoder_first_call_done
-        compiled = self._compiled_encoder_for_bucket(recurrent_policy, bucket)
-        if first_call:
-            encoded_padded, h_out_padded, c_out_padded = self._timed_first_call(
-                f"bucket encoder {bucket}",
-                compiled,
+        encoded_padded, h_out_padded, c_out_padded = (
+            recurrent_policy._encode_with_history_inference_impl(
                 padded_device,
                 h_padded,
                 c_padded,
             )
-            self._encoder_first_call_done.add(bucket)
-        else:
-            encoded_padded, h_out_padded, c_out_padded = compiled(padded_device, h_padded, c_padded)
+        )
 
         encoded, h_out, c_out = _slice_encoded_to_live(
             encoded_padded,
@@ -516,7 +478,6 @@ class TextInferencePipeline:
             import torch.fx.experimental._config as _fx_cfg  # noqa: PLC0415
 
             cast(Any, _fx_cfg).use_duck_shape = False
-            compiled_single_step = torch.compile(_decoder_step_body_single_batch, dynamic=True)
             compiled_multi_step = torch.compile(_decoder_step_body_multi_batch, dynamic=True)
 
             def _patched_step_callable(text_policy: Any) -> Callable[..., Any]:
@@ -525,18 +486,15 @@ class TextInferencePipeline:
                     raise RuntimeError("text_policy.grammar_decoder must be configured")
 
                 def step(state: Any, *args: Any, **kwargs: Any) -> Any:
-                    compiled_step = (
-                        compiled_single_step
-                        if int(state.step.shape[0]) == 1
-                        else compiled_multi_step
-                    )
-                    return compiled_step(gd, state, *args, **kwargs)
+                    if int(state.step.shape[0]) == 1:
+                        return _decoder_step_body(gd, state, *args, **kwargs)
+                    return compiled_multi_step(gd, state, *args, **kwargs)
 
                 return step
 
             cast(Any, _decoder_inference_mod)._decoder_step_callable = _patched_step_callable
             # Sentinel so we don't reinstall on every call.
-            self._compiled_decoder_steps = (compiled_single_step, compiled_multi_step)
+            self._compiled_decoder_steps = (_decoder_step_body, compiled_multi_step)
         decoder_fn: Callable[..., Any] = decoder_sample
         # Always hand the decoder a fixed-shape bitmap so the compiled
         # decoder_sample doesn't recompile on size-0 vs size-N or

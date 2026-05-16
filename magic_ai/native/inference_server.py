@@ -893,7 +893,11 @@ class TextInferenceServer:
         self._pipeline = TextInferencePipeline(
             deterministic=self._deterministic,
             bucketed=bucketed_inference and self._device.type == "cuda",
-            compile_decoder=bucketed_inference and self._device.type == "cuda",
+            # Decoder-step compile is fragile inside the threaded inference
+            # server on current PyTorch: tail batches can hit "FX tracing a
+            # dynamo-optimized function" failures. Keep server inference eager;
+            # --torch-compile still applies to replay/update training paths.
+            compile_decoder=False,
         )
         self._arena = _HostPackedArena(use_pinned=self._device.type == "cuda")
         self._timing = timing_stats
