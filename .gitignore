@@ -15,6 +15,7 @@ wheels/
 /decks/
 /checkpoints/
 /wandb/
+/logs/
 /.cache/
 /rust/**/target/
 tea_debug.log
