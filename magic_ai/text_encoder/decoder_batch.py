@@ -43,19 +43,25 @@ class DecoderSampleOutput:
 class DecoderReplayScores:
     """Result of teacher-forced replay scoring for the grammar decoder.
 
-    The raw ``vocab_logits`` / ``pointer_logits`` and the masked
-    ``vocab_log_softmax`` / ``pointer_log_softmax`` tensors are exposed so
-    R-NaD's per-choice NeuRD update can build flat (group, choice) tensors
-    against them; PPO discards them and only reads ``per_row_*``.
+    Vocab logits stay dense (``V`` is small in the grammar decoder); the
+    pointer head emits per-legal-cell logits via the packed-cell layout
+    (see :class:`magic_ai.text_encoder.replay_buffer.DecoderCells`). R-NaD's
+    per-choice NeuRD update gathers the vocab side at `(b, t, c)` and reads
+    the pointer side straight from the per-legal tensors. PPO discards both
+    and only reads ``per_row_*``.
     """
 
     per_row_log_pi: Tensor  # [B] sum of per-step log p of stored target
     per_row_entropy: Tensor  # [B] sum of per-step entropy of the stored decision
     per_step_log_pi: Tensor  # [B, L] per-step log p (zeroed at pad positions)
     vocab_logits: Tensor  # [B, L, V_vocab] raw decoder vocab logits
-    pointer_logits: Tensor  # [B, L, T_enc] raw decoder pointer logits
     vocab_log_softmax: Tensor  # [B, L, V_vocab] log-softmax under vocab_mask
-    pointer_log_softmax: Tensor  # [B, L, T_enc] log-softmax under pointer_mask
+    # Per-legal-cell pointer head outputs. ``p_legal_*`` shape matches
+    # ``DecoderCells.p_legal_choice`` (one entry per legal pointer
+    # position across all active pointer cells). Avoids the dense
+    # ``[B, L, T_enc]`` pointer-logits materialization.
+    p_legal_logits: Tensor  # [N_p_legal] raw decoder pointer logits per cell-choice
+    p_legal_log_softmax: Tensor  # [N_p_legal] segment log-softmax over each cell's legal entries
 
 
 @dataclass(frozen=True)

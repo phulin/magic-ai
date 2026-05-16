@@ -254,49 +254,102 @@ def decoder_score_replay(
     encoded: Tensor,
     encoder_attention_mask: Tensor,
     target_tokens: Tensor,
-    target_pointer_pos: Tensor,
-    is_pointer_step: Tensor,
     pad_mask: Tensor,
     vocab_mask: Tensor,
-    pointer_mask: Tensor,
+    cells: Any,
 ) -> DecoderReplayScores:
     """Teacher-forced log-prob of stored decoder targets, per row.
 
     Mirrors :func:`policy_value_pretrain.decoder_cross_entropy_loss` but
     returns per-row log-π and per-row entropy instead of a scalar loss, so
     PPO / R-NaD can plug in importance ratios and entropy bonuses.
+
+    Vocab side: dense ``[B, L, V]`` (``V`` is small for the grammar
+    decoder, so the dense head is the right shape). Pointer side: the
+    decoder pointer head runs per-legal-cell via
+    :meth:`GrammarDecoder.forward_teacher_forced_with_cells`, avoiding
+    the dense ``[B, L, T_enc]`` materialization. Per-step pointer log-π
+    and entropy come from a segment softmax over each pointer cell's
+    legal entries.
     """
 
     grammar_decoder = text_policy.grammar_decoder
     if grammar_decoder is None:
         raise RuntimeError("text_policy.grammar_decoder must be configured")
-    vocab_logits, pointer_logits = grammar_decoder.forward_teacher_forced(
-        target_tokens.to(dtype=torch.long), encoded, encoder_attention_mask
+    p_cell_b = cells.p_cell_b.to(dtype=torch.long)
+    p_cell_t = cells.p_cell_t.to(dtype=torch.long)
+    p_legal_cell_id = cells.p_legal_cell_id.to(dtype=torch.long)
+    p_legal_choice = cells.p_legal_choice.to(dtype=torch.long)
+    vocab_logits, p_legal_logits = grammar_decoder.forward_teacher_forced_with_cells(
+        target_tokens.to(dtype=torch.long),
+        encoded,
+        encoder_attention_mask,
+        p_cell_b=p_cell_b,
+        p_cell_t=p_cell_t,
+        p_legal_cell_id=p_legal_cell_id,
+        p_legal_choice=p_legal_choice,
     )
     neg_inf = torch.finfo(vocab_logits.dtype).min
     v_logp = torch.log_softmax(vocab_logits.masked_fill(~vocab_mask, neg_inf), dim=-1)
-    p_logp = torch.log_softmax(pointer_logits.masked_fill(~pointer_mask, neg_inf), dim=-1)
-    # ``target_pointer_pos`` carries combined_sample's -1 sentinel on vocab
-    # steps and may exceed replay-time T_enc when the replay batch pads to
-    # a shorter sequence than sample-time. Clamp into bounds; downstream
-    # ``is_pointer_step`` & ``pad_mask`` zero the contribution at non-pointer
-    # steps so the clamped value there is irrelevant. ``target_tokens`` is
-    # already PAD-substituted at sample time (see ``decoder_sample``), so
-    # no clamp needed there.
-    p_max = p_logp.shape[-1] - 1
+
+    # Per-cell segment log_softmax over the pointer cells' legal entries.
+    n_p_cells = int(p_cell_b.shape[0])
+    if p_legal_logits.numel() > 0:
+        max_per_p_cell = torch.full(
+            (n_p_cells,),
+            neg_inf,
+            dtype=p_legal_logits.dtype,
+            device=p_legal_logits.device,
+        )
+        max_per_p_cell.scatter_reduce_(
+            0, p_legal_cell_id, p_legal_logits, reduce="amax", include_self=True
+        )
+        shifted = p_legal_logits - max_per_p_cell[p_legal_cell_id]
+        exp_shifted = shifted.exp()
+        sum_per_p_cell = torch.zeros(
+            n_p_cells, dtype=p_legal_logits.dtype, device=p_legal_logits.device
+        )
+        sum_per_p_cell.scatter_add_(0, p_legal_cell_id, exp_shifted)
+        logsumexp_per_p_cell = sum_per_p_cell.log() + max_per_p_cell
+        p_legal_log_softmax = p_legal_logits - logsumexp_per_p_cell[p_legal_cell_id]
+    else:
+        p_legal_log_softmax = p_legal_logits.new_empty((0,))
+
+    # ``target_tokens`` is already PAD-substituted at sample time (see
+    # ``decoder_sample``), so no clamp needed.
     target_tok = target_tokens.to(dtype=torch.long)
-    target_ptr = target_pointer_pos.to(dtype=torch.long).clamp(min=0, max=max(p_max, 0))
     v_chosen = v_logp.gather(-1, target_tok.unsqueeze(-1)).squeeze(-1)
-    p_chosen = p_logp.gather(-1, target_ptr.unsqueeze(-1)).squeeze(-1)
-    step_logp = torch.where(is_pointer_step, p_chosen, v_chosen)
+
+    # Pointer chosen log-π per cell: exactly one ``is_chosen`` legal
+    # entry per cell (invariant from sampling); masking preserves cell
+    # order since legal entries are stored contiguously per cell.
+    p_chosen_per_cell = p_legal_log_softmax[cells.p_legal_is_chosen]  # [N_p_cells]
+
+    # Assemble per-step log-π. Vocab cells use the dense gather; pointer
+    # cells use the per-cell scalar — scatter back to [B, L] so the rest
+    # of the contract (per_step_log_pi shape, per_row sum) is unchanged.
+    step_logp = v_chosen.clone()
+    if n_p_cells > 0:
+        step_logp[p_cell_b, p_cell_t] = p_chosen_per_cell
+    # Inactive cells contribute zero.
     step_logp = step_logp.where(pad_mask, torch.zeros_like(step_logp))
 
-    # Entropy under the same mask.
+    # Entropy.
     v_p = v_logp.exp()
-    p_p = p_logp.exp()
-    v_ent = -(v_p * v_logp.where(v_p > 0, torch.zeros_like(v_logp))).sum(dim=-1)
-    p_ent = -(p_p * p_logp.where(p_p > 0, torch.zeros_like(p_logp))).sum(dim=-1)
-    step_ent = torch.where(is_pointer_step, p_ent, v_ent)
+    v_ent_dense = -(v_p * v_logp.where(v_p > 0, torch.zeros_like(v_logp))).sum(dim=-1)
+    # Per-pointer-cell entropy from the segment-softmax distribution.
+    if p_legal_logits.numel() > 0:
+        p_p_per_legal = p_legal_log_softmax.exp()
+        p_ent_per_legal = -(p_p_per_legal * p_legal_log_softmax)
+        p_ent_per_cell = torch.zeros(
+            n_p_cells, dtype=p_legal_logits.dtype, device=p_legal_logits.device
+        )
+        p_ent_per_cell.scatter_add_(0, p_legal_cell_id, p_ent_per_legal)
+    else:
+        p_ent_per_cell = p_legal_logits.new_empty((0,))
+    step_ent = v_ent_dense.clone()
+    if n_p_cells > 0:
+        step_ent[p_cell_b, p_cell_t] = p_ent_per_cell
     step_ent = step_ent.where(pad_mask, torch.zeros_like(step_ent))
 
     return DecoderReplayScores(
@@ -304,9 +357,9 @@ def decoder_score_replay(
         per_row_entropy=step_ent.sum(dim=-1),
         per_step_log_pi=step_logp,
         vocab_logits=vocab_logits,
-        pointer_logits=pointer_logits,
         vocab_log_softmax=v_logp,
-        pointer_log_softmax=p_logp,
+        p_legal_logits=p_legal_logits,
+        p_legal_log_softmax=p_legal_log_softmax,
     )
 
 

@@ -282,6 +282,25 @@ class GrammarDecoder(nn.Module):
         pointer_logits = torch.matmul(q, encoded.transpose(-1, -2)) / self.cfg.pointer_temperature
         return vocab_logits, pointer_logits
 
+    def _decoder_body(
+        self, target_tokens: Tensor, encoded: Tensor, encoder_attention_mask: Tensor
+    ) -> Tensor:
+        """Shared transformer body for the teacher-forced forwards.
+
+        Returns the post-norm hidden state ``[B, L, D]``. Pulled out so
+        the dense-head and per-cell-pointer-head variants can share it
+        without duplicating the layer loop.
+        """
+        x = self.tok_emb(target_tokens)
+        _, t, _ = x.shape
+        cos = cast(Tensor, self.rope_cos)[:t].to(dtype=x.dtype, device=x.device)
+        sin = cast(Tensor, self.rope_sin)[:t].to(dtype=x.dtype, device=x.device)
+        for raw_layer in self.layers:
+            layer = cast(_DecoderLayer, raw_layer)
+            cross_k, cross_v = layer.cross_attn.project_kv(encoded)
+            x = layer(x, cos, sin, cross_k, cross_v, encoder_attention_mask)
+        return self.final_norm(x)
+
     def forward_teacher_forced(
         self,
         target_tokens: Tensor,
@@ -293,16 +312,49 @@ class GrammarDecoder(nn.Module):
         Pointer logits cover ALL encoder positions; the caller is
         responsible for masking down to legal anchor positions.
         """
-        x = self.tok_emb(target_tokens)
-        b, t, _ = x.shape
-        cos = cast(Tensor, self.rope_cos)[:t].to(dtype=x.dtype, device=x.device)
-        sin = cast(Tensor, self.rope_sin)[:t].to(dtype=x.dtype, device=x.device)
-        for raw_layer in self.layers:
-            layer = cast(_DecoderLayer, raw_layer)
-            cross_k, cross_v = layer.cross_attn.project_kv(encoded)
-            x = layer(x, cos, sin, cross_k, cross_v, encoder_attention_mask)
-        x = self.final_norm(x)
-        return self._heads(x, encoded)
+        h = self._decoder_body(target_tokens, encoded, encoder_attention_mask)
+        return self._heads(h, encoded)
+
+    def forward_teacher_forced_with_cells(
+        self,
+        target_tokens: Tensor,
+        encoded: Tensor,
+        encoder_attention_mask: Tensor,
+        *,
+        p_cell_b: Tensor,
+        p_cell_t: Tensor,
+        p_legal_cell_id: Tensor,
+        p_legal_choice: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Same body as ``forward_teacher_forced``, but the pointer head
+        runs per-legal-cell instead of dense `[B, L, T_enc]`.
+
+        For pointer cells (``p_cell_b[i], p_cell_t[i]``) and their legal
+        encoder positions (``p_legal_choice``), returns
+
+        ``(vocab_logits [B, L, V], p_legal_logits [N_p_legal])``
+
+        where ``p_legal_logits[i] = q[cell_b, cell_t] · encoded[cell_b,
+        legal_choice] / pointer_temperature``. Avoids materializing the
+        dense ``[B, L, T_enc]`` pointer-logits tensor, the main compute
+        win of the packed-cell layout.
+
+        ``vocab_logits`` stays dense (``V`` is small in the grammar
+        decoder, so the per-cell variant wouldn't recoup the indexing
+        overhead).
+        """
+        h = self._decoder_body(target_tokens, encoded, encoder_attention_mask)
+        vocab_logits = self.vocab_head(h)
+        if p_cell_b.numel() == 0:
+            p_legal_logits = h.new_empty((0,))
+            return vocab_logits, p_legal_logits
+        h_at_p_cells = h[p_cell_b, p_cell_t]  # [N_p_cells, D]
+        q_at_p_cells = self.pointer_head(h_at_p_cells)  # [N_p_cells, D]
+        q_per_p_legal = q_at_p_cells[p_legal_cell_id]  # [N_p_legal, D]
+        p_legal_b = p_cell_b[p_legal_cell_id]  # [N_p_legal]
+        enc_at_p_legal = encoded[p_legal_b, p_legal_choice]  # [N_p_legal, D]
+        p_legal_logits = (q_per_p_legal * enc_at_p_legal).sum(-1) / self.cfg.pointer_temperature
+        return vocab_logits, p_legal_logits
 
     def init_state(self, encoded: Tensor, max_decode_len: int | None = None) -> DecoderState:
         """Pre-project cross-attn K/V and pre-allocate self-attn KV cache.

@@ -216,31 +216,6 @@ class LSTMStatefulTextPolicy(nn.Module):
             replay_rows=[],
         )
 
-    def evaluate_replay(
-        self,
-        encoded: Tensor,
-        encoder_attention_mask: Tensor,
-        target_tokens: Tensor,
-        target_pointer_pos: Tensor,
-        is_pointer_step: Tensor,
-        pad_mask: Tensor,
-        vocab_mask: Tensor,
-        pointer_mask: Tensor,
-    ):
-        """Teacher-forced replay scoring under the grammar decoder."""
-
-        return decoder_score_replay(
-            self.policy.text_policy,
-            encoded,
-            encoder_attention_mask,
-            target_tokens,
-            target_pointer_pos,
-            is_pointer_step,
-            pad_mask,
-            vocab_mask,
-            pointer_mask,
-        )
-
     # ------------------------------------------------------------------ #
     # Polymorphic R-NaD / PPO surface                                    #
     #                                                                    #
@@ -373,11 +348,9 @@ class LSTMStatefulTextPolicy(nn.Module):
             encoded,
             attn_mask,
             target_tokens,
-            target_pointer_pos,
-            is_pointer_step,
             pad_mask,
             vocab_mask,
-            pointer_mask,
+            batch.cells.to(device=encoded.device),
         )
         values = self.policy.text_policy.run_heads(encoded_snaps)
         return (
@@ -455,7 +428,10 @@ class LSTMStatefulTextPolicy(nn.Module):
         v_cell_b = cells.v_cell_b.to(dtype=torch.long)
         v_cell_t = cells.v_cell_t.to(dtype=torch.long)
         p_cell_b = cells.p_cell_b.to(dtype=torch.long)
-        p_cell_t = cells.p_cell_t.to(dtype=torch.long)
+        # ``p_cell_t`` isn't needed in the consumer anymore — pointer
+        # logits are already per-cell from the decoder forward, so the
+        # only per-cell ``(b, t)`` we need is for the dense-vocab gather
+        # and the per-cell ``b`` for ``step_for_decision_group``.
         v_legal_cell_id = cells.v_legal_cell_id.to(dtype=torch.long)
         p_legal_cell_id = cells.p_legal_cell_id.to(dtype=torch.long)
         # Per-legal (b, t, choice): each legal entry inherits (b, t) of
@@ -464,13 +440,15 @@ class LSTMStatefulTextPolicy(nn.Module):
         v_t = v_cell_t[v_legal_cell_id]
         v_c = cells.v_legal_choice.to(dtype=torch.long)
         p_b = p_cell_b[p_legal_cell_id]
-        p_t = p_cell_t[p_legal_cell_id]
         p_c = cells.p_legal_choice.to(dtype=torch.long)
 
+        # Vocab side is still dense (``V`` is small); pointer side comes
+        # straight off the decoder's per-cell head — no [B, L, T_enc]
+        # indexing left.
         v_logits = scores.vocab_logits[v_b, v_t, v_c]
         v_logp = scores.vocab_log_softmax[v_b, v_t, v_c]
-        p_logits = scores.pointer_logits[p_b, p_t, p_c]
-        p_logp = scores.pointer_log_softmax[p_b, p_t, p_c]
+        p_logits = scores.p_legal_logits
+        p_logp = scores.p_legal_log_softmax
 
         # Group ordering: vocab cells get ids [0, N_v_cells), pointer
         # cells get ids [N_v_cells, N_v_cells + N_p_cells). R-NaD's

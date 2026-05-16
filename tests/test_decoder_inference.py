@@ -150,16 +150,28 @@ def test_decoder_score_replay_returns_finite_scalar_per_row():
     vocab_mask = torch.ones((b, L, GRAMMAR_VOCAB_SIZE), dtype=torch.bool)
     pointer_mask = torch.ones((b, L, t_enc), dtype=torch.bool)
 
+    # The function now consumes packed cells; build them on host from
+    # the dense masks (matches what ``TextReplayBuffer.gather`` does).
+    from magic_ai.text_encoder.replay_buffer import _build_decoder_cells
+
+    cells = _build_decoder_cells(
+        pad_mask=pad_mask,
+        is_pointer_step=is_pointer_step,
+        vocab_mask=vocab_mask,
+        pointer_mask=pointer_mask,
+        target_tokens=target_tokens,
+        target_pointer_pos=target_pointer_pos,
+        output_log_prob=torch.zeros((b, L), dtype=torch.float32),
+    )
+
     scores = decoder_score_replay(
         cast(TextPolicy, text_policy),
         encoded,
         encoder_attention_mask,
         target_tokens,
-        target_pointer_pos,
-        is_pointer_step,
         pad_mask,
         vocab_mask,
-        pointer_mask,
+        cells,
     )
 
     assert scores.per_row_log_pi.shape == (b,)

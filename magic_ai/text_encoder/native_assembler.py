@@ -521,17 +521,34 @@ def encode_tokens_packed(
         raise NativeEncodingError(message)
     outputs.batch_handle = int(handle_out[0])
     outputs.spec_overflow[0] = int(spec_out.spec_overflow)
+    n_blockers_max = int(outputs.legal_edge_bitmap.shape[1])
+    n_attackers_max = int(outputs.legal_edge_bitmap.shape[2])
+    # Clip excess blockers/attackers: the bitmap tensor is preallocated at
+    # ``(N_blockers_max, N_attackers_max)``, so the native side has already
+    # physically truncated. Clamp the reported counts to match; if those
+    # were the only overflow sources, clear ``spec_overflow`` and proceed.
+    blockers_view = outputs.legal_edge_n_blockers[:batch_size]
+    attackers_view = outputs.legal_edge_n_attackers[:batch_size]
     if int(spec_out.spec_overflow) != 0:
+        blockers_view.clamp_(max=n_blockers_max)
+        attackers_view.clamp_(max=n_attackers_max)
+        t_spec_max_ = int(outputs.spec_tokens.shape[1])
+        n_anchors_max_ = int(outputs.pointer_anchor_positions.shape[1])
+        other_overflow = (
+            int(outputs.spec_lens[:batch_size].max().item()) > t_spec_max_
+            or int(outputs.pointer_anchor_counts[:batch_size].max().item()) > n_anchors_max_
+        )
+        if not other_overflow:
+            outputs.spec_overflow[0] = 0
+    if int(outputs.spec_overflow[0]) != 0:
         from magic_ai.slot_encoder.native_encoder import NativeEncodingError
 
         t_spec_max = int(outputs.spec_tokens.shape[1])
         n_anchors_max = int(outputs.pointer_anchor_positions.shape[1])
-        n_blockers_max = int(outputs.legal_edge_bitmap.shape[1])
-        n_attackers_max = int(outputs.legal_edge_bitmap.shape[2])
         spec_lens = outputs.spec_lens[:batch_size].tolist()
         anchor_counts = outputs.pointer_anchor_counts[:batch_size].tolist()
         decision_types = outputs.decision_type[:batch_size].tolist()
-        n_blockers = outputs.legal_edge_n_blockers[:batch_size].tolist()
+        n_blockers = blockers_view.tolist()
         n_attackers = outputs.legal_edge_n_attackers[:batch_size].tolist()
 
         # The native side may either record the attempted length (>cap) or

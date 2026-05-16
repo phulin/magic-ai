@@ -55,9 +55,9 @@ Phase 2 (cells layout + per-choice consumer) — landed in this commit:
       edge case returns empty arenas.
 - [x] Run full test suite. `ruff format / check / ty`.
 
-Phase 3 (per-cell pointer head in decoder forward) — TODO:
+Phase 3 (per-cell pointer head in decoder forward) — landed:
 
-- [ ] Add `GrammarDecoder.forward_teacher_forced_pointer_cells` that
+- [x] Add `GrammarDecoder.forward_teacher_forced_pointer_cells` that
       runs the transformer body, returns dense vocab_logits + per-cell
       pointer logits. Cells consumed: pointer cell `(b, t)` indices
       and per-cell `legal_idx` (encoder positions).

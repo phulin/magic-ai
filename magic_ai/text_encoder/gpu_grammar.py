@@ -13,6 +13,8 @@ module is the vectorized equivalent.
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 from torch import Tensor
 
@@ -25,6 +27,85 @@ from magic_ai.text_encoder.grammar import (
 )
 
 N_ANCHOR_KINDS = 5  # AnchorKind enum width
+
+
+def _grammar_update_body(
+    sampled_vocab: Tensor,  # [B] long
+    sampled_pointer_pos: Tensor,  # [B] long
+    is_pointer_step: Tensor,  # [B] bool
+    *,
+    # static lookup tables (treated as immutable across the decode loop)
+    pos_to_subj: Tensor,  # [B, T_enc] long
+    pos_to_kind: Tensor,  # [B, T_enc] long
+    b_arange: Tensor,  # [B] long
+    # mutable state
+    chosen_per_kind: Tensor,  # [B, N_ANCHOR_KINDS, MAX_K] bool
+    last_chosen_blk_subj: Tensor,  # [B] long
+    current_int: Tensor,  # [B] long
+    n_digits: Tensor,  # [B] long
+    ended: Tensor,  # [B] bool
+    step: Tensor,  # [B] long
+    t_enc: int,
+    max_k: int,
+    atk_kind: int,
+    blk_kind: int,
+    end_id: int,
+    digit_0_id: int,
+    digit_9_id: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Pure-functional body of :meth:`GrammarMaskState.update`.
+
+    Returns ``(chosen_per_kind, last_chosen_blk_subj, current_int, n_digits,
+    ended, step)`` so the wrapper can be ``torch.compile``-d as a single
+    fused graph instead of paying ~20 op dispatches per decoder step.
+    """
+    active = ~ended
+    safe_pos = sampled_pointer_pos.clamp(min=0, max=max(t_enc - 1, 0))
+    safe_pos_idx = safe_pos.unsqueeze(-1)
+    subj_at_chosen = pos_to_subj.gather(1, safe_pos_idx).squeeze(-1)
+    kind_at_chosen = pos_to_kind.gather(1, safe_pos_idx).squeeze(-1)
+    valid_choice = is_pointer_step & active & (subj_at_chosen >= 0)
+    safe_subj = subj_at_chosen.clamp(min=0, max=max(max_k - 1, 0))
+
+    is_atk = valid_choice & (kind_at_chosen == atk_kind)
+    is_blk = valid_choice & (kind_at_chosen == blk_kind)
+    is_atk_or_blk = is_atk | is_blk
+
+    # Single fused write for both ATK and BLK: pick the kind row from
+    # ``kind_at_chosen`` (already validated for atk/blk above; fall back to
+    # 0 for inactive rows where ``is_atk_or_blk`` is False — the OR with
+    # False is a no-op for that cell).
+    upd_kind = torch.where(is_atk_or_blk, kind_at_chosen, kind_at_chosen.new_zeros(()))
+    cur = chosen_per_kind[b_arange, upd_kind, safe_subj]
+    chosen_per_kind = chosen_per_kind.clone()
+    chosen_per_kind[b_arange, upd_kind, safe_subj] = cur | is_atk_or_blk
+
+    last_chosen_blk_subj = torch.where(is_blk, safe_subj, last_chosen_blk_subj)
+
+    is_vocab_step = ~is_pointer_step
+    is_digit = (
+        is_vocab_step & active & (sampled_vocab >= digit_0_id) & (sampled_vocab <= digit_9_id)
+    )
+    digit_val = (sampled_vocab - digit_0_id).clamp(min=0, max=9)
+    current_int = torch.where(is_digit, current_int * 10 + digit_val, current_int)
+    n_digits = torch.where(is_digit, n_digits + 1, n_digits)
+
+    is_end = is_vocab_step & active & (sampled_vocab == end_id)
+    ended = ended | is_end
+    step = step + 1
+    return chosen_per_kind, last_chosen_blk_subj, current_int, n_digits, ended, step
+
+
+# Lazily compiled (per the project's pattern: ``dynamic=True`` so a single
+# trace serves all batch sizes / MAX_K values).
+_compiled_grammar_update_body: object | None = None
+
+
+def _get_grammar_update_fn() -> object:
+    global _compiled_grammar_update_body
+    if _compiled_grammar_update_body is None:
+        _compiled_grammar_update_body = torch.compile(_grammar_update_body, dynamic=True)
+    return _compiled_grammar_update_body
 
 
 class GrammarMaskState:
@@ -277,48 +358,42 @@ class GrammarMaskState:
         sampled_pointer_pos: Tensor,  # [B] long
         is_pointer_step: Tensor,  # [B] bool
     ) -> None:
-        """Advance state given the sampled action."""
-        active = ~self.ended
+        """Advance state given the sampled action.
 
-        # Look up subject_index and kind of the chosen pointer position.
-        safe_pos = sampled_pointer_pos.clamp(min=0, max=max(self.T_enc - 1, 0))
-        subj_at_chosen = self.pos_to_subj.gather(1, safe_pos.unsqueeze(-1)).squeeze(-1)
-        kind_at_chosen = self.pos_to_kind.gather(1, safe_pos.unsqueeze(-1)).squeeze(-1)
-        valid_choice = is_pointer_step & active & (subj_at_chosen >= 0)
-        safe_subj = subj_at_chosen.clamp(min=0, max=max(self.MAX_K - 1, 0))
-
-        atk_kind = int(AnchorKind.LEGAL_ATTACKER)
-        blk_kind = int(AnchorKind.LEGAL_BLOCKER)
-        is_atk = valid_choice & (kind_at_chosen == atk_kind)
-        is_blk = valid_choice & (kind_at_chosen == blk_kind)
-
-        # Set ``chosen_per_kind[b, kind, safe_subj[b]] |= is_atk[b]`` (and
-        # the same for blockers). Single advanced-indexing update.
-        b_idx = self._b_arange
-        cur = self.chosen_per_kind[b_idx, atk_kind, safe_subj]
-        self.chosen_per_kind[b_idx, atk_kind, safe_subj] = cur | is_atk
-        cur = self.chosen_per_kind[b_idx, blk_kind, safe_subj]
-        self.chosen_per_kind[b_idx, blk_kind, safe_subj] = cur | is_blk
-        self.last_chosen_blk_subj = torch.where(is_blk, safe_subj, self.last_chosen_blk_subj)
-
-        # Digit emission for CHOOSE_MODE/X.
-        is_vocab_step = ~is_pointer_step
-        is_digit = (
-            is_vocab_step & active & (sampled_vocab >= DIGIT_0_ID) & (sampled_vocab <= DIGIT_9_ID)
+        Dispatches to ``_grammar_update_body`` wrapped in ``torch.compile``
+        so the ~20 per-step tensor ops fuse into a single graph launch.
+        Without this, py-spy showed ``update`` dominating decoder time on
+        the Python side from kernel-dispatch overhead.
+        """
+        fn = cast(Any, _get_grammar_update_fn())
+        (
+            self.chosen_per_kind,
+            self.last_chosen_blk_subj,
+            self.current_int,
+            self.n_digits,
+            self.ended,
+            self.step,
+        ) = fn(
+            sampled_vocab,
+            sampled_pointer_pos,
+            is_pointer_step,
+            pos_to_subj=self.pos_to_subj,
+            pos_to_kind=self.pos_to_kind,
+            b_arange=self._b_arange,
+            chosen_per_kind=self.chosen_per_kind,
+            last_chosen_blk_subj=self.last_chosen_blk_subj,
+            current_int=self.current_int,
+            n_digits=self.n_digits,
+            ended=self.ended,
+            step=self.step,
+            t_enc=self.T_enc,
+            max_k=self.MAX_K,
+            atk_kind=int(AnchorKind.LEGAL_ATTACKER),
+            blk_kind=int(AnchorKind.LEGAL_BLOCKER),
+            end_id=int(GrammarVocab.END),
+            digit_0_id=DIGIT_0_ID,
+            digit_9_id=DIGIT_9_ID,
         )
-        digit_val = (sampled_vocab - DIGIT_0_ID).clamp(min=0, max=9)
-        self.current_int = torch.where(
-            is_digit, self.current_int * 10 + digit_val, self.current_int
-        )
-        self.n_digits = torch.where(is_digit, self.n_digits + 1, self.n_digits)
-
-        # END.
-        is_end = is_vocab_step & active & (sampled_vocab == int(GrammarVocab.END))
-        self.ended = self.ended | is_end
-
-        # Step always increments. Past-ended rows draw masked-empty masks
-        # next call so their tokens are no-ops.
-        self.step = self.step + 1
 
 
 __all__ = ["GrammarMaskState", "N_ANCHOR_KINDS"]

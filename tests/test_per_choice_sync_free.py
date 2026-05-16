@@ -179,5 +179,110 @@ class DecoderCellsParityTests(unittest.TestCase):
         self.assertEqual(tuple(cells.p_legal_choice.shape), (0,))
 
 
+class DecoderPerCellPointerParityTests(unittest.TestCase):
+    """The per-cell pointer head must agree with the dense
+    `[B, L, T_enc]` pointer head on per_row_log_pi / per_row_entropy /
+    per_step_log_pi (within float tolerance). Verifies the segment
+    log-softmax reduction matches the dense log-softmax over the same
+    masked positions."""
+
+    def test_per_cell_matches_dense_pointer_head(self) -> None:
+        from typing import cast
+
+        from magic_ai.text_encoder.decoder import GrammarDecoder, GrammarDecoderConfig
+        from magic_ai.text_encoder.decoder_inference import decoder_score_replay
+        from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE
+        from magic_ai.text_encoder.policy import TextPolicy
+        from magic_ai.text_encoder.replay_buffer import _build_decoder_cells
+
+        torch.manual_seed(0xDEAD)
+        b, t_enc, l_max, d_model = 2, 6, 4, 16
+        cfg = GrammarDecoderConfig(
+            d_model=d_model,
+            n_layers=1,
+            n_heads=2,
+            max_decode_len=l_max,
+            pointer_temperature=1.0,
+            grammar_vocab_size=GRAMMAR_VOCAB_SIZE,
+        )
+        decoder = GrammarDecoder(cfg).eval()
+
+        class _StubPolicy:
+            def __init__(self, decoder):
+                self.grammar_decoder = decoder
+
+        encoded = torch.randn(b, t_enc, d_model)
+        attn = torch.ones((b, t_enc), dtype=torch.bool)
+        target_tokens = torch.randint(0, GRAMMAR_VOCAB_SIZE, (b, l_max))
+        target_pointer_pos = torch.randint(0, t_enc, (b, l_max))
+        is_pointer_step = torch.tensor([[False, True, True, False]] * b, dtype=torch.bool)
+        pad_mask = torch.tensor([[True, True, True, False]] * b, dtype=torch.bool)
+        vocab_mask = torch.ones((b, l_max, GRAMMAR_VOCAB_SIZE), dtype=torch.bool)
+        # Force pointer_mask to be non-trivial so the per-cell segment
+        # softmax has multiple legal entries per cell.
+        pointer_mask = torch.zeros((b, l_max, t_enc), dtype=torch.bool)
+        pointer_mask[:, 1, :4] = True
+        pointer_mask[:, 2, 1:5] = True
+        cells = _build_decoder_cells(
+            pad_mask=pad_mask,
+            is_pointer_step=is_pointer_step,
+            vocab_mask=vocab_mask,
+            pointer_mask=pointer_mask,
+            target_tokens=target_tokens,
+            target_pointer_pos=target_pointer_pos,
+            output_log_prob=torch.zeros((b, l_max), dtype=torch.float32),
+        )
+
+        text_policy = _StubPolicy(decoder)
+
+        with torch.no_grad():
+            new_scores = decoder_score_replay(
+                cast(TextPolicy, text_policy),
+                encoded,
+                attn,
+                target_tokens,
+                pad_mask,
+                vocab_mask,
+                cells,
+            )
+
+            # Reference: dense computation. Mirrors what
+            # ``decoder_score_replay`` did before the per-cell rewrite.
+            vocab_logits, pointer_logits = decoder.forward_teacher_forced(
+                target_tokens.to(dtype=torch.long), encoded, attn
+            )
+            neg_inf = torch.finfo(vocab_logits.dtype).min
+            v_logp = torch.log_softmax(vocab_logits.masked_fill(~vocab_mask, neg_inf), dim=-1)
+            p_logp_dense = torch.log_softmax(
+                pointer_logits.masked_fill(~pointer_mask, neg_inf), dim=-1
+            )
+            p_max = p_logp_dense.shape[-1] - 1
+            target_tok = target_tokens.to(dtype=torch.long)
+            target_ptr = target_pointer_pos.to(dtype=torch.long).clamp(min=0, max=max(p_max, 0))
+            v_chosen = v_logp.gather(-1, target_tok.unsqueeze(-1)).squeeze(-1)
+            p_chosen = p_logp_dense.gather(-1, target_ptr.unsqueeze(-1)).squeeze(-1)
+            ref_step_logp = torch.where(is_pointer_step, p_chosen, v_chosen).where(
+                pad_mask, torch.zeros_like(v_chosen)
+            )
+            ref_per_row_log_pi = ref_step_logp.sum(dim=-1)
+
+            v_p = v_logp.exp()
+            p_p = p_logp_dense.exp()
+            v_ent = -(v_p * v_logp.where(v_p > 0, torch.zeros_like(v_logp))).sum(dim=-1)
+            p_ent = -(p_p * p_logp_dense.where(p_p > 0, torch.zeros_like(p_logp_dense))).sum(dim=-1)
+            ref_step_ent = torch.where(is_pointer_step, p_ent, v_ent).where(
+                pad_mask, torch.zeros_like(v_ent)
+            )
+            ref_per_row_entropy = ref_step_ent.sum(dim=-1)
+
+        torch.testing.assert_close(new_scores.per_step_log_pi, ref_step_logp, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(
+            new_scores.per_row_log_pi, ref_per_row_log_pi, rtol=1e-5, atol=1e-5
+        )
+        torch.testing.assert_close(
+            new_scores.per_row_entropy, ref_per_row_entropy, rtol=1e-5, atol=1e-5
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
