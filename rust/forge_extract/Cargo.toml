@@ -9,6 +9,9 @@ codegen-units = 1
 
 [dependencies]
 anyhow = "1"
+arrow-array = "58"
+arrow-ipc = { version = "58", features = ["zstd"] }
+arrow-schema = "58"
 blake2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 flate2 = "1"

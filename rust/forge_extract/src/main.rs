@@ -11,12 +11,20 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
+use arrow_array::{
+    ArrayRef, Float32Array, Int64Array, LargeStringArray, RecordBatch, StringArray, UInt16Array,
+    UInt32Array, UInt8Array,
+};
+use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
+use arrow_ipc::{CompressionType, MetadataVersion};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -31,16 +39,26 @@ const FORMAT_VERSION: u32 = 2;
 const CHOICE_KINDS: &[&str] = &["priority", "attack", "block", "may", "choose"];
 const DEFAULT_KIND_PRIORITY: &[&str] = &["may", "block", "attack", "choose", "priority"];
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    JsonlGz,
+    Arrow,
+}
+
 #[derive(Parser, Debug)]
-#[command(about = "Extract Forge choice situations to JSONL (parser-only Rust port)")]
+#[command(about = "Extract Forge choice situations to JSONL.GZ or Arrow IPC")]
 struct Args {
     /// Forge game archive (zip of *.jsonl.gz members).
     #[arg(long)]
     zip: PathBuf,
 
-    /// Output .jsonl.gz path.
+    /// Output .jsonl.gz path, or output directory when --output-format arrow.
     #[arg(long)]
     out: PathBuf,
+
+    /// Output serialization format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::JsonlGz)]
+    output_format: OutputFormat,
 
     /// Comma-separated kinds (or "all").
     #[arg(long, default_value = "all")]
@@ -79,6 +97,11 @@ struct Args {
     /// gzip compression level for the output (0-9).
     #[arg(long, default_value_t = 6)]
     compresslevel: u32,
+
+    /// Target rows per Arrow shard. Shards flush only after a game batch, so
+    /// they may exceed this by one game.
+    #[arg(long, default_value_t = 262_144)]
+    arrow_shard_rows: usize,
 }
 
 fn main() -> Result<()> {
@@ -115,26 +138,17 @@ fn main() -> Result<()> {
     }
     eprintln!("members: {}", members.len());
 
-    // Writer thread: serialize JSONL output and gzip-compress.
-    let (tx, rx) = mpsc::sync_channel::<Vec<Vec<u8>>>(64);
+    // Writer thread: serialize output without blocking parser workers on disk I/O.
+    let (tx, rx) = mpsc::sync_channel::<WriterBatch>(64);
     let out_path = args.out.clone();
     let level = args.compresslevel;
+    let output_format = args.output_format;
+    let arrow_shard_rows = args.arrow_shard_rows;
     let writer_handle = thread::spawn(move || -> Result<WriterStats> {
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+        match output_format {
+            OutputFormat::JsonlGz => write_jsonl_gz(rx, out_path, level),
+            OutputFormat::Arrow => write_arrow_dir(rx, out_path, arrow_shard_rows),
         }
-        let f = File::create(&out_path).with_context(|| format!("creating {:?}", out_path))?;
-        let mut gz = GzEncoder::new(BufWriter::new(f), Compression::new(level));
-        let mut records = 0u64;
-        for batch in rx {
-            for line in batch {
-                gz.write_all(&line)?;
-                gz.write_all(b"\n")?;
-                records += 1;
-            }
-        }
-        gz.try_finish()?;
-        Ok(WriterStats { records })
     });
 
     let progress_every = args.progress_every;
@@ -184,14 +198,26 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let mut batch: Vec<Vec<u8>> = Vec::with_capacity(selected.len());
+            let mut json_batch: Vec<Vec<u8>> = Vec::new();
+            let mut arrow_batch: Vec<ArrowDecisionRow> = Vec::new();
+            match output_format {
+                OutputFormat::JsonlGz => json_batch.reserve(selected.len()),
+                OutputFormat::Arrow => arrow_batch.reserve(selected.len()),
+            }
             for c in selected {
                 let kind_idx = choice_kind_index(c.kind).unwrap();
                 kind_counts[kind_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let rec = build_record(&c, &meta, member);
-                batch.push(sonic_rs::to_vec(&rec)?);
+                match output_format {
+                    OutputFormat::JsonlGz => json_batch.push(sonic_rs::to_vec(&rec)?),
+                    OutputFormat::Arrow => arrow_batch.push(ArrowDecisionRow::from_record(&rec)?),
+                }
             }
             games_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let batch = match output_format {
+                OutputFormat::JsonlGz => WriterBatch::JsonLines(json_batch),
+                OutputFormat::Arrow => WriterBatch::ArrowRows(arrow_batch),
+            };
             tx.send(batch).map_err(|e| anyhow!("writer dropped: {e}"))?;
 
             if progress_every > 0 && n % progress_every == 0 {
@@ -219,12 +245,37 @@ fn main() -> Result<()> {
         "written_choose": kind_counts[4].load(std::sync::atomic::Ordering::Relaxed),
     });
     let summary = json!({
+        "output_format": match args.output_format {
+            OutputFormat::JsonlGz => "jsonl.gz",
+            OutputFormat::Arrow => "arrow",
+        },
         "games_seen": games_seen.load(std::sync::atomic::Ordering::Relaxed),
         "games_written": games_written.load(std::sync::atomic::Ordering::Relaxed),
         "candidates_seen": candidates_seen.load(std::sync::atomic::Ordering::Relaxed),
         "records_written": writer_stats.records,
+        "shards_written": writer_stats.shards,
         "kinds": kind_summary,
     });
+    if matches!(args.output_format, OutputFormat::Arrow) {
+        write_arrow_manifest(
+            &args.out,
+            &ArrowManifestStats {
+                shards: writer_stats.shards,
+                records_written: writer_stats.records,
+                shard_target_rows: args.arrow_shard_rows,
+                games_seen: games_seen.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                games_written: games_written.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                candidates_seen: candidates_seen.load(std::sync::atomic::Ordering::Relaxed) as u64,
+                kind_counts: [
+                    kind_counts[0].load(std::sync::atomic::Ordering::Relaxed) as u64,
+                    kind_counts[1].load(std::sync::atomic::Ordering::Relaxed) as u64,
+                    kind_counts[2].load(std::sync::atomic::Ordering::Relaxed) as u64,
+                    kind_counts[3].load(std::sync::atomic::Ordering::Relaxed) as u64,
+                    kind_counts[4].load(std::sync::atomic::Ordering::Relaxed) as u64,
+                ],
+            },
+        )?;
+    }
     println!("{}", sonic_rs::to_string_pretty(&summary)?);
     Ok(())
 }
@@ -237,6 +288,312 @@ enum Selection {
 
 struct WriterStats {
     records: u64,
+    shards: u64,
+}
+
+enum WriterBatch {
+    JsonLines(Vec<Vec<u8>>),
+    ArrowRows(Vec<ArrowDecisionRow>),
+}
+
+struct ArrowDecisionRow {
+    format_version: u16,
+    game_id: String,
+    archive_member: String,
+    kind_id: u8,
+    candidate_index: u32,
+    candidate_count: u32,
+    source_seq: i64,
+    target_seq: i64,
+    perspective_id: String,
+    perspective_name: String,
+    winner_id: Option<String>,
+    winner_name: Option<String>,
+    terminal_sign: f32,
+    snapshot_json: String,
+    observed_json: String,
+    outcome_players_json: String,
+    outcome_extras_json: String,
+}
+
+impl ArrowDecisionRow {
+    fn from_record(record: &OutputRecord<'_>) -> Result<Self> {
+        Ok(Self {
+            format_version: u16::try_from(record.format_version)
+                .context("format_version does not fit uint16")?,
+            game_id: record.game_id.to_string(),
+            archive_member: record.archive_member.to_string(),
+            kind_id: u8::try_from(choice_kind_index(record.choice.kind).unwrap())
+                .context("kind id does not fit uint8")?,
+            candidate_index: u32::try_from(record.choice.candidate_index)
+                .context("candidate_index does not fit uint32")?,
+            candidate_count: u32::try_from(record.choice.candidate_count)
+                .context("candidate_count does not fit uint32")?,
+            source_seq: record.choice.source_seq,
+            target_seq: record.choice.target_seq,
+            perspective_id: record.choice.perspective_id.to_string(),
+            perspective_name: record.choice.perspective_name.to_string(),
+            winner_id: record.outcome.winner_id.map(str::to_string),
+            winner_name: record.outcome.winner_name.map(str::to_string),
+            terminal_sign: record.outcome.terminal_sign as f32,
+            snapshot_json: sonic_rs::to_string(record.state.snapshot)
+                .context("serializing snapshot_json")?,
+            observed_json: sonic_rs::to_string(record.choice.observed)
+                .context("serializing observed_json")?,
+            outcome_players_json: sonic_rs::to_string(record.outcome.players)
+                .context("serializing outcome_players_json")?,
+            outcome_extras_json: sonic_rs::to_string(record.outcome.extras)
+                .context("serializing outcome_extras_json")?,
+        })
+    }
+}
+
+fn write_jsonl_gz(
+    rx: mpsc::Receiver<WriterBatch>,
+    out_path: PathBuf,
+    compresslevel: u32,
+) -> Result<WriterStats> {
+    if let Some(parent) = out_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let f = File::create(&out_path).with_context(|| format!("creating {:?}", out_path))?;
+    let mut gz = GzEncoder::new(BufWriter::new(f), Compression::new(compresslevel));
+    let mut records = 0u64;
+    for batch in rx {
+        let WriterBatch::JsonLines(lines) = batch else {
+            return Err(anyhow!("arrow batch sent to json writer"));
+        };
+        for line in lines {
+            gz.write_all(&line)?;
+            gz.write_all(b"\n")?;
+            records += 1;
+        }
+    }
+    gz.try_finish()?;
+    Ok(WriterStats { records, shards: 0 })
+}
+
+fn write_arrow_dir(
+    rx: mpsc::Receiver<WriterBatch>,
+    out_dir: PathBuf,
+    shard_target_rows: usize,
+) -> Result<WriterStats> {
+    if shard_target_rows == 0 {
+        return Err(anyhow!("--arrow-shard-rows must be greater than zero"));
+    }
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {:?}", out_dir))?;
+    ensure_arrow_output_dir_is_clean(&out_dir)?;
+    let schema = arrow_extracted_schema();
+    let mut writer = ArrowShardWriter {
+        out_dir,
+        schema,
+        shard_target_rows,
+        shard_index: 0,
+        pending: Vec::new(),
+        records: 0,
+    };
+    for batch in rx {
+        let WriterBatch::ArrowRows(rows) = batch else {
+            return Err(anyhow!("json batch sent to arrow writer"));
+        };
+        writer.push_game_batch(rows)?;
+    }
+    writer.finish()
+}
+
+fn ensure_arrow_output_dir_is_clean(out_dir: &PathBuf) -> Result<()> {
+    for entry in std::fs::read_dir(out_dir).with_context(|| format!("reading {:?}", out_dir))? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if name == "manifest.json" || (name.starts_with("part-") && name.ends_with(".arrow")) {
+            return Err(anyhow!(
+                "Arrow output directory {:?} already contains {name}; choose a new directory",
+                out_dir
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct ArrowShardWriter {
+    out_dir: PathBuf,
+    schema: SchemaRef,
+    shard_target_rows: usize,
+    shard_index: u64,
+    pending: Vec<ArrowDecisionRow>,
+    records: u64,
+}
+
+impl ArrowShardWriter {
+    fn push_game_batch(&mut self, rows: Vec<ArrowDecisionRow>) -> Result<()> {
+        self.records += rows.len() as u64;
+        self.pending.extend(rows);
+        if self.pending.len() >= self.shard_target_rows {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<WriterStats> {
+        self.flush()?;
+        Ok(WriterStats {
+            records: self.records,
+            shards: self.shard_index,
+        })
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let rows = std::mem::take(&mut self.pending);
+        let batch = arrow_batch_from_rows(self.schema.clone(), &rows)?;
+        let path = self
+            .out_dir
+            .join(format!("part-{:06}.arrow", self.shard_index));
+        let tmp = path.with_extension("arrow.tmp");
+        let f = File::create(&tmp).with_context(|| format!("creating {:?}", tmp))?;
+        let mut buf = BufWriter::new(f);
+        let options = IpcWriteOptions::try_new(8, false, MetadataVersion::V5)?
+            .try_with_compression(Some(CompressionType::ZSTD))?;
+        {
+            let mut writer =
+                FileWriter::try_new_with_options(&mut buf, self.schema.as_ref(), options)?;
+            writer.write(&batch)?;
+            writer.finish()?;
+        }
+        buf.flush()?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("renaming {:?} to {:?}", tmp, path))?;
+        self.shard_index += 1;
+        Ok(())
+    }
+}
+
+fn arrow_extracted_schema() -> SchemaRef {
+    let mut metadata = HashMap::new();
+    metadata.insert(
+        "format".to_string(),
+        "forge_pretrain_decision_arrow".to_string(),
+    );
+    metadata.insert("format_version".to_string(), "1".to_string());
+    metadata.insert("stage".to_string(), "extracted".to_string());
+    Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("format_version", DataType::UInt16, false),
+            Field::new("game_id", DataType::Utf8, false),
+            Field::new("archive_member", DataType::Utf8, false),
+            Field::new("kind_id", DataType::UInt8, false),
+            Field::new("candidate_index", DataType::UInt32, false),
+            Field::new("candidate_count", DataType::UInt32, false),
+            Field::new("source_seq", DataType::Int64, false),
+            Field::new("target_seq", DataType::Int64, false),
+            Field::new("perspective_id", DataType::Utf8, false),
+            Field::new("perspective_name", DataType::Utf8, false),
+            Field::new("winner_id", DataType::Utf8, true),
+            Field::new("winner_name", DataType::Utf8, true),
+            Field::new("terminal_sign", DataType::Float32, false),
+            Field::new("snapshot_json", DataType::LargeUtf8, false),
+            Field::new("observed_json", DataType::LargeUtf8, false),
+            Field::new("outcome_players_json", DataType::LargeUtf8, false),
+            Field::new("outcome_extras_json", DataType::LargeUtf8, false),
+        ],
+        metadata,
+    ))
+}
+
+fn arrow_batch_from_rows(schema: SchemaRef, rows: &[ArrowDecisionRow]) -> Result<RecordBatch> {
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(UInt16Array::from(
+            rows.iter().map(|r| r.format_version).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|r| r.game_id.as_str()),
+        )),
+        Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|r| r.archive_member.as_str()),
+        )),
+        Arc::new(UInt8Array::from(
+            rows.iter().map(|r| r.kind_id).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt32Array::from(
+            rows.iter().map(|r| r.candidate_index).collect::<Vec<_>>(),
+        )),
+        Arc::new(UInt32Array::from(
+            rows.iter().map(|r| r.candidate_count).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.source_seq).collect::<Vec<_>>(),
+        )),
+        Arc::new(Int64Array::from(
+            rows.iter().map(|r| r.target_seq).collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|r| r.perspective_id.as_str()),
+        )),
+        Arc::new(StringArray::from_iter_values(
+            rows.iter().map(|r| r.perspective_name.as_str()),
+        )),
+        Arc::new(StringArray::from_iter(
+            rows.iter().map(|r| r.winner_id.as_deref()),
+        )),
+        Arc::new(StringArray::from_iter(
+            rows.iter().map(|r| r.winner_name.as_deref()),
+        )),
+        Arc::new(Float32Array::from(
+            rows.iter().map(|r| r.terminal_sign).collect::<Vec<_>>(),
+        )),
+        Arc::new(LargeStringArray::from_iter_values(
+            rows.iter().map(|r| r.snapshot_json.as_str()),
+        )),
+        Arc::new(LargeStringArray::from_iter_values(
+            rows.iter().map(|r| r.observed_json.as_str()),
+        )),
+        Arc::new(LargeStringArray::from_iter_values(
+            rows.iter().map(|r| r.outcome_players_json.as_str()),
+        )),
+        Arc::new(LargeStringArray::from_iter_values(
+            rows.iter().map(|r| r.outcome_extras_json.as_str()),
+        )),
+    ];
+    RecordBatch::try_new(schema, columns).context("building Arrow record batch")
+}
+
+struct ArrowManifestStats {
+    shards: u64,
+    records_written: u64,
+    shard_target_rows: usize,
+    games_seen: u64,
+    games_written: u64,
+    candidates_seen: u64,
+    kind_counts: [u64; 5],
+}
+
+fn write_arrow_manifest(out_dir: &PathBuf, stats: &ArrowManifestStats) -> Result<()> {
+    let manifest = json!({
+        "format": "forge_pretrain_decision_arrow",
+        "format_version": 1,
+        "stage": "extracted",
+        "compression": "zstd",
+        "shards": stats.shards,
+        "records_written": stats.records_written,
+        "shard_target_rows": stats.shard_target_rows,
+        "stats": {
+            "games_seen": stats.games_seen,
+            "games_written": stats.games_written,
+            "candidates_seen": stats.candidates_seen,
+            "written_priority": stats.kind_counts[0],
+            "written_attack": stats.kind_counts[1],
+            "written_block": stats.kind_counts[2],
+            "written_may": stats.kind_counts[3],
+            "written_choose": stats.kind_counts[4],
+        },
+    });
+    let path = out_dir.join("manifest.json");
+    std::fs::write(&path, sonic_rs::to_string_pretty(&manifest)?)
+        .with_context(|| format!("writing {:?}", path))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2389,5 +2746,67 @@ mod tests {
             candidates[0].observed.get("raw").and_then(Value::as_str),
             Some("PlayerB played Island (97)")
         );
+    }
+
+    #[test]
+    fn arrow_writer_round_trips_one_shard() {
+        use arrow_array::Array;
+
+        let out_dir = std::env::temp_dir().join(format!(
+            "forge_extract_arrow_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let row = ArrowDecisionRow {
+            format_version: FORMAT_VERSION as u16,
+            game_id: "game-1".to_string(),
+            archive_member: "game-1.jsonl.gz".to_string(),
+            kind_id: 0,
+            candidate_index: 1,
+            candidate_count: 2,
+            source_seq: 10,
+            target_seq: 11,
+            perspective_id: "p1".to_string(),
+            perspective_name: "PlayerA".to_string(),
+            winner_id: Some("p1".to_string()),
+            winner_name: Some("PlayerA".to_string()),
+            terminal_sign: 1.0,
+            snapshot_json: "{\"pending\":{\"kind\":\"priority\"}}".to_string(),
+            observed_json: "{\"raw\":\"Pass priority\"}".to_string(),
+            outcome_players_json: "[]".to_string(),
+            outcome_extras_json: "{}".to_string(),
+        };
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(WriterBatch::ArrowRows(vec![row])).unwrap();
+        drop(tx);
+
+        let stats = write_arrow_dir(rx, out_dir.clone(), 1).unwrap();
+        assert_eq!(stats.records, 1);
+        assert_eq!(stats.shards, 1);
+
+        let file = File::open(out_dir.join("part-000000.arrow")).unwrap();
+        let mut reader = arrow_ipc::reader::FileReader::try_new(file, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let game_id = batch
+            .column_by_name("game_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let kind_id = batch
+            .column_by_name("kind_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
+        assert_eq!(game_id.value(0), "game-1");
+        assert_eq!(kind_id.value(0), 0);
+
+        std::fs::remove_dir_all(out_dir).ok();
     }
 }
