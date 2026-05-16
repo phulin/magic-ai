@@ -2334,9 +2334,12 @@ fn synthesize_combat_passes(
         let window = &events[start..end];
 
         if step == "DECLARE_ATTACKERS" && want_attack {
-            let any_header = window
-                .iter()
-                .any(|r| r.row_type() == "LOG" && parse_attacks_header(r.description()).is_some());
+            let any_header = window.iter().any(|r| {
+                r.row_type() == "LOG"
+                    && parse_attacks_header(r.description())
+                        .map(|h| h.count > 0)
+                        .unwrap_or(false)
+            });
             if !any_header {
                 let source = window[0];
                 if let Some(observed) = assigned_attack_observed(window) {
@@ -2725,6 +2728,48 @@ mod tests {
         let (_, unblocked) = parse_didnt_block("PlayerB didn't block Giant Spider (56).").unwrap();
         assert_eq!(unblocked.name, "Giant Spider");
         assert_eq!(unblocked.id_prefix, "forge:56");
+    }
+
+    #[test]
+    fn zero_attack_header_emits_no_attack_candidate() {
+        let snapshot = json!({
+            "activePlayerId": "p2",
+            "priorityPlayerId": "p2",
+            "players": [
+                {"id": "p1", "name": "PlayerA", "life": 20, "librarySize": 40},
+                {"id": "p2", "name": "PlayerB", "life": 20, "librarySize": 40}
+            ],
+            "battlefield": [
+                {"id": "p2:bf:0:Grizzly Bears", "controllerId": "p2", "name": "Grizzly Bears", "power": 2}
+            ],
+            "step": "DECLARE_ATTACKERS"
+        });
+        let rows = vec![event_row(
+            "LOG",
+            21,
+            Some("PlayerB attacks PlayerA with 0 creatures"),
+            &snapshot,
+        )];
+
+        let candidates = extract_candidates(&rows, &["attack".to_string()], true);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].kind, "attack");
+        assert_eq!(
+            candidates[0]
+                .observed
+                .get("no_attack")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            candidates[0]
+                .observed
+                .get("attackers")
+                .and_then(Value::as_array)
+                .map(|arr| arr.len()),
+            Some(0)
+        );
     }
 
     #[test]
