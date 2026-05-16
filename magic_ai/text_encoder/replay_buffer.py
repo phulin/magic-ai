@@ -2056,6 +2056,8 @@ class TextReplayBuffer:
         token_start: int,
         encoded: PackedTextBatch,
         batch_index: int,
+        *,
+        clear_decoder: bool = True,
     ) -> None:
         self._validate_packed_batch_index(encoded, batch_index)
         # Avoid syncing on cu_seqlens for every staged row at finish-time.
@@ -2069,7 +2071,8 @@ class TextReplayBuffer:
             raise ValueError("encoded packed row token width exceeds buffer max_tokens")
 
         self.card_ref_positions[row].fill_(-1)
-        self._clear_decoder_rows(torch.tensor([row], dtype=torch.long, device=self.device))
+        if clear_decoder:
+            self._clear_decoder_rows(torch.tensor([row], dtype=torch.long, device=self.device))
 
         self._write_row_packed_tokens(
             row,

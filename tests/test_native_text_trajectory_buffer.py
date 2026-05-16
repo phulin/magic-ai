@@ -68,7 +68,6 @@ def _make_replay_buffer(*, capacity: int = 16) -> TextReplayBuffer:
 def _make_decoder_batch(b: int, *, l_max: int = 4, n_max: int = 2) -> NativeTextDecoderBatch:
     from magic_ai.text_encoder.decoder_batch import DecoderSampleOutput
 
-    t_enc = 8
     sample = DecoderSampleOutput(
         output_token_ids=torch.arange(b * l_max, dtype=torch.long).view(b, l_max) % 5,
         output_pointer_pos=torch.full((b, l_max), 0, dtype=torch.long),
@@ -77,7 +76,7 @@ def _make_decoder_batch(b: int, *, l_max: int = 4, n_max: int = 2) -> NativeText
         output_pad_mask=torch.ones((b, l_max), dtype=torch.bool),
         log_probs=torch.full((b, l_max), -0.1),
         vocab_mask=torch.ones((b, l_max, 4), dtype=torch.bool),
-        pointer_mask=torch.ones((b, l_max, t_enc), dtype=torch.bool),
+        pointer_mask=torch.ones((b, l_max, n_max), dtype=torch.bool),
         decision_type=torch.zeros((b,), dtype=torch.long),  # PRIORITY
         pointer_anchor_handles=torch.arange(b * n_max, dtype=torch.long).view(b, n_max),
         pointer_anchor_count=torch.full((b,), n_max, dtype=torch.long),
@@ -94,10 +93,10 @@ def _make_packed_row(token_count: int = 3) -> PackedTextBatch:
     pos_in_seq = torch.arange(token_count, dtype=torch.int32)
     token_ids = torch.arange(token_count, dtype=torch.int32) + 1
     card_ref = torch.full((n, MAX_CARD_REFS), -1, dtype=torch.int32)
-    pointer_anchor_positions = torch.full((n, 2), -1, dtype=torch.int32)
-    pointer_anchor_kinds = torch.full((n, 2), -1, dtype=torch.int32)
-    pointer_anchor_subjects = torch.full((n, 2), -1, dtype=torch.int32)
-    pointer_anchor_handles = torch.full((n, 2), -1, dtype=torch.int32)
+    pointer_anchor_positions = torch.tensor([[0, min(1, token_count - 1)]], dtype=torch.int32)
+    pointer_anchor_kinds = torch.zeros((n, 2), dtype=torch.int32)
+    pointer_anchor_subjects = torch.zeros((n, 2), dtype=torch.int32)
+    pointer_anchor_handles = torch.arange(2, dtype=torch.int32).view(n, 2)
     return PackedTextBatch(
         token_ids=token_ids,
         seq_id=seq_id,

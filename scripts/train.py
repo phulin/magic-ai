@@ -572,7 +572,15 @@ class NativeTextTrajectoryBuffer:
 
         del seal  # decoder commit always seals via commit_decoder_decision + commit
         device = replay_buffer.device
+        timing_stats = self.timing_stats
+        finish_part_start = time.perf_counter()
         with self._lock:
+            if timing_stats is not None:
+                timing_stats.add(
+                    "finish_append_wait_lock",
+                    time.perf_counter() - finish_part_start,
+                )
+            finish_part_start = time.perf_counter()
             counts_host = [len(self._rows[int(e)]) for e in env_indices]
             counts_t = torch.tensor(counts_host, dtype=torch.long, device=device)
             total = sum(counts_host)
@@ -585,71 +593,94 @@ class NativeTextTrajectoryBuffer:
                 self._rows[env_i] = []
                 self._token_counts[env_i] = 0
                 self.step_count_host[env_i] = 0
+            if timing_stats is not None:
+                timing_stats.add(
+                    "finish_append_reset_slots",
+                    time.perf_counter() - finish_part_start,
+                )
 
         # Build the merged decoder batch (concat across rows).
-        merged_decoder = NativeTextDecoderBatch.concat([row.decoder for row in staged])
+        finish_part_start = time.perf_counter()
+        with torch.profiler.record_function("finish_append_build_decoder"):
+            merged_decoder = NativeTextDecoderBatch.concat([row.decoder for row in staged])
+        if timing_stats is not None:
+            timing_stats.add(
+                "finish_append_build_decoder",
+                time.perf_counter() - finish_part_start,
+            )
 
         # Translate to DecoderDecisionPayload shape. Replay scoring needs
         # anchor-indexed masks plus the original row-local encoder positions
         # so the compact pointer columns can be scored against encoder states.
         # Everything is host-side now (replay storage, staged decoder rows,
         # and the merged decoder built from them) — no D→H needed.
+        finish_part_start = time.perf_counter()
         store_dev = replay_buffer.core.trace_kind_id.device
-        n_max = max(
-            max(int(row.packed_parent.pointer_anchor_positions.shape[1]) for row in staged),
-            int(merged_decoder.pointer_anchor_handles.shape[1]),
-        )
-        anchor_positions = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
-        anchor_kinds = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
-        anchor_subjects = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
-        anchor_handles = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
-        for out_i, row in enumerate(staged):
-            src = row.packed_parent
-            src_i = int(row.packed_index)
-            width = int(src.pointer_anchor_positions.shape[1])
-            if width <= 0:
-                continue
-            anchor_positions[out_i, :width] = src.pointer_anchor_positions[src_i].to(
-                device=store_dev, dtype=torch.int32
+        with torch.profiler.record_function("finish_append_build_indices"):
+            n_max = max(
+                max(int(row.packed_parent.pointer_anchor_positions.shape[1]) for row in staged),
+                int(merged_decoder.pointer_anchor_handles.shape[1]),
             )
-            anchor_kinds[out_i, :width] = src.pointer_anchor_kinds[src_i].to(
-                device=store_dev, dtype=torch.int32
+            anchor_positions = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
+            anchor_kinds = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
+            anchor_subjects = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
+            anchor_handles = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
+            for out_i, row in enumerate(staged):
+                src = row.packed_parent
+                src_i = int(row.packed_index)
+                width = int(src.pointer_anchor_positions.shape[1])
+                if width <= 0:
+                    continue
+                anchor_positions[out_i, :width] = src.pointer_anchor_positions[src_i].to(
+                    device=store_dev, dtype=torch.int32
+                )
+                anchor_kinds[out_i, :width] = src.pointer_anchor_kinds[src_i].to(
+                    device=store_dev, dtype=torch.int32
+                )
+                anchor_subjects[out_i, :width] = src.pointer_anchor_subjects[src_i].to(
+                    device=store_dev, dtype=torch.int32
+                )
+                anchor_handles[out_i, :width] = src.pointer_anchor_handles[src_i].to(
+                    device=store_dev, dtype=torch.int32
+                )
+            cnt = (
+                ((anchor_positions >= 0) & (anchor_kinds >= 0) & (anchor_handles >= 0))
+                .sum(dim=-1)
+                .to(dtype=torch.int32)
             )
-            anchor_subjects[out_i, :width] = src.pointer_anchor_subjects[src_i].to(
-                device=store_dev, dtype=torch.int32
+            # Empty legal-edge bitmap; combat decisions need it filled out
+            # by the encoder, but for IMPALA staging we leave a placeholder.
+            legal_edge = torch.zeros((total, 0, 0), dtype=torch.bool, device=store_dev)
+            legal_n = torch.zeros((total,), dtype=torch.int32, device=store_dev)
+        if timing_stats is not None:
+            timing_stats.add(
+                "finish_append_build_indices",
+                time.perf_counter() - finish_part_start,
             )
-            anchor_handles[out_i, :width] = src.pointer_anchor_handles[src_i].to(
-                device=store_dev, dtype=torch.int32
-            )
-        cnt = (
-            ((anchor_positions >= 0) & (anchor_kinds >= 0) & (anchor_handles >= 0))
-            .sum(dim=-1)
-            .to(dtype=torch.int32)
-        )
-        # Empty legal-edge bitmap; combat decisions need it filled out
-        # by the encoder, but for IMPALA staging we leave a placeholder.
-        legal_edge = torch.zeros((total, 0, 0), dtype=torch.bool, device=store_dev)
-        legal_n = torch.zeros((total,), dtype=torch.int32, device=store_dev)
-        from magic_ai.text_encoder.replay_buffer import DecoderDecisionPayload
+        finish_part_start = time.perf_counter()
+        with torch.profiler.record_function("finish_append_payload"):
+            from magic_ai.text_encoder.replay_buffer import DecoderDecisionPayload
 
-        payload = DecoderDecisionPayload(
-            output_token_ids=merged_decoder.output_token_ids.to(dtype=torch.int32),
-            output_pointer_pos=merged_decoder.output_pointer_pos.to(dtype=torch.int32),
-            output_is_pointer=merged_decoder.output_is_pointer.to(dtype=torch.bool),
-            output_pad_mask=merged_decoder.output_pad_mask.to(dtype=torch.bool),
-            output_log_prob=merged_decoder.log_probs.to(dtype=torch.float32),
-            decision_type=merged_decoder.decision_type.to(dtype=torch.int32),
-            pointer_anchor_positions=anchor_positions,
-            pointer_anchor_kinds=anchor_kinds,
-            pointer_anchor_subjects=anchor_subjects,
-            pointer_anchor_handles=anchor_handles,
-            pointer_anchor_count=cnt,
-            legal_edge_bitmap=legal_edge,
-            legal_edge_n_blockers=legal_n,
-            legal_edge_n_attackers=legal_n,
-            vocab_mask=merged_decoder.vocab_mask.to(dtype=torch.bool),
-            pointer_mask=merged_decoder.pointer_mask.to(dtype=torch.bool),
-        )
+            payload = DecoderDecisionPayload(
+                output_token_ids=merged_decoder.output_token_ids.to(dtype=torch.int32),
+                output_pointer_pos=merged_decoder.output_pointer_pos.to(dtype=torch.int32),
+                output_is_pointer=merged_decoder.output_is_pointer.to(dtype=torch.bool),
+                output_pad_mask=merged_decoder.output_pad_mask.to(dtype=torch.bool),
+                output_log_prob=merged_decoder.log_probs.to(dtype=torch.float32),
+                decision_type=merged_decoder.decision_type.to(dtype=torch.int32),
+                pointer_anchor_positions=anchor_positions,
+                pointer_anchor_kinds=anchor_kinds,
+                pointer_anchor_subjects=anchor_subjects,
+                pointer_anchor_handles=anchor_handles,
+                pointer_anchor_count=cnt,
+                legal_edge_bitmap=legal_edge,
+                legal_edge_n_blockers=legal_n,
+                legal_edge_n_attackers=legal_n,
+                vocab_mask=merged_decoder.vocab_mask.to(dtype=torch.bool),
+                pointer_mask=merged_decoder.pointer_mask.to(dtype=torch.bool),
+            )
+        if timing_stats is not None:
+            timing_stats.add("finish_append_payload", time.perf_counter() - finish_part_start)
 
         # Reserve a window in the replay buffer covering all rows. Tokens
         # come from the staged packed rows; decisions are stored as zero
@@ -657,31 +688,45 @@ class NativeTextTrajectoryBuffer:
         from magic_ai.text_encoder.batch import PackedTextBatch  # local import
 
         token_count = sum(row.n_tokens for row in staged)
+        finish_part_start = time.perf_counter()
         reservation = replay_buffer.reserve_append(
             row_count=total,
             token_count=token_count,
             decision_count=0,
         )
+        if timing_stats is not None:
+            timing_stats.add(
+                "finish_append_reserve",
+                time.perf_counter() - finish_part_start,
+            )
         try:
-            # Write encoded rows + common fields FIRST. The packed-row
-            # helper clears the decoder row as part of its scratch reset
-            # (see ``TextReplayBuffer._write_packed_encoded_row``), so the
-            # decoder commit must come after.
+            # Write encoded rows + common fields first. Decoder rows are
+            # cleared once by ``commit_decoder_decision`` below; clearing them
+            # per row here would launch many small CUDA fills.
             row_start = int(reservation.row_start)
             row_end = int(reservation.row_end)
             row_cursor = row_start
             token_cursor = int(reservation.token_start)
-            for row in staged:
-                replay_buffer._write_packed_encoded_row(
-                    row_cursor,
-                    token_cursor,
-                    cast(PackedTextBatch, row.packed_parent),
-                    batch_index=row.packed_index,
+            finish_part_start = time.perf_counter()
+            with torch.profiler.record_function("finish_append_encoded_rows"):
+                for row in staged:
+                    replay_buffer._write_packed_encoded_row(
+                        row_cursor,
+                        token_cursor,
+                        cast(PackedTextBatch, row.packed_parent),
+                        batch_index=row.packed_index,
+                        clear_decoder=False,
+                    )
+                    row_cursor += 1
+                    token_cursor += row.n_tokens
+            if timing_stats is not None:
+                timing_stats.add(
+                    "finish_append_encoded_rows",
+                    time.perf_counter() - finish_part_start,
                 )
-                row_cursor += 1
-                token_cursor += row.n_tokens
             # Common fields, all host-to-host now that staging + storage
             # are both on host.
+            finish_part_start = time.perf_counter()
             core = replay_buffer.core
             decision_type_t = merged_decoder.decision_type.to(dtype=torch.long)
             trace_kind_lut = _decision_type_trace_kind_lut(store_dev)
@@ -707,29 +752,61 @@ class NativeTextTrajectoryBuffer:
             core.old_log_prob[row_start:row_end] = old_log_prob
             core.value[row_start:row_end] = value_t
             core.perspective_player_idx[row_start:row_end] = perspective_t
+            if timing_stats is not None:
+                timing_stats.add(
+                    "finish_append_common_fields",
+                    time.perf_counter() - finish_part_start,
+                )
+            finish_part_start = time.perf_counter()
             core.decision_start[row_start:row_end] = 0
             core.decision_count[row_start:row_end] = 0
+            if timing_stats is not None:
+                timing_stats.add(
+                    "finish_append_decision_gather",
+                    time.perf_counter() - finish_part_start,
+                )
             if core.lstm_h_in is not None and core.lstm_c_in is not None:
+                finish_part_start = time.perf_counter()
                 if any(row.lstm_h_in is None or row.lstm_c_in is None for row in staged):
                     raise ValueError("recurrent buffer requires lstm states on every staged row")
                 h_stack = torch.stack([cast(torch.Tensor, row.lstm_h_in) for row in staged], dim=0)
                 c_stack = torch.stack([cast(torch.Tensor, row.lstm_c_in) for row in staged], dim=0)
                 core._write_recurrent_batch(row_start, row_end, h_stack, c_stack)
+                if timing_stats is not None:
+                    timing_stats.add(
+                        "finish_append_lstm_gather",
+                        time.perf_counter() - finish_part_start,
+                    )
+            finish_part_start = time.perf_counter()
             replay_buffer.commit_decoder_decision(reservation, payload)
+            if timing_stats is not None:
+                timing_stats.add(
+                    "finish_append_decoder_commit",
+                    time.perf_counter() - finish_part_start,
+                )
+            finish_part_start = time.perf_counter()
             replay_buffer._mark_append_ready_range(
                 int(reservation.row_start), int(reservation.row_end)
             )
             replay_buffer.commit(reservation)
+            if timing_stats is not None:
+                timing_stats.add("finish_append_commit", time.perf_counter() - finish_part_start)
         except BaseException:
             # On failure, leave the reservation un-sealed (caller must drop).
             raise
 
+        finish_part_start = time.perf_counter()
         rows = torch.arange(
             int(reservation.row_start),
             int(reservation.row_end),
             dtype=torch.long,
             device=device,
         )
+        if timing_stats is not None:
+            timing_stats.add(
+                "finish_append_rows_tensor",
+                time.perf_counter() - finish_part_start,
+            )
         return rows, counts_t
 
     def append_envs_to_replay(
@@ -5164,13 +5241,21 @@ def train_text_native_batched_envs(
                 "server_scatter",
                 "learner_finish_games",
                 "finish_terminal_reward",
+                "finish_metadata",
                 "finish_gae",
                 "finish_append_wait_lock",
+                "finish_append_reset_slots",
+                "finish_append_build_decoder",
                 "finish_append_build_indices",
+                "finish_append_payload",
+                "finish_append_reserve",
+                "finish_append_encoded_rows",
+                "finish_append_common_fields",
                 "finish_append_decision_gather",
                 "finish_append_lstm_gather",
-                "finish_append_replay_copy",
-                "finish_append_reset_slots",
+                "finish_append_decoder_commit",
+                "finish_append_commit",
+                "finish_append_rows_tensor",
                 "finish_close_bookkeeping",
                 "learner_update",
             ):
