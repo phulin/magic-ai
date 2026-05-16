@@ -112,6 +112,133 @@ class DecoderGatherOutput:
 
 
 @dataclass(frozen=True)
+class DecoderCells:
+    """Packed-cell view over a gathered batch's grammar layout.
+
+    Active decoder steps split into ``vocab`` cells and ``pointer`` cells
+    (separated arenas so the consumer never needs a ``.where``-style
+    split). Each cell's legal choices are stored as a flat
+    ``legal_choice`` arena, indexed by ``legal_cell_id`` (which cell
+    each legal entry belongs to).
+
+    Built CPU-side in :meth:`TextReplayBuffer.gather` from the dense
+    ``output_pad_mask`` / ``output_is_pointer`` / ``vocab_mask`` /
+    ``pointer_mask`` already gathered — sync-free.
+    """
+
+    # Vocab cells (one per active vocab decoder step).
+    v_cell_b: Tensor  # [N_v_cells] int32 - row index in the gathered batch
+    v_cell_t: Tensor  # [N_v_cells] int32 - step index
+    v_cell_behavior_log_prob: Tensor  # [N_v_cells] float32
+    # Per legal vocab choice across all vocab cells.
+    v_legal_choice: Tensor  # [N_v_legal] int32 - vocab token id
+    v_legal_cell_id: Tensor  # [N_v_legal] int32 - 0..N_v_cells-1
+    v_legal_is_chosen: Tensor  # [N_v_legal] bool
+
+    # Pointer cells (same structure; ``legal_choice`` is encoder
+    # position instead of vocab id).
+    p_cell_b: Tensor
+    p_cell_t: Tensor
+    p_cell_behavior_log_prob: Tensor
+    p_legal_choice: Tensor
+    p_legal_cell_id: Tensor
+    p_legal_is_chosen: Tensor
+
+    def to(self, device: torch.device | str) -> DecoderCells:
+        target = torch.device(device)
+        if self.v_cell_b.device == target:
+            return self
+
+        def _mv(t: Tensor) -> Tensor:
+            return t.to(device=target, non_blocking=True)
+
+        return DecoderCells(
+            v_cell_b=_mv(self.v_cell_b),
+            v_cell_t=_mv(self.v_cell_t),
+            v_cell_behavior_log_prob=_mv(self.v_cell_behavior_log_prob),
+            v_legal_choice=_mv(self.v_legal_choice),
+            v_legal_cell_id=_mv(self.v_legal_cell_id),
+            v_legal_is_chosen=_mv(self.v_legal_is_chosen),
+            p_cell_b=_mv(self.p_cell_b),
+            p_cell_t=_mv(self.p_cell_t),
+            p_cell_behavior_log_prob=_mv(self.p_cell_behavior_log_prob),
+            p_legal_choice=_mv(self.p_legal_choice),
+            p_legal_cell_id=_mv(self.p_legal_cell_id),
+            p_legal_is_chosen=_mv(self.p_legal_is_chosen),
+        )
+
+
+def _build_decoder_cells(
+    pad_mask: Tensor,  # [B, L] bool, CPU
+    is_pointer_step: Tensor,  # [B, L] bool, CPU
+    vocab_mask: Tensor,  # [B, L, V] bool, CPU
+    pointer_mask: Tensor,  # [B, L, T_enc] bool, CPU
+    target_tokens: Tensor,  # [B, L] int (long or int32), CPU - chosen vocab id
+    target_pointer_pos: Tensor,  # [B, L] int, CPU - chosen pointer pos
+    output_log_prob: Tensor,  # [B, L] float32, CPU - behavior log p of chosen action
+) -> DecoderCells:
+    """CPU-only construction of the packed cell layout.
+
+    ``target_pointer_pos`` may exceed the gathered batch's ``T_enc``
+    (sampler can store a wider pointer space than train-time
+    encoder). The caller is responsible for ensuring it's been clamped
+    or that ``pointer_mask`` already zeros the offending columns —
+    matches the existing ``decoder_score_replay`` contract.
+    """
+    v_active_step = pad_mask & ~is_pointer_step  # [B, L]
+    p_active_step = pad_mask & is_pointer_step  # [B, L]
+
+    # Vocab cells.
+    v_cell_pos = v_active_step.nonzero(as_tuple=False)  # [N_v_cells, 2]
+    v_cell_b = v_cell_pos[:, 0].to(torch.int32)
+    v_cell_t = v_cell_pos[:, 1].to(torch.int32)
+    # Per-(b, t) cell index, only valid where v_active_step is True.
+    v_active_flat = v_active_step.view(-1).to(torch.long)
+    v_cell_idx_dense = (v_active_flat.cumsum(0) - 1).view(pad_mask.shape)
+    # Vocab legal entries.
+    v_legal_active = vocab_mask & v_active_step.unsqueeze(-1)  # [B, L, V]
+    v_legal_pos = v_legal_active.nonzero(as_tuple=False)  # [N_v_legal, 3]
+    v_legal_b = v_legal_pos[:, 0]
+    v_legal_t = v_legal_pos[:, 1]
+    v_legal_choice = v_legal_pos[:, 2].to(torch.int32)
+    v_legal_cell_id = v_cell_idx_dense[v_legal_b, v_legal_t].to(torch.int32)
+    v_legal_chosen_token = target_tokens[v_legal_b, v_legal_t].to(torch.int32)
+    v_legal_is_chosen = v_legal_choice == v_legal_chosen_token
+    v_cell_behavior_log_prob = output_log_prob[v_cell_b.long(), v_cell_t.long()].to(torch.float32)
+
+    # Pointer cells.
+    p_cell_pos = p_active_step.nonzero(as_tuple=False)  # [N_p_cells, 2]
+    p_cell_b = p_cell_pos[:, 0].to(torch.int32)
+    p_cell_t = p_cell_pos[:, 1].to(torch.int32)
+    p_active_flat = p_active_step.view(-1).to(torch.long)
+    p_cell_idx_dense = (p_active_flat.cumsum(0) - 1).view(pad_mask.shape)
+    p_legal_active = pointer_mask & p_active_step.unsqueeze(-1)  # [B, L, T_enc]
+    p_legal_pos = p_legal_active.nonzero(as_tuple=False)  # [N_p_legal, 3]
+    p_legal_b = p_legal_pos[:, 0]
+    p_legal_t = p_legal_pos[:, 1]
+    p_legal_choice = p_legal_pos[:, 2].to(torch.int32)
+    p_legal_cell_id = p_cell_idx_dense[p_legal_b, p_legal_t].to(torch.int32)
+    p_legal_chosen_pos = target_pointer_pos[p_legal_b, p_legal_t].to(torch.int32)
+    p_legal_is_chosen = p_legal_choice == p_legal_chosen_pos
+    p_cell_behavior_log_prob = output_log_prob[p_cell_b.long(), p_cell_t.long()].to(torch.float32)
+
+    return DecoderCells(
+        v_cell_b=v_cell_b,
+        v_cell_t=v_cell_t,
+        v_cell_behavior_log_prob=v_cell_behavior_log_prob,
+        v_legal_choice=v_legal_choice,
+        v_legal_cell_id=v_legal_cell_id,
+        v_legal_is_chosen=v_legal_is_chosen,
+        p_cell_b=p_cell_b,
+        p_cell_t=p_cell_t,
+        p_cell_behavior_log_prob=p_cell_behavior_log_prob,
+        p_legal_choice=p_legal_choice,
+        p_legal_cell_id=p_legal_cell_id,
+        p_legal_is_chosen=p_legal_is_chosen,
+    )
+
+
+@dataclass(frozen=True)
 class TextReplayBatch:
     encoded: PackedTextBatch
     trace_kind_id: Tensor
@@ -138,6 +265,12 @@ class TextReplayBatch:
     n_active_steps: int
     n_vocab_cells: int
     n_ptr_cells: int
+    # Packed-cell view (vocab cells + pointer cells in two arenas).
+    # Built CPU-side from the dense masks at gather time. The per-cell
+    # decoder forward and the per-choice consumer read from this
+    # directly — no dense ``[B, L, V]`` / ``[B, L, T_enc]`` rebuilding
+    # at training time.
+    cells: DecoderCells
 
     def to(self, device: torch.device | str) -> TextReplayBatch:
         """Move every tensor field to ``device``. Used to H→D a CPU-resident
@@ -176,6 +309,7 @@ class TextReplayBatch:
             n_active_steps=self.n_active_steps,
             n_vocab_cells=self.n_vocab_cells,
             n_ptr_cells=self.n_ptr_cells,
+            cells=self.cells.to(target),
         )
 
 
@@ -1822,21 +1956,37 @@ class TextReplayBuffer:
             max_seqlen=max_seqlen,
         )
         decoder = self.gather_decoder(idx)
-        # Bool-sum the three grammar masks on host *before* H→D so the
-        # per-choice training path can use ``torch.nonzero_static(size=N)``
-        # — eliminates three data-dependent shape syncs per RNaD policy.
-        # Reduce along the choice axis first so the [B, L, V] / [B, L, T]
-        # AND tensors never get materialized; we only need scalar totals,
-        # not the rasterized intermediate masks themselves.
+        # Build the packed-cell view on host (replay storage is CPU, so
+        # this is pure CPU work — no GPU sync). The per-choice consumer
+        # and the per-cell decoder pointer head both read straight from
+        # ``cells``, no dense [B, L, V] / [B, L, T_enc] rebuilding at
+        # training time.
         pad_mask_bool = decoder.output_pad_mask.to(dtype=torch.bool)
         is_ptr_bool = decoder.output_is_pointer.to(dtype=torch.bool)
         vocab_active_step = pad_mask_bool & ~is_ptr_bool  # [B, L]
         ptr_active_step = pad_mask_bool & is_ptr_bool  # [B, L]
-        vocab_legal_per_step = decoder.vocab_mask.sum(dim=-1)  # [B, L] int
-        ptr_legal_per_step = decoder.pointer_mask.sum(dim=-1)  # [B, L] int
+        # Sum the choice axis first so the [B, L, V] / [B, L, T] AND
+        # intermediate never gets materialized for the *counts*.
+        vocab_legal_per_step = decoder.vocab_mask.sum(dim=-1)
+        ptr_legal_per_step = decoder.pointer_mask.sum(dim=-1)
         n_active_steps = int(pad_mask_bool.sum().item())
         n_vocab_cells = int((vocab_active_step * vocab_legal_per_step).sum().item())
         n_ptr_cells = int((ptr_active_step * ptr_legal_per_step).sum().item())
+        # ``target_pointer_pos`` may carry the sample-time T_enc which
+        # can exceed the gathered batch's T_enc. The cell builder uses
+        # it only to compare against ``p_legal_choice`` (which is
+        # within ``pointer_mask``'s columns), so out-of-range values
+        # simply land in the False branch — clamping isn't required for
+        # correctness. Matches ``decoder_score_replay``'s tolerance.
+        cells = _build_decoder_cells(
+            pad_mask=pad_mask_bool,
+            is_pointer_step=is_ptr_bool,
+            vocab_mask=decoder.vocab_mask.to(dtype=torch.bool),
+            pointer_mask=decoder.pointer_mask.to(dtype=torch.bool),
+            target_tokens=decoder.output_token_ids,
+            target_pointer_pos=decoder.output_pointer_pos,
+            output_log_prob=decoder.output_log_prob,
+        )
         return TextReplayBatch(
             encoded=encoded,
             trace_kind_id=common.trace_kind_id,
@@ -1859,6 +2009,7 @@ class TextReplayBuffer:
             n_active_steps=n_active_steps,
             n_vocab_cells=n_vocab_cells,
             n_ptr_cells=n_ptr_cells,
+            cells=cells,
         )
 
     def write_projected_state(self, rows: Tensor, projected: Tensor) -> None:

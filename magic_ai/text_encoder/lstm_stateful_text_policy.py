@@ -442,66 +442,60 @@ class LSTMStatefulTextPolicy(nn.Module):
             extras,
         ) = self._score_replay_rows(replay_rows)
         batch, pointer_mask = extras
-        device = vocab_mask.device
+        del pointer_mask, target_tokens, target_pointer_pos, is_pointer_step, vocab_mask, pad_mask
+        device = values.device
+        cells = batch.cells
 
-        # ----- Decision groups: one per active decoder step -----
-        # True-counts of the three masks were computed on host inside
-        # ``TextReplayBuffer.gather`` (replay_buffer.py:gather), so we can
-        # use ``torch.nonzero_static(mask, size=N)`` with the exact size
-        # and avoid the data-dependent shape sync on every call. Three
-        # syncs/call × four policies/update was ~48% of train wall time.
-        b, l_max = pad_mask.shape
-        group_active = pad_mask  # [B, L] bool
-        # Per-(b,t) integer id (0..G-1) for active cells, -1 elsewhere.
-        active_long = group_active.to(dtype=torch.long)
-        group_ids_dense = active_long.view(-1).cumsum(0) - 1
-        group_ids = group_ids_dense.view(b, l_max)
-        # Flat index list of active (b, t) pairs — no sync.
-        active_pos = torch.nonzero_static(group_active, size=batch.n_active_steps)  # [G, 2]
-        g_b = active_pos[:, 0]
-        g_t = active_pos[:, 1]
-        step_for_decision_group = g_b  # batch-step id (0..B-1)
-        behavior_lp_per_group = batch.decoder.output_log_prob.to(device=device, dtype=values.dtype)[
-            g_b, g_t
-        ]
+        # ----- Per-choice from packed cells -----
+        # ``cells`` is a sync-free packed view built CPU-side at gather:
+        # vocab and pointer cells live in separated arenas, each with
+        # its own legal-choice arena. The per-choice path is now a
+        # straight gather — no nonzero, no cumsum, no [B, L, V] /
+        # [B, L, T_enc] mask materialization.
+        v_cell_b = cells.v_cell_b.to(dtype=torch.long)
+        v_cell_t = cells.v_cell_t.to(dtype=torch.long)
+        p_cell_b = cells.p_cell_b.to(dtype=torch.long)
+        p_cell_t = cells.p_cell_t.to(dtype=torch.long)
+        v_legal_cell_id = cells.v_legal_cell_id.to(dtype=torch.long)
+        p_legal_cell_id = cells.p_legal_cell_id.to(dtype=torch.long)
+        # Per-legal (b, t, choice): each legal entry inherits (b, t) of
+        # its cell.
+        v_b = v_cell_b[v_legal_cell_id]
+        v_t = v_cell_t[v_legal_cell_id]
+        v_c = cells.v_legal_choice.to(dtype=torch.long)
+        p_b = p_cell_b[p_legal_cell_id]
+        p_t = p_cell_t[p_legal_cell_id]
+        p_c = cells.p_legal_choice.to(dtype=torch.long)
 
-        # ----- Vocab cells: active & !is_pointer & vocab_mask -----
-        vocab_cell_active = (
-            pad_mask.unsqueeze(-1) & (~is_pointer_step).unsqueeze(-1) & vocab_mask
-        )  # [B, L, V]
-        vocab_cells = torch.nonzero_static(vocab_cell_active, size=batch.n_vocab_cells)  # [Nv, 3]
-        v_b = vocab_cells[:, 0]
-        v_t = vocab_cells[:, 1]
-        v_c = vocab_cells[:, 2]
         v_logits = scores.vocab_logits[v_b, v_t, v_c]
         v_logp = scores.vocab_log_softmax[v_b, v_t, v_c]
-        v_group = group_ids[v_b, v_t]
-        v_sampled = v_c == target_tokens[v_b, v_t]
-
-        # ----- Pointer cells: active & is_pointer & pointer_mask -----
-        ptr_cell_active = pad_mask.unsqueeze(-1) & is_pointer_step.unsqueeze(-1) & pointer_mask
-        ptr_cells = torch.nonzero_static(ptr_cell_active, size=batch.n_ptr_cells)
-        p_b = ptr_cells[:, 0]
-        p_t = ptr_cells[:, 1]
-        p_c = ptr_cells[:, 2]
         p_logits = scores.pointer_logits[p_b, p_t, p_c]
         p_logp = scores.pointer_log_softmax[p_b, p_t, p_c]
-        p_group = group_ids[p_b, p_t]
-        p_sampled = p_c == target_pointer_pos[p_b, p_t]
+
+        # Group ordering: vocab cells get ids [0, N_v_cells), pointer
+        # cells get ids [N_v_cells, N_v_cells + N_p_cells). R-NaD's
+        # downstream operations on ``decision_group_id_flat`` are
+        # commutative (scatter_add) and only read consistent mappings
+        # within a single per_choice output, so the choice of ordering
+        # doesn't affect downstream results.
+        n_v_cells = int(cells.v_cell_b.shape[0])
+        v_group = v_legal_cell_id
+        p_group = p_legal_cell_id + n_v_cells
 
         flat_logits = torch.cat([v_logits, p_logits], dim=0)
         flat_log_probs = torch.cat([v_logp, p_logp], dim=0)
         decision_group_id_flat = torch.cat([v_group, p_group], dim=0)
-        is_sampled_flat = torch.cat([v_sampled, p_sampled], dim=0)
+        is_sampled_flat = torch.cat([cells.v_legal_is_chosen, cells.p_legal_is_chosen], dim=0)
         choice_cols = torch.cat([v_c, p_c], dim=0)
-        # ``step_for_decision_group[group_id] == g_b[group_id]`` and
-        # ``decision_group_id_flat[cell]``'s b-coord equals the cell's own
-        # b-coord by construction, so ``group_idx`` is just the concat of
-        # the cells' b-coords — skip the indirect index.
         group_idx = torch.cat([v_b, p_b], dim=0)
+        step_for_decision_group = torch.cat([v_cell_b, p_cell_b], dim=0)
+        behavior_lp_per_group = torch.cat(
+            [cells.v_cell_behavior_log_prob, cells.p_cell_behavior_log_prob], dim=0
+        ).to(dtype=values.dtype)
 
         # Decoder has no "may" Bernoulli head; zero everything so
         # may_neurd_loss masks itself out via ``may_is_active=False``.
+        b = int(batch.encoded.seq_lengths.shape[0])
         may_is_active = torch.zeros(b, dtype=torch.bool, device=device)
         may_logits_per_step = torch.zeros(b, dtype=values.dtype, device=device)
         may_selected_per_step = torch.zeros(b, dtype=values.dtype, device=device)
