@@ -9,7 +9,7 @@ replay scoring delegate to the module-level helpers in
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -30,14 +30,28 @@ from magic_ai.text_encoder.recurrent import RecurrentTextPolicy, RecurrentTextPo
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
 
 
+@dataclass(frozen=True)
+class TextReplayForwardCache:
+    """Reusable forward results for one gathered text replay batch."""
+
+    batch: Any
+    scores: DecoderReplayScores
+    values: Tensor
+    target_tokens: Tensor
+    target_pointer_pos: Tensor
+    is_pointer_step: Tensor
+    pad_mask: Tensor
+    vocab_mask: Tensor
+    h_concat: Tensor | None = None
+
+
 class LSTMStatefulTextPolicy(nn.Module):
     """Owns per-env / per-player LSTM state for the recurrent text policy and
     exposes the trainer-facing sampling / replay-scoring surface.
 
     Phase 5 reduced this class from ~3500 LoC to a thin shell. R-NaD's
-    fused per-policy forward (``evaluate_replay_batch_per_choice``,
-    ``precompute_replay_forward``) used to drive a hundred lines of inline-
-    blank scoring; the equivalent decoder-based wiring lives in Phase 6.
+    fused per-policy forward now reuses the decoder replay-scoring cache
+    produced by ``precompute_replay_forward``.
     """
 
     spr_enabled: bool = False
@@ -246,20 +260,32 @@ class LSTMStatefulTextPolicy(nn.Module):
         # policy device for the forward pass.
         return self.rollout_buffer.gather(host_rows).to(self.device)
 
+    def prepare_rnad_replay_batch(self, replay_rows: Sequence[int]) -> Any:
+        """Gather one device-side replay batch for all R-NaD policy copies."""
+
+        return self._gather_replay_decoder([int(r) for r in replay_rows])
+
     def precompute_replay_forward(
         self,
         episodes: list[list[int]],
-        **_kwargs: Any,
-    ) -> None:
-        """Pre-encode the replay batch.
+        **kwargs: Any,
+    ) -> TextReplayForwardCache:
+        """Pre-score one flat replay batch for R-NaD.
 
-        Slot policy returns a cache that downstream per-choice scoring
-        reuses; the decoder path threads its encoder forward inside
-        :meth:`evaluate_replay_batch_per_choice`, so this hook returns
-        ``None`` and the trainer falls back to the standard call.
+        R-NaD calls this once per policy copy before asking for
+        per-choice tensors. Holding the scored batch here prevents the
+        expensive gather + encoder + teacher-forced decoder path from
+        running twice for the same policy inside one update.
         """
-        del episodes
-        return None
+        prepared = kwargs.get("prepared_batch")
+        if prepared is not None:
+            batch = prepared
+        else:
+            flat_rows = kwargs.get("flat_rows_override")
+            if flat_rows is None:
+                flat_rows = [int(r) for ep in episodes for r in ep]
+            batch = self._gather_replay_decoder(flat_rows)
+        return self._score_replay_batch(batch)
 
     def count_active_replay_steps(
         self,
@@ -286,18 +312,9 @@ class LSTMStatefulTextPolicy(nn.Module):
         active = int((decision_type >= 0).sum().item())
         return active, active
 
-    def _score_replay_rows(
-        self, replay_rows: list[int] | Tensor
-    ) -> tuple[DecoderReplayScores, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Any]:
-        """Shared core for ``evaluate_replay_batch`` and the per-choice variant.
+    def _score_replay_batch(self, batch: Any) -> TextReplayForwardCache:
+        """Run the replay encoder + teacher-forced decoder once for ``batch``."""
 
-        Returns the decoder replay scores plus the per-step targets, masks,
-        and value head outputs — everything both PPO and R-NaD downstream
-        paths need. ``batch`` is the gathered replay batch so the per-choice
-        path can also lift stored mu log-probs.
-        """
-
-        batch = self._gather_replay_decoder(replay_rows)
         # Run encoder with the per-row recurrent state recorded at rollout
         # time so train-time scoring matches sample-time exactly. Replay
         # storage layout is [B, layers, hidden]; LSTM wants [layers, B, hidden].
@@ -307,61 +324,79 @@ class LSTMStatefulTextPolicy(nn.Module):
         c_in = (
             batch.lstm_c_in.permute(1, 0, 2).contiguous() if batch.lstm_c_in is not None else None
         )
-        encoded_snaps, _h_out, _c_out = self.policy.encode_with_history(
-            batch.encoded, h_in=h_in, c_in=c_in
-        )
-        # ``encode_with_history`` on a PackedTextBatch returns a packed
-        # ``[T_packed, D]`` hidden tensor; the decoder cross-attn wants the
-        # padded ``[B, T_max, D]`` shape with an explicit attention mask.
-        encoded, attn_mask = scatter_packed_to_padded(encoded_snaps.encoded, batch.encoded)
-        b = int(encoded.shape[0])
-        t_enc = int(encoded.shape[1])
-
-        decoder = batch.decoder
-        target_tokens = decoder.output_token_ids.to(dtype=torch.long).clamp_min(0)
-        target_pointer_pos = decoder.output_pointer_pos.to(dtype=torch.long).clamp_min(0)
-        is_pointer_step = decoder.output_is_pointer.to(dtype=torch.bool)
-        pad_mask = decoder.output_pad_mask.to(dtype=torch.bool)
-
-        # Per-step grammar masks were saved by the live sampler at rollout
-        # time; carry them straight to the score function. The replay
-        # buffer stores ``pointer_mask`` at the buffer's ``max_tokens``
-        # column width — truncate to the current encoder padding.
-        # (Stored cells past ``T_enc_sample`` are False by construction,
-        # so truncation never drops a True cell.)
-        vocab_mask = decoder.vocab_mask.to(device=encoded.device, dtype=torch.bool)
-        pointer_mask_full = decoder.pointer_mask.to(device=encoded.device, dtype=torch.bool)
-        if pointer_mask_full.shape[2] >= t_enc:
-            pointer_mask = pointer_mask_full[:, :, :t_enc].contiguous()
-        else:
-            # Replay-time encoder is wider than what the buffer stored —
-            # zero-pad the tail. Anchor positions never exceed sample-time
-            # T_enc, so the padded tail is False anyway.
-            pad = torch.zeros(
-                (b, pointer_mask_full.shape[1], t_enc - pointer_mask_full.shape[2]),
-                dtype=torch.bool,
-                device=encoded.device,
+        device_type = batch.encoded.token_ids.device.type
+        autocast_enabled = device_type == "cuda"
+        with torch.autocast(
+            device_type=device_type, dtype=torch.bfloat16, enabled=autocast_enabled
+        ):
+            encoded_snaps, _h_out, _c_out = self.policy.encode_with_history(
+                batch.encoded, h_in=h_in, c_in=c_in
             )
-            pointer_mask = torch.cat([pointer_mask_full, pad], dim=2)
-        scores = decoder_score_replay(
-            self.policy.text_policy,
-            encoded,
-            attn_mask,
-            target_tokens,
-            pad_mask,
-            vocab_mask,
-            batch.cells.to(device=encoded.device),
+            # ``encode_with_history`` on a PackedTextBatch returns a packed
+            # ``[T_packed, D]`` hidden tensor; the decoder cross-attn wants the
+            # padded ``[B, T_max, D]`` shape with an explicit attention mask.
+            encoded, attn_mask = scatter_packed_to_padded(encoded_snaps.encoded, batch.encoded)
+
+            decoder = batch.decoder
+            target_tokens = decoder.output_token_ids.to(dtype=torch.long).clamp_min(0)
+            target_pointer_pos = decoder.output_pointer_pos.to(dtype=torch.long).clamp_min(0)
+            is_pointer_step = decoder.output_is_pointer.to(dtype=torch.bool)
+            pad_mask = decoder.output_pad_mask.to(dtype=torch.bool)
+
+            # Per-step grammar masks were saved by the live sampler at rollout
+            # time; carry the vocab support straight to the score function.
+            # Pointer support is consumed through ``batch.cells`` so replay
+            # scoring never materializes dense ``[B, L, T_enc]`` pointer logits.
+            vocab_mask = decoder.vocab_mask.to(device=encoded.device, dtype=torch.bool)
+            scores = decoder_score_replay(
+                self.policy.text_policy,
+                encoded,
+                attn_mask,
+                target_tokens,
+                pad_mask,
+                vocab_mask,
+                batch.cells.to(device=encoded.device),
+            )
+            values = self.policy.text_policy.run_heads(encoded_snaps)
+        return TextReplayForwardCache(
+            batch=batch,
+            scores=scores,
+            values=values.squeeze(-1),
+            target_tokens=target_tokens,
+            target_pointer_pos=target_pointer_pos,
+            is_pointer_step=is_pointer_step,
+            pad_mask=pad_mask,
+            vocab_mask=vocab_mask,
+            h_concat=None,
         )
-        values = self.policy.text_policy.run_heads(encoded_snaps)
+
+    def _score_replay_rows(
+        self,
+        replay_rows: list[int] | Tensor,
+        *,
+        cached: Any | None = None,
+    ) -> tuple[DecoderReplayScores, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Any]:
+        """Shared core for ``evaluate_replay_batch`` and the per-choice variant.
+
+        Returns the decoder replay scores plus the per-step targets, masks,
+        and value head outputs — everything both PPO and R-NaD downstream
+        paths need. ``batch`` is the gathered replay batch so the per-choice
+        path can also lift stored mu log-probs.
+        """
+
+        cache = cached if isinstance(cached, TextReplayForwardCache) else None
+        if cache is None:
+            batch = self._gather_replay_decoder(replay_rows)
+            cache = self._score_replay_batch(batch)
         return (
-            scores,
-            values.squeeze(-1),
-            target_tokens,
-            target_pointer_pos,
-            is_pointer_step,
-            pad_mask,
-            vocab_mask,
-            (batch, pointer_mask),
+            cache.scores,
+            cache.values,
+            cache.target_tokens,
+            cache.target_pointer_pos,
+            cache.is_pointer_step,
+            cache.pad_mask,
+            cache.vocab_mask,
+            cache.batch,
         )
 
     def evaluate_replay_batch(
@@ -397,13 +432,13 @@ class LSTMStatefulTextPolicy(nn.Module):
         pair across the batch in the same order R-NaD's NeuRD update
         expects from :class:`magic_ai.replay_decisions.ReplayPerChoice`.
 
-        ``lstm_state_override`` / ``hidden_override`` / ``cached`` are
-        accepted for protocol parity with the slot policy. The decoder
+        ``lstm_state_override`` / ``hidden_override`` are accepted for
+        protocol parity with the slot policy. The decoder
         pipeline always rescans the LSTM from the per-row state stored
-        in the replay buffer (see :meth:`_score_replay_rows`), so all
-        three are ignored.
+        in the replay buffer (see :meth:`_score_replay_rows`). ``cached``
+        carries the pre-scored R-NaD batch when available.
         """
-        del lstm_state_override, hidden_override, cached
+        del lstm_state_override, hidden_override
         (
             scores,
             values,
@@ -413,9 +448,9 @@ class LSTMStatefulTextPolicy(nn.Module):
             pad_mask,
             vocab_mask,
             extras,
-        ) = self._score_replay_rows(replay_rows)
-        batch, pointer_mask = extras
-        del pointer_mask, target_tokens, target_pointer_pos, is_pointer_step, vocab_mask, pad_mask
+        ) = self._score_replay_rows(replay_rows, cached=cached)
+        batch = extras
+        del target_tokens, target_pointer_pos, is_pointer_step, vocab_mask, pad_mask
         device = values.device
         cells = batch.cells
 
@@ -571,4 +606,4 @@ class LSTMStatefulTextPolicy(nn.Module):
         return None
 
 
-__all__ = ["LSTMStatefulTextPolicy"]
+__all__ = ["LSTMStatefulTextPolicy", "TextReplayForwardCache"]

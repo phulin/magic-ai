@@ -96,6 +96,13 @@ class RecurrentTextPolicy(nn.Module):
             ]
             | None
         ) = None
+        self._compiled_encode_with_history_packed: (
+            Callable[
+                [PackedTextBatch, Tensor | None, Tensor | None],
+                tuple[EncodedSnapshots, Tensor, Tensor],
+            ]
+            | None
+        ) = None
         # Compile is wired up lazily on the first CUDA forward (see
         # ``forward_packed``). flash_attn_varlen replaced the old NJT-subclass
         # attention so the historical AOT-autograd backward mismatch no longer
@@ -103,10 +110,9 @@ class RecurrentTextPolicy(nn.Module):
         # only compile when we actually see a CUDA tensor.
         #
         # Inference goes through ``TextInferencePipeline``'s bucketed compile
-        # (Phase C). The direct callers of ``encode_with_history``
-        # (opponent-pool eval, the pipeline's bucket-doesn't-fit fallback)
-        # run eager: they're low-frequency and the bucketed compile already
-        # owns the steady-state inference forward.
+        # (Phase C). Replay scoring can call ``encode_with_history`` directly,
+        # so it gets its own lazy packed compile point when --torch-compile is
+        # enabled.
 
     def init_state(self, batch_size: int, device: torch.device) -> tuple[Tensor, Tensor]:
         shape = (self.lstm_layers, batch_size, self.lstm_hidden)
@@ -180,13 +186,26 @@ class RecurrentTextPolicy(nn.Module):
     ) -> tuple[EncodedSnapshots, Tensor, Tensor]:
         """Run encoder with history-conditioning + LSTM update.
 
-        Eager. The bucketed inference path
-        (:class:`TextInferencePipeline`) compiles ``_encode_with_history_impl``
-        directly per bucket (Phase C); train-time replay scoring uses
-        ``forward_packed`` (compiled separately). Direct callers of this
-        method are infrequent enough that a third compile point isn't worth
-        the warmup cost.
+        The bucketed inference path (:class:`TextInferencePipeline`)
+        compiles ``_encode_with_history_impl`` directly per bucket. Replay
+        scoring uses this method on packed batches, so --torch-compile
+        lazily compiles that packed encode-only path on CUDA.
         """
+        if (
+            isinstance(batch, PackedTextBatch)
+            and self.cfg.compile_forward
+            and batch.token_ids.device.type == "cuda"
+        ):
+            if self._compiled_encode_with_history_packed is None:
+                self._compiled_encode_with_history_packed = cast(
+                    Callable[
+                        [PackedTextBatch, Tensor | None, Tensor | None],
+                        tuple[EncodedSnapshots, Tensor, Tensor],
+                    ],
+                    torch.compile(self._encode_with_history_impl, dynamic=True),
+                )
+            if not is_fx_symbolic_tracing():
+                return self._compiled_encode_with_history_packed(batch, h_in, c_in)
         return self._encode_with_history_impl(batch, h_in, c_in)
 
     def _encode_with_history_impl(

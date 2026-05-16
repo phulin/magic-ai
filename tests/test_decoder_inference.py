@@ -149,6 +149,7 @@ def test_decoder_score_replay_returns_finite_scalar_per_row():
     pad_mask = torch.tensor([[True, True, True, False]] * b, dtype=torch.bool)
     vocab_mask = torch.ones((b, L, GRAMMAR_VOCAB_SIZE), dtype=torch.bool)
     pointer_mask = torch.ones((b, L, t_enc), dtype=torch.bool)
+    pointer_anchor_positions = torch.arange(t_enc, dtype=torch.int32).expand(b, t_enc)
 
     # The function now consumes packed cells; build them on host from
     # the dense masks (matches what ``TextReplayBuffer.gather`` does).
@@ -159,6 +160,7 @@ def test_decoder_score_replay_returns_finite_scalar_per_row():
         is_pointer_step=is_pointer_step,
         vocab_mask=vocab_mask,
         pointer_mask=pointer_mask,
+        pointer_anchor_positions=pointer_anchor_positions,
         target_tokens=target_tokens,
         target_pointer_pos=target_pointer_pos,
         output_log_prob=torch.zeros((b, L), dtype=torch.float32),

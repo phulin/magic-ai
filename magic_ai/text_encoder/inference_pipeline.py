@@ -34,6 +34,7 @@ from torch import Tensor
 
 from magic_ai.text_encoder import decoder_inference as _decoder_inference_mod
 from magic_ai.text_encoder.batch import PackedTextBatch, scatter_packed_to_padded
+from magic_ai.text_encoder.decision_spec import AnchorKind, DecisionType
 from magic_ai.text_encoder.decoder_batch import (
     NativeTextDecoderBatch,
     native_decoder_batch_from_sample,
@@ -73,6 +74,31 @@ _PAD_TOKEN_ID = 0
 # bigger than this would be truncated — assert at copy time.
 _BUCKET_BITMAP_BLOCKERS = 16
 _BUCKET_BITMAP_ATTACKERS = 16
+
+
+def _decoder_len_for_decision_type(
+    decision_type: int,
+    pointer_anchor_kinds: Tensor,
+    *,
+    cap: int,
+) -> int:
+    """Small decode cap for a homogeneous decision-type slice."""
+
+    if decision_type < 0:
+        return 1
+    if decision_type in (
+        int(DecisionType.PRIORITY),
+        int(DecisionType.CHOOSE_TARGETS),
+        int(DecisionType.MAY),
+    ):
+        return min(int(cap), 3)
+    if decision_type == int(DecisionType.DECLARE_ATTACKERS):
+        n = int((pointer_anchor_kinds == int(AnchorKind.LEGAL_ATTACKER)).sum(dim=1).max().item())
+        return max(2, min(int(cap), 2 + 4 * n))
+    if decision_type == int(DecisionType.DECLARE_BLOCKERS):
+        n = int((pointer_anchor_kinds == int(AnchorKind.LEGAL_BLOCKER)).sum(dim=1).max().item())
+        return max(2, min(int(cap), 2 + 4 * n))
+    return int(cap)
 
 
 def _select_bucket(
@@ -528,30 +554,84 @@ class TextInferencePipeline:
             ak = min(int(src_bitmap.shape[2]), _BUCKET_BITMAP_ATTACKERS)
             if bk > 0 and ak > 0:
                 bitmap[:, :bk, :ak].copy_(src_bitmap[:, :bk, :ak])
-        decoder_args = (
-            text_policy,
-            encoded,
-            attn_mask,
-            encoded_device_batch.decision_type.to(device=device, dtype=torch.long),
-            anchor_positions_rowlocal.to(device=device, dtype=torch.long),
-            encoded_device_batch.pointer_anchor_kinds.to(device=device, dtype=torch.long),
-            encoded_device_batch.pointer_anchor_subjects.to(device=device, dtype=torch.long),
-            encoded_device_batch.pointer_anchor_handles.to(device=device, dtype=torch.long),
-        )
-        decoder_kwargs: dict[str, Any] = {
-            "legal_edge_bitmap": bitmap,
-            "greedy": self._deterministic,
-        }
-        if self._compile_decoder and not self._decoder_first_call_done:
-            sample = self._timed_first_call(
-                "decoder_sample", decoder_fn, *decoder_args, **decoder_kwargs
-            )
-            self._decoder_first_call_done = True
-        else:
-            sample = decoder_fn(*decoder_args, **decoder_kwargs)
         value = text_policy.run_heads(encoded_snaps)
+        decision_type_dev = encoded_device_batch.decision_type.to(device=device, dtype=torch.long)
+        anchor_pos_dev = anchor_positions_rowlocal.to(device=device, dtype=torch.long)
+        anchor_kinds_dev = encoded_device_batch.pointer_anchor_kinds.to(
+            device=device, dtype=torch.long
+        )
+        anchor_subj_dev = encoded_device_batch.pointer_anchor_subjects.to(
+            device=device, dtype=torch.long
+        )
+        anchor_handles_dev = encoded_device_batch.pointer_anchor_handles.to(
+            device=device, dtype=torch.long
+        )
+
+        # Decode homogeneous decision-type slices with the shortest sound cap.
+        # This avoids running 32 autoregressive steps for fixed-shape
+        # priority/may/target decisions while preserving row order for the
+        # engine reply.
+        decision_type_host = merged_packed.decision_type.to(device="cpu", dtype=torch.long)
+        anchor_kinds_host = merged_packed.pointer_anchor_kinds.to(device="cpu", dtype=torch.long)
+        grammar_decoder = getattr(text_policy, "grammar_decoder", None)
+        max_decode_cap = int(
+            grammar_decoder.cfg.max_decode_len if grammar_decoder is not None else 32
+        )
+        parts: list[NativeTextDecoderBatch] = []
+        order_chunks: list[Tensor] = []
+        first_decoder_call = self._compile_decoder and not self._decoder_first_call_done
+        for dt in sorted({int(x) for x in decision_type_host.tolist()}):
+            row_idx_host = (decision_type_host == dt).nonzero(as_tuple=False).flatten()
+            if int(row_idx_host.numel()) == 0:
+                continue
+            row_idx = row_idx_host.to(device=device, dtype=torch.long)
+            max_decode_len = _decoder_len_for_decision_type(
+                dt,
+                anchor_kinds_host.index_select(0, row_idx_host),
+                cap=max_decode_cap,
+            )
+            decoder_args = (
+                text_policy,
+                encoded.index_select(0, row_idx),
+                attn_mask.index_select(0, row_idx),
+                decision_type_dev.index_select(0, row_idx),
+                anchor_pos_dev.index_select(0, row_idx),
+                anchor_kinds_dev.index_select(0, row_idx),
+                anchor_subj_dev.index_select(0, row_idx),
+                anchor_handles_dev.index_select(0, row_idx),
+            )
+            decoder_kwargs: dict[str, Any] = {
+                "legal_edge_bitmap": bitmap.index_select(0, row_idx),
+                "max_decode_len": max_decode_len,
+                "greedy": self._deterministic,
+            }
+            if first_decoder_call:
+                sample = self._timed_first_call(
+                    f"decoder_sample dt={dt} L={max_decode_len}",
+                    decoder_fn,
+                    *decoder_args,
+                    **decoder_kwargs,
+                )
+                self._decoder_first_call_done = True
+                first_decoder_call = False
+            else:
+                sample = decoder_fn(*decoder_args, **decoder_kwargs)
+            parts.append(
+                native_decoder_batch_from_sample(
+                    sample,
+                    value=value.index_select(0, row_idx),
+                )
+            )
+            order_chunks.append(row_idx_host)
+        if not parts:
+            raise RuntimeError("decoder sampling produced no parts")
+        decoder = NativeTextDecoderBatch.concat(parts)
+        order = torch.cat(order_chunks, dim=0)
+        restore = torch.empty_like(order)
+        restore[order] = torch.arange(int(order.numel()), dtype=order.dtype)
+        decoder = decoder.index_select(restore.to(device=decoder.decision_type.device))
         return InferenceOutput(
-            decoder=native_decoder_batch_from_sample(sample, value=value),
+            decoder=decoder,
             h_out=h_out,
             c_out=c_out,
         )

@@ -138,6 +138,7 @@ from magic_ai.text_encoder.card_cache import (  # noqa: E402
     load_oracle_db,
     save_card_cache,
 )
+from magic_ai.text_encoder.decoder import GrammarDecoderConfig  # noqa: E402
 from magic_ai.text_encoder.decoder_batch import NativeTextDecoderBatch  # noqa: E402
 from magic_ai.text_encoder.lstm_stateful_text_policy import (  # noqa: E402
     LSTMStatefulTextPolicy,
@@ -588,26 +589,43 @@ class NativeTextTrajectoryBuffer:
         # Build the merged decoder batch (concat across rows).
         merged_decoder = NativeTextDecoderBatch.concat([row.decoder for row in staged])
 
-        # Translate to DecoderDecisionPayload shape — replay scoring needs
-        # both pointer-position and subject-index. We don't carry encoder
-        # positions here (they were translated to subjects at sample time);
-        # store -1 for output_pointer_pos and the subjects for the new field.
-        # Everything is host-side now (replay storage, staged decoder
-        # rows, and the merged decoder built from them) — no D→H needed.
+        # Translate to DecoderDecisionPayload shape. Replay scoring needs
+        # anchor-indexed masks plus the original row-local encoder positions
+        # so the compact pointer columns can be scored against encoder states.
+        # Everything is host-side now (replay storage, staged decoder rows,
+        # and the merged decoder built from them) — no D→H needed.
         store_dev = replay_buffer.core.trace_kind_id.device
-        l_max = int(merged_decoder.output_token_ids.shape[1])
-        n_max = int(merged_decoder.pointer_anchor_handles.shape[1])
-        zero_pos = torch.full((total, l_max), -1, dtype=torch.int32, device=store_dev)
-        anchor_kinds = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
-        anchor_subjects = torch.arange(n_max, device=store_dev, dtype=torch.int32).expand(
-            total, n_max
+        n_max = max(
+            max(int(row.packed_parent.pointer_anchor_positions.shape[1]) for row in staged),
+            int(merged_decoder.pointer_anchor_handles.shape[1]),
         )
-        # Mask out anchors past pointer_anchor_count.
-        cnt = merged_decoder.pointer_anchor_count.to(dtype=torch.int32)
-        mask = anchor_subjects < cnt.unsqueeze(-1)
-        anchor_subjects = torch.where(mask, anchor_subjects, torch.full_like(anchor_subjects, -1))
-        anchor_handles = merged_decoder.pointer_anchor_handles.to(dtype=torch.int32)
-        anchor_handles = torch.where(mask, anchor_handles, torch.full_like(anchor_handles, -1))
+        anchor_positions = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
+        anchor_kinds = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
+        anchor_subjects = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
+        anchor_handles = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
+        for out_i, row in enumerate(staged):
+            src = row.packed_parent
+            src_i = int(row.packed_index)
+            width = int(src.pointer_anchor_positions.shape[1])
+            if width <= 0:
+                continue
+            anchor_positions[out_i, :width] = src.pointer_anchor_positions[src_i].to(
+                device=store_dev, dtype=torch.int32
+            )
+            anchor_kinds[out_i, :width] = src.pointer_anchor_kinds[src_i].to(
+                device=store_dev, dtype=torch.int32
+            )
+            anchor_subjects[out_i, :width] = src.pointer_anchor_subjects[src_i].to(
+                device=store_dev, dtype=torch.int32
+            )
+            anchor_handles[out_i, :width] = src.pointer_anchor_handles[src_i].to(
+                device=store_dev, dtype=torch.int32
+            )
+        cnt = (
+            ((anchor_positions >= 0) & (anchor_kinds >= 0) & (anchor_handles >= 0))
+            .sum(dim=-1)
+            .to(dtype=torch.int32)
+        )
         # Empty legal-edge bitmap; combat decisions need it filled out
         # by the encoder, but for IMPALA staging we leave a placeholder.
         legal_edge = torch.zeros((total, 0, 0), dtype=torch.bool, device=store_dev)
@@ -621,7 +639,7 @@ class NativeTextTrajectoryBuffer:
             output_pad_mask=merged_decoder.output_pad_mask.to(dtype=torch.bool),
             output_log_prob=merged_decoder.log_probs.to(dtype=torch.float32),
             decision_type=merged_decoder.decision_type.to(dtype=torch.int32),
-            pointer_anchor_positions=zero_pos[:, :n_max].clone(),
+            pointer_anchor_positions=anchor_positions,
             pointer_anchor_kinds=anchor_kinds,
             pointer_anchor_subjects=anchor_subjects,
             pointer_anchor_handles=anchor_handles,
@@ -832,6 +850,38 @@ def build_slot_backend(args: argparse.Namespace, device: torch.device) -> SlotTr
     )
 
 
+def _resolve_grammar_decoder_config(
+    args: argparse.Namespace,
+    encoder_cfg: TextEncoderConfig,
+) -> GrammarDecoderConfig:
+    layers = getattr(args, "decoder_layers", None)
+    if layers is None:
+        layers = min(int(encoder_cfg.n_layers), GrammarDecoderConfig.n_layers)
+    heads = getattr(args, "decoder_heads", None)
+    if heads is None:
+        head_cap = min(int(encoder_cfg.n_heads), GrammarDecoderConfig.n_heads)
+        heads = next((h for h in range(head_cap, 0, -1) if encoder_cfg.d_model % h == 0), 1)
+    d_ff = getattr(args, "decoder_d_ff", None)
+    if d_ff is None:
+        d_ff = int(encoder_cfg.d_ff)
+    max_decode_len_arg = getattr(args, "decoder_max_decode_len", None)
+    max_decode_len = int(
+        GrammarDecoderConfig.max_decode_len if max_decode_len_arg is None else max_decode_len_arg
+    )
+    if int(encoder_cfg.d_model) % int(heads) != 0:
+        raise ValueError(
+            f"--decoder-heads ({heads}) must divide encoder d_model ({encoder_cfg.d_model})"
+        )
+    return GrammarDecoderConfig(
+        d_model=int(encoder_cfg.d_model),
+        n_layers=int(layers),
+        n_heads=int(heads),
+        d_ff=int(d_ff),
+        max_decode_len=max_decode_len,
+        compile_mask_update=bool(getattr(args, "compile_decoder_mask_update", False)),
+    )
+
+
 def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTrainingBackend:
     tokenizer = load_tokenizer()
     cache_path = Path(args.card_token_cache)
@@ -889,10 +939,12 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
             d_ff=args.text_d_ff,
             max_seq_len=combined_max_tokens,
         )
+    decoder_cfg = _resolve_grammar_decoder_config(args, cfg)
     recurrent_cfg = RecurrentTextPolicyConfig(
         encoder=cfg,
         lstm_hidden=cfg.d_model,
-        compile_forward=args.torch_compile,
+        compile_forward=bool(getattr(args, "torch_compile", False)),
+        grammar_decoder_cfg=decoder_cfg,
     )
     policy = LSTMStatefulTextPolicy(recurrent_cfg).to(device)
     policy.init_lstm_env_states(args.num_envs)
@@ -914,6 +966,7 @@ def build_text_backend(args: argparse.Namespace, device: torch.device) -> TextTr
         max_targets_per_option=args.max_targets_per_option,
         max_decision_groups=args.max_decision_groups,
         max_cached_choices=args.max_cached_choices,
+        max_decoder_len=decoder_cfg.max_decode_len,
         recurrent_layers=recurrent_cfg.lstm_layers,
         recurrent_hidden_dim=cfg.d_model,
         lstm_proj_hidden=recurrent_cfg.lstm_hidden,
@@ -1353,6 +1406,20 @@ def validate_checkpoint_encoder(
         saved = text_config.get(key)
         requested = getattr(args, key, None)
         if saved != requested:
+            raise ValueError(
+                f"text checkpoint {key}={saved!r} is incompatible with "
+                f"--{key.replace('_', '-')} {requested!r}"
+            )
+    decoder_keys = (
+        "decoder_layers",
+        "decoder_heads",
+        "decoder_d_ff",
+        "decoder_max_decode_len",
+    )
+    for key in decoder_keys:
+        saved = text_config.get(key)
+        requested = getattr(args, key, None)
+        if saved is not None and requested is not None and saved != requested:
             raise ValueError(
                 f"text checkpoint {key}={saved!r} is incompatible with "
                 f"--{key.replace('_', '-')} {requested!r}"
@@ -2360,6 +2427,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-heads", type=int, default=4)
     parser.add_argument("--text-d-ff", type=int, default=512)
     parser.add_argument(
+        "--decoder-layers",
+        type=int,
+        default=None,
+        help="grammar decoder transformer layers; default min(--text-layers/HF layers, 2)",
+    )
+    parser.add_argument(
+        "--decoder-heads",
+        type=int,
+        default=None,
+        help="grammar decoder attention heads; default largest encoder-compatible head count <= 4",
+    )
+    parser.add_argument(
+        "--decoder-d-ff",
+        type=int,
+        default=None,
+        help="grammar decoder feed-forward width; default matches the resolved text encoder d_ff",
+    )
+    parser.add_argument(
+        "--decoder-max-decode-len",
+        type=int,
+        default=GrammarDecoderConfig.max_decode_len,
+        help="maximum autoregressive decoder steps before per-decision-type shortening",
+    )
+    parser.add_argument(
+        "--compile-decoder-mask-update",
+        action="store_true",
+        help=(
+            "torch.compile the grammar-mask state update; faster steady-state, slower first sample"
+        ),
+    )
+    parser.add_argument(
         "--text-encoder-backend",
         choices=("scratch", "hf"),
         default="scratch",
@@ -2764,6 +2862,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--text-heads must be at least 1")
     if getattr(args, "text_d_ff", 1) < 1:
         raise ValueError("--text-d-ff must be at least 1")
+    if getattr(args, "decoder_layers", None) is not None and args.decoder_layers < 1:
+        raise ValueError("--decoder-layers must be at least 1")
+    if getattr(args, "decoder_heads", None) is not None and args.decoder_heads < 1:
+        raise ValueError("--decoder-heads must be at least 1")
+    if getattr(args, "decoder_d_ff", None) is not None and args.decoder_d_ff < 1:
+        raise ValueError("--decoder-d-ff must be at least 1")
+    decoder_max_decode_len = getattr(args, "decoder_max_decode_len", 1)
+    if decoder_max_decode_len is not None and decoder_max_decode_len < 1:
+        raise ValueError("--decoder-max-decode-len must be at least 1")
     if getattr(args, "text_hf_layers", None) is not None and args.text_hf_layers < 1:
         raise ValueError("--text-hf-layers must be at least 1")
     if getattr(args, "max_decision_groups", 1) < 1:
@@ -5908,6 +6015,15 @@ def save_checkpoint(
         actual_text_cfg = getattr(
             getattr(getattr(policy, "policy", None), "text_policy", None), "cfg", None
         )
+        actual_decoder_cfg = getattr(
+            getattr(
+                getattr(getattr(policy, "policy", None), "text_policy", None),
+                "grammar_decoder",
+                None,
+            ),
+            "cfg",
+            None,
+        )
         metadata["text_config"] = {
             "text_max_tokens": getattr(args, "text_max_tokens", None),
             "text_encoder_backend": getattr(args, "text_encoder_backend", "scratch"),
@@ -5920,6 +6036,20 @@ def save_checkpoint(
             "text_layers": getattr(actual_text_cfg, "n_layers", getattr(args, "text_layers", None)),
             "text_heads": getattr(actual_text_cfg, "n_heads", getattr(args, "text_heads", None)),
             "text_d_ff": getattr(actual_text_cfg, "d_ff", getattr(args, "text_d_ff", None)),
+            "decoder_layers": getattr(
+                actual_decoder_cfg, "n_layers", getattr(args, "decoder_layers", None)
+            ),
+            "decoder_heads": getattr(
+                actual_decoder_cfg, "n_heads", getattr(args, "decoder_heads", None)
+            ),
+            "decoder_d_ff": getattr(
+                actual_decoder_cfg, "d_ff", getattr(args, "decoder_d_ff", None)
+            ),
+            "decoder_max_decode_len": getattr(
+                actual_decoder_cfg,
+                "max_decode_len",
+                getattr(args, "decoder_max_decode_len", None),
+            ),
             "hidden_layers": getattr(args, "hidden_layers", None),
             "max_options": getattr(args, "max_options", None),
             "max_targets_per_option": getattr(args, "max_targets_per_option", None),

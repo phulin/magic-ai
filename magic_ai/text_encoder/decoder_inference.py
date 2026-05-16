@@ -34,14 +34,14 @@ def _decoder_step_body(
     prev_pointer_pos: Tensor,
     encoded: Tensor,
     encoder_attention_mask: Tensor,
-    pos_to_subject_map: Tensor,
+    pointer_key_states: Tensor,
     greedy: bool,
     temperature: float,
 ) -> tuple[
     Tensor,  # vocab_mask
     Tensor,  # pointer_mask
     Tensor,  # structural_tok (PAD on pointer steps, sampled vocab otherwise)
-    Tensor,  # sampled_pointer
+    Tensor,  # sampled_pointer anchor index
     Tensor,  # sampled_vocab (raw, kept for state.update)
     Tensor,  # gathered_subj
     Tensor,  # is_pointer_step
@@ -60,7 +60,12 @@ def _decoder_step_body(
     valid_step = ~state.ended
     vocab_mask, pointer_mask = state.next_mask()
     vocab_logits, pointer_logits, decoder_state = grammar_decoder.step(
-        prev_token, prev_pointer_pos, encoded, encoder_attention_mask, decoder_state
+        prev_token,
+        prev_pointer_pos,
+        encoded,
+        encoder_attention_mask,
+        decoder_state,
+        pointer_keys=pointer_key_states,
     )
     is_pointer_step = ~vocab_mask.any(dim=-1)
     sampled_vocab, sampled_pointer = combined_sample(
@@ -83,8 +88,8 @@ def _decoder_step_body(
         torch.full_like(sampled_vocab, int(GrammarVocab.PAD)),
         sampled_vocab,
     )
-    safe_pointer = sampled_pointer.clamp_min(0)
-    gathered_subj = pos_to_subject_map.gather(1, safe_pointer.unsqueeze(-1)).squeeze(-1)
+    safe_pointer = sampled_pointer.clamp(min=0, max=max(pointer_key_states.shape[1] - 1, 0))
+    gathered_subj = state.pointer_anchor_subjects.gather(1, safe_pointer.unsqueeze(-1)).squeeze(-1)
     return (
         vocab_mask,
         pointer_mask,
@@ -151,10 +156,19 @@ def decoder_sample(
     L = int(max_decode_len)
 
     decision_type_dev = decision_type.to(device=device, dtype=torch.long)
-    anchor_pos_dev = pointer_anchor_positions.to(device=device, dtype=torch.long)
-    anchor_kinds_dev = pointer_anchor_kinds.to(device=device, dtype=torch.long)
-    anchor_subj_dev = pointer_anchor_subjects.to(device=device, dtype=torch.long)
+    anchor_pos_in = pointer_anchor_positions.to(device=device, dtype=torch.long)
+    anchor_kinds_in = pointer_anchor_kinds.to(device=device, dtype=torch.long)
+    anchor_subj_in = pointer_anchor_subjects.to(device=device, dtype=torch.long)
     anchor_handles_dev = pointer_anchor_handles.to(device=device, dtype=torch.long)
+    n_anchor_in = int(anchor_pos_in.shape[1])
+    if n_anchor_in == 0:
+        anchor_pos_dev = torch.full((b, 1), -1, dtype=torch.long, device=device)
+        anchor_kinds_dev = torch.full((b, 1), -1, dtype=torch.long, device=device)
+        anchor_subj_dev = torch.full((b, 1), -1, dtype=torch.long, device=device)
+    else:
+        anchor_pos_dev = anchor_pos_in
+        anchor_kinds_dev = anchor_kinds_in
+        anchor_subj_dev = anchor_subj_in
 
     state = GrammarMaskState(
         decision_type=decision_type_dev,
@@ -164,6 +178,7 @@ def decoder_sample(
         encoded_seq_len=t_enc,
         legal_edge_bitmap=legal_edge_bitmap,
         max_value=spec_max_value,
+        compile_update=bool(getattr(grammar_decoder.cfg, "compile_mask_update", False)),
     )
 
     out_tokens = torch.zeros((b, L), dtype=torch.long, device=device)
@@ -176,9 +191,16 @@ def decoder_sample(
     # the exact same support. The FSA-reconstruction path the buffer
     # used to take has been removed.
     out_vocab_mask = torch.zeros((b, L, GRAMMAR_VOCAB_SIZE), dtype=torch.bool, device=device)
-    out_pointer_mask = torch.zeros((b, L, t_enc), dtype=torch.bool, device=device)
+    n_anchor = int(anchor_pos_dev.shape[1])
+    out_pointer_mask = torch.zeros((b, L, n_anchor), dtype=torch.bool, device=device)
 
-    pos_to_subject_map = state.pos_to_subj  # [B, T_enc] long, -1 fill
+    safe_anchor_pos = anchor_pos_dev.clamp(min=0, max=max(t_enc - 1, 0))
+    anchor_valid = (anchor_pos_dev >= 0) & (anchor_pos_dev < t_enc)
+    pointer_key_states = encoded.gather(
+        1,
+        safe_anchor_pos.unsqueeze(-1).expand(b, n_anchor, int(encoded.shape[-1])),
+    )
+    pointer_key_states = pointer_key_states.masked_fill(~anchor_valid.unsqueeze(-1), 0.0)
 
     # Pre-allocate the KV cache to the full decode length so the compiled
     # step body sees constant shapes every iteration. init_state also does
@@ -208,14 +230,20 @@ def decoder_sample(
             prev_pointer_pos,
             encoded,
             encoder_attention_mask,
-            pos_to_subject_map,
+            pointer_key_states,
             greedy,
             temperature,
         )
+        safe_anchor = sampled_pointer.clamp(min=0, max=max(n_anchor - 1, 0))
+        sampled_pointer_pos = anchor_pos_dev.gather(1, safe_anchor.unsqueeze(-1)).squeeze(-1)
         out_vocab_mask[:, step, :] = vocab_mask
         out_pointer_mask[:, step, :] = pointer_mask
         out_tokens[:, step] = structural_tok
-        out_pointer_pos[:, step] = sampled_pointer
+        out_pointer_pos[:, step] = torch.where(
+            is_pointer_step & valid_step,
+            sampled_pointer_pos,
+            torch.full_like(sampled_pointer_pos, -1),
+        )
         out_pointer_subjects[:, step] = torch.where(
             is_pointer_step & valid_step,
             gathered_subj,
@@ -230,9 +258,13 @@ def decoder_sample(
         # — those are awkward for Dynamo and add guards.
         state.update(sampled_vocab, sampled_pointer, is_pointer_step)
         prev_token = structural_tok
-        prev_pointer_pos = sampled_pointer
+        prev_pointer_pos = sampled_pointer_pos
 
-    pointer_anchor_count = (anchor_subj_dev >= 0).sum(dim=-1).to(dtype=torch.long)
+    pointer_anchor_count = (
+        ((anchor_pos_in >= 0) & (anchor_pos_in < t_enc) & (anchor_kinds_in >= 0))
+        .sum(dim=-1)
+        .to(dtype=torch.long)
+    )
 
     return DecoderSampleOutput(
         output_token_ids=out_tokens,
@@ -276,6 +308,8 @@ def decoder_score_replay(
     grammar_decoder = text_policy.grammar_decoder
     if grammar_decoder is None:
         raise RuntimeError("text_policy.grammar_decoder must be configured")
+    v_cell_b = cells.v_cell_b.to(dtype=torch.long)
+    v_cell_t = cells.v_cell_t.to(dtype=torch.long)
     p_cell_b = cells.p_cell_b.to(dtype=torch.long)
     p_cell_t = cells.p_cell_t.to(dtype=torch.long)
     p_legal_cell_id = cells.p_legal_cell_id.to(dtype=torch.long)
@@ -328,7 +362,9 @@ def decoder_score_replay(
     # Assemble per-step log-π. Vocab cells use the dense gather; pointer
     # cells use the per-cell scalar — scatter back to [B, L] so the rest
     # of the contract (per_step_log_pi shape, per_row sum) is unchanged.
-    step_logp = v_chosen.clone()
+    step_logp = torch.zeros_like(v_chosen)
+    if int(v_cell_b.shape[0]) > 0:
+        step_logp[v_cell_b, v_cell_t] = v_chosen[v_cell_b, v_cell_t]
     if n_p_cells > 0:
         step_logp[p_cell_b, p_cell_t] = p_chosen_per_cell
     # Inactive cells contribute zero.
@@ -347,7 +383,9 @@ def decoder_score_replay(
         p_ent_per_cell.scatter_add_(0, p_legal_cell_id, p_ent_per_legal)
     else:
         p_ent_per_cell = p_legal_logits.new_empty((0,))
-    step_ent = v_ent_dense.clone()
+    step_ent = torch.zeros_like(v_ent_dense)
+    if int(v_cell_b.shape[0]) > 0:
+        step_ent[v_cell_b, v_cell_t] = v_ent_dense[v_cell_b, v_cell_t]
     if n_p_cells > 0:
         step_ent[p_cell_b, p_cell_t] = p_ent_per_cell
     step_ent = step_ent.where(pad_mask, torch.zeros_like(step_ent))

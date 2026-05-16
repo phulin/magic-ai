@@ -95,6 +95,7 @@ class DecoderCellsParityTests(unittest.TestCase):
         is_pointer_step = torch.rand(b, l_max, generator=rng) > 0.5
         vocab_mask = torch.rand(b, l_max, v_vocab, generator=rng) > 0.6
         pointer_mask = torch.rand(b, l_max, t_enc, generator=rng) > 0.6
+        pointer_anchor_positions = torch.arange(t_enc, dtype=torch.int32).expand(b, t_enc)
         target_tokens = torch.randint(0, v_vocab, (b, l_max), generator=rng)
         target_pointer_pos = torch.randint(0, t_enc, (b, l_max), generator=rng)
         output_log_prob = torch.randn(b, l_max, generator=rng)
@@ -104,6 +105,7 @@ class DecoderCellsParityTests(unittest.TestCase):
             is_pointer_step=is_pointer_step,
             vocab_mask=vocab_mask,
             pointer_mask=pointer_mask,
+            pointer_anchor_positions=pointer_anchor_positions,
             target_tokens=target_tokens,
             target_pointer_pos=target_pointer_pos,
             output_log_prob=output_log_prob,
@@ -161,6 +163,7 @@ class DecoderCellsParityTests(unittest.TestCase):
         is_pointer_step = torch.zeros(b, l_max, dtype=torch.bool)
         vocab_mask = torch.zeros(b, l_max, v_vocab, dtype=torch.bool)
         pointer_mask = torch.zeros(b, l_max, t_enc, dtype=torch.bool)
+        pointer_anchor_positions = torch.arange(t_enc, dtype=torch.int32).expand(b, t_enc)
         target_tokens = torch.zeros(b, l_max, dtype=torch.long)
         target_pointer_pos = torch.zeros(b, l_max, dtype=torch.long)
         output_log_prob = torch.zeros(b, l_max, dtype=torch.float32)
@@ -169,6 +172,7 @@ class DecoderCellsParityTests(unittest.TestCase):
             is_pointer_step=is_pointer_step,
             vocab_mask=vocab_mask,
             pointer_mask=pointer_mask,
+            pointer_anchor_positions=pointer_anchor_positions,
             target_tokens=target_tokens,
             target_pointer_pos=target_pointer_pos,
             output_log_prob=output_log_prob,
@@ -215,6 +219,8 @@ class DecoderPerCellPointerParityTests(unittest.TestCase):
         attn = torch.ones((b, t_enc), dtype=torch.bool)
         target_tokens = torch.randint(0, GRAMMAR_VOCAB_SIZE, (b, l_max))
         target_pointer_pos = torch.randint(0, t_enc, (b, l_max))
+        target_pointer_pos[:, 1] = torch.randint(0, 4, (b,))
+        target_pointer_pos[:, 2] = torch.randint(1, 5, (b,))
         is_pointer_step = torch.tensor([[False, True, True, False]] * b, dtype=torch.bool)
         pad_mask = torch.tensor([[True, True, True, False]] * b, dtype=torch.bool)
         vocab_mask = torch.ones((b, l_max, GRAMMAR_VOCAB_SIZE), dtype=torch.bool)
@@ -223,11 +229,13 @@ class DecoderPerCellPointerParityTests(unittest.TestCase):
         pointer_mask = torch.zeros((b, l_max, t_enc), dtype=torch.bool)
         pointer_mask[:, 1, :4] = True
         pointer_mask[:, 2, 1:5] = True
+        pointer_anchor_positions = torch.arange(t_enc, dtype=torch.int32).expand(b, t_enc)
         cells = _build_decoder_cells(
             pad_mask=pad_mask,
             is_pointer_step=is_pointer_step,
             vocab_mask=vocab_mask,
             pointer_mask=pointer_mask,
+            pointer_anchor_positions=pointer_anchor_positions,
             target_tokens=target_tokens,
             target_pointer_pos=target_pointer_pos,
             output_log_prob=torch.zeros((b, l_max), dtype=torch.float32),

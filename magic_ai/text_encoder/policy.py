@@ -77,14 +77,19 @@ class TextPolicy(nn.Module):
         self.value_head = ValueHead(cfg.d_model)
         self.mlm_head = MLMHead(self.encoder)
         if decoder_cfg is None:
-            # Pick the largest n_heads <= the default that divides d_model so
-            # tiny test configs (d_model=32, etc.) don't trip the assertion.
-            default_heads = GrammarDecoderConfig.n_heads
+            # Mirror the encoder width/depth by default, with a compatible
+            # head count for tiny test configs.
+            default_heads = min(cfg.n_heads, GrammarDecoderConfig.n_heads)
             n_heads = next(
                 (h for h in range(default_heads, 0, -1) if cfg.d_model % h == 0),
                 1,
             )
-            decoder_cfg = GrammarDecoderConfig(d_model=cfg.d_model, n_heads=n_heads)
+            decoder_cfg = GrammarDecoderConfig(
+                d_model=cfg.d_model,
+                n_layers=cfg.n_layers,
+                n_heads=n_heads,
+                d_ff=cfg.d_ff,
+            )
         self.grammar_decoder = GrammarDecoder(decoder_cfg)
 
     def encode_only(

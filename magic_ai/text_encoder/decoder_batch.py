@@ -33,7 +33,7 @@ class DecoderSampleOutput:
     # principle but a single bug in the reconstruction silently corrupts
     # IS ratios for every step in every minibatch until you trip on it.
     vocab_mask: Tensor  # [B, L, V_vocab] bool
-    pointer_mask: Tensor  # [B, L, T_enc] bool
+    pointer_mask: Tensor  # [B, L, N_anchor] bool
     decision_type: Tensor  # [B] int64 (passed through)
     pointer_anchor_handles: Tensor  # [B, N_max] int64 (passed through)
     pointer_anchor_count: Tensor  # [B] int64 (passed through)
@@ -102,10 +102,10 @@ class NativeTextDecoderBatch:
     value: Tensor  # [B] float
     output_pad_mask: Tensor  # [B, L_max] bool
     # Per-step grammar masks captured at sample time. Shapes are
-    # ``[B, L_max, V_vocab]`` and ``[B, L_max, T_enc]`` — concat pads the
-    # T_enc dim across parts that have different encoder widths.
+    # ``[B, L_max, V_vocab]`` and ``[B, L_max, N_anchor]`` — concat pads
+    # the anchor dim across parts that have different anchor widths.
     vocab_mask: Tensor
-    pointer_mask: Tensor
+    pointer_mask: Tensor  # [B, L_max, N_anchor] bool
 
     def __len__(self) -> int:
         return int(self.decision_type.shape[0])
@@ -130,15 +130,35 @@ class NativeTextDecoderBatch:
             pointer_mask=self.pointer_mask[key],
         )
 
+    def index_select(self, index: Tensor) -> NativeTextDecoderBatch:
+        """Gather rows by integer index, preserving every wire field."""
+
+        idx = index.to(device=self.decision_type.device, dtype=torch.long)
+        return NativeTextDecoderBatch(
+            decision_type=self.decision_type.index_select(0, idx),
+            output_token_ids=self.output_token_ids.index_select(0, idx),
+            output_pointer_pos=self.output_pointer_pos.index_select(0, idx),
+            output_pointer_subjects=self.output_pointer_subjects.index_select(0, idx),
+            output_is_pointer=self.output_is_pointer.index_select(0, idx),
+            output_lens=self.output_lens.index_select(0, idx),
+            pointer_anchor_handles=self.pointer_anchor_handles.index_select(0, idx),
+            pointer_anchor_count=self.pointer_anchor_count.index_select(0, idx),
+            log_probs=self.log_probs.index_select(0, idx),
+            value=self.value.index_select(0, idx),
+            output_pad_mask=self.output_pad_mask.index_select(0, idx),
+            vocab_mask=self.vocab_mask.index_select(0, idx),
+            pointer_mask=self.pointer_mask.index_select(0, idx),
+        )
+
     @classmethod
     def concat(cls, parts: Sequence[NativeTextDecoderBatch]) -> NativeTextDecoderBatch:
-        """Row-axis concatenation; left-pads ragged L_max / N_max / T_enc with fill."""
+        """Row-axis concatenation; left-pads ragged L_max / N_max / N_anchor with fill."""
         if len(parts) == 1:
             return parts[0]
         l_max = max(int(p.output_token_ids.shape[1]) for p in parts)
         n_max = max(int(p.pointer_anchor_handles.shape[1]) for p in parts)
         v_max = max(int(p.vocab_mask.shape[2]) for p in parts)
-        t_enc_max = max(int(p.pointer_mask.shape[2]) for p in parts)
+        n_anchor_max = max(int(p.pointer_mask.shape[2]) for p in parts)
 
         def _pad2d(t: Tensor, width: int, *, fill: int | float) -> Tensor:
             cur = int(t.shape[1])
@@ -186,7 +206,7 @@ class NativeTextDecoderBatch:
                 [_pad3d(p.vocab_mask, l_max, v_max, fill=0) for p in parts], dim=0
             ),
             pointer_mask=torch.cat(
-                [_pad3d(p.pointer_mask, l_max, t_enc_max, fill=0) for p in parts], dim=0
+                [_pad3d(p.pointer_mask, l_max, n_anchor_max, fill=0) for p in parts], dim=0
             ),
         )
 

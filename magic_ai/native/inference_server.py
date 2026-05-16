@@ -95,7 +95,7 @@ class DecoderHostView:
     log_probs_sum: torch.Tensor  # [n] float32 (sum over L_max)
     value: torch.Tensor  # [n] float32
     vocab_mask: torch.Tensor  # [n, L_max, V_vocab] bool
-    pointer_mask: torch.Tensor  # [n, L_max, T_enc] bool
+    pointer_mask: torch.Tensor  # [n, L_max, N_anchor] bool
 
 
 @dataclass(frozen=True)

@@ -31,12 +31,12 @@ N_ANCHOR_KINDS = 5  # AnchorKind enum width
 
 def _grammar_update_body(
     sampled_vocab: Tensor,  # [B] long
-    sampled_pointer_pos: Tensor,  # [B] long
+    sampled_pointer_idx: Tensor,  # [B] long
     is_pointer_step: Tensor,  # [B] bool
     *,
     # static lookup tables (treated as immutable across the decode loop)
-    pos_to_subj: Tensor,  # [B, T_enc] long
-    pos_to_kind: Tensor,  # [B, T_enc] long
+    anchor_subjects: Tensor,  # [B, N_anchor] long
+    anchor_kinds: Tensor,  # [B, N_anchor] long
     b_arange: Tensor,  # [B] long
     # mutable state
     chosen_per_kind: Tensor,  # [B, N_ANCHOR_KINDS, MAX_K] bool
@@ -45,8 +45,8 @@ def _grammar_update_body(
     n_digits: Tensor,  # [B] long
     ended: Tensor,  # [B] bool
     step: Tensor,  # [B] long
-    t_enc: int,
     max_k: int,
+    n_anchor: int,
     atk_kind: int,
     blk_kind: int,
     end_id: int,
@@ -60,11 +60,11 @@ def _grammar_update_body(
     fused graph instead of paying ~20 op dispatches per decoder step.
     """
     active = ~ended
-    safe_pos = sampled_pointer_pos.clamp(min=0, max=max(t_enc - 1, 0))
-    safe_pos_idx = safe_pos.unsqueeze(-1)
-    subj_at_chosen = pos_to_subj.gather(1, safe_pos_idx).squeeze(-1)
-    kind_at_chosen = pos_to_kind.gather(1, safe_pos_idx).squeeze(-1)
-    valid_choice = is_pointer_step & active & (subj_at_chosen >= 0)
+    safe_idx = sampled_pointer_idx.clamp(min=0, max=max(n_anchor - 1, 0))
+    safe_idx_2d = safe_idx.unsqueeze(-1)
+    subj_at_chosen = anchor_subjects.gather(1, safe_idx_2d).squeeze(-1)
+    kind_at_chosen = anchor_kinds.gather(1, safe_idx_2d).squeeze(-1)
+    valid_choice = is_pointer_step & active & (subj_at_chosen >= 0) & (kind_at_chosen >= 0)
     safe_subj = subj_at_chosen.clamp(min=0, max=max(max_k - 1, 0))
 
     is_atk = valid_choice & (kind_at_chosen == atk_kind)
@@ -127,6 +127,7 @@ class GrammarMaskState:
         encoded_seq_len: int,
         legal_edge_bitmap: Tensor | None = None,  # [B, N_blk, N_atk] bool
         max_value: Tensor | None = None,  # [B] long, -1 = N/A
+        compile_update: bool = False,
     ) -> None:
         device = decision_type.device
         b, n = pointer_anchor_kinds.shape
@@ -135,6 +136,9 @@ class GrammarMaskState:
         self.T_enc = t_enc
         self.device = device
         self.decision_type = decision_type
+        self.pointer_anchor_positions = pointer_anchor_positions
+        self.pointer_anchor_kinds = pointer_anchor_kinds
+        self.pointer_anchor_subjects = pointer_anchor_subjects
         self.legal_edge_bitmap = (
             legal_edge_bitmap.to(device=device, dtype=torch.bool)
             if legal_edge_bitmap is not None
@@ -145,35 +149,13 @@ class GrammarMaskState:
             if max_value is not None
             else torch.full((self.B,), -1, dtype=torch.long, device=device)
         )
+        self.compile_update = bool(compile_update)
 
         # MAX_K bounds the per-kind subject_index. The renderer assigns
         # subject_index < (anchor count of that kind) ≤ N, so N is a safe
         # upper bound for the per-kind chosen-bitmap width.
         max_k = max(int(n), 1)
         self.MAX_K = max_k
-
-        # pos_to_kind / pos_to_subj: dense [B, T_enc] lookup tables built
-        # once from the anchor lists. Values at non-anchor positions are -1.
-        # Built via a sync-free scatter: invalid (b, j) anchor entries scatter
-        # into a trailing trash column that gets sliced off at the end.
-        valid = (
-            (pointer_anchor_positions >= 0)
-            & (pointer_anchor_positions < t_enc)
-            & (pointer_anchor_kinds >= 0)
-            & (pointer_anchor_subjects >= 0)
-        )
-        if n > 0:
-            pos_to_kind_full = torch.full((self.B, t_enc + 1), -1, dtype=torch.long, device=device)
-            pos_to_subj_full = torch.full((self.B, t_enc + 1), -1, dtype=torch.long, device=device)
-            trash = torch.full_like(pointer_anchor_positions, t_enc)
-            safe_pos = torch.where(valid, pointer_anchor_positions, trash)
-            pos_to_kind_full.scatter_(1, safe_pos, pointer_anchor_kinds)
-            pos_to_subj_full.scatter_(1, safe_pos, pointer_anchor_subjects)
-            self.pos_to_kind = pos_to_kind_full[:, :t_enc].contiguous()
-            self.pos_to_subj = pos_to_subj_full[:, :t_enc].contiguous()
-        else:
-            self.pos_to_kind = torch.full((self.B, t_enc), -1, dtype=torch.long, device=device)
-            self.pos_to_subj = torch.full((self.B, t_enc), -1, dtype=torch.long, device=device)
 
         # n_per_kind[b, k]: count of anchors of kind k for row b.
         n_per_kind = torch.zeros((self.B, N_ANCHOR_KINDS), dtype=torch.long, device=device)
@@ -209,16 +191,16 @@ class GrammarMaskState:
     # ------------------------------------------------------------------ #
 
     def next_mask(self) -> tuple[Tensor, Tensor]:
-        """Return ``(vocab_mask [B, V], pointer_pos_mask [B, T_enc])`` for the
+        """Return ``(vocab_mask [B, V], pointer_anchor_mask [B, N_anchor])`` for the
         current step, fully on-device."""
 
         device = self.device
-        b, v, t = self.B, GRAMMAR_VOCAB_SIZE, self.T_enc
+        b, v, n = self.B, GRAMMAR_VOCAB_SIZE, self.pointer_anchor_kinds.shape[1]
         dt = self.decision_type
         s = self.step
 
         vocab = torch.zeros((b, v), dtype=torch.bool, device=device)
-        ptr = torch.zeros((b, t), dtype=torch.bool, device=device)
+        ptr = torch.zeros((b, n), dtype=torch.bool, device=device)
 
         # PRIORITY: OPEN, ptr LEGAL_ACTION, END.
         is_pri = dt == int(DecisionType.PRIORITY)
@@ -314,21 +296,33 @@ class GrammarMaskState:
     ) -> None:
         """OR into ``ptr_mask`` the legal pointer positions for ``kind`` on the
         active rows. ``no_repeat`` excludes already-chosen subjects."""
-        kind_match = self.pos_to_kind == kind  # [B, T_enc]
+        kind_match = self.pointer_anchor_kinds == kind  # [B, N_anchor]
+        valid_anchor = (
+            kind_match
+            & (self.pointer_anchor_positions >= 0)
+            & (self.pointer_anchor_positions < self.T_enc)
+            & (self.pointer_anchor_subjects >= 0)
+        )
         if no_repeat:
-            safe_subj = self.pos_to_subj.clamp(min=0)
+            safe_subj = self.pointer_anchor_subjects.clamp(min=0, max=max(self.MAX_K - 1, 0))
             chosen_at_pos = self.chosen_per_kind[:, kind, :].gather(1, safe_subj)
-            chosen_at_pos = chosen_at_pos & (self.pos_to_subj >= 0)
-            avail = kind_match & ~chosen_at_pos
+            chosen_at_pos = chosen_at_pos & (self.pointer_anchor_subjects >= 0)
+            avail = valid_anchor & ~chosen_at_pos
         else:
-            avail = kind_match
+            avail = valid_anchor
         ptr_mask |= avail & row_active.unsqueeze(-1)
 
     def _or_pointer_edge(self, ptr_mask: Tensor, row_active: Tensor) -> None:
         """DECLARE_BLOCKERS phase 3: pointer LEGAL_ATTACKER restricted by the
         per-blocker legal-edge bitmap."""
         kind = int(AnchorKind.LEGAL_ATTACKER)
-        kind_match = self.pos_to_kind == kind
+        kind_match = self.pointer_anchor_kinds == kind
+        valid_anchor = (
+            kind_match
+            & (self.pointer_anchor_positions >= 0)
+            & (self.pointer_anchor_positions < self.T_enc)
+            & (self.pointer_anchor_subjects >= 0)
+        )
         # Treat an empty-shape bitmap (``[B, 0, 0]``) like ``None``: the
         # inference-server batch merger pads non-DECLARE_BLOCKERS batches
         # with an empty bitmap when *any* batch has one, so a stray empty
@@ -336,16 +330,16 @@ class GrammarMaskState:
         # zero-sized dim.
         edge = self.legal_edge_bitmap
         if edge is None or edge.shape[1] == 0 or edge.shape[2] == 0:
-            avail = kind_match
+            avail = valid_anchor
         else:
             n_blk, n_atk = int(edge.shape[1]), int(edge.shape[2])
             blk_idx = self.last_chosen_blk_subj.clamp(min=0, max=max(n_blk - 1, 0))
             edge_per_atk = edge.gather(
                 1, blk_idx.view(self.B, 1, 1).expand(self.B, 1, n_atk)
             ).squeeze(1)  # [B, n_atk]
-            safe_subj = self.pos_to_subj.clamp(min=0, max=max(n_atk - 1, 0))
+            safe_subj = self.pointer_anchor_subjects.clamp(min=0, max=max(n_atk - 1, 0))
             edge_at_pos = edge_per_atk.gather(1, safe_subj)
-            avail = kind_match & edge_at_pos
+            avail = valid_anchor & edge_at_pos
         ptr_mask |= avail & row_active.unsqueeze(-1)
 
     # ------------------------------------------------------------------ #
@@ -355,17 +349,21 @@ class GrammarMaskState:
     def update(
         self,
         sampled_vocab: Tensor,  # [B] long
-        sampled_pointer_pos: Tensor,  # [B] long
+        sampled_pointer_pos: Tensor,  # [B] long anchor index
         is_pointer_step: Tensor,  # [B] bool
     ) -> None:
         """Advance state given the sampled action.
 
-        Dispatches to ``_grammar_update_body`` wrapped in ``torch.compile``
-        so the ~20 per-step tensor ops fuse into a single graph launch.
-        Without this, py-spy showed ``update`` dominating decoder time on
-        the Python side from kernel-dispatch overhead.
+        Optionally dispatches to ``_grammar_update_body`` wrapped in
+        ``torch.compile`` so the ~20 per-step tensor ops fuse into a
+        single graph launch. The eager default avoids a multi-minute cold
+        compile on first decoder use.
         """
-        fn = cast(Any, _get_grammar_update_fn())
+        fn = (
+            cast(Any, _get_grammar_update_fn())
+            if self.compile_update
+            else cast(Any, _grammar_update_body)
+        )
         (
             self.chosen_per_kind,
             self.last_chosen_blk_subj,
@@ -377,8 +375,8 @@ class GrammarMaskState:
             sampled_vocab,
             sampled_pointer_pos,
             is_pointer_step,
-            pos_to_subj=self.pos_to_subj,
-            pos_to_kind=self.pos_to_kind,
+            anchor_subjects=self.pointer_anchor_subjects,
+            anchor_kinds=self.pointer_anchor_kinds,
             b_arange=self._b_arange,
             chosen_per_kind=self.chosen_per_kind,
             last_chosen_blk_subj=self.last_chosen_blk_subj,
@@ -386,8 +384,8 @@ class GrammarMaskState:
             n_digits=self.n_digits,
             ended=self.ended,
             step=self.step,
-            t_enc=self.T_enc,
             max_k=self.MAX_K,
+            n_anchor=int(self.pointer_anchor_kinds.shape[1]),
             atk_kind=int(AnchorKind.LEGAL_ATTACKER),
             blk_kind=int(AnchorKind.LEGAL_BLOCKER),
             end_id=int(GrammarVocab.END),

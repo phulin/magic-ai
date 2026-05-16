@@ -59,7 +59,7 @@ class DecoderDecisionPayload:
     legal_edge_n_attackers: Tensor  # [B] int32
     # Per-step grammar masks captured by the live sampler.
     vocab_mask: Tensor  # [B, L, V_vocab] bool
-    pointer_mask: Tensor  # [B, L, T_enc] bool — col width may be < buffer.max_tokens
+    pointer_mask: Tensor  # [B, L, N_anchor] bool — col width may be < buffer.max_anchors
 
 
 @dataclass(frozen=True)
@@ -81,7 +81,7 @@ class DecoderGatherOutput:
     legal_edge_n_blockers: Tensor
     legal_edge_n_attackers: Tensor
     vocab_mask: Tensor  # [B, L, V_vocab] bool
-    pointer_mask: Tensor  # [B, L, max_tokens] bool
+    pointer_mask: Tensor  # [B, L, max_anchors] bool
 
     def to(self, device: torch.device | str) -> DecoderGatherOutput:
         target = torch.device(device)
@@ -172,21 +172,23 @@ def _build_decoder_cells(
     pad_mask: Tensor,  # [B, L] bool, CPU
     is_pointer_step: Tensor,  # [B, L] bool, CPU
     vocab_mask: Tensor,  # [B, L, V] bool, CPU
-    pointer_mask: Tensor,  # [B, L, T_enc] bool, CPU
+    pointer_mask: Tensor,  # [B, L, N_anchor] bool, CPU
+    pointer_anchor_positions: Tensor,  # [B, N_anchor] int, CPU - encoder positions
     target_tokens: Tensor,  # [B, L] int (long or int32), CPU - chosen vocab id
     target_pointer_pos: Tensor,  # [B, L] int, CPU - chosen pointer pos
     output_log_prob: Tensor,  # [B, L] float32, CPU - behavior log p of chosen action
 ) -> DecoderCells:
     """CPU-only construction of the packed cell layout.
 
-    ``target_pointer_pos`` may exceed the gathered batch's ``T_enc``
-    (sampler can store a wider pointer space than train-time
-    encoder). The caller is responsible for ensuring it's been clamped
-    or that ``pointer_mask`` already zeros the offending columns —
-    matches the existing ``decoder_score_replay`` contract.
+    ``pointer_mask`` is anchor-indexed. The returned pointer legal choices
+    are converted back to encoder positions because the decoder pointer
+    head scores against encoder hidden states.
     """
+    valid_pointer_anchor = pointer_anchor_positions >= 0
     v_active_step = pad_mask & ~is_pointer_step  # [B, L]
-    p_active_step = pad_mask & is_pointer_step  # [B, L]
+    p_active_step = (
+        pad_mask & is_pointer_step & (pointer_mask & valid_pointer_anchor.unsqueeze(1)).any(dim=-1)
+    )  # [B, L]
 
     # Vocab cells.
     v_cell_pos = v_active_step.nonzero(as_tuple=False)  # [N_v_cells, 2]
@@ -212,11 +214,12 @@ def _build_decoder_cells(
     p_cell_t = p_cell_pos[:, 1].to(torch.int32)
     p_active_flat = p_active_step.view(-1).to(torch.long)
     p_cell_idx_dense = (p_active_flat.cumsum(0) - 1).view(pad_mask.shape)
-    p_legal_active = pointer_mask & p_active_step.unsqueeze(-1)  # [B, L, T_enc]
+    p_legal_active = pointer_mask & p_active_step.unsqueeze(-1) & valid_pointer_anchor.unsqueeze(1)
     p_legal_pos = p_legal_active.nonzero(as_tuple=False)  # [N_p_legal, 3]
     p_legal_b = p_legal_pos[:, 0]
     p_legal_t = p_legal_pos[:, 1]
-    p_legal_choice = p_legal_pos[:, 2].to(torch.int32)
+    p_legal_anchor = p_legal_pos[:, 2]
+    p_legal_choice = pointer_anchor_positions[p_legal_b, p_legal_anchor].to(torch.int32)
     p_legal_cell_id = p_cell_idx_dense[p_legal_b, p_legal_t].to(torch.int32)
     p_legal_chosen_pos = target_pointer_pos[p_legal_b, p_legal_t].to(torch.int32)
     p_legal_is_chosen = p_legal_choice == p_legal_chosen_pos
@@ -563,7 +566,7 @@ class TextReplayBuffer:
                     "pointer_mask",
                     torch.bool,
                     fill=False,
-                    inner_shape=(self.max_decoder_len, self.max_tokens),
+                    inner_shape=(self.max_decoder_len, self.max_anchors),
                 ),
             ),
             device=self.device,
@@ -1789,18 +1792,17 @@ class TextReplayBuffer:
 
         # Per-step grammar masks captured by the live sampler. ``vocab_mask``
         # is fixed-width along the vocab axis; ``pointer_mask``'s column
-        # axis is ``T_enc`` at sample time and can be < buffer.max_tokens
-        # (encoder padding for that batch). Pad with False; replay-time
-        # readers truncate to the current ``T_enc``.
+        # axis is anchor-indexed and can be < buffer.max_anchors. Pad with
+        # False.
         v_w = int(payload.vocab_mask.shape[2])
         p_w = int(payload.pointer_mask.shape[2])
         if v_w > GRAMMAR_VOCAB_SIZE:
             raise ValueError(
                 f"vocab_mask width {v_w} exceeds GRAMMAR_VOCAB_SIZE {GRAMMAR_VOCAB_SIZE}"
             )
-        if p_w > self.max_tokens:
+        if p_w > self.max_anchors:
             raise ValueError(
-                f"pointer_mask T_enc {p_w} exceeds buffer max_tokens {self.max_tokens}"
+                f"pointer_mask width {p_w} exceeds buffer max_anchors {self.max_anchors}"
             )
         if l_payload > 0 and v_w > 0:
             self.decoder.vocab_mask[rows, :l_payload, :v_w] = payload.vocab_mask.to(
@@ -1983,6 +1985,7 @@ class TextReplayBuffer:
             is_pointer_step=is_ptr_bool,
             vocab_mask=decoder.vocab_mask.to(dtype=torch.bool),
             pointer_mask=decoder.pointer_mask.to(dtype=torch.bool),
+            pointer_anchor_positions=decoder.pointer_anchor_positions,
             target_tokens=decoder.output_token_ids,
             target_pointer_pos=decoder.output_pointer_pos,
             output_log_prob=decoder.output_log_prob,

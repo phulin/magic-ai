@@ -151,7 +151,7 @@ def main() -> int:
     pad_mask = sample.output_pad_mask
     L = target_tokens.shape[1]
     vocab_mask = torch.ones((b, L, GRAMMAR_VOCAB_SIZE), dtype=torch.bool, device=device)
-    pointer_mask = torch.ones((b, L, t_enc), dtype=torch.bool, device=device)
+    pointer_mask = torch.ones((b, L, pos.shape[1]), dtype=torch.bool, device=device)
     # ``decoder_score_replay`` now consumes packed cells; build them on
     # host from the (fully True) grammar masks for the smoke run.
     from magic_ai.text_encoder.replay_buffer import _build_decoder_cells  # noqa: PLC0415
@@ -161,6 +161,7 @@ def main() -> int:
         is_pointer_step=is_pointer_step.cpu(),
         vocab_mask=vocab_mask.cpu(),
         pointer_mask=pointer_mask.cpu(),
+        pointer_anchor_positions=pos.cpu(),
         target_tokens=target_tokens.cpu(),
         target_pointer_pos=target_pointer_pos.cpu(),
         output_log_prob=torch.zeros((b, L), dtype=torch.float32),

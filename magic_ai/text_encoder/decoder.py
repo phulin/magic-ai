@@ -35,14 +35,15 @@ except ImportError:
 
 @dataclass
 class GrammarDecoderConfig:
-    d_model: int = 384
-    n_layers: int = 4
-    n_heads: int = 6
-    d_ff: int = 1536
+    d_model: int = 128
+    n_layers: int = 2
+    n_heads: int = 4
+    d_ff: int = 512
     dropout: float = 0.0
-    max_decode_len: int = 64
+    max_decode_len: int = 32
     grammar_vocab_size: int = GRAMMAR_VOCAB_SIZE
     pointer_temperature: float = 1.0
+    compile_mask_update: bool = False
 
 
 def _build_rope_cache(
@@ -276,10 +277,16 @@ class GrammarDecoder(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def _heads(self, h: Tensor, encoded: Tensor) -> tuple[Tensor, Tensor]:
+    def _heads(
+        self,
+        h: Tensor,
+        encoded: Tensor,
+        pointer_keys: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         vocab_logits = self.vocab_head(h)
         q = self.pointer_head(h)
-        pointer_logits = torch.matmul(q, encoded.transpose(-1, -2)) / self.cfg.pointer_temperature
+        key = encoded if pointer_keys is None else pointer_keys
+        pointer_logits = torch.matmul(q, key.transpose(-1, -2)) / self.cfg.pointer_temperature
         return vocab_logits, pointer_logits
 
     def _decoder_body(
@@ -398,6 +405,8 @@ class GrammarDecoder(nn.Module):
         encoded: Tensor,
         encoder_attention_mask: Tensor,
         state: DecoderState,
+        *,
+        pointer_keys: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, DecoderState]:
         """One autoregressive step. Caller is responsible for the host-sync
         that turns logits into a chosen token before the engine mask
@@ -431,7 +440,7 @@ class GrammarDecoder(nn.Module):
                 step_idx,
             )
         x = self.final_norm(x)
-        vocab_logits, pointer_logits = self._heads(x, encoded)
+        vocab_logits, pointer_logits = self._heads(x, encoded, pointer_keys=pointer_keys)
         # Self-attn caches are mutated in place by `_CausalSelfAttention.step`;
         # only step_idx is replaced (a new 0-D tensor with the next position).
         new_state = DecoderState(
