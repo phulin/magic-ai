@@ -356,7 +356,7 @@ class TextInferencePipeline:
         compiled = cast(
             Callable[..., Any],
             torch.compile(
-                recurrent_policy._encode_with_history_impl,
+                recurrent_policy._encode_with_history_inference_impl,
                 mode="default",
                 dynamic=False,
                 fullgraph=False,

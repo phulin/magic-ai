@@ -103,6 +103,13 @@ class RecurrentTextPolicy(nn.Module):
             ]
             | None
         ) = None
+        self._compiled_encode_with_history_packed_nograd: (
+            Callable[
+                [PackedTextBatch, Tensor | None, Tensor | None],
+                tuple[EncodedSnapshots, Tensor, Tensor],
+            ]
+            | None
+        ) = None
         # Compile is wired up lazily on the first CUDA forward (see
         # ``forward_packed``). flash_attn_varlen replaced the old NJT-subclass
         # attention so the historical AOT-autograd backward mismatch no longer
@@ -196,16 +203,56 @@ class RecurrentTextPolicy(nn.Module):
             and self.cfg.compile_forward
             and batch.token_ids.device.type == "cuda"
         ):
-            if self._compiled_encode_with_history_packed is None:
-                self._compiled_encode_with_history_packed = cast(
-                    Callable[
-                        [PackedTextBatch, Tensor | None, Tensor | None],
-                        tuple[EncodedSnapshots, Tensor, Tensor],
-                    ],
-                    torch.compile(self._encode_with_history_impl, dynamic=True),
-                )
             if not is_fx_symbolic_tracing():
-                return self._compiled_encode_with_history_packed(batch, h_in, c_in)
+                if torch.is_grad_enabled():
+                    if self._compiled_encode_with_history_packed is None:
+                        self._compiled_encode_with_history_packed = cast(
+                            Callable[
+                                [PackedTextBatch, Tensor | None, Tensor | None],
+                                tuple[EncodedSnapshots, Tensor, Tensor],
+                            ],
+                            torch.compile(self._encode_with_history_replay_grad_impl, dynamic=True),
+                        )
+                    return self._compiled_encode_with_history_packed(batch, h_in, c_in)
+                if self._compiled_encode_with_history_packed_nograd is None:
+                    self._compiled_encode_with_history_packed_nograd = cast(
+                        Callable[
+                            [PackedTextBatch, Tensor | None, Tensor | None],
+                            tuple[EncodedSnapshots, Tensor, Tensor],
+                        ],
+                        torch.compile(self._encode_with_history_replay_nograd_impl, dynamic=True),
+                    )
+                return self._compiled_encode_with_history_packed_nograd(batch, h_in, c_in)
+        return self._encode_with_history_impl(batch, h_in, c_in)
+
+    def _encode_with_history_inference_impl(
+        self,
+        batch: PackedTextBatch,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
+    ) -> tuple[EncodedSnapshots, Tensor, Tensor]:
+        """Inference-only compile target for bucketed sampling."""
+
+        return self._encode_with_history_impl(batch, h_in, c_in)
+
+    def _encode_with_history_replay_grad_impl(
+        self,
+        batch: PackedTextBatch,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
+    ) -> tuple[EncodedSnapshots, Tensor, Tensor]:
+        """Replay-scoring compile target for online grad-enabled scoring."""
+
+        return self._encode_with_history_impl(batch, h_in, c_in)
+
+    def _encode_with_history_replay_nograd_impl(
+        self,
+        batch: PackedTextBatch,
+        h_in: Tensor | None = None,
+        c_in: Tensor | None = None,
+    ) -> tuple[EncodedSnapshots, Tensor, Tensor]:
+        """Replay-scoring compile target for target/no-grad scoring."""
+
         return self._encode_with_history_impl(batch, h_in, c_in)
 
     def _encode_with_history_impl(
