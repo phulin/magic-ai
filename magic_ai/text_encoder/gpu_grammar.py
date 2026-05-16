@@ -195,7 +195,7 @@ class GrammarMaskState:
         current step, fully on-device."""
 
         device = self.device
-        b, v, n = self.B, GRAMMAR_VOCAB_SIZE, self.pointer_anchor_kinds.shape[1]
+        b, v, n = self.step.shape[0], GRAMMAR_VOCAB_SIZE, self.pointer_anchor_kinds.shape[1]
         dt = self.decision_type
         s = self.step
 
@@ -334,9 +334,10 @@ class GrammarMaskState:
         else:
             n_blk, n_atk = int(edge.shape[1]), int(edge.shape[2])
             blk_idx = self.last_chosen_blk_subj.clamp(min=0, max=max(n_blk - 1, 0))
-            edge_per_atk = edge.gather(
-                1, blk_idx.view(self.B, 1, 1).expand(self.B, 1, n_atk)
-            ).squeeze(1)  # [B, n_atk]
+            b = row_active.shape[0]
+            edge_per_atk = edge.gather(1, blk_idx.view(b, 1, 1).expand(b, 1, n_atk)).squeeze(
+                1
+            )  # [B, n_atk]
             safe_subj = self.pointer_anchor_subjects.clamp(min=0, max=max(n_atk - 1, 0))
             edge_at_pos = edge_per_atk.gather(1, safe_subj)
             avail = valid_anchor & edge_at_pos

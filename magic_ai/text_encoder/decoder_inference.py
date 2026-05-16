@@ -104,6 +104,18 @@ def _decoder_step_body(
     )
 
 
+def _decoder_step_body_single_batch(*args: Any, **kwargs: Any) -> Any:
+    """Distinct compile target for ``B == 1`` decoder-step calls."""
+
+    return _decoder_step_body(*args, **kwargs)
+
+
+def _decoder_step_body_multi_batch(*args: Any, **kwargs: Any) -> Any:
+    """Distinct compile target for ``B > 1`` decoder-step calls."""
+
+    return _decoder_step_body(*args, **kwargs)
+
+
 def _decoder_step_callable(text_policy: TextPolicy) -> Callable[..., Any]:
     """Return a closure binding ``grammar_decoder`` to a step function.
 

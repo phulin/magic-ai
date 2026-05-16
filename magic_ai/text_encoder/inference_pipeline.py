@@ -40,7 +40,8 @@ from magic_ai.text_encoder.decoder_batch import (
     native_decoder_batch_from_sample,
 )
 from magic_ai.text_encoder.decoder_inference import (
-    _decoder_step_body,
+    _decoder_step_body_multi_batch,
+    _decoder_step_body_single_batch,
     decoder_sample,
 )
 from magic_ai.text_encoder.policy import EncodedSnapshots
@@ -329,7 +330,7 @@ class TextInferencePipeline:
         # — deferred. dynamic=True doesn't get CUDA Graphs but inductor can
         # still fuse the per-step ops, cutting per-iteration launches.
         self._compile_decoder = bool(compile_decoder)
-        self._compiled_decoder_sample: Callable[..., Any] | None = None
+        self._compiled_decoder_steps: tuple[Callable[..., Any], Callable[..., Any]] | None = None
         # Track whether we've printed the timing line for each (bucket /
         # decoder) compile so we don't keep printing on steady-state calls.
         self._encoder_first_call_done: set[tuple[int, int]] = set()
@@ -505,11 +506,7 @@ class TextInferencePipeline:
         # loop stays Python. Compiled callable is installed by patching
         # ``_decoder_inference_mod._decoder_step_callable`` so the existing
         # ``decoder_sample`` body picks it up unchanged.
-        if (
-            self._compile_decoder
-            and device.type == "cuda"
-            and self._compiled_decoder_sample is None
-        ):
+        if self._compile_decoder and device.type == "cuda" and self._compiled_decoder_steps is None:
             # Duck-shape inference notices that distinct dims happen to share
             # a value on the first trace (e.g. ``cross_k.stride(0) == B*T_enc``)
             # and bakes that equation into a guard, triggering a recompile any
@@ -519,24 +516,27 @@ class TextInferencePipeline:
             import torch.fx.experimental._config as _fx_cfg  # noqa: PLC0415
 
             cast(Any, _fx_cfg).use_duck_shape = False
-            compiled_step = cast(
-                Callable[..., Any],
-                torch.compile(_decoder_step_body, dynamic=True),
-            )
+            compiled_single_step = torch.compile(_decoder_step_body_single_batch, dynamic=True)
+            compiled_multi_step = torch.compile(_decoder_step_body_multi_batch, dynamic=True)
 
             def _patched_step_callable(text_policy: Any) -> Callable[..., Any]:
                 gd = text_policy.grammar_decoder
                 if gd is None:
                     raise RuntimeError("text_policy.grammar_decoder must be configured")
 
-                def step(*args: Any, **kwargs: Any) -> Any:
-                    return compiled_step(gd, *args, **kwargs)
+                def step(state: Any, *args: Any, **kwargs: Any) -> Any:
+                    compiled_step = (
+                        compiled_single_step
+                        if int(state.step.shape[0]) == 1
+                        else compiled_multi_step
+                    )
+                    return compiled_step(gd, state, *args, **kwargs)
 
                 return step
 
             cast(Any, _decoder_inference_mod)._decoder_step_callable = _patched_step_callable
             # Sentinel so we don't reinstall on every call.
-            self._compiled_decoder_sample = compiled_step
+            self._compiled_decoder_steps = (compiled_single_step, compiled_multi_step)
         decoder_fn: Callable[..., Any] = decoder_sample
         # Always hand the decoder a fixed-shape bitmap so the compiled
         # decoder_sample doesn't recompile on size-0 vs size-N or
