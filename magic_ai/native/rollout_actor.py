@@ -271,19 +271,18 @@ class TextRolloutActor:
         ready_games = [env.game for env in ready_envs]
         ready_env_indices = [int(env.slot_idx) for env in ready_envs]
 
-        # Drain BEFORE encode: ``_finish_inference`` clones from
+        # Drain BEFORE encode: ``_finish_inference`` copies from
         # ``batch.packed``, which is a view into this actor's reusable
         # encoder arena. If a queued ``_InferenceDone`` is processed after
-        # the next ``_encode_packed`` overwrites the arena, the clone reads
-        # stale data. Draining here keeps the clone reading the values that
-        # were live when its batch was submitted.
+        # the next ``_encode_packed`` overwrites the arena, staging reads
+        # stale data. Draining here keeps staging on the submitted values.
         self._drain_completed_inference()
 
         start = time.perf_counter()
         _, nat_outputs = self._encode_packed(ready_games, ready_players)
         self._record_timing("actor_encode", start)
         start = time.perf_counter()
-        packed = nat_outputs.to_packed_text_batch(trim=True, derive_token_metadata=True)
+        packed = nat_outputs.to_packed_text_batch(trim=False, derive_token_metadata=True)
         self._record_timing("actor_pack", start)
 
         batch = _SubmitBatch(
@@ -358,40 +357,12 @@ class TextRolloutActor:
         try:
             start = time.perf_counter()
             host = reply.host_decoder
-            # Clone the actor's pre-submit packed batch once; staging stores
-            # (packed_parent, row_index) per env-step and defers row slicing
-            # to commit time. No per-row Python-side PackedTextBatch
-            # construction in the hot path.
-            from magic_ai.text_encoder.batch import PackedTextBatch  # noqa: PLC0415
-
-            packed_src = batch.packed
-            packed = PackedTextBatch(
-                token_ids=packed_src.token_ids.clone(),
-                seq_id=packed_src.seq_id.clone(),
-                pos_in_seq=packed_src.pos_in_seq.clone(),
-                cu_seqlens=packed_src.cu_seqlens.clone(),
-                seq_lengths=packed_src.seq_lengths.clone(),
-                state_positions=packed_src.state_positions.clone(),
-                card_ref_positions=packed_src.card_ref_positions.clone(),
-                spec_lens=packed_src.spec_lens.clone(),
-                decision_type=packed_src.decision_type.clone(),
-                pointer_anchor_positions=packed_src.pointer_anchor_positions.clone(),
-                pointer_anchor_kinds=packed_src.pointer_anchor_kinds.clone(),
-                pointer_anchor_subjects=packed_src.pointer_anchor_subjects.clone(),
-                pointer_anchor_handles=packed_src.pointer_anchor_handles.clone(),
-                legal_edge_bitmap=(
-                    packed_src.legal_edge_bitmap.clone()
-                    if packed_src.legal_edge_bitmap is not None
-                    else None
-                ),
-                total_tokens=packed_src.total_tokens,
-                seq_lengths_host=packed_src.seq_lengths_host,
-                max_seqlen=packed_src.max_seqlen,
-            )
+            # The staging buffer copies the batch into its row table before
+            # returning, so this can remain a view into the actor encoder arena.
             self.staging_buffer.stage_batch(
                 batch.ready_env_indices,
                 host,
-                packed_parent=packed,
+                packed_parent=batch.packed,
                 perspective_player_indices=reply.perspective_player_indices,
                 lstm_h_in=reply.lstm_h_in,
                 lstm_c_in=reply.lstm_c_in,

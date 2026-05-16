@@ -139,7 +139,7 @@ from magic_ai.text_encoder.card_cache import (  # noqa: E402
     save_card_cache,
 )
 from magic_ai.text_encoder.decoder import GrammarDecoderConfig  # noqa: E402
-from magic_ai.text_encoder.decoder_batch import NativeTextDecoderBatch  # noqa: E402
+from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE  # noqa: E402
 from magic_ai.text_encoder.lstm_stateful_text_policy import (  # noqa: E402
     LSTMStatefulTextPolicy,
 )
@@ -399,41 +399,13 @@ class TextTrainingBackend:
     batch_workers: int = 1
 
 
-@dataclass
-class _StagedDecoderRow:
-    """One env-step worth of decoder targets + encoded snapshot.
-
-    Stored Python-side (one per finished env-step) and gathered into the
-    shared :class:`TextReplayBuffer` at episode-commit time. ``packed_parent``
-    holds the whole cloned multi-row :class:`PackedTextBatch` from the actor
-    tick that produced this row; ``packed_index`` is this row's index inside
-    it. Per-row slicing is deferred to commit time where it's effectively
-    free — :meth:`_write_packed_encoded_row` already accepts a batch index.
-    """
-
-    decoder: NativeTextDecoderBatch  # length-1 row slice (host, cloned)
-    packed_parent: Any  # PackedTextBatch (host, cloned, shared across rows of same tick)
-    packed_index: int  # row index inside packed_parent
-    n_tokens: int  # cached token width for pre-commit accounting
-    perspective_player_idx: int
-    lstm_h_in: torch.Tensor | None  # [layers, hidden] host, view into clone
-    lstm_c_in: torch.Tensor | None
-
-
 class NativeTextTrajectoryBuffer:
     """Per-env staging for the native batched IMPALA text decoder rollout.
 
-    Each actor stages :class:`_StagedDecoderRow` records here as it processes
-    inference replies. When an env's episode finishes (or hits the step cap),
-    :meth:`append_envs_to_replay_returning_tensor` reserves a window in the
-    shared :class:`TextReplayBuffer`, writes the encoded snapshots, the
-    decoder targets via :meth:`TextReplayBuffer.commit_decoder_decision`, and
-    the IMPALA-side common fields, then seals the reservation.
-
-    The store is a Python ring per env (one list of length :attr:`max_steps`)
-    rather than a fixed tensor rectangle. Decoder targets are short and
-    variable-width, so a tensor rectangle would over-allocate; the per-step
-    object holds tensor slices already in the right shape.
+    Actor replies are written into a tensor staging table. Each active env-step
+    owns one staged row id; variable-length token streams live in a padded
+    per-row slab and are compacted only when the finished episode is appended
+    into the replay ring.
     """
 
     def __init__(
@@ -451,13 +423,229 @@ class NativeTextTrajectoryBuffer:
         self.device = replay_buffer.device
         self._lock = threading.Lock()
         self.timing_stats: Any | None = None
-        self._rows: list[list[_StagedDecoderRow]] = [[] for _ in range(self.num_envs)]
-        # Per-env aggregate token counts, kept in sync with ``_rows`` so the
-        # learner's admission check (``can_append_envs_to_replay``) is O(1)
-        # per env instead of re-walking each row's ``n_tokens``.
-        self._token_counts: list[int] = [0 for _ in range(self.num_envs)]
-        # Public host mirror for compatibility with the slot-buffer surface.
-        self.step_count_host: list[int] = [0 for _ in range(self.num_envs)]
+        shape = (self.num_envs, self.max_steps)
+        self._row_id = torch.full(shape, -1, dtype=torch.long)
+        self._token_length = torch.zeros(shape, dtype=torch.int32)
+        self._perspective_player_idx = torch.zeros(shape, dtype=torch.int16)
+        self._step_counts = torch.zeros((self.num_envs,), dtype=torch.int32)
+        # Per-env aggregate token counts, kept in sync with the metadata table
+        # so replay admission checks are O(number of envs being committed).
+        self._token_counts = torch.zeros((self.num_envs,), dtype=torch.int64)
+        self._staged_capacity = 0
+        self._next_staged_row = 0
+        self._free_row_ids = torch.empty((0,), dtype=torch.long)
+        self._pin_staging = replay_buffer.device.type == "cuda" and torch.cuda.is_available()
+        self._token_ids: torch.Tensor | None = None
+        self._card_ref_positions: torch.Tensor | None = None
+        self._decoder_decision_type: torch.Tensor | None = None
+        self._decoder_output_token_ids: torch.Tensor | None = None
+        self._decoder_output_pointer_pos: torch.Tensor | None = None
+        self._decoder_output_is_pointer: torch.Tensor | None = None
+        self._decoder_output_pad_mask: torch.Tensor | None = None
+        self._decoder_log_probs: torch.Tensor | None = None
+        self._decoder_value: torch.Tensor | None = None
+        self._pointer_anchor_positions: torch.Tensor | None = None
+        self._pointer_anchor_kinds: torch.Tensor | None = None
+        self._pointer_anchor_subjects: torch.Tensor | None = None
+        self._pointer_anchor_handles: torch.Tensor | None = None
+        self._vocab_mask: torch.Tensor | None = None
+        self._pointer_mask: torch.Tensor | None = None
+        self._lstm_h_in: torch.Tensor | None = None
+        self._lstm_c_in: torch.Tensor | None = None
+
+    @property
+    def step_count_host(self) -> list[int]:
+        """Host mirror for compatibility with the slot-buffer surface."""
+
+        return self._step_counts.tolist()
+
+    def _new_staging_tensor(
+        self,
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+        fill: int | float | bool | None = None,
+    ) -> torch.Tensor:
+        kwargs: dict[str, Any] = {"dtype": dtype}
+        if self._pin_staging:
+            kwargs["pin_memory"] = True
+        if fill is None:
+            return torch.empty(shape, **kwargs)
+        return torch.full(shape, fill, **kwargs)
+
+    def _grow_staging_tensor(
+        self,
+        current: torch.Tensor | None,
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+        fill: int | float | bool | None = None,
+    ) -> torch.Tensor:
+        grown = self._new_staging_tensor(shape, dtype=dtype, fill=fill)
+        if current is not None and int(current.shape[0]) > 0:
+            grown[: int(current.shape[0])] = current
+        return grown
+
+    def _ensure_staged_capacity(self, needed: int, *, has_lstm: bool) -> None:
+        if needed <= self._staged_capacity:
+            if has_lstm and self._lstm_h_in is None:
+                self._lstm_h_in = self._new_staging_tensor(
+                    (
+                        self._staged_capacity,
+                        self._replay_buffer.recurrent_layers,
+                        self._replay_buffer.recurrent_hidden_dim,
+                    ),
+                    dtype=torch.float32,
+                    fill=0.0,
+                )
+                self._lstm_c_in = self._new_staging_tensor(
+                    (
+                        self._staged_capacity,
+                        self._replay_buffer.recurrent_layers,
+                        self._replay_buffer.recurrent_hidden_dim,
+                    ),
+                    dtype=torch.float32,
+                    fill=0.0,
+                )
+            return
+        max_rows = self.num_envs * self.max_steps
+        new_capacity = min(max(needed, max(1024, self._staged_capacity * 2)), max_rows)
+        if new_capacity < needed:
+            raise RuntimeError("native text staging row capacity exhausted")
+
+        replay = self._replay_buffer
+        l_dec = replay.max_decoder_len
+        n_anchor = replay.max_anchors
+        self._token_ids = self._grow_staging_tensor(
+            self._token_ids,
+            (new_capacity, replay.max_tokens),
+            dtype=torch.int32,
+            fill=0,
+        )
+        self._card_ref_positions = self._grow_staging_tensor(
+            self._card_ref_positions,
+            (new_capacity, replay.max_card_refs),
+            dtype=torch.int32,
+            fill=-1,
+        )
+        self._decoder_decision_type = self._grow_staging_tensor(
+            self._decoder_decision_type,
+            (new_capacity,),
+            dtype=torch.int32,
+            fill=-1,
+        )
+        self._decoder_output_token_ids = self._grow_staging_tensor(
+            self._decoder_output_token_ids,
+            (new_capacity, l_dec),
+            dtype=torch.int32,
+            fill=0,
+        )
+        self._decoder_output_pointer_pos = self._grow_staging_tensor(
+            self._decoder_output_pointer_pos,
+            (new_capacity, l_dec),
+            dtype=torch.int32,
+            fill=-1,
+        )
+        self._decoder_output_is_pointer = self._grow_staging_tensor(
+            self._decoder_output_is_pointer,
+            (new_capacity, l_dec),
+            dtype=torch.bool,
+            fill=False,
+        )
+        self._decoder_output_pad_mask = self._grow_staging_tensor(
+            self._decoder_output_pad_mask,
+            (new_capacity, l_dec),
+            dtype=torch.bool,
+            fill=False,
+        )
+        self._decoder_log_probs = self._grow_staging_tensor(
+            self._decoder_log_probs,
+            (new_capacity, l_dec),
+            dtype=torch.float32,
+            fill=0.0,
+        )
+        self._decoder_value = self._grow_staging_tensor(
+            self._decoder_value,
+            (new_capacity,),
+            dtype=torch.float32,
+            fill=0.0,
+        )
+        self._pointer_anchor_positions = self._grow_staging_tensor(
+            self._pointer_anchor_positions,
+            (new_capacity, n_anchor),
+            dtype=torch.int32,
+            fill=-1,
+        )
+        self._pointer_anchor_kinds = self._grow_staging_tensor(
+            self._pointer_anchor_kinds,
+            (new_capacity, n_anchor),
+            dtype=torch.int32,
+            fill=-1,
+        )
+        self._pointer_anchor_subjects = self._grow_staging_tensor(
+            self._pointer_anchor_subjects,
+            (new_capacity, n_anchor),
+            dtype=torch.int32,
+            fill=-1,
+        )
+        self._pointer_anchor_handles = self._grow_staging_tensor(
+            self._pointer_anchor_handles,
+            (new_capacity, n_anchor),
+            dtype=torch.int32,
+            fill=-1,
+        )
+        self._vocab_mask = self._grow_staging_tensor(
+            self._vocab_mask,
+            (new_capacity, l_dec, GRAMMAR_VOCAB_SIZE),
+            dtype=torch.bool,
+            fill=False,
+        )
+        self._pointer_mask = self._grow_staging_tensor(
+            self._pointer_mask,
+            (new_capacity, l_dec, n_anchor),
+            dtype=torch.bool,
+            fill=False,
+        )
+        if has_lstm or self._lstm_h_in is not None:
+            self._lstm_h_in = self._grow_staging_tensor(
+                self._lstm_h_in,
+                (new_capacity, replay.recurrent_layers, replay.recurrent_hidden_dim),
+                dtype=torch.float32,
+                fill=0.0,
+            )
+            self._lstm_c_in = self._grow_staging_tensor(
+                self._lstm_c_in,
+                (new_capacity, replay.recurrent_layers, replay.recurrent_hidden_dim),
+                dtype=torch.float32,
+                fill=0.0,
+            )
+        self._staged_capacity = new_capacity
+
+    def _allocate_staged_rows_locked(self, n: int, *, has_lstm: bool) -> torch.Tensor:
+        n = int(n)
+        free_n = int(self._free_row_ids.numel())
+        if free_n >= n:
+            self._ensure_staged_capacity(self._staged_capacity, has_lstm=has_lstm)
+            row_ids = self._free_row_ids[-n:].clone()
+            self._free_row_ids = self._free_row_ids[:-n]
+            return row_ids
+        fresh_n = n - free_n
+        start = self._next_staged_row
+        end = start + fresh_n
+        self._ensure_staged_capacity(end, has_lstm=has_lstm)
+        fresh = torch.arange(start, end, dtype=torch.long)
+        self._next_staged_row = end
+        if free_n == 0:
+            return fresh
+        row_ids = torch.cat((self._free_row_ids, fresh), dim=0)
+        self._free_row_ids = self._free_row_ids[:0]
+        return row_ids
+
+    def _release_staged_rows_locked(self, row_ids: torch.Tensor) -> None:
+        valid = row_ids.to(dtype=torch.long)
+        valid = valid[valid >= 0]
+        if int(valid.numel()) > 0:
+            self._free_row_ids = torch.cat((self._free_row_ids, valid), dim=0)
 
     # ------------------------------------------------------------------ stage
 
@@ -476,13 +664,8 @@ class NativeTextTrajectoryBuffer:
         ``host_decoder`` is a :class:`DecoderHostView` carrying the full
         decoder batch on host. ``packed_parent`` is the matching
         multi-row :class:`PackedTextBatch` for the whole actor tick,
-        host-side and already cloned upstream. LSTM state slices come
-        from the inference reply already on host.
-
-        Per-row PackedTextBatch slices are NOT built here. We carry
-        ``(packed_parent, row_index)`` instead; commit-time slicing is
-        free because ``_write_packed_encoded_row`` already takes a batch
-        index.
+        host-side. LSTM state slices come from the inference reply already
+        on host.
         """
 
         n = len(env_indices)
@@ -493,67 +676,139 @@ class NativeTextTrajectoryBuffer:
         if len(perspective_player_indices) != n:
             raise ValueError("perspective length must match env_indices length")
 
-        # Clone the whole batch once, then take cheap [i:i+1] views per row.
-        # Previously we did 13 small clones per row; at 200+ rows per batch
-        # the Python overhead dominated actor_stage. The cloned batch tensor
-        # stays alive until every view-holding _StagedDecoderRow is committed,
-        # which is fine — the alternative was N×13 small allocations anyway.
-        hd_clone = NativeTextDecoderBatch(
-            decision_type=host_decoder.decision_type.clone(),
-            output_token_ids=host_decoder.output_token_ids.clone(),
-            output_pointer_pos=host_decoder.output_pointer_pos.clone(),
-            output_pointer_subjects=host_decoder.output_pointer_subjects.clone(),
-            output_is_pointer=host_decoder.output_is_pointer.clone(),
-            output_lens=host_decoder.output_lens.clone(),
-            pointer_anchor_handles=host_decoder.pointer_anchor_handles.clone(),
-            pointer_anchor_count=host_decoder.pointer_anchor_count.clone(),
-            log_probs=host_decoder.log_probs.clone(),
-            value=host_decoder.value.clone(),
-            output_pad_mask=host_decoder.output_pad_mask.clone(),
-            vocab_mask=host_decoder.vocab_mask.clone(),
-            pointer_mask=host_decoder.pointer_mask.clone(),
-        )
-        h_clone = lstm_h_in.clone() if lstm_h_in is not None else None
-        c_clone = lstm_c_in.clone() if lstm_c_in is not None else None
-        seq_lengths_host = packed_parent.seq_lengths_host or tuple(
-            int(x) for x in packed_parent.seq_lengths.tolist()
-        )
+        seq_lengths = packed_parent.seq_lengths.to(dtype=torch.int32, device="cpu")
+        token_offsets = torch.zeros((n,), dtype=torch.int32)
+        if n > 1:
+            token_offsets[1:] = seq_lengths.cumsum(0)[:-1]
+        env_t = torch.as_tensor(env_indices, dtype=torch.long)
+        perspective_t = torch.as_tensor(perspective_player_indices, dtype=torch.int16)
+        if self.validate:
+            replay = self._replay_buffer
+            if int(seq_lengths.max().item()) > replay.max_tokens:
+                raise ValueError("staged text row exceeds replay max_tokens")
+            if int(host_decoder.output_token_ids.shape[1]) != replay.max_decoder_len:
+                raise ValueError("decoder max length does not match replay buffer")
+            if int(packed_parent.card_ref_positions.shape[1]) != replay.max_card_refs:
+                raise ValueError("card-ref width does not match replay buffer")
+            if int(packed_parent.pointer_anchor_positions.shape[1]) != replay.max_anchors:
+                raise ValueError("pointer-anchor width does not match replay buffer")
+            if int(host_decoder.vocab_mask.shape[2]) != GRAMMAR_VOCAB_SIZE:
+                raise ValueError("vocab-mask width does not match grammar vocab")
+            if int(host_decoder.pointer_mask.shape[2]) != replay.max_anchors:
+                raise ValueError("pointer-mask width does not match replay buffer")
 
         with self._lock:
-            for i, env_idx in enumerate(env_indices):
-                env_i = int(env_idx)
-                if self.validate and len(self._rows[env_i]) >= self.max_steps:
-                    raise RuntimeError(f"native text staging buffer is full for env {env_i}")
-                # Replay writer wants [layers, hidden] per row; the source
-                # tensor is [layers, n, hidden] so slice along the env dim.
-                # Views into the cloned batch tensor are fine — torch.stack
-                # at commit time handles non-contiguous strides.
-                h_slice = h_clone[:, i] if h_clone is not None else None
-                c_slice = c_clone[:, i] if c_clone is not None else None
-                n_tokens_i = int(seq_lengths_host[i])
-                self._rows[env_i].append(
-                    _StagedDecoderRow(
-                        decoder=hd_clone[i : i + 1],
-                        packed_parent=packed_parent,
-                        packed_index=i,
-                        n_tokens=n_tokens_i,
-                        perspective_player_idx=int(perspective_player_indices[i]),
-                        lstm_h_in=h_slice,
-                        lstm_c_in=c_slice,
-                    )
-                )
-                self._token_counts[env_i] += n_tokens_i
-                self.step_count_host[env_i] = len(self._rows[env_i])
+            if self.validate:
+                if bool(((env_t < 0) | (env_t >= self.num_envs)).any().item()):
+                    raise IndexError("env index out of range")
+                if int(torch.unique(env_t).numel()) != n:
+                    raise ValueError("env_indices must be unique within a staged batch")
+                if bool((self._step_counts[env_t] >= self.max_steps).any().item()):
+                    raise RuntimeError("native text staging buffer is full for at least one env")
+            row_ids = self._allocate_staged_rows_locked(n, has_lstm=lstm_h_in is not None)
+            step_t = self._step_counts[env_t].to(dtype=torch.long)
+            self._row_id[env_t, step_t] = row_ids
+            self._token_length[env_t, step_t] = seq_lengths
+            self._perspective_player_idx[env_t, step_t] = perspective_t
+            self._step_counts[env_t] += 1
+            self._token_counts.index_add_(0, env_t, seq_lengths.to(dtype=torch.int64))
+            self._write_staged_rows(
+                row_ids=row_ids,
+                packed_parent=packed_parent,
+                decoder=host_decoder,
+                token_offsets=token_offsets,
+                seq_lengths=seq_lengths,
+                lstm_h_in=lstm_h_in,
+                lstm_c_in=lstm_c_in,
+            )
+
+    def _write_staged_rows(
+        self,
+        *,
+        row_ids: torch.Tensor,
+        packed_parent: Any,
+        decoder: Any,
+        token_offsets: torch.Tensor,
+        seq_lengths: torch.Tensor,
+        lstm_h_in: torch.Tensor | None,
+        lstm_c_in: torch.Tensor | None,
+    ) -> None:
+        token_ids = self._token_ids
+        card_ref_positions = self._card_ref_positions
+        decoder_decision_type = self._decoder_decision_type
+        decoder_output_token_ids = self._decoder_output_token_ids
+        decoder_output_pointer_pos = self._decoder_output_pointer_pos
+        decoder_output_is_pointer = self._decoder_output_is_pointer
+        decoder_output_pad_mask = self._decoder_output_pad_mask
+        decoder_log_probs = self._decoder_log_probs
+        decoder_value = self._decoder_value
+        pointer_anchor_positions = self._pointer_anchor_positions
+        pointer_anchor_kinds = self._pointer_anchor_kinds
+        pointer_anchor_subjects = self._pointer_anchor_subjects
+        pointer_anchor_handles = self._pointer_anchor_handles
+        vocab_mask = self._vocab_mask
+        pointer_mask = self._pointer_mask
+        if (
+            token_ids is None
+            or card_ref_positions is None
+            or decoder_decision_type is None
+            or decoder_output_token_ids is None
+            or decoder_output_pointer_pos is None
+            or decoder_output_is_pointer is None
+            or decoder_output_pad_mask is None
+            or decoder_log_probs is None
+            or decoder_value is None
+            or pointer_anchor_positions is None
+            or pointer_anchor_kinds is None
+            or pointer_anchor_subjects is None
+            or pointer_anchor_handles is None
+            or vocab_mask is None
+            or pointer_mask is None
+        ):
+            raise RuntimeError("staging tensors were not allocated")
+
+        max_len = int(seq_lengths.max().item())
+        if max_len > 0:
+            pos = torch.arange(max_len, dtype=torch.long)
+            live = pos.unsqueeze(0) < seq_lengths.to(dtype=torch.long).unsqueeze(1)
+            src = token_offsets.to(dtype=torch.long).unsqueeze(1) + pos.unsqueeze(0)
+            src = torch.where(live, src, torch.zeros_like(src))
+            values = packed_parent.token_ids[src].to(dtype=torch.int32)
+            token_ids[row_ids.unsqueeze(1), pos.unsqueeze(0)] = values
+        card_ref_positions[row_ids] = packed_parent.card_ref_positions.to(torch.int32)
+        pointer_anchor_positions[row_ids] = packed_parent.pointer_anchor_positions.to(torch.int32)
+        pointer_anchor_kinds[row_ids] = packed_parent.pointer_anchor_kinds.to(torch.int32)
+        pointer_anchor_subjects[row_ids] = packed_parent.pointer_anchor_subjects.to(torch.int32)
+        pointer_anchor_handles[row_ids] = packed_parent.pointer_anchor_handles.to(torch.int32)
+        decoder_decision_type[row_ids] = decoder.decision_type.to(torch.int32)
+        decoder_output_token_ids[row_ids] = decoder.output_token_ids.to(torch.int32)
+        decoder_output_pointer_pos[row_ids] = decoder.output_pointer_pos.to(torch.int32)
+        decoder_output_is_pointer[row_ids] = decoder.output_is_pointer.to(torch.bool)
+        decoder_output_pad_mask[row_ids] = decoder.output_pad_mask.to(torch.bool)
+        decoder_log_probs[row_ids] = decoder.log_probs.to(torch.float32)
+        decoder_value[row_ids] = decoder.value.to(torch.float32)
+        vocab_mask[row_ids] = decoder.vocab_mask.to(torch.bool)
+        pointer_mask[row_ids] = decoder.pointer_mask.to(torch.bool)
+        if lstm_h_in is not None and lstm_c_in is not None:
+            if self._lstm_h_in is None or self._lstm_c_in is None:
+                raise RuntimeError("recurrent staging tensors were not allocated")
+            self._lstm_h_in[row_ids] = lstm_h_in.permute(1, 0, 2).to(torch.float32)
+            self._lstm_c_in[row_ids] = lstm_c_in.permute(1, 0, 2).to(torch.float32)
 
     def reset_env(self, env_idx: int) -> None:
         with self._lock:
             env_i = int(env_idx)
-            self._rows[env_i] = []
+            count = int(self._step_counts[env_i].item())
+            if count > 0:
+                self._release_staged_rows_locked(self._row_id[env_i, :count].clone())
+            self._row_id[env_i].fill_(-1)
+            self._token_length[env_i].zero_()
+            self._perspective_player_idx[env_i].zero_()
+            self._step_counts[env_i] = 0
             self._token_counts[env_i] = 0
-            self.step_count_host[env_i] = 0
 
     def active_step_count(self, env_idx: int) -> int:
-        return self.step_count_host[int(env_idx)]
+        return int(self._step_counts[int(env_idx)].item())
 
     # ---------------------------------------------------------------- commit
 
@@ -581,232 +836,85 @@ class NativeTextTrajectoryBuffer:
                     time.perf_counter() - finish_part_start,
                 )
             finish_part_start = time.perf_counter()
-            counts_host = [len(self._rows[int(e)]) for e in env_indices]
-            counts_t = torch.tensor(counts_host, dtype=torch.long, device=device)
-            total = sum(counts_host)
+            env_t = torch.as_tensor(env_indices, dtype=torch.long)
+            counts_cpu = self._step_counts[env_t].to(dtype=torch.long)
+            counts_t = counts_cpu.to(device=device)
+            total = int(counts_cpu.sum().item())
             if total == 0:
                 return torch.zeros(0, dtype=torch.long, device=device), counts_t
-            staged: list[_StagedDecoderRow] = []
-            for e in env_indices:
-                env_i = int(e)
-                staged.extend(self._rows[env_i])
-                self._rows[env_i] = []
-                self._token_counts[env_i] = 0
-                self.step_count_host[env_i] = 0
+            env_order = torch.repeat_interleave(
+                torch.arange(int(env_t.numel()), dtype=torch.long),
+                counts_cpu,
+                output_size=total,
+            )
+            step_base = torch.repeat_interleave(
+                counts_cpu.cumsum(0) - counts_cpu,
+                counts_cpu,
+                output_size=total,
+            )
+            step_t = torch.arange(total, dtype=torch.long) - step_base
+            source_env = env_t[env_order]
+            staged_row_ids = self._row_id[source_env, step_t].clone()
+            token_lengths = self._token_length[source_env, step_t].clone()
+            perspective_player_idx = self._perspective_player_idx[source_env, step_t].clone()
+            self._row_id[env_t].fill_(-1)
+            self._token_length[env_t].zero_()
+            self._perspective_player_idx[env_t].zero_()
+            self._step_counts[env_t] = 0
+            self._token_counts[env_t] = 0
             if timing_stats is not None:
                 timing_stats.add(
                     "finish_append_reset_slots",
                     time.perf_counter() - finish_part_start,
                 )
 
-        # Build the merged decoder batch (concat across rows).
-        finish_part_start = time.perf_counter()
-        with torch.profiler.record_function("finish_append_build_decoder"):
-            merged_decoder = NativeTextDecoderBatch.concat([row.decoder for row in staged])
-        if timing_stats is not None:
-            timing_stats.add(
-                "finish_append_build_decoder",
-                time.perf_counter() - finish_part_start,
-            )
+        if (
+            self._token_ids is None
+            or self._card_ref_positions is None
+            or self._decoder_decision_type is None
+            or self._decoder_output_token_ids is None
+            or self._decoder_output_pointer_pos is None
+            or self._decoder_output_is_pointer is None
+            or self._decoder_output_pad_mask is None
+            or self._decoder_log_probs is None
+            or self._decoder_value is None
+            or self._pointer_anchor_positions is None
+            or self._pointer_anchor_kinds is None
+            or self._pointer_anchor_subjects is None
+            or self._pointer_anchor_handles is None
+            or self._vocab_mask is None
+            or self._pointer_mask is None
+        ):
+            raise RuntimeError("staging tensors were not allocated")
 
-        # Translate to DecoderDecisionPayload shape. Replay scoring needs
-        # anchor-indexed masks plus the original row-local encoder positions
-        # so the compact pointer columns can be scored against encoder states.
-        # Everything is host-side now (replay storage, staged decoder rows,
-        # and the merged decoder built from them) — no D→H needed.
-        finish_part_start = time.perf_counter()
-        store_dev = replay_buffer.core.trace_kind_id.device
-        with torch.profiler.record_function("finish_append_build_indices"):
-            n_max = max(
-                max(int(row.packed_parent.pointer_anchor_positions.shape[1]) for row in staged),
-                int(merged_decoder.pointer_anchor_handles.shape[1]),
-            )
-            anchor_positions = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
-            anchor_kinds = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
-            anchor_subjects = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
-            anchor_handles = torch.full((total, n_max), -1, dtype=torch.int32, device=store_dev)
-            for out_i, row in enumerate(staged):
-                src = row.packed_parent
-                src_i = int(row.packed_index)
-                width = int(src.pointer_anchor_positions.shape[1])
-                if width <= 0:
-                    continue
-                anchor_positions[out_i, :width] = src.pointer_anchor_positions[src_i].to(
-                    device=store_dev, dtype=torch.int32
-                )
-                anchor_kinds[out_i, :width] = src.pointer_anchor_kinds[src_i].to(
-                    device=store_dev, dtype=torch.int32
-                )
-                anchor_subjects[out_i, :width] = src.pointer_anchor_subjects[src_i].to(
-                    device=store_dev, dtype=torch.int32
-                )
-                anchor_handles[out_i, :width] = src.pointer_anchor_handles[src_i].to(
-                    device=store_dev, dtype=torch.int32
-                )
-            cnt = (
-                ((anchor_positions >= 0) & (anchor_kinds >= 0) & (anchor_handles >= 0))
-                .sum(dim=-1)
-                .to(dtype=torch.int32)
-            )
-            # Empty legal-edge bitmap; combat decisions need it filled out
-            # by the encoder, but for IMPALA staging we leave a placeholder.
-            legal_edge = torch.zeros((total, 0, 0), dtype=torch.bool, device=store_dev)
-            legal_n = torch.zeros((total,), dtype=torch.int32, device=store_dev)
-        if timing_stats is not None:
-            timing_stats.add(
-                "finish_append_build_indices",
-                time.perf_counter() - finish_part_start,
-            )
-        finish_part_start = time.perf_counter()
-        with torch.profiler.record_function("finish_append_payload"):
-            from magic_ai.text_encoder.replay_buffer import DecoderDecisionPayload
-
-            payload = DecoderDecisionPayload(
-                output_token_ids=merged_decoder.output_token_ids.to(dtype=torch.int32),
-                output_pointer_pos=merged_decoder.output_pointer_pos.to(dtype=torch.int32),
-                output_is_pointer=merged_decoder.output_is_pointer.to(dtype=torch.bool),
-                output_pad_mask=merged_decoder.output_pad_mask.to(dtype=torch.bool),
-                output_log_prob=merged_decoder.log_probs.to(dtype=torch.float32),
-                decision_type=merged_decoder.decision_type.to(dtype=torch.int32),
-                pointer_anchor_positions=anchor_positions,
-                pointer_anchor_kinds=anchor_kinds,
-                pointer_anchor_subjects=anchor_subjects,
-                pointer_anchor_handles=anchor_handles,
-                pointer_anchor_count=cnt,
-                legal_edge_bitmap=legal_edge,
-                legal_edge_n_blockers=legal_n,
-                legal_edge_n_attackers=legal_n,
-                vocab_mask=merged_decoder.vocab_mask.to(dtype=torch.bool),
-                pointer_mask=merged_decoder.pointer_mask.to(dtype=torch.bool),
-            )
-        if timing_stats is not None:
-            timing_stats.add("finish_append_payload", time.perf_counter() - finish_part_start)
-
-        # Reserve a window in the replay buffer covering all rows. Tokens
-        # come from the staged packed rows; decisions are stored as zero
-        # (decoder-pipeline rows don't use the inline-blank decision arrays).
-        from magic_ai.text_encoder.batch import PackedTextBatch  # local import
-
-        token_count = sum(row.n_tokens for row in staged)
-        finish_part_start = time.perf_counter()
-        reservation = replay_buffer.reserve_append(
-            row_count=total,
-            token_count=token_count,
-            decision_count=0,
-        )
-        if timing_stats is not None:
-            timing_stats.add(
-                "finish_append_reserve",
-                time.perf_counter() - finish_part_start,
-            )
         try:
-            # Write encoded rows + common fields first. Decoder rows are
-            # cleared once by ``commit_decoder_decision`` below; clearing them
-            # per row here would launch many small CUDA fills.
-            row_start = int(reservation.row_start)
-            row_end = int(reservation.row_end)
-            row_cursor = row_start
-            token_cursor = int(reservation.token_start)
-            finish_part_start = time.perf_counter()
-            with torch.profiler.record_function("finish_append_encoded_rows"):
-                for row in staged:
-                    replay_buffer._write_packed_encoded_row(
-                        row_cursor,
-                        token_cursor,
-                        cast(PackedTextBatch, row.packed_parent),
-                        batch_index=row.packed_index,
-                        clear_decoder=False,
-                    )
-                    row_cursor += 1
-                    token_cursor += row.n_tokens
-            if timing_stats is not None:
-                timing_stats.add(
-                    "finish_append_encoded_rows",
-                    time.perf_counter() - finish_part_start,
-                )
-            # Common fields, all host-to-host now that staging + storage
-            # are both on host.
-            finish_part_start = time.perf_counter()
-            core = replay_buffer.core
-            decision_type_t = merged_decoder.decision_type.to(dtype=torch.long)
-            trace_kind_lut = _decision_type_trace_kind_lut(store_dev)
-            trace_kind_ids = trace_kind_lut[decision_type_t.clamp(min=0)]
-            trace_kind_ids = torch.where(
-                decision_type_t < 0,
-                torch.zeros_like(trace_kind_ids),
-                trace_kind_ids,
+            rows = replay_buffer.append_staged_decoder_rows_compact(
+                staged_row_ids=staged_row_ids,
+                staged_token_ids=self._token_ids,
+                staged_card_ref_positions=self._card_ref_positions,
+                staged_decision_type=self._decoder_decision_type,
+                staged_output_token_ids=self._decoder_output_token_ids,
+                staged_output_pointer_pos=self._decoder_output_pointer_pos,
+                staged_output_is_pointer=self._decoder_output_is_pointer,
+                staged_output_pad_mask=self._decoder_output_pad_mask,
+                staged_log_probs=self._decoder_log_probs,
+                staged_value=self._decoder_value,
+                staged_pointer_anchor_positions=self._pointer_anchor_positions,
+                staged_pointer_anchor_kinds=self._pointer_anchor_kinds,
+                staged_pointer_anchor_subjects=self._pointer_anchor_subjects,
+                staged_pointer_anchor_handles=self._pointer_anchor_handles,
+                staged_vocab_mask=self._vocab_mask,
+                staged_pointer_mask=self._pointer_mask,
+                staged_lstm_h_in=self._lstm_h_in,
+                staged_lstm_c_in=self._lstm_c_in,
+                token_lengths=token_lengths,
+                perspective_player_idx=perspective_player_idx,
+                trace_kind_lut=_decision_type_trace_kind_lut(device),
+                timing_stats=timing_stats,
             )
-            old_log_prob = (
-                merged_decoder.log_probs.to(dtype=torch.float32).reshape(total, -1).sum(dim=-1)
-            )
-            value_t = merged_decoder.value.to(dtype=torch.float32).reshape(total)
-            perspective_t = torch.tensor(
-                [int(row.perspective_player_idx) for row in staged],
-                dtype=core.perspective_player_idx.dtype,
-                device=store_dev,
-            )
-            core.trace_kind_id[row_start:row_end] = trace_kind_ids.to(
-                dtype=core.trace_kind_id.dtype
-            )
-            core.may_selected[row_start:row_end] = 0.0
-            core.old_log_prob[row_start:row_end] = old_log_prob
-            core.value[row_start:row_end] = value_t
-            core.perspective_player_idx[row_start:row_end] = perspective_t
-            if timing_stats is not None:
-                timing_stats.add(
-                    "finish_append_common_fields",
-                    time.perf_counter() - finish_part_start,
-                )
-            finish_part_start = time.perf_counter()
-            core.decision_start[row_start:row_end] = 0
-            core.decision_count[row_start:row_end] = 0
-            if timing_stats is not None:
-                timing_stats.add(
-                    "finish_append_decision_gather",
-                    time.perf_counter() - finish_part_start,
-                )
-            if core.lstm_h_in is not None and core.lstm_c_in is not None:
-                finish_part_start = time.perf_counter()
-                if any(row.lstm_h_in is None or row.lstm_c_in is None for row in staged):
-                    raise ValueError("recurrent buffer requires lstm states on every staged row")
-                h_stack = torch.stack([cast(torch.Tensor, row.lstm_h_in) for row in staged], dim=0)
-                c_stack = torch.stack([cast(torch.Tensor, row.lstm_c_in) for row in staged], dim=0)
-                core._write_recurrent_batch(row_start, row_end, h_stack, c_stack)
-                if timing_stats is not None:
-                    timing_stats.add(
-                        "finish_append_lstm_gather",
-                        time.perf_counter() - finish_part_start,
-                    )
-            finish_part_start = time.perf_counter()
-            replay_buffer.commit_decoder_decision(reservation, payload)
-            if timing_stats is not None:
-                timing_stats.add(
-                    "finish_append_decoder_commit",
-                    time.perf_counter() - finish_part_start,
-                )
-            finish_part_start = time.perf_counter()
-            replay_buffer._mark_append_ready_range(
-                int(reservation.row_start), int(reservation.row_end)
-            )
-            replay_buffer.commit(reservation)
-            if timing_stats is not None:
-                timing_stats.add("finish_append_commit", time.perf_counter() - finish_part_start)
-        except BaseException:
-            # On failure, leave the reservation un-sealed (caller must drop).
-            raise
-
-        finish_part_start = time.perf_counter()
-        rows = torch.arange(
-            int(reservation.row_start),
-            int(reservation.row_end),
-            dtype=torch.long,
-            device=device,
-        )
-        if timing_stats is not None:
-            timing_stats.add(
-                "finish_append_rows_tensor",
-                time.perf_counter() - finish_part_start,
-            )
+        finally:
+            with self._lock:
+                self._release_staged_rows_locked(staged_row_ids)
         return rows, counts_t
 
     def append_envs_to_replay(
@@ -843,12 +951,9 @@ class NativeTextTrajectoryBuffer:
         """
 
         with self._lock:
-            total_rows = 0
-            total_tokens = 0
-            for e in env_indices:
-                env_i = int(e)
-                total_rows += len(self._rows[env_i])
-                total_tokens += self._token_counts[env_i]
+            env_t = torch.as_tensor(env_indices, dtype=torch.long)
+            total_rows = int(self._step_counts[env_t].sum().item())
+            total_tokens = int(self._token_counts[env_t].sum().item())
         if total_rows == 0:
             return True
         return replay_buffer.can_reserve(
@@ -5249,6 +5354,7 @@ def train_text_native_batched_envs(
                 "finish_append_build_indices",
                 "finish_append_payload",
                 "finish_append_reserve",
+                "finish_append_prepare_rows",
                 "finish_append_encoded_rows",
                 "finish_append_common_fields",
                 "finish_append_decision_gather",

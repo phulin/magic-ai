@@ -8,6 +8,7 @@ the V1 inline-blank fields. V1 rows are not readable by V2 code.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -1653,6 +1654,232 @@ class TextReplayBuffer:
 
         self._mark_append_ready_range(row_start, row_end)
         self._seal_reservation(reservation)
+        return rows
+
+    def append_staged_decoder_rows_compact(
+        self,
+        *,
+        staged_row_ids: Tensor,
+        staged_token_ids: Tensor,
+        staged_card_ref_positions: Tensor,
+        staged_decision_type: Tensor,
+        staged_output_token_ids: Tensor,
+        staged_output_pointer_pos: Tensor,
+        staged_output_is_pointer: Tensor,
+        staged_output_pad_mask: Tensor,
+        staged_log_probs: Tensor,
+        staged_value: Tensor,
+        staged_pointer_anchor_positions: Tensor,
+        staged_pointer_anchor_kinds: Tensor,
+        staged_pointer_anchor_subjects: Tensor,
+        staged_pointer_anchor_handles: Tensor,
+        staged_vocab_mask: Tensor,
+        staged_pointer_mask: Tensor,
+        staged_lstm_h_in: Tensor | None,
+        staged_lstm_c_in: Tensor | None,
+        token_lengths: Tensor,
+        perspective_player_idx: Tensor,
+        trace_kind_lut: Tensor,
+        timing_stats: Any | None = None,
+    ) -> Tensor:
+        """Append finished staged rows into one compact replay reservation."""
+
+        total = int(staged_row_ids.numel())
+        if total == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+
+        def _record(name: str, start: float) -> None:
+            if timing_stats is not None:
+                timing_stats.add(name, time.perf_counter() - start)
+
+        def _prefix_starts(lengths: Tensor) -> Tensor:
+            starts = torch.zeros_like(lengths)
+            if int(lengths.numel()) > 1:
+                starts[1:] = lengths.cumsum(0)[:-1]
+            return starts
+
+        staged_row_ids_h = staged_row_ids.to(dtype=torch.long, device="cpu")
+        token_lengths_h = token_lengths.to(dtype=torch.long, device="cpu")
+        perspective_h = perspective_player_idx.to(dtype=torch.long, device="cpu")
+        if int(token_lengths_h.numel()) != total:
+            raise ValueError("token_lengths must match staged_row_ids length")
+        if int(perspective_h.numel()) != total:
+            raise ValueError("perspective_player_idx must match staged_row_ids length")
+        if self.validate and bool((token_lengths_h > self.max_tokens).any().item()):
+            raise ValueError("encoded packed row token width exceeds buffer max_tokens")
+        if bool((staged_row_ids_h < 0).any().item()):
+            raise ValueError("staged_row_ids contains an invalid row")
+
+        total_tokens = int(token_lengths_h.sum().item())
+        token_offsets_h = _prefix_starts(token_lengths_h)
+
+        finish_part_start = time.perf_counter()
+        reservation = self.reserve_append(
+            row_count=total,
+            token_count=total_tokens,
+            decision_count=0,
+        )
+        _record("finish_append_reserve", finish_part_start)
+
+        row_start = int(reservation.row_start)
+        row_end = int(reservation.row_end)
+        token_start = int(reservation.token_start)
+        rows = torch.arange(row_start, row_end, dtype=torch.long, device=self.device)
+
+        try:
+            finish_part_start = time.perf_counter()
+            self.row_token_length_host[row_start:row_end] = token_lengths_h.to(
+                dtype=torch.int32
+            ).tolist()
+            token_lengths_device = token_lengths_h.to(dtype=torch.int32, device=self.device)
+            token_starts_device = (token_start + token_offsets_h).to(
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.row_token_start[rows] = token_starts_device
+            self.row_token_length[rows] = token_lengths_device
+            self.seq_lengths[rows] = token_lengths_device
+            self.card_ref_positions.index_fill_(0, rows, -1)
+            self._clear_decoder_rows(rows)
+            _record("finish_append_prepare_rows", finish_part_start)
+
+            finish_part_start = time.perf_counter()
+            if total_tokens > 0:
+                token_row = torch.repeat_interleave(
+                    torch.arange(total, dtype=torch.long),
+                    token_lengths_h,
+                    output_size=total_tokens,
+                )
+                within_row = torch.arange(total_tokens, dtype=torch.long) - torch.repeat_interleave(
+                    token_offsets_h,
+                    token_lengths_h,
+                    output_size=total_tokens,
+                )
+                dest_token_index = (token_start + token_offsets_h[token_row] + within_row).to(
+                    device=self.device
+                )
+                self.packed_token_ids[dest_token_index] = staged_token_ids[
+                    staged_row_ids_h[token_row],
+                    within_row,
+                ].to(
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+            self.card_ref_positions[rows] = staged_card_ref_positions[staged_row_ids_h].to(
+                device=self.device,
+                dtype=self.card_ref_positions.dtype,
+            )
+            _record("finish_append_encoded_rows", finish_part_start)
+
+            finish_part_start = time.perf_counter()
+            self.decoder.output_token_ids[rows] = staged_output_token_ids[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.int32,
+            )
+            self.decoder.output_pointer_pos[rows] = staged_output_pointer_pos[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.int32,
+            )
+            self.decoder.output_is_pointer[rows] = staged_output_is_pointer[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.bool,
+            )
+            self.decoder.output_pad_mask[rows] = staged_output_pad_mask[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.bool,
+            )
+            self.decoder.output_log_prob[rows] = staged_log_probs[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.float32,
+            )
+            decision_type = staged_decision_type[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.int32,
+            )
+            self.decoder.decision_type[rows] = decision_type
+            anchor_positions = staged_pointer_anchor_positions[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.int32,
+            )
+            anchor_kinds = staged_pointer_anchor_kinds[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.int32,
+            )
+            anchor_subjects = staged_pointer_anchor_subjects[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.int32,
+            )
+            anchor_handles = staged_pointer_anchor_handles[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.int32,
+            )
+            self.decoder.pointer_anchor_positions[rows] = anchor_positions
+            self.decoder.pointer_anchor_kinds[rows] = anchor_kinds
+            self.decoder.pointer_anchor_subjects[rows] = anchor_subjects
+            self.decoder.pointer_anchor_handles[rows] = anchor_handles
+            self.decoder.pointer_anchor_count[rows] = (
+                ((anchor_positions >= 0) & (anchor_kinds >= 0) & (anchor_handles >= 0))
+                .sum(dim=-1)
+                .to(dtype=torch.int32)
+            )
+            self.decoder.vocab_mask[rows] = staged_vocab_mask[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.bool,
+            )
+            self.decoder.pointer_mask[rows] = staged_pointer_mask[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.bool,
+            )
+            _record("finish_append_decoder_commit", finish_part_start)
+
+            finish_part_start = time.perf_counter()
+            trace_kind_lut = trace_kind_lut.to(device=self.device)
+            decision_type_l = decision_type.to(dtype=torch.long)
+            trace_kind_ids = trace_kind_lut[decision_type_l.clamp(min=0)]
+            trace_kind_ids = torch.where(
+                decision_type_l < 0,
+                torch.zeros_like(trace_kind_ids),
+                trace_kind_ids,
+            )
+            self.core.trace_kind_id[rows] = trace_kind_ids.to(dtype=self.core.trace_kind_id.dtype)
+            self.core.may_selected[rows] = 0.0
+            self.core.old_log_prob[rows] = (
+                staged_log_probs[staged_row_ids_h]
+                .to(device=self.device, dtype=torch.float32)
+                .sum(dim=-1)
+            )
+            self.core.value[rows] = staged_value[staged_row_ids_h].to(
+                device=self.device,
+                dtype=torch.float32,
+            )
+            self.core.perspective_player_idx[rows] = perspective_h.to(
+                device=self.device,
+                dtype=self.core.perspective_player_idx.dtype,
+            )
+            self.core.decision_start[rows] = 0
+            self.core.decision_count[rows] = 0
+            _record("finish_append_common_fields", finish_part_start)
+
+            if self.core.lstm_h_in is not None and self.core.lstm_c_in is not None:
+                finish_part_start = time.perf_counter()
+                if staged_lstm_h_in is None or staged_lstm_c_in is None:
+                    raise ValueError("recurrent buffer requires staged lstm states")
+                self.core._write_recurrent_batch(
+                    row_start,
+                    row_end,
+                    staged_lstm_h_in[staged_row_ids_h],
+                    staged_lstm_c_in[staged_row_ids_h],
+                )
+                _record("finish_append_lstm_gather", finish_part_start)
+
+            finish_part_start = time.perf_counter()
+            self._mark_append_ready_range(row_start, row_end)
+            self.commit(reservation)
+            _record("finish_append_commit", finish_part_start)
+        except BaseException:
+            # On failure, leave the reservation un-sealed (caller must drop).
+            raise
+
         return rows
 
     def append_native_payload(self, payload: Any, ready_event: Any | None = None) -> Tensor:

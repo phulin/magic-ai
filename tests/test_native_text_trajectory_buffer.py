@@ -20,6 +20,7 @@ from magic_ai.text_encoder.decoder_batch import (
     NativeTextDecoderBatch,
     native_decoder_batch_from_sample,
 )
+from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE
 from magic_ai.text_encoder.replay_buffer import TextReplayBuffer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from scripts.train import NativeTextTrajectoryBuffer
@@ -75,7 +76,7 @@ def _make_decoder_batch(b: int, *, l_max: int = 4, n_max: int = 2) -> NativeText
         output_is_pointer=torch.zeros((b, l_max), dtype=torch.bool),
         output_pad_mask=torch.ones((b, l_max), dtype=torch.bool),
         log_probs=torch.full((b, l_max), -0.1),
-        vocab_mask=torch.ones((b, l_max, 4), dtype=torch.bool),
+        vocab_mask=torch.ones((b, l_max, GRAMMAR_VOCAB_SIZE), dtype=torch.bool),
         pointer_mask=torch.ones((b, l_max, n_max), dtype=torch.bool),
         decision_type=torch.zeros((b,), dtype=torch.long),  # PRIORITY
         pointer_anchor_handles=torch.arange(b * n_max, dtype=torch.long).view(b, n_max),
@@ -84,19 +85,30 @@ def _make_decoder_batch(b: int, *, l_max: int = 4, n_max: int = 2) -> NativeText
     return native_decoder_batch_from_sample(sample, value=torch.zeros(b))
 
 
-def _make_packed_row(token_count: int = 3) -> PackedTextBatch:
-    n = 1
-    rows_t = torch.tensor([token_count], dtype=torch.int32)
-    cu = torch.tensor([0, token_count], dtype=torch.int32)
+def _make_packed_batch(lengths: list[int], *, token_base: int = 1) -> PackedTextBatch:
+    n = len(lengths)
+    rows_t = torch.tensor(lengths, dtype=torch.int32)
+    cu = torch.zeros(n + 1, dtype=torch.int32)
+    cu[1:] = rows_t.cumsum(0)
+    token_count = int(cu[-1].item())
     state_pos = cu[:-1].clone()
-    seq_id = torch.zeros(token_count, dtype=torch.int32)
-    pos_in_seq = torch.arange(token_count, dtype=torch.int32)
-    token_ids = torch.arange(token_count, dtype=torch.int32) + 1
+    seq_id = torch.repeat_interleave(torch.arange(n, dtype=torch.int32), rows_t)
+    pos_in_seq = torch.arange(token_count, dtype=torch.int32) - torch.repeat_interleave(
+        state_pos,
+        rows_t,
+    )
+    token_ids = torch.arange(token_base, token_base + token_count, dtype=torch.int32)
     card_ref = torch.full((n, MAX_CARD_REFS), -1, dtype=torch.int32)
-    pointer_anchor_positions = torch.tensor([[0, min(1, token_count - 1)]], dtype=torch.int32)
+    pointer_anchor_positions = torch.stack(
+        (
+            torch.zeros(n, dtype=torch.int32),
+            torch.clamp(rows_t - 1, min=0, max=1),
+        ),
+        dim=1,
+    )
     pointer_anchor_kinds = torch.zeros((n, 2), dtype=torch.int32)
     pointer_anchor_subjects = torch.zeros((n, 2), dtype=torch.int32)
-    pointer_anchor_handles = torch.arange(2, dtype=torch.int32).view(n, 2)
+    pointer_anchor_handles = torch.arange(n * 2, dtype=torch.int32).view(n, 2)
     return PackedTextBatch(
         token_ids=token_ids,
         seq_id=seq_id,
@@ -105,8 +117,8 @@ def _make_packed_row(token_count: int = 3) -> PackedTextBatch:
         seq_lengths=rows_t,
         state_positions=state_pos,
         card_ref_positions=card_ref,
-        seq_lengths_host=(token_count,),
-        max_seqlen=token_count,
+        seq_lengths_host=tuple(lengths),
+        max_seqlen=max(lengths),
         spec_lens=torch.zeros(n, dtype=torch.int32),
         decision_type=torch.zeros(n, dtype=torch.int32),
         pointer_anchor_positions=pointer_anchor_positions,
@@ -115,6 +127,10 @@ def _make_packed_row(token_count: int = 3) -> PackedTextBatch:
         pointer_anchor_handles=pointer_anchor_handles,
         legal_edge_bitmap=None,
     )
+
+
+def _make_packed_row(token_count: int = 3) -> PackedTextBatch:
+    return _make_packed_batch([token_count])
 
 
 class NativeTextTrajectoryBufferTest(unittest.TestCase):
@@ -157,6 +173,45 @@ class NativeTextTrajectoryBufferTest(unittest.TestCase):
         # pointer_anchor_count should be 2 for each row.
         for r in rows_h:
             self.assertEqual(int(replay.decoder.pointer_anchor_count[r].item()), 2)
+
+    def test_batched_segments_commit_compact_rows_in_env_order(self) -> None:
+        replay = _make_replay_buffer()
+        buf = NativeTextTrajectoryBuffer(replay, num_envs=2, max_steps=4)
+
+        decoder0 = _make_decoder_batch(b=2)
+        decoder0.output_token_ids.add_(10)
+        buf.stage_batch(
+            env_indices=[0, 1],
+            host_decoder=_host_view(decoder0),
+            packed_parent=_make_packed_batch([3, 2], token_base=10),
+            perspective_player_indices=[0, 1],
+        )
+        decoder1 = _make_decoder_batch(b=2)
+        decoder1.output_token_ids.add_(50)
+        buf.stage_batch(
+            env_indices=[0, 1],
+            host_decoder=_host_view(decoder1),
+            packed_parent=_make_packed_batch([4, 1], token_base=100),
+            perspective_player_indices=[0, 1],
+        )
+
+        rows, counts = buf.append_envs_to_replay_returning_tensor([1, 0], replay)
+
+        self.assertEqual(counts.tolist(), [2, 2])
+        rows_h = rows.tolist()
+        lengths = replay.row_token_length[rows].tolist()
+        self.assertEqual(lengths, [2, 1, 3, 4])
+        packed = [
+            replay.packed_token_ids[
+                int(replay.row_token_start[r].item()) : int(replay.row_token_start[r].item())
+                + int(replay.row_token_length[r].item())
+            ].tolist()
+            for r in rows_h
+        ]
+        self.assertEqual(packed, [[13, 14], [104], [10, 11, 12], [100, 101, 102, 103]])
+        first_decoder_tokens = replay.decoder.output_token_ids[rows, 0].tolist()
+        self.assertEqual(first_decoder_tokens, [14, 54, 10, 50])
+        self.assertEqual(replay.perspective_player_idx[rows].tolist(), [1, 1, 0, 0])
 
     def test_reset_env_drops_staged_rows(self) -> None:
         replay = _make_replay_buffer()
