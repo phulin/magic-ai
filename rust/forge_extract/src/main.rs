@@ -28,6 +28,7 @@ use clap::{Parser, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use regex::Regex;
@@ -90,7 +91,7 @@ struct Args {
     #[arg(long)]
     threads: Option<usize>,
 
-    /// Print progress every N games.
+    /// Update progress details every N zip members. Set to 0 to disable the progress bar.
     #[arg(long, default_value_t = 1000)]
     progress_every: usize,
 
@@ -102,6 +103,24 @@ struct Args {
     /// they may exceed this by one game.
     #[arg(long, default_value_t = 262_144)]
     arrow_shard_rows: usize,
+}
+
+fn make_progress_bar(total: usize, enabled: bool) -> ProgressBar {
+    if !enabled {
+        return ProgressBar::hidden();
+    }
+
+    let progress_bar = ProgressBar::new(total as u64);
+    progress_bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(2));
+    progress_bar.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] \
+             {pos}/{len} members ({per_sec}, ETA {eta_precise}) {msg}",
+        )
+        .expect("valid progress template")
+        .progress_chars("#>-"),
+    );
+    progress_bar
 }
 
 fn main() -> Result<()> {
@@ -152,85 +171,99 @@ fn main() -> Result<()> {
     });
 
     let progress_every = args.progress_every;
+    let total_members = members.len();
+    let progress_bar = make_progress_bar(total_members, progress_every > 0);
+    let members_done = std::sync::atomic::AtomicUsize::new(0);
     let zip_path = args.zip.clone();
     let games_seen = std::sync::atomic::AtomicUsize::new(0);
     let games_written = std::sync::atomic::AtomicUsize::new(0);
     let candidates_seen = std::sync::atomic::AtomicUsize::new(0);
     let kind_counts: [std::sync::atomic::AtomicUsize; 5] = Default::default();
 
-    members.par_iter().try_for_each_init(
+    let parse_result = members.par_iter().try_for_each_init(
         || -> Result<ZipArchive<BufReader<File>>> {
             let f = File::open(&zip_path)?;
             Ok(ZipArchive::new(BufReader::new(f))?)
         },
         |zf_res, member| -> Result<()> {
-            let zf = match zf_res {
-                Ok(z) => z,
-                Err(e) => return Err(anyhow!("zip init: {e}")),
-            };
-            let entry = zf.by_name(member)?;
-            let rows = read_jsonl_member(entry)?;
-            let meta = match meta_from_rows(&rows) {
-                Some(m) if !m.game_id.is_empty() => m,
-                _ => return Ok(()),
-            };
-            let n = games_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let result = (|| -> Result<()> {
+                let zf = match zf_res {
+                    Ok(z) => z,
+                    Err(e) => return Err(anyhow!("zip init: {e}")),
+                };
+                let entry = zf.by_name(member)?;
+                let rows = read_jsonl_member(entry)?;
+                let meta = match meta_from_rows(&rows) {
+                    Some(m) if !m.game_id.is_empty() => m,
+                    _ => return Ok(()),
+                };
+                games_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            let candidates = extract_candidates(&rows, &enabled_kinds, args.trajectory);
-            candidates_seen.fetch_add(candidates.len(), std::sync::atomic::Ordering::Relaxed);
-            if candidates.is_empty() {
-                return Ok(());
-            }
-
-            let selected: Vec<Candidate> = if args.trajectory {
-                candidates
-            } else {
-                match selection {
-                    Selection::Hash => {
-                        stable_choices(candidates, args.choices_per_game, meta.game_id)
-                    }
-                    Selection::Priority => {
-                        priority_choices(candidates, &kind_priority, args.choices_per_game)
-                    }
+                let candidates = extract_candidates(&rows, &enabled_kinds, args.trajectory);
+                candidates_seen.fetch_add(candidates.len(), std::sync::atomic::Ordering::Relaxed);
+                if candidates.is_empty() {
+                    return Ok(());
                 }
-            };
-            if selected.is_empty() {
-                return Ok(());
-            }
 
-            let mut json_batch: Vec<Vec<u8>> = Vec::new();
-            let mut arrow_batch: Vec<ArrowDecisionRow> = Vec::new();
-            match output_format {
-                OutputFormat::JsonlGz => json_batch.reserve(selected.len()),
-                OutputFormat::Arrow => arrow_batch.reserve(selected.len()),
-            }
-            for c in selected {
-                let kind_idx = choice_kind_index(c.kind).unwrap();
-                kind_counts[kind_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let rec = build_record(&c, &meta, member);
+                let selected: Vec<Candidate> = if args.trajectory {
+                    candidates
+                } else {
+                    match selection {
+                        Selection::Hash => {
+                            stable_choices(candidates, args.choices_per_game, meta.game_id)
+                        }
+                        Selection::Priority => {
+                            priority_choices(candidates, &kind_priority, args.choices_per_game)
+                        }
+                    }
+                };
+                if selected.is_empty() {
+                    return Ok(());
+                }
+
+                let mut json_batch: Vec<Vec<u8>> = Vec::new();
+                let mut arrow_batch: Vec<ArrowDecisionRow> = Vec::new();
                 match output_format {
-                    OutputFormat::JsonlGz => json_batch.push(sonic_rs::to_vec(&rec)?),
-                    OutputFormat::Arrow => arrow_batch.push(ArrowDecisionRow::from_record(&rec)?),
+                    OutputFormat::JsonlGz => json_batch.reserve(selected.len()),
+                    OutputFormat::Arrow => arrow_batch.reserve(selected.len()),
+                }
+                for c in selected {
+                    let kind_idx = choice_kind_index(c.kind).unwrap();
+                    kind_counts[kind_idx].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let rec = build_record(&c, &meta, member);
+                    match output_format {
+                        OutputFormat::JsonlGz => json_batch.push(sonic_rs::to_vec(&rec)?),
+                        OutputFormat::Arrow => {
+                            arrow_batch.push(ArrowDecisionRow::from_record(&rec)?)
+                        }
+                    }
+                }
+                games_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let batch = match output_format {
+                    OutputFormat::JsonlGz => WriterBatch::JsonLines(json_batch),
+                    OutputFormat::Arrow => WriterBatch::ArrowRows(arrow_batch),
+                };
+                tx.send(batch).map_err(|e| anyhow!("writer dropped: {e}"))?;
+                Ok(())
+            })();
+
+            if progress_every > 0 {
+                let done = members_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                progress_bar.inc(1);
+                if done % progress_every == 0 || done == total_members {
+                    progress_bar.set_message(format!(
+                        "seen={} written={} candidates={}",
+                        games_seen.load(std::sync::atomic::Ordering::Relaxed),
+                        games_written.load(std::sync::atomic::Ordering::Relaxed),
+                        candidates_seen.load(std::sync::atomic::Ordering::Relaxed),
+                    ));
                 }
             }
-            games_written.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let batch = match output_format {
-                OutputFormat::JsonlGz => WriterBatch::JsonLines(json_batch),
-                OutputFormat::Arrow => WriterBatch::ArrowRows(arrow_batch),
-            };
-            tx.send(batch).map_err(|e| anyhow!("writer dropped: {e}"))?;
-
-            if progress_every > 0 && n % progress_every == 0 {
-                eprintln!(
-                    "{{\"games_seen\":{}, \"games_written\":{}, \"candidates_seen\":{}}}",
-                    n,
-                    games_written.load(std::sync::atomic::Ordering::Relaxed),
-                    candidates_seen.load(std::sync::atomic::Ordering::Relaxed),
-                );
-            }
-            Ok(())
+            result
         },
-    )?;
+    );
+    progress_bar.finish_and_clear();
+    parse_result?;
     drop(tx);
 
     let writer_stats = writer_handle
