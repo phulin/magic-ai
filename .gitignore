@@ -16,5 +16,6 @@ wheels/
 /checkpoints/
 /wandb/
 /.cache/
+/rust/**/target/
 tea_debug.log
 .env

@@ -656,9 +656,14 @@ fn priority_pending(raw_snapshot: &Value, _perspective_id: &str) -> Option<Value
     }))
 }
 
-fn attackers_pending(raw_snapshot: &Value, perspective_id: &str) -> Option<Value> {
+fn attackers_pending(
+    raw_snapshot: &Value,
+    perspective_id: &str,
+    display_ids: &DisplayIdIndex,
+) -> Option<Value> {
     let bf = raw_snapshot.get("battlefield").and_then(Value::as_array)?;
     let mut options: Vec<Value> = Vec::new();
+    let mut display_usage = indexmap::IndexMap::new();
     for card in bf {
         let Some(obj) = card.as_object() else { continue };
         if obj.get("controllerId").and_then(Value::as_str) != Some(perspective_id) {
@@ -668,7 +673,7 @@ fn attackers_pending(raw_snapshot: &Value, perspective_id: &str) -> Option<Value
         if power <= 0 {
             continue;
         }
-        let id = obj.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let id = card_handle(card, display_ids, &mut display_usage);
         let name = obj.get("name").and_then(Value::as_str).unwrap_or("").to_string();
         options.push(json!({
             "id": id,
@@ -688,12 +693,17 @@ fn attackers_pending(raw_snapshot: &Value, perspective_id: &str) -> Option<Value
 fn blockers_pending(
     raw_snapshot: &Value,
     perspective_id: &str,
-    attacker_prefixes: &[String],
+    attacker_refs: &[(String, String)],
+    display_ids: &DisplayIdIndex,
 ) -> Option<Value> {
     let bf = raw_snapshot.get("battlefield").and_then(Value::as_array)?;
 
     let mut attacker_targets: Vec<Value> = Vec::new();
-    for prefix in attacker_prefixes {
+    for (prefix, name) in attacker_refs {
+        if prefix.starts_with("forge:") {
+            attacker_targets.push(json!({"id": prefix, "label": name}));
+            continue;
+        }
         for card in bf {
             let Some(obj) = card.as_object() else { continue };
             let cid = obj.get("id").and_then(Value::as_str).unwrap_or("");
@@ -708,6 +718,7 @@ fn blockers_pending(
         return None;
     }
     let mut options: Vec<Value> = Vec::new();
+    let mut display_usage = indexmap::IndexMap::new();
     for card in bf {
         let Some(obj) = card.as_object() else { continue };
         if obj.get("controllerId").and_then(Value::as_str) != Some(perspective_id) {
@@ -720,7 +731,7 @@ fn blockers_pending(
         if obj.get("tapped").and_then(Value::as_bool).unwrap_or(false) {
             continue;
         }
-        let id = obj.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        let id = card_handle(card, display_ids, &mut display_usage);
         let name = obj.get("name").and_then(Value::as_str).unwrap_or("").to_string();
         options.push(json!({
             "id": id,
@@ -801,6 +812,26 @@ static LOG_PUTS_BF_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"^(?P<player>.+?) puts (?P<name>.+?) \[[^\]]+\] from hand onto the Battlefield")
         .unwrap()
 });
+static COMBAT_CARD_REF_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?P<name>[^()\n]+?)\s+\((?P<id>[0-9]+)\)").unwrap());
+static ASSIGNED_ATTACK_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?P<player>.+?) assigned (?P<attackers>.+) to attack (?P<defender>.+?)\.$")
+        .unwrap()
+});
+static ASSIGNED_BLOCK_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^(?P<player>.+?) assigned (?P<blockers>.+?) to block (?P<attacker>.+?)\.$")
+        .unwrap()
+});
+static DIDNT_BLOCK_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(?P<player>.+?) didn't block (?P<attacker>.+?)\.$").unwrap());
+
+type DisplayIdIndex = indexmap::IndexMap<String, Vec<String>>;
+
+#[derive(Clone)]
+struct CombatCardRef {
+    name: String,
+    id_prefix: String,
+}
 
 #[derive(Clone)]
 struct AttacksHeader {
@@ -842,6 +873,308 @@ fn parse_attacker_line(desc: &str) -> Option<AttackerLine> {
         id_prefix,
         blockers,
     })
+}
+
+fn forge_display_handle(display_id: &str) -> String {
+    format!("forge:{display_id}")
+}
+
+fn clean_combat_name(raw: &str) -> String {
+    let mut s = raw.trim().trim_start_matches(',').trim();
+    if let Some(rest) = s.strip_prefix("and ") {
+        s = rest.trim();
+    }
+    s.to_string()
+}
+
+fn parse_combat_card_refs(raw: &str) -> Vec<CombatCardRef> {
+    COMBAT_CARD_REF_RE
+        .captures_iter(raw)
+        .filter_map(|cap| {
+            let name = clean_combat_name(&cap["name"]);
+            if name.is_empty() {
+                return None;
+            }
+            Some(CombatCardRef {
+                name,
+                id_prefix: forge_display_handle(&cap["id"]),
+            })
+        })
+        .collect()
+}
+
+fn combat_ref_json(card: &CombatCardRef) -> Value {
+    json!({"name": card.name, "id_prefix": card.id_prefix})
+}
+
+fn push_unique_combat_ref(out: &mut Vec<CombatCardRef>, card: CombatCardRef) {
+    if out.iter().any(|c| c.id_prefix == card.id_prefix) {
+        return;
+    }
+    out.push(card);
+}
+
+fn parse_assigned_attack(desc: &str) -> Option<(String, String, Vec<CombatCardRef>)> {
+    let cap = ASSIGNED_ATTACK_RE.captures(desc)?;
+    let attackers = parse_combat_card_refs(&cap["attackers"]);
+    if attackers.is_empty() {
+        return None;
+    }
+    Some((
+        cap["player"].to_string(),
+        cap["defender"].to_string(),
+        attackers,
+    ))
+}
+
+fn parse_assigned_block(desc: &str) -> Option<(String, Vec<CombatCardRef>, CombatCardRef)> {
+    let cap = ASSIGNED_BLOCK_RE.captures(desc)?;
+    let blockers = parse_combat_card_refs(&cap["blockers"]);
+    let mut attackers = parse_combat_card_refs(&cap["attacker"]);
+    if blockers.is_empty() || attackers.is_empty() {
+        return None;
+    }
+    Some((cap["player"].to_string(), blockers, attackers.remove(0)))
+}
+
+fn parse_didnt_block(desc: &str) -> Option<(String, CombatCardRef)> {
+    let cap = DIDNT_BLOCK_RE.captures(desc)?;
+    let mut attackers = parse_combat_card_refs(&cap["attacker"]);
+    if attackers.is_empty() {
+        return None;
+    }
+    Some((cap["player"].to_string(), attackers.remove(0)))
+}
+
+fn has_assigned_attack_log(row: &Value) -> bool {
+    if row.get("type").and_then(Value::as_str) != Some("LOG") {
+        return false;
+    }
+    row.get("description")
+        .and_then(Value::as_str)
+        .map(|desc| desc.lines().any(|line| parse_assigned_attack(line).is_some()))
+        .unwrap_or(false)
+}
+
+fn has_new_block_log(row: &Value) -> bool {
+    if row.get("type").and_then(Value::as_str) != Some("LOG") {
+        return false;
+    }
+    row.get("description")
+        .and_then(Value::as_str)
+        .map(|desc| {
+            desc.lines().any(|line| {
+                parse_assigned_block(line).is_some() || parse_didnt_block(line).is_some()
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn assigned_attack_observed(window: &[&Value]) -> Option<Value> {
+    let mut actor_name = String::new();
+    let mut defender_name = String::new();
+    let mut attackers: Vec<CombatCardRef> = Vec::new();
+    let mut raw_lines: Vec<String> = Vec::new();
+
+    for row in window {
+        if row.get("type").and_then(Value::as_str) != Some("LOG") {
+            continue;
+        }
+        let desc = row.get("description").and_then(Value::as_str).unwrap_or("");
+        for line in desc.lines() {
+            let Some((actor, defender, cards)) = parse_assigned_attack(line) else {
+                continue;
+            };
+            if actor_name.is_empty() {
+                actor_name = actor;
+            }
+            if defender_name.is_empty() {
+                defender_name = defender;
+            }
+            for card in cards {
+                push_unique_combat_ref(&mut attackers, card);
+            }
+            raw_lines.push(line.to_string());
+        }
+    }
+    if attackers.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "raw": raw_lines.join("\n"),
+        "actor_name": actor_name,
+        "defender_name": defender_name,
+        "attackers": attackers.iter().map(combat_ref_json).collect::<Vec<_>>(),
+    }))
+}
+
+fn assigned_block_observed(window: &[&Value]) -> Option<Value> {
+    let mut actor_name = String::new();
+    let mut attackers: Vec<CombatCardRef> = Vec::new();
+    let mut assignments: Vec<Value> = Vec::new();
+    let mut raw_lines: Vec<String> = Vec::new();
+
+    for row in window {
+        if row.get("type").and_then(Value::as_str) != Some("LOG") {
+            continue;
+        }
+        let desc = row.get("description").and_then(Value::as_str).unwrap_or("");
+        for line in desc.lines() {
+            if let Some((actor, blockers, attacker)) = parse_assigned_block(line) {
+                if actor_name.is_empty() {
+                    actor_name = actor;
+                }
+                push_unique_combat_ref(&mut attackers, attacker.clone());
+                for blocker in blockers {
+                    assignments.push(json!({
+                        "attacker_name": attacker.name,
+                        "attacker_id_prefix": attacker.id_prefix,
+                        "blocker_name": blocker.name,
+                        "blocker_id_prefix": blocker.id_prefix,
+                    }));
+                }
+                raw_lines.push(line.to_string());
+                continue;
+            }
+            if let Some((actor, attacker)) = parse_didnt_block(line) {
+                if actor_name.is_empty() {
+                    actor_name = actor;
+                }
+                push_unique_combat_ref(&mut attackers, attacker);
+                raw_lines.push(line.to_string());
+            }
+        }
+    }
+    if attackers.is_empty() && assignments.is_empty() {
+        return None;
+    }
+
+    let snap = window
+        .first()
+        .and_then(|r| r.get("snapshot"))
+        .cloned()
+        .unwrap_or(json!({}));
+    let active = snap
+        .get("activePlayerId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Some(json!({
+        "raw": raw_lines.join("\n"),
+        "actor_name": actor_name,
+        "attacker_player": raw_player_name_by_id(&snap, active),
+        "attackers": attackers.iter().map(combat_ref_json).collect::<Vec<_>>(),
+        "assignments": assignments,
+        "no_block": assignments.is_empty(),
+    }))
+}
+
+fn display_key(controller_id: &str, card_name: &str) -> String {
+    format!("{controller_id}\t{card_name}")
+}
+
+fn add_display_ref(
+    display_ids: &mut DisplayIdIndex,
+    controller_id: &str,
+    card_name: &str,
+    id_prefix: &str,
+) {
+    if controller_id.is_empty() || card_name.is_empty() || !id_prefix.starts_with("forge:") {
+        return;
+    }
+    let ids = display_ids
+        .entry(display_key(controller_id, card_name))
+        .or_default();
+    if !ids.iter().any(|id| id == id_prefix) {
+        ids.push(id_prefix.to_string());
+    }
+}
+
+fn display_ids_from_observed(
+    raw_snapshot: &Value,
+    perspective_id: &str,
+    kind: &str,
+    observed: &Value,
+) -> DisplayIdIndex {
+    let mut out = DisplayIdIndex::new();
+    match kind {
+        "attack" => {
+            for card in observed
+                .get("attackers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                add_display_ref(
+                    &mut out,
+                    perspective_id,
+                    card.get("name").and_then(Value::as_str).unwrap_or(""),
+                    card.get("id_prefix").and_then(Value::as_str).unwrap_or(""),
+                );
+            }
+        }
+        "block" => {
+            let active_id = raw_snapshot
+                .get("activePlayerId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            for card in observed
+                .get("attackers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                add_display_ref(
+                    &mut out,
+                    active_id,
+                    card.get("name").and_then(Value::as_str).unwrap_or(""),
+                    card.get("id_prefix").and_then(Value::as_str).unwrap_or(""),
+                );
+            }
+            for assignment in observed
+                .get("assignments")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                add_display_ref(
+                    &mut out,
+                    perspective_id,
+                    assignment
+                        .get("blocker_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    assignment
+                        .get("blocker_id_prefix")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn card_handle(
+    card: &Value,
+    display_ids: &DisplayIdIndex,
+    display_usage: &mut indexmap::IndexMap<String, usize>,
+) -> String {
+    let controller = card.get("controllerId").and_then(Value::as_str).unwrap_or("");
+    let name = card.get("name").and_then(Value::as_str).unwrap_or("");
+    let key = display_key(controller, name);
+    if let Some(ids) = display_ids.get(&key) {
+        let used = display_usage.entry(key).or_insert(0);
+        if *used < ids.len() {
+            let id = ids[*used].clone();
+            *used += 1;
+            return id;
+        }
+    }
+    card.get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{controller}:bf:{name}"))
 }
 
 fn priority_label(desc: &str, event_type: &str) -> Option<Value> {
@@ -962,6 +1295,7 @@ fn make_candidate(
 ) -> Option<Candidate> {
     let raw_snapshot = source.get("snapshot")?;
     let mut normalized = normalize_snapshot(raw_snapshot, perspective_id);
+    let display_ids = display_ids_from_observed(raw_snapshot, perspective_id, kind, &observed);
 
     match kind {
         "priority" => {
@@ -991,7 +1325,7 @@ fn make_candidate(
             if attacker_prefixes.is_empty() && !no_attack {
                 return None;
             }
-            let pending = attackers_pending(raw_snapshot, perspective_id)?;
+            let pending = attackers_pending(raw_snapshot, perspective_id, &display_ids)?;
             let opt_ids: Vec<String> = pending
                 .get("options")
                 .and_then(Value::as_array)
@@ -1017,18 +1351,20 @@ fn make_candidate(
                 .insert("pending".into(), pending);
         }
         "block" => {
-            let attacker_prefixes: Vec<String> = observed
+            let attacker_refs: Vec<(String, String)> = observed
                 .get("attackers")
                 .and_then(Value::as_array)
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|a| {
-                            a.get("id_prefix").and_then(Value::as_str).map(String::from)
+                            let prefix = a.get("id_prefix").and_then(Value::as_str)?;
+                            let name = a.get("name").and_then(Value::as_str).unwrap_or("");
+                            Some((prefix.to_string(), name.to_string()))
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-            let pending = blockers_pending(raw_snapshot, perspective_id, &attacker_prefixes)?;
+            let pending = blockers_pending(raw_snapshot, perspective_id, &attacker_refs, &display_ids)?;
             let opt_ids: Vec<String> = pending
                 .get("options")
                 .and_then(Value::as_array)
@@ -1359,9 +1695,11 @@ fn extract_candidates(
     candidates
 }
 
-/// Walk DECLARE_ATTACKERS / DECLARE_BLOCKERS step windows. For any window with
-/// no attack header (or no `blocked by` lines), synthesize an empty-attack /
-/// empty-block candidate so the policy sees "chose not to act" decisions.
+/// Walk DECLARE_ATTACKERS / DECLARE_BLOCKERS step windows. Newer Forge logs
+/// write combat choices as "assigned X to attack/block" lines rather than the
+/// older "Attacker:" summaries, so extract those here. For windows with no
+/// positive action, synthesize an empty-attack / empty-block candidate so the
+/// policy sees "chose not to act" decisions.
 fn synthesize_combat_passes(
     events: &[&Value],
     archive_member: &str,
@@ -1407,6 +1745,44 @@ fn synthesize_combat_passes(
             });
             if !any_header {
                 let source = window[0];
+                if let Some(observed) = assigned_attack_observed(window) {
+                    if let Some(snap) = source.get("snapshot") {
+                        let actor_name = observed
+                            .get("actor_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let mut actor_id = raw_player_id_by_name(snap, &actor_name);
+                        if actor_id.is_empty() {
+                            actor_id = snap
+                                .get("activePlayerId")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                        }
+                        let target = window
+                            .iter()
+                            .find(|r| has_assigned_attack_log(r))
+                            .copied()
+                            .unwrap_or(source);
+                        if !actor_id.is_empty() {
+                            if let Some(c) = make_candidate(
+                                "attack",
+                                archive_member,
+                                &meta.game_id,
+                                source,
+                                target,
+                                &actor_id,
+                                &actor_name,
+                                observed,
+                            ) {
+                                out.push(c);
+                            }
+                        }
+                    }
+                    i = end;
+                    continue;
+                }
                 if let Some(snap) = source.get("snapshot") {
                     let active = snap
                         .get("activePlayerId")
@@ -1437,6 +1813,55 @@ fn synthesize_combat_passes(
                 }
             }
         } else if step == "DECLARE_BLOCKERS" && want_block {
+            let any_attacker_line = window.iter().any(|r| {
+                r.get("type").and_then(Value::as_str) == Some("LOG")
+                    && r.get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .starts_with("Attacker:")
+            });
+            if !any_attacker_line {
+                if let Some(observed) = assigned_block_observed(window) {
+                    let source = window[0];
+                    if let Some(snap) = source.get("snapshot") {
+                        let actor_name = observed
+                            .get("actor_name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let mut actor_id = raw_player_id_by_name(snap, &actor_name);
+                        if actor_id.is_empty() {
+                            let active = snap
+                                .get("activePlayerId")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            actor_id = raw_opponent_id(snap, &active);
+                        }
+                        let target = window
+                            .iter()
+                            .find(|r| has_new_block_log(r))
+                            .copied()
+                            .unwrap_or(source);
+                        if !actor_id.is_empty() {
+                            if let Some(c) = make_candidate(
+                                "block",
+                                archive_member,
+                                &meta.game_id,
+                                source,
+                                target,
+                                &actor_id,
+                                &actor_name,
+                                observed,
+                            ) {
+                                out.push(c);
+                            }
+                        }
+                    }
+                    i = end;
+                    continue;
+                }
+            }
             let any_block = window.iter().any(|r| {
                 if r.get("type").and_then(Value::as_str) != Some("LOG") {
                     return false;
@@ -1621,3 +2046,44 @@ fn build_record(c: &Candidate, meta: &Meta, candidate_count: usize) -> Value {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_assigned_attack_list() {
+        let (_, defender, attackers) = parse_assigned_attack(
+            "PlayerB assigned Dancing Scimitar (93), Zephyr Falcon (73) and Zephyr Falcon (71) to attack PlayerA.",
+        )
+        .unwrap();
+
+        assert_eq!(defender, "PlayerA");
+        assert_eq!(
+            attackers.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["Dancing Scimitar", "Zephyr Falcon", "Zephyr Falcon"]
+        );
+        assert_eq!(
+            attackers
+                .iter()
+                .map(|c| c.id_prefix.as_str())
+                .collect::<Vec<_>>(),
+            vec!["forge:93", "forge:73", "forge:71"]
+        );
+    }
+
+    #[test]
+    fn parses_assigned_block_and_no_block_lines() {
+        let (_, blockers, attacker) = parse_assigned_block(
+            "PlayerB assigned Carrion Ants (121) to block Ironroot Treefolk (53).",
+        )
+        .unwrap();
+        assert_eq!(blockers[0].name, "Carrion Ants");
+        assert_eq!(blockers[0].id_prefix, "forge:121");
+        assert_eq!(attacker.name, "Ironroot Treefolk");
+        assert_eq!(attacker.id_prefix, "forge:53");
+
+        let (_, unblocked) = parse_didnt_block("PlayerB didn't block Giant Spider (56).").unwrap();
+        assert_eq!(unblocked.name, "Giant Spider");
+        assert_eq!(unblocked.id_prefix, "forge:56");
+    }
+}
