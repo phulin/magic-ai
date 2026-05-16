@@ -717,8 +717,8 @@ class NativeTextTrajectoryBuffer:
             replay = self._replay_buffer
             if int(seq_lengths.max().item()) > replay.max_tokens:
                 raise ValueError("staged text row exceeds replay max_tokens")
-            if int(host_decoder.output_token_ids.shape[1]) != replay.max_decoder_len:
-                raise ValueError("decoder max length does not match replay buffer")
+            if int(host_decoder.output_token_ids.shape[1]) > replay.max_decoder_len:
+                raise ValueError("decoder max length exceeds replay buffer")
             if int(packed_parent.card_ref_positions.shape[1]) != replay.max_card_refs:
                 raise ValueError("card-ref width does not match replay buffer")
             if int(packed_parent.pointer_anchor_positions.shape[1]) != replay.max_anchors:
@@ -812,14 +812,31 @@ class NativeTextTrajectoryBuffer:
         pointer_anchor_subjects[row_ids] = packed_parent.pointer_anchor_subjects.to(torch.int32)
         pointer_anchor_handles[row_ids] = packed_parent.pointer_anchor_handles.to(torch.int32)
         decoder_decision_type[row_ids] = decoder.decision_type.to(torch.int32)
-        decoder_output_token_ids[row_ids] = decoder.output_token_ids.to(torch.int32)
-        decoder_output_pointer_pos[row_ids] = decoder.output_pointer_pos.to(torch.int32)
-        decoder_output_is_pointer[row_ids] = decoder.output_is_pointer.to(torch.bool)
-        decoder_output_pad_mask[row_ids] = decoder.output_pad_mask.to(torch.bool)
-        decoder_log_probs[row_ids] = decoder.log_probs.to(torch.float32)
+        decoder_output_token_ids.index_fill_(0, row_ids, 0)
+        decoder_output_pointer_pos.index_fill_(0, row_ids, -1)
+        decoder_output_is_pointer.index_fill_(0, row_ids, False)
+        decoder_output_pad_mask.index_fill_(0, row_ids, False)
+        decoder_log_probs.index_fill_(0, row_ids, 0.0)
+        vocab_mask.index_fill_(0, row_ids, False)
+        pointer_mask.index_fill_(0, row_ids, False)
+        decoder_len = int(decoder.output_token_ids.shape[1])
+        if decoder_len > int(decoder_output_token_ids.shape[1]):
+            raise ValueError("decoder max length exceeds staging buffer")
+        if decoder_len > 0:
+            decoder_output_token_ids[row_ids, :decoder_len] = decoder.output_token_ids.to(
+                torch.int32
+            )
+            decoder_output_pointer_pos[row_ids, :decoder_len] = decoder.output_pointer_pos.to(
+                torch.int32
+            )
+            decoder_output_is_pointer[row_ids, :decoder_len] = decoder.output_is_pointer.to(
+                torch.bool
+            )
+            decoder_output_pad_mask[row_ids, :decoder_len] = decoder.output_pad_mask.to(torch.bool)
+            decoder_log_probs[row_ids, :decoder_len] = decoder.log_probs.to(torch.float32)
+            vocab_mask[row_ids, :decoder_len] = decoder.vocab_mask.to(torch.bool)
+            pointer_mask[row_ids, :decoder_len] = decoder.pointer_mask.to(torch.bool)
         decoder_value[row_ids] = decoder.value.to(torch.float32)
-        vocab_mask[row_ids] = decoder.vocab_mask.to(torch.bool)
-        pointer_mask[row_ids] = decoder.pointer_mask.to(torch.bool)
         if lstm_h_in is not None and lstm_c_in is not None:
             if self._lstm_h_in is None or self._lstm_c_in is None:
                 raise RuntimeError("recurrent staging tensors were not allocated")
@@ -5249,12 +5266,14 @@ def train_text_native_batched_envs(
                 next_episode_idx += 1
             return games
 
-        for actor_id, actor in enumerate(actors):
-            initial = _spawn_initial(actor_id)
-            actor.start(initial)
-
-        active_actors = num_actors
-        actor_done: list[bool] = [False] * num_actors
+        initial_batches = [_spawn_initial(actor_id) for actor_id in range(num_actors)]
+        actor_done: list[bool] = [
+            not initial and next_episode_idx >= args.episodes for initial in initial_batches
+        ]
+        active_actors = sum(1 for done in actor_done if not done)
+        for actor, initial, done in zip(actors, initial_batches, actor_done, strict=True):
+            if not done:
+                actor.start(initial)
         pending_refill_slots: list[list[int]] = [[] for _ in range(num_actors)]
         deferred_finishes: list[FinishedEnv] = []
         last_progress_t = time.monotonic()
