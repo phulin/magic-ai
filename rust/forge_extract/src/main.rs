@@ -53,6 +53,12 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     choices_per_game: usize,
 
+    /// Emit every extractable decision per game in trajectory order. Also
+    /// infers priority passes, but only from priority windows where the
+    /// player had at least one non-pass playable action.
+    #[arg(long, default_value_t = false)]
+    trajectory: bool,
+
     /// Kind ordering when --selection priority.
     #[arg(long, default_value = "may,block,attack,choose,priority")]
     kind_priority: String,
@@ -156,15 +162,23 @@ fn main() -> Result<()> {
         };
         let n = games_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
-        let candidates = extract_candidates(member, &meta, &rows, &enabled_kinds);
+        let candidates = extract_candidates(member, &meta, &rows, &enabled_kinds, args.trajectory);
         candidates_seen.fetch_add(candidates.len(), std::sync::atomic::Ordering::Relaxed);
         if candidates.is_empty() {
             return Ok(());
         }
 
-        let selected: Vec<Candidate> = match selection {
-            Selection::Hash => stable_choices(candidates, args.choices_per_game),
-            Selection::Priority => priority_choices(candidates, &kind_priority, args.choices_per_game),
+        let selected: Vec<Candidate> = if args.trajectory {
+            candidates
+        } else {
+            match selection {
+                Selection::Hash => stable_choices(candidates, args.choices_per_game),
+                Selection::Priority => priority_choices(
+                    candidates,
+                    &kind_priority,
+                    args.choices_per_game,
+                ),
+            }
         };
         if selected.is_empty() {
             return Ok(());
@@ -1205,6 +1219,51 @@ fn priority_label(desc: &str, event_type: &str) -> Option<Value> {
     None
 }
 
+fn is_pass_action(kind: &str) -> bool {
+    kind.eq_ignore_ascii_case("PASS") || kind.eq_ignore_ascii_case("PASS_PRIORITY")
+}
+
+fn is_mana_ability_action(kind: &str, description: &str) -> bool {
+    let upper_kind = kind.to_ascii_uppercase();
+    if upper_kind.contains("MANA") {
+        return true;
+    }
+    let lower = description.to_ascii_lowercase();
+    let looks_like_activation = upper_kind == "ACTIVATE"
+        || upper_kind == "ACTIVATED"
+        || upper_kind == "ACTIVATE_ABILITY"
+        || upper_kind.contains("ACTIVAT");
+    looks_like_activation
+        && (lower.contains("add {")
+            || lower.contains(" adds {")
+            || lower.contains("add one mana")
+            || lower.contains("adds one mana")
+            || lower.contains("add mana")
+            || lower.contains("adds mana")
+            || lower.contains(": add "))
+}
+
+fn has_policy_relevant_non_pass_action(snapshot: &Value) -> bool {
+    snapshot
+        .get("playableActions")
+        .and_then(Value::as_array)
+        .map(|actions| {
+            actions.iter().any(|action| {
+                let kind = action
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .or_else(|| action.get("kind").and_then(Value::as_str))
+                    .unwrap_or("");
+                let description = action
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                !is_pass_action(kind) && !is_mana_ability_action(kind, description)
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn choose_label(desc: &str) -> Option<Value> {
     if !desc.to_ascii_lowercase().contains("choose") {
         return None;
@@ -1503,11 +1562,14 @@ fn extract_candidates(
     meta: &Meta,
     rows: &[Value],
     enabled: &[String],
+    trajectory: bool,
 ) -> Vec<Candidate> {
     let events = event_rows(rows);
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut last_priority_by_player: indexmap::IndexMap<String, (usize, &Value)> =
         indexmap::IndexMap::new();
+    let mut consumed_priority_sources: std::collections::HashSet<(i64, String)> =
+        std::collections::HashSet::new();
     let want_priority = enabled.iter().any(|k| k == "priority");
     let want_attack = enabled.iter().any(|k| k == "attack");
     let want_block = enabled.iter().any(|k| k == "block");
@@ -1531,6 +1593,13 @@ fn extract_candidates(
             if let Some(label) = priority_label(desc, row_type) {
                 let actor_id = priority_id.clone();
                 if let Some((_, source)) = last_priority_by_player.get(&actor_id).copied() {
+                    let source_key = (
+                        source.get("seq").and_then(Value::as_i64).unwrap_or(0),
+                        actor_id.clone(),
+                    );
+                    if consumed_priority_sources.contains(&source_key) {
+                        continue;
+                    }
                     if let Some(c) = make_candidate(
                         "priority",
                         archive_member,
@@ -1541,6 +1610,7 @@ fn extract_candidates(
                         &raw_player_name_by_id(&snap, &actor_id),
                         label,
                     ) {
+                        consumed_priority_sources.insert(source_key);
                         candidates.push(c);
                     }
                 }
@@ -1684,15 +1754,92 @@ fn extract_candidates(
     }
 
     if want_attack || want_block {
-        synthesize_combat_passes(&events, archive_member, meta, want_attack, want_block, &mut candidates);
+        synthesize_combat_passes(
+            &events,
+            archive_member,
+            meta,
+            want_attack,
+            want_block,
+            &mut candidates,
+        );
+    }
+    if trajectory && want_priority {
+        infer_priority_passes(
+            &events,
+            archive_member,
+            meta,
+            &consumed_priority_sources,
+            &mut candidates,
+        );
     }
 
+    candidates.sort_by_key(|c| (c.source_seq, c.target_seq, kind_rank(c.kind)));
     let total = candidates.len();
     for (i, c) in candidates.iter_mut().enumerate() {
         c.candidate_index = i;
         c.candidate_count = total;
     }
     candidates
+}
+
+fn kind_rank(kind: &str) -> u8 {
+    match kind {
+        "priority" => 0,
+        "attack" => 1,
+        "block" => 2,
+        "may" => 3,
+        "choose" => 4,
+        _ => 5,
+    }
+}
+
+fn infer_priority_passes(
+    events: &[&Value],
+    archive_member: &str,
+    meta: &Meta,
+    consumed_priority_sources: &std::collections::HashSet<(i64, String)>,
+    out: &mut Vec<Candidate>,
+) {
+    for (idx, row) in events.iter().enumerate() {
+        if row.get("type").and_then(Value::as_str) != Some("PRIORITY") {
+            continue;
+        }
+        let Some(snap) = row.get("snapshot") else {
+            continue;
+        };
+        if !has_policy_relevant_non_pass_action(snap) {
+            continue;
+        }
+        let actor_id = snap
+            .get("priorityPlayerId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if actor_id.is_empty() {
+            continue;
+        }
+        let seq = row.get("seq").and_then(Value::as_i64).unwrap_or(0);
+        if consumed_priority_sources.contains(&(seq, actor_id.to_string())) {
+            continue;
+        }
+        let target = events.get(idx + 1).copied().unwrap_or(row);
+        let observed = json!({
+            "raw": "Pass priority",
+            "event_type": "PASS",
+            "is_inferred": true,
+        });
+        if let Some(c) = make_candidate(
+            "priority",
+            archive_member,
+            &meta.game_id,
+            row,
+            target,
+            actor_id,
+            &raw_player_name_by_id(snap, actor_id),
+            observed,
+        ) {
+            out.push(c);
+        }
+    }
 }
 
 /// Walk DECLARE_ATTACKERS / DECLARE_BLOCKERS step windows. Newer Forge logs
@@ -2085,5 +2232,100 @@ mod tests {
         let (_, unblocked) = parse_didnt_block("PlayerB didn't block Giant Spider (56).").unwrap();
         assert_eq!(unblocked.name, "Giant Spider");
         assert_eq!(unblocked.id_prefix, "forge:56");
+    }
+
+    #[test]
+    fn priority_pass_inference_requires_policy_relevant_action() {
+        let pass_only = json!({
+            "playableActions": [
+                {"type": "PASS", "description": "Pass priority"}
+            ]
+        });
+        let mana_only = json!({
+            "playableActions": [
+                {
+                    "type": "ACTIVATE_ABILITY",
+                    "sourceName": "Forest",
+                    "description": "{T}: Add {G}."
+                },
+                {"type": "PASS", "description": "Pass priority"}
+            ]
+        });
+        let actionable = json!({
+            "playableActions": [
+                {
+                    "type": "ACTIVATED",
+                    "sourceName": "Prodigal Sorcerer",
+                    "description": "{T}: Deal 1 damage to any target."
+                },
+                {"type": "PASS", "description": "Pass priority"}
+            ]
+        });
+
+        assert!(!has_policy_relevant_non_pass_action(&pass_only));
+        assert!(!has_policy_relevant_non_pass_action(&mana_only));
+        assert!(has_policy_relevant_non_pass_action(&actionable));
+    }
+
+    #[test]
+    fn trajectory_uses_priority_source_once() {
+        let meta = Meta {
+            game_id: "game".to_string(),
+            winner_id: None,
+            winner_name: None,
+            players: vec![],
+            extras: json!({}),
+        };
+        let snapshot = json!({
+            "activePlayerId": "p2",
+            "priorityPlayerId": "p2",
+            "players": [
+                {"id": "p1", "name": "PlayerA", "life": 20, "librarySize": 40},
+                {"id": "p2", "name": "PlayerB", "life": 20, "librarySize": 40}
+            ],
+            "playableActions": [
+                {"type": "LAND", "sourceName": "Island", "description": "Play Island"},
+                {"type": "SPELL", "sourceName": "Ornithopter", "description": "Cast Ornithopter"},
+                {"type": "PASS", "description": "Pass priority"}
+            ]
+        });
+        let rows = vec![
+            json!({
+                "record": "EVENT",
+                "type": "PRIORITY",
+                "seq": 11,
+                "snapshot": snapshot,
+            }),
+            json!({
+                "record": "EVENT",
+                "type": "LOG",
+                "seq": 12,
+                "description": "PlayerB played Island (97)",
+                "snapshot": snapshot,
+            }),
+            json!({
+                "record": "EVENT",
+                "type": "STACK_PUSH",
+                "seq": 13,
+                "description": "STACK_PUSH Ornithopter by PlayerB",
+                "snapshot": snapshot,
+            }),
+        ];
+
+        let candidates = extract_candidates(
+            "game.jsonl.gz",
+            &meta,
+            &rows,
+            &["priority".to_string()],
+            true,
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source_seq, 11);
+        assert_eq!(candidates[0].target_seq, 12);
+        assert_eq!(
+            candidates[0].observed.get("raw").and_then(Value::as_str),
+            Some("PlayerB played Island (97)")
+        );
     }
 }
