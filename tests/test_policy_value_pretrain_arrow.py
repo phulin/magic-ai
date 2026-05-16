@@ -5,7 +5,7 @@ from typing import Any, cast
 
 import orjson
 import torch
-from magic_ai.text_encoder.batch import TextEncodedBatch, pack_batch
+from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch, pack_batch
 from magic_ai.text_encoder.decision_spec import DecisionType
 from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE
 from magic_ai.text_encoder.policy import EncodedSnapshots
@@ -264,15 +264,20 @@ class _FakeRecurrentPolicy(nn.Module):
 
     def encode_with_history(
         self,
-        batch: TextEncodedBatch,
+        batch: PackedTextBatch | TextEncodedBatch,
         h_in: torch.Tensor | None = None,
         c_in: torch.Tensor | None = None,
     ) -> tuple[EncodedSnapshots, torch.Tensor, torch.Tensor]:
         assert h_in is not None
         assert c_in is not None
         self.calls.append(h_in.detach().clone())
-        state_vec = batch.token_ids[:, :1].float() + 10.0 * h_in[-1]
-        packed = pack_batch(batch)
+        if isinstance(batch, PackedTextBatch):
+            state_vec = batch.token_ids[batch.state_positions.to(torch.long)].view(-1, 1).float()
+            packed = batch
+        else:
+            state_vec = batch.token_ids[:, :1].float()
+            packed = pack_batch(batch)
+        state_vec = state_vec + 10.0 * h_in[-1]
         encoded = torch.zeros((int(packed.token_ids.shape[0]), 1), dtype=torch.float32)
         snaps = EncodedSnapshots(
             card_vectors=torch.zeros((int(batch.token_ids.shape[0]), 0, 1)),

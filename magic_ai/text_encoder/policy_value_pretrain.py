@@ -25,7 +25,7 @@ import math
 from array import array
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -41,9 +41,12 @@ from transformers import PreTrainedTokenizerFast
 
 from magic_ai.game_state import GameStateSnapshot, PendingState
 from magic_ai.text_encoder.batch import (
+    PackedTextBatch,
     TextEncodedBatch,
+    TokenizationContext,
     collate,
-    tokenize_snapshot,
+    packed_sequence_layout,
+    tokenize_snapshots,
 )
 from magic_ai.text_encoder.decision_spec import AnchorKind, DecisionSpec, DecisionType
 from magic_ai.text_encoder.forge_target_encoding import (
@@ -55,7 +58,7 @@ from magic_ai.text_encoder.forge_target_encoding import (
 )
 from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE, batch_next_mask_torch
 from magic_ai.text_encoder.recurrent import RecurrentTextPolicy
-from magic_ai.text_encoder.render import OracleEntry, RenderError, render_snapshot
+from magic_ai.text_encoder.render import OracleEntry, RenderError, SnapshotRenderer
 from magic_ai.text_encoder.render_spec import DecisionSpecRenderer
 from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
 from magic_ai.text_encoder.training import (
@@ -184,8 +187,15 @@ class _PreparedDecoderExample:
     spec: DecisionSpec
     target: DecoderTarget
     value_target: float
-    # subject_index → encoder_position, by anchor kind, for fast pointer lookup.
-    anchor_pos_by_kind: dict[int, list[int]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _DecoderCandidate:
+    """Record fields that survive target translation and are worth rendering."""
+
+    snapshot: GameStateSnapshot
+    target: DecoderTarget
+    value_target: float
 
 
 @dataclass(frozen=True)
@@ -727,6 +737,12 @@ class ForgeChoiceDataset:
         self.tokenizer = tokenizer
         self.oracle = oracle
         self._spec_renderer = DecisionSpecRenderer(tokenizer)
+        self._tokenization_context = TokenizationContext.from_tokenizer(tokenizer)
+        self._snapshot_renderer = SnapshotRenderer(
+            oracle,
+            max_card_refs=MAX_CARD_REFS,
+            record_char_anchors=False,
+        )
         self._arrow_index: _ArrowCorpusIndex | None = None
         self.records: list[dict[str, Any]] = []
         # Group records by game_id while preserving input order (the sharder
@@ -797,7 +813,7 @@ class ForgeChoiceDataset:
             return self._arrow_index.game_records(index, cap=self.cfg.max_decisions_per_game)
         return self.games[index][: self.cfg.max_decisions_per_game]
 
-    def _prepare_decoder(self, record: dict[str, Any]) -> _PreparedDecoderExample | None:
+    def _decoder_candidate(self, record: dict[str, Any]) -> _DecoderCandidate | None:
         choice = record.get("choice") or {}
         observed = cast(dict[str, Any], choice.get("observed") or {})
         snapshot = cast(dict[str, Any], (record.get("state") or {}).get("snapshot") or {})
@@ -811,51 +827,71 @@ class ForgeChoiceDataset:
         target = translate_observed_to_target(pending, observed)
         if target is None or not target.output_token_ids:
             return None
-
-        try:
-            rendered = render_snapshot(
-                cast(GameStateSnapshot, snapshot),
-                oracle=self.oracle,
-                max_card_refs=MAX_CARD_REFS,
-            )
-            encoded = tokenize_snapshot(rendered, self.tokenizer)
-            spec = self._spec_renderer.render(
-                cast(GameStateSnapshot, snapshot), card_refs=rendered.card_refs
-            )
-        except RenderError, RuntimeError, KeyError, TypeError, ValueError, NotImplementedError:
-            return None
-
-        # Build per-kind subject_index → encoder_position lookup; the
-        # spec anchors are positioned relative to the spec section start,
-        # so add the row's state-token length here (the same offset the
-        # collator applies).
-        state_len = len(encoded.token_ids)
-        anchor_pos_by_kind: dict[int, list[int]] = {}
-        for anchor in spec.anchors:
-            arr = anchor_pos_by_kind.setdefault(int(anchor.kind), [])
-            while len(arr) <= anchor.subject_index:
-                arr.append(-1)
-            arr[anchor.subject_index] = int(anchor.token_position) + state_len
-
-        return _PreparedDecoderExample(
-            encoded=encoded,
-            spec=spec,
+        return _DecoderCandidate(
+            snapshot=cast(GameStateSnapshot, snapshot),
             target=target,
             value_target=_value_target(record, self.cfg),
-            anchor_pos_by_kind=anchor_pos_by_kind,
         )
+
+    def _prepare_decoder(self, record: dict[str, Any]) -> _PreparedDecoderExample | None:
+        prepared = self._prepare_decoder_many([record])
+        return prepared[0] if prepared else None
+
+    def _prepare_decoder_many(
+        self, records: Sequence[dict[str, Any]]
+    ) -> list[_PreparedDecoderExample]:
+        candidates: list[_DecoderCandidate] = []
+        rendered_rows = []
+        specs: list[DecisionSpec] = []
+        for record in records:
+            candidate = self._decoder_candidate(record)
+            if candidate is None:
+                continue
+            try:
+                rendered = self._snapshot_renderer.render(candidate.snapshot)
+                spec = self._spec_renderer.render(candidate.snapshot, card_refs=rendered.card_refs)
+            except RenderError, RuntimeError, KeyError, TypeError, ValueError, NotImplementedError:
+                continue
+            candidates.append(candidate)
+            rendered_rows.append(rendered)
+            specs.append(spec)
+
+        if not candidates:
+            return []
+        try:
+            encoded_rows = tokenize_snapshots(
+                rendered_rows,
+                self.tokenizer,
+                context=self._tokenization_context,
+            )
+        except RenderError, RuntimeError, KeyError, TypeError, ValueError, NotImplementedError:
+            return []
+
+        return [
+            _PreparedDecoderExample(
+                encoded=encoded,
+                spec=spec,
+                target=candidate.target,
+                value_target=candidate.value_target,
+            )
+            for candidate, encoded, spec in zip(candidates, encoded_rows, specs, strict=True)
+        ]
 
     def _batch_from_indices(self, indices: Sequence[int]) -> ForgeDecoderBatch:
         prepared: list[_PreparedDecoderExample] = []
         cursor = 0
         while len(prepared) < len(indices) and cursor < len(indices) * 4:
-            item = self._prepare_decoder(self._record_at(int(indices[cursor % len(indices)])))
-            cursor += 1
-            if item is not None:
-                prepared.append(item)
+            remaining = len(indices) - len(prepared)
+            record_indices = [
+                int(indices[(cursor + off) % len(indices)]) for off in range(remaining)
+            ]
+            cursor += remaining
+            prepared.extend(
+                self._prepare_decoder_many([self._record_at(i) for i in record_indices])
+            )
         if not prepared:
             raise ValueError("no renderable Forge decoder examples in selected batch")
-        return self._batch_from_prepared(prepared)
+        return self._batch_from_prepared(prepared[: len(indices)])
 
     def _batch_from_prepared(self, prepared: list[_PreparedDecoderExample]) -> ForgeDecoderBatch:
         if not prepared:
@@ -1070,11 +1106,7 @@ class ForgeChoiceDataset:
         prepared_per_game: list[list[_PreparedDecoderExample]] = []
         for gi in game_indices:
             game_records = self._game_records(gi)
-            prepared_game: list[_PreparedDecoderExample] = []
-            for record in game_records:
-                item = self._prepare_decoder(record)
-                if item is not None:
-                    prepared_game.append(item)
+            prepared_game = self._prepare_decoder_many(game_records)
             if prepared_game:
                 prepared_per_game.append(prepared_game)
         if not prepared_per_game:
@@ -1214,6 +1246,51 @@ def _index_text_encoded_batch(
     )
 
 
+def _index_text_encoded_batch_packed(
+    batch: TextEncodedBatch, rows: Tensor, rows_host: Sequence[int]
+) -> PackedTextBatch:
+    seq_lengths = batch.seq_lengths.index_select(0, rows).to(torch.int32)
+    source_lengths = batch.seq_lengths_host
+    if source_lengths is None:
+        seq_lengths_host = tuple(int(x) for x in seq_lengths.detach().cpu().tolist())
+    else:
+        seq_lengths_host = tuple(int(source_lengths[i]) for i in rows_host)
+    total_tokens = sum(seq_lengths_host)
+    max_seqlen = max(seq_lengths_host, default=0)
+    cu, state_positions, seq_id, pos_in_seq = packed_sequence_layout(
+        seq_lengths,
+        total_tokens=total_tokens,
+    )
+    row_token_ids = batch.token_ids.index_select(0, rows)
+    token_ids = row_token_ids[seq_id.to(torch.long), pos_in_seq.to(torch.long)].to(torch.int32)
+    legal_edge_bitmap = (
+        batch.legal_edge_bitmap.index_select(0, rows)
+        if batch.legal_edge_bitmap is not None
+        else None
+    )
+    return PackedTextBatch(
+        token_ids=token_ids,
+        seq_id=seq_id,
+        pos_in_seq=pos_in_seq,
+        cu_seqlens=cu,
+        seq_lengths=seq_lengths,
+        state_positions=state_positions.clone(),
+        card_ref_positions=batch.card_ref_positions.index_select(0, rows).to(torch.int32),
+        spec_lens=batch.spec_lens.index_select(0, rows).contiguous(),
+        decision_type=batch.decision_type.index_select(0, rows).contiguous(),
+        pointer_anchor_positions=batch.pointer_anchor_positions.index_select(0, rows).to(
+            torch.int32
+        ),
+        pointer_anchor_kinds=batch.pointer_anchor_kinds.index_select(0, rows).contiguous(),
+        pointer_anchor_subjects=batch.pointer_anchor_subjects.index_select(0, rows).contiguous(),
+        pointer_anchor_handles=batch.pointer_anchor_handles.index_select(0, rows).contiguous(),
+        legal_edge_bitmap=legal_edge_bitmap,
+        total_tokens=total_tokens,
+        seq_lengths_host=seq_lengths_host,
+        max_seqlen=max_seqlen,
+    )
+
+
 class ForgePolicyValueTrainer:
     def __init__(
         self,
@@ -1283,7 +1360,7 @@ class ForgePolicyValueTrainer:
             if int(active_cells.numel()) == 0:
                 continue
             active_games = batch.game_indices_by_timestep[t]
-            timestep_encoded = _index_text_encoded_batch(
+            timestep_encoded = _index_text_encoded_batch_packed(
                 batch.decoder.encoded, active_cells, batch.cell_indices_by_timestep_host[t]
             )
             h_in = h.index_select(1, active_games)
