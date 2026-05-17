@@ -25,6 +25,7 @@ Bidirectional text-encoder for game state and actions. Core pipeline: game snaps
 - `replay_triton.py` — Optional CUDA/Triton kernels for packed replay-buffer batch append writes, gather packing, and position rebasing.
 - `rollout.py` — End-to-end Python Magic game player using text encoder and RecurrentTextPolicy.
 - `token_tables.py` — Closed-vocabulary token-id lookup tables for every assembler emission; source of truth for native side.
+- `token_table_export.py` — Versioned JSON artifact export for Rust/other non-Python assemblers consuming `TokenTables` without tokenizer logic.
 - `tokenizer.py` — ModernBERT BPE tokenizer augmented with custom mana/card-ref/status/structural tokens.
 - `training.py` — Value/inline-blank loss helpers plus TextEncoderTrainer.
 - `inline_blanks.py` — Stable inline-blank group-kind enums shared by renderer, batches, training losses, and policy sampling.

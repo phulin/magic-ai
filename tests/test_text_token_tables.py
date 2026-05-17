@@ -37,7 +37,7 @@ from magic_ai.text_encoder.token_tables import (
     build_token_tables,
     fragment_text,
 )
-from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, load_tokenizer
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, MAX_DICT_ENTRIES, load_tokenizer
 
 
 @pytest.fixture(scope="module")
@@ -172,6 +172,12 @@ def test_card_ref_singletons(tokenizer, tables) -> None:
     assert len(tables.card_ref) == MAX_CARD_REFS
     for k in range(MAX_CARD_REFS):
         assert tables.card_ref[k] == tokenizer.convert_tokens_to_ids(f"<card-ref:{k}>")
+
+
+def test_dict_entry_singletons_are_sequence_local(tokenizer, tables) -> None:
+    assert len(tables.dict_entry) == MAX_DICT_ENTRIES
+    for k in range(MAX_DICT_ENTRIES):
+        assert tables.dict_entry[k] == tokenizer.convert_tokens_to_ids(f"<dict-entry:{k}>")
 
 
 def test_card_body_strips_card_closer(tables) -> None:

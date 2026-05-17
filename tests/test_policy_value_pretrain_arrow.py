@@ -4,9 +4,11 @@ from pathlib import Path
 from typing import Any, cast
 
 import orjson
+import pyarrow as pa
+import pyarrow.ipc as pa_ipc
 import torch
 from magic_ai.text_encoder.batch import PackedTextBatch, TextEncodedBatch, pack_batch
-from magic_ai.text_encoder.decision_spec import DecisionType
+from magic_ai.text_encoder.decision_spec import AnchorKind, DecisionType
 from magic_ai.text_encoder.grammar import GRAMMAR_VOCAB_SIZE
 from magic_ai.text_encoder.policy import EncodedSnapshots
 from magic_ai.text_encoder.policy_value_pretrain import (
@@ -223,6 +225,154 @@ def test_arrow_game_index_sidecar_round_trips(tmp_path: Path) -> None:
     assert loaded.game_batches.tolist() == spans.game_batches.tolist()
     assert loaded.game_starts.tolist() == spans.game_starts.tolist()
     assert loaded.game_lengths.tolist() == spans.game_lengths.tolist()
+
+
+def _write_pretokenized_arrow_fixture(
+    root: Path,
+    records: list[dict[str, Any]],
+    token_rows: list[list[int]],
+    card_ref_rows: list[list[int]],
+    action_token_rows: list[list[int]] | None = None,
+) -> None:
+    root.mkdir(parents=True)
+    schema = pa.schema(
+        [
+            pa.field("format_version", pa.uint16(), nullable=False),
+            pa.field("game_id", pa.utf8(), nullable=False),
+            pa.field("archive_member", pa.utf8(), nullable=False),
+            pa.field("kind_id", pa.uint8(), nullable=False),
+            pa.field("candidate_index", pa.uint32(), nullable=False),
+            pa.field("candidate_count", pa.uint32(), nullable=False),
+            pa.field("source_seq", pa.int64(), nullable=False),
+            pa.field("target_seq", pa.int64(), nullable=False),
+            pa.field("perspective_id", pa.utf8(), nullable=False),
+            pa.field("perspective_name", pa.utf8(), nullable=False),
+            pa.field("winner_id", pa.utf8(), nullable=True),
+            pa.field("winner_name", pa.utf8(), nullable=True),
+            pa.field("terminal_sign", pa.float32(), nullable=False),
+            pa.field("snapshot_json", pa.large_utf8(), nullable=False),
+            pa.field("observed_json", pa.large_utf8(), nullable=False),
+            pa.field("outcome_players_json", pa.large_utf8(), nullable=False),
+            pa.field("outcome_extras_json", pa.large_utf8(), nullable=False),
+            pa.field("token_ids", pa.list_(pa.int32()), nullable=False),
+            pa.field("seq_length", pa.uint32(), nullable=False),
+            pa.field("card_ref_positions", pa.list_(pa.int32()), nullable=False),
+            pa.field("token_overflow", pa.bool_(), nullable=False),
+            pa.field("card_ref_overflow", pa.bool_(), nullable=False),
+            pa.field("action_token_ids", pa.list_(pa.int32()), nullable=False),
+            pa.field("action_seq_length", pa.uint32(), nullable=False),
+            pa.field("decision_type", pa.int32(), nullable=False),
+            pa.field("pointer_anchor_positions", pa.list_(pa.int32()), nullable=False),
+            pa.field("pointer_anchor_kinds", pa.list_(pa.int32()), nullable=False),
+            pa.field("pointer_anchor_subjects", pa.list_(pa.int32()), nullable=False),
+            pa.field("pointer_anchor_handles", pa.list_(pa.int32()), nullable=False),
+            pa.field("legal_edge_bitmap", pa.list_(pa.uint8()), nullable=False),
+            pa.field("legal_edge_n_blockers", pa.uint32(), nullable=False),
+            pa.field("legal_edge_n_attackers", pa.uint32(), nullable=False),
+        ],
+        metadata={
+            "format": "forge_pretrain_decision_arrow",
+            "format_version": "2",
+            "stage": "pretokenized",
+        },
+    )
+    rows = []
+    if action_token_rows is None:
+        action_token_rows = [[201, 202, 203, 204, 204, 205] for _ in records]
+    for record, tokens, card_refs, action_tokens in zip(
+        records, token_rows, card_ref_rows, action_token_rows, strict=True
+    ):
+        choice = cast(dict[str, Any], record["choice"])
+        outcome = cast(dict[str, Any], record["outcome"])
+        rows.append(
+            [
+                2,
+                record["game_id"],
+                record["archive_member"],
+                0,
+                choice["candidate_index"],
+                choice["candidate_count"],
+                choice["source_seq"],
+                choice["target_seq"],
+                choice["perspective_id"],
+                choice["perspective_name"],
+                outcome["winner_id"],
+                outcome["winner_name"],
+                outcome["terminal_sign"],
+                orjson.dumps(cast(dict[str, Any], record["state"])["snapshot"]).decode(),
+                orjson.dumps(choice["observed"]).decode(),
+                orjson.dumps(outcome["players"]).decode(),
+                orjson.dumps(outcome["extras"]).decode(),
+                tokens,
+                len(tokens),
+                card_refs,
+                False,
+                False,
+                action_tokens,
+                len(action_tokens),
+                int(DecisionType.PRIORITY),
+                [3, 4],
+                [int(AnchorKind.LEGAL_ACTION), int(AnchorKind.LEGAL_ACTION)],
+                [0, 1],
+                [0, 1],
+                [],
+                0,
+                0,
+            ]
+        )
+    columns = list(zip(*rows, strict=True))
+    batch = pa.record_batch(
+        [pa.array(col, type=field.type) for col, field in zip(columns, schema)],
+        schema=schema,
+    )
+    with pa.OSFile(str(root / "part-000000.arrow"), "wb") as sink:
+        with pa_ipc.new_file(sink, schema, options=pa_ipc.IpcWriteOptions(compression="zstd")) as w:
+            w.write_batch(batch)
+    (root / "manifest.json").write_bytes(
+        orjson.dumps(
+            {
+                "format": "forge_pretrain_decision_arrow",
+                "format_version": 2,
+                "stage": "pretokenized",
+                "compression": "zstd",
+                "game_index": "game_index.arrow",
+                "shards": 1,
+                "records_written": len(records),
+            }
+        )
+    )
+
+
+def test_dataset_loads_pretokenized_arrow_state_tokens(tmp_path: Path) -> None:
+    base = _record_from_fixture()
+    record = _with_choice(
+        base,
+        game_id="game-pretokenized",
+        seq=10,
+        snapshot=cast(dict[str, Any], cast(dict[str, Any], base["state"])["snapshot"]),
+        observed={"raw": "Pass priority", "event_type": "PASS", "is_inferred": True},
+    )
+    arrow_dir = tmp_path / "pretokenized"
+    card_refs = [-1] * 256
+    card_refs[7] = 1
+    _write_pretokenized_arrow_fixture(arrow_dir, [record], [[101, 102, 103]], [card_refs])
+
+    tokenizer = load_tokenizer()
+    cfg = ForgePolicyValueConfig(
+        data_path=arrow_dir,
+        batch_size=1,
+        eval_fraction=0.0,
+        pad_token_id=int(tokenizer.pad_token_id or 0),
+        sequence_mode="none",
+    )
+    dataset = ForgeChoiceDataset(cfg, tokenizer=tokenizer, oracle={}, split="all")
+    batch = dataset._batch_from_indices([0])
+
+    assert dataset.n_examples == 1
+    assert batch.encoded.seq_lengths.tolist()[0] > 3
+    assert batch.encoded.token_ids[0, :3].tolist() == [101, 102, 103]
+    assert batch.encoded.token_ids[0, 3:9].tolist() == [201, 202, 203, 204, 204, 205]
+    assert batch.encoded.card_ref_positions[0, 7].item() == 1
 
 
 class _FakeGrammarDecoder(nn.Module):

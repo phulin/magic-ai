@@ -79,6 +79,7 @@ DEFAULT_N_ATTACKERS_MAX: int = 16
 
 
 _packed_ctypes_lib: ctypes.CDLL | None = None
+_dict_entry_lookup_cache: tuple[int, int, torch.Tensor] | None = None
 
 
 def _tensor_ptr(tensor: torch.Tensor, ctype: Any) -> Any:
@@ -136,6 +137,76 @@ def _load_packed_ctypes_lib() -> ctypes.CDLL | None:
         return None
     _packed_ctypes_lib = lib
     return lib
+
+
+def _dict_entry_lookup(dict_entry_ids: torch.Tensor) -> torch.Tensor:
+    """Return token-id -> dict-entry-index lookup for the active table."""
+
+    global _dict_entry_lookup_cache
+    if dict_entry_ids.numel() == 0:
+        return torch.empty((0,), dtype=torch.int64)
+    max_id = int(dict_entry_ids.max().item())
+    key = (int(dict_entry_ids.data_ptr()), max_id)
+    if _dict_entry_lookup_cache is not None and _dict_entry_lookup_cache[:2] == key:
+        return _dict_entry_lookup_cache[2]
+    lookup = torch.full((max_id + 1,), -1, dtype=torch.int64)
+    lookup[dict_entry_ids.to(dtype=torch.int64)] = torch.arange(
+        dict_entry_ids.numel(), dtype=torch.int64
+    )
+    _dict_entry_lookup_cache = (key[0], key[1], lookup)
+    return lookup
+
+
+def _localize_dict_entries(
+    token_ids: torch.Tensor,
+    seq_lengths: torch.Tensor,
+    *,
+    batch_size: int,
+) -> None:
+    """Rewrite native persistent dict-entry ids to sequence-local ids in-place.
+
+    Current libmage dedup mode emits ``<dict-entry:card_row>``. The text format
+    used by Rust and the tokenizer contract treats dict-entry ids as local
+    per-sequence slots, assigned by first appearance in the dictionary block.
+    """
+
+    from magic_ai.text_encoder.native_token_tables import active_packed
+
+    packed = active_packed()
+    if packed is None or packed.dict_entry_ids.numel() == 0:
+        return
+    dict_entry_ids = packed.dict_entry_ids
+    lookup = _dict_entry_lookup(dict_entry_ids)
+    max_id = int(lookup.numel() - 1)
+    offset = 0
+    for row_idx in range(batch_size):
+        length = int(seq_lengths[row_idx].item())
+        row_tokens = token_ids[offset : offset + length]
+        offset += length
+        if length == 0:
+            continue
+
+        in_range = (row_tokens >= 0) & (row_tokens <= max_id)
+        if not bool(in_range.any().item()):
+            continue
+        entry_idx = torch.full((length,), -1, dtype=torch.int64)
+        entry_idx[in_range] = lookup[row_tokens[in_range].to(dtype=torch.int64)]
+        present = entry_idx[entry_idx >= 0].tolist()
+        if not present:
+            continue
+
+        old_to_local: dict[int, int] = {}
+        for old_idx in present:
+            if old_idx in old_to_local:
+                continue
+            slot = len(old_to_local)
+            if slot >= dict_entry_ids.numel():
+                break
+            old_to_local[int(old_idx)] = slot
+        for old_idx, slot in old_to_local.items():
+            if old_idx == slot:
+                continue
+            row_tokens[entry_idx == old_idx] = int(dict_entry_ids[slot].item())
 
 
 @dataclass
@@ -505,6 +576,8 @@ def encode_tokens_packed(
         from magic_ai.slot_encoder.native_encoder import NativeEncodingError
 
         raise NativeEncodingError(message)
+    if getattr(encoder, "dedup_card_bodies", False):
+        _localize_dict_entries(outputs.token_ids, outputs.seq_lengths, batch_size=batch_size)
 
     # Second pass: decision-spec tokens. Pointer anchors are shifted by the
     # per-row state-text length so they reference the combined stream.

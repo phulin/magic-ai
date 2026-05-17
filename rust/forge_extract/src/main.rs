@@ -15,9 +15,10 @@ use std::sync::Arc;
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
+use arrow_array::builder::{Int32Builder, ListBuilder, UInt8Builder};
 use arrow_array::{
-    ArrayRef, Float32Array, Int64Array, LargeStringArray, RecordBatch, StringArray, UInt16Array,
-    UInt32Array, UInt8Array,
+    ArrayRef, BooleanArray, Float32Array, Int32Array, Int64Array, LargeStringArray, RecordBatch,
+    StringArray, UInt16Array, UInt32Array, UInt8Array,
 };
 use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
 use arrow_ipc::{CompressionType, MetadataVersion};
@@ -51,11 +52,11 @@ enum OutputFormat {
 struct Args {
     /// Forge game archive (zip of *.jsonl.gz members).
     #[arg(long)]
-    zip: PathBuf,
+    zip: Option<PathBuf>,
 
     /// Output .jsonl.gz path, or output directory when --output-format arrow.
     #[arg(long)]
-    out: PathBuf,
+    out: Option<PathBuf>,
 
     /// Output serialization format.
     #[arg(long, value_enum, default_value_t = OutputFormat::JsonlGz)]
@@ -103,6 +104,15 @@ struct Args {
     /// they may exceed this by one game.
     #[arg(long, default_value_t = 262_144)]
     arrow_shard_rows: usize,
+
+    /// Optional Python-exported token-table artifact. When set with Arrow
+    /// output, the extractor emits pre-tokenized state rows.
+    #[arg(long)]
+    token_tables: Option<PathBuf>,
+
+    /// Debug-only: emit token ids for one already-normalized snapshot JSON.
+    #[arg(long, hide = true)]
+    emit_state_json: Option<PathBuf>,
 }
 
 fn make_progress_bar(total: usize, enabled: bool) -> ProgressBar {
@@ -140,10 +150,65 @@ fn main() -> Result<()> {
         "priority" => Selection::Priority,
         other => return Err(anyhow!("unknown --selection {other:?}")),
     };
+    if args.token_tables.is_some()
+        && !matches!(args.output_format, OutputFormat::Arrow)
+        && args.emit_state_json.is_none()
+    {
+        return Err(anyhow!(
+            "--token-tables is only supported with --output-format arrow"
+        ));
+    }
+    let token_tables = args
+        .token_tables
+        .as_ref()
+        .map(|path| load_token_table_bundle(path))
+        .transpose()?
+        .map(Arc::new);
+
+    if let Some(snapshot_path) = &args.emit_state_json {
+        let bundle = token_tables
+            .as_deref()
+            .ok_or_else(|| anyhow!("--emit-state-json requires --token-tables"))?;
+        let f =
+            File::open(snapshot_path).with_context(|| format!("opening {:?}", snapshot_path))?;
+        let snapshot: Value = sonic_rs::from_reader(BufReader::new(f))
+            .with_context(|| format!("parsing {:?}", snapshot_path))?;
+        let state = emit_tokenized_state(&snapshot, bundle)?;
+        let spec = emit_decision_spec(&snapshot, bundle);
+        let payload = json!({
+            "token_ids": state.token_ids,
+            "seq_length": state.token_ids.len(),
+            "card_ref_positions": state.card_ref_positions,
+            "card_ref_overflow": state.card_ref_overflow,
+            "action_token_ids": spec.as_ref().map(|s| s.token_ids.as_slice()).unwrap_or(&[]),
+            "action_seq_length": spec.as_ref().map(|s| s.token_ids.len()).unwrap_or(0),
+            "decision_type": spec.as_ref().map(|s| s.decision_type).unwrap_or(DECISION_NONE),
+            "pointer_anchor_positions": spec.as_ref().map(|s| s.anchor_positions.as_slice()).unwrap_or(&[]),
+            "pointer_anchor_kinds": spec.as_ref().map(|s| s.anchor_kinds.as_slice()).unwrap_or(&[]),
+            "pointer_anchor_subjects": spec.as_ref().map(|s| s.anchor_subjects.as_slice()).unwrap_or(&[]),
+            "pointer_anchor_handles": spec.as_ref().map(|s| s.anchor_handles.as_slice()).unwrap_or(&[]),
+            "legal_edge_bitmap": spec.as_ref().map(|s| s.legal_edge_bitmap.as_slice()).unwrap_or(&[]),
+            "legal_edge_n_blockers": spec.as_ref().map(|s| s.legal_edge_n_blockers).unwrap_or(0),
+            "legal_edge_n_attackers": spec.as_ref().map(|s| s.legal_edge_n_attackers).unwrap_or(0),
+        });
+        println!("{}", sonic_rs::to_string(&payload)?);
+        return Ok(());
+    }
+
+    let zip_path = args
+        .zip
+        .as_ref()
+        .ok_or_else(|| anyhow!("--zip is required unless --emit-state-json is set"))?;
+    let out_path = args
+        .out
+        .as_ref()
+        .ok_or_else(|| anyhow!("--out is required unless --emit-state-json is set"))?
+        .clone();
+    let pretokenized = token_tables.is_some();
 
     // Enumerate members up-front (cheap; zip central directory only).
     let members: Vec<String> = {
-        let f = File::open(&args.zip).with_context(|| format!("opening {:?}", args.zip))?;
+        let f = File::open(zip_path).with_context(|| format!("opening {:?}", zip_path))?;
         let mut zf = ZipArchive::new(BufReader::new(f))?;
         (0..zf.len())
             .filter_map(|i| zf.by_index(i).ok().map(|e| e.name().to_string()))
@@ -159,14 +224,14 @@ fn main() -> Result<()> {
 
     // Writer thread: serialize output without blocking parser workers on disk I/O.
     let (tx, rx) = mpsc::sync_channel::<WriterBatch>(64);
-    let out_path = args.out.clone();
     let level = args.compresslevel;
     let output_format = args.output_format;
     let arrow_shard_rows = args.arrow_shard_rows;
+    let manifest_out_path = out_path.clone();
     let writer_handle = thread::spawn(move || -> Result<WriterStats> {
         match output_format {
             OutputFormat::JsonlGz => write_jsonl_gz(rx, out_path, level),
-            OutputFormat::Arrow => write_arrow_dir(rx, out_path, arrow_shard_rows),
+            OutputFormat::Arrow => write_arrow_dir(rx, out_path, arrow_shard_rows, pretokenized),
         }
     });
 
@@ -174,7 +239,7 @@ fn main() -> Result<()> {
     let total_members = members.len();
     let progress_bar = make_progress_bar(total_members, progress_every > 0);
     let members_done = std::sync::atomic::AtomicUsize::new(0);
-    let zip_path = args.zip.clone();
+    let zip_path = zip_path.clone();
     let games_seen = std::sync::atomic::AtomicUsize::new(0);
     let games_written = std::sync::atomic::AtomicUsize::new(0);
     let candidates_seen = std::sync::atomic::AtomicUsize::new(0);
@@ -234,7 +299,13 @@ fn main() -> Result<()> {
                     match output_format {
                         OutputFormat::JsonlGz => json_batch.push(sonic_rs::to_vec(&rec)?),
                         OutputFormat::Arrow => {
-                            arrow_batch.push(ArrowDecisionRow::from_record(&rec)?)
+                            let mut row = ArrowDecisionRow::from_record(&rec)?;
+                            if let Some(bundle) = token_tables.as_deref() {
+                                let state = emit_tokenized_state(rec.state.snapshot, bundle)?;
+                                let spec = emit_decision_spec(rec.state.snapshot, bundle);
+                                row.attach_tokenized_state(state, spec);
+                            }
+                            arrow_batch.push(row)
                         }
                     }
                 }
@@ -291,7 +362,7 @@ fn main() -> Result<()> {
     });
     if matches!(args.output_format, OutputFormat::Arrow) {
         write_arrow_manifest(
-            &args.out,
+            &manifest_out_path,
             &ArrowManifestStats {
                 shards: writer_stats.shards,
                 records_written: writer_stats.records,
@@ -306,6 +377,7 @@ fn main() -> Result<()> {
                     kind_counts[3].load(std::sync::atomic::Ordering::Relaxed) as u64,
                     kind_counts[4].load(std::sync::atomic::Ordering::Relaxed) as u64,
                 ],
+                pretokenized,
             },
         )?;
     }
@@ -347,6 +419,21 @@ struct ArrowDecisionRow {
     observed_json: String,
     outcome_players_json: String,
     outcome_extras_json: String,
+    token_ids: Option<Vec<i32>>,
+    seq_length: Option<u32>,
+    card_ref_positions: Option<Vec<i32>>,
+    token_overflow: bool,
+    card_ref_overflow: bool,
+    action_token_ids: Option<Vec<i32>>,
+    action_seq_length: Option<u32>,
+    decision_type: Option<i32>,
+    pointer_anchor_positions: Option<Vec<i32>>,
+    pointer_anchor_kinds: Option<Vec<i32>>,
+    pointer_anchor_subjects: Option<Vec<i32>>,
+    pointer_anchor_handles: Option<Vec<i32>>,
+    legal_edge_bitmap: Option<Vec<u8>>,
+    legal_edge_n_blockers: Option<u32>,
+    legal_edge_n_attackers: Option<u32>,
 }
 
 impl ArrowDecisionRow {
@@ -377,7 +464,950 @@ impl ArrowDecisionRow {
                 .context("serializing outcome_players_json")?,
             outcome_extras_json: sonic_rs::to_string(record.outcome.extras)
                 .context("serializing outcome_extras_json")?,
+            token_ids: None,
+            seq_length: None,
+            card_ref_positions: None,
+            token_overflow: false,
+            card_ref_overflow: false,
+            action_token_ids: None,
+            action_seq_length: None,
+            decision_type: None,
+            pointer_anchor_positions: None,
+            pointer_anchor_kinds: None,
+            pointer_anchor_subjects: None,
+            pointer_anchor_handles: None,
+            legal_edge_bitmap: None,
+            legal_edge_n_blockers: None,
+            legal_edge_n_attackers: None,
         })
+    }
+
+    fn attach_tokenized_state(&mut self, state: TokenizedState, spec: Option<DecisionSpecState>) {
+        self.seq_length = Some(state.token_ids.len() as u32);
+        self.token_ids = Some(state.token_ids);
+        self.card_ref_positions = Some(state.card_ref_positions);
+        self.token_overflow = false;
+        self.card_ref_overflow = state.card_ref_overflow;
+        if let Some(spec) = spec {
+            self.action_seq_length = Some(spec.token_ids.len() as u32);
+            self.action_token_ids = Some(spec.token_ids);
+            self.decision_type = Some(spec.decision_type);
+            self.pointer_anchor_positions = Some(spec.anchor_positions);
+            self.pointer_anchor_kinds = Some(spec.anchor_kinds);
+            self.pointer_anchor_subjects = Some(spec.anchor_subjects);
+            self.pointer_anchor_handles = Some(spec.anchor_handles);
+            self.legal_edge_bitmap = Some(spec.legal_edge_bitmap);
+            self.legal_edge_n_blockers = Some(spec.legal_edge_n_blockers as u32);
+            self.legal_edge_n_attackers = Some(spec.legal_edge_n_attackers as u32);
+        } else {
+            self.action_seq_length = Some(0);
+            self.action_token_ids = Some(Vec::new());
+            self.decision_type = Some(DECISION_NONE);
+            self.pointer_anchor_positions = Some(Vec::new());
+            self.pointer_anchor_kinds = Some(Vec::new());
+            self.pointer_anchor_subjects = Some(Vec::new());
+            self.pointer_anchor_handles = Some(Vec::new());
+            self.legal_edge_bitmap = Some(Vec::new());
+            self.legal_edge_n_blockers = Some(0);
+            self.legal_edge_n_attackers = Some(0);
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+struct SequenceTable {
+    offsets: Vec<usize>,
+    tokens: Vec<i32>,
+}
+
+impl SequenceTable {
+    fn get(&self, index: usize) -> &[i32] {
+        if index + 1 >= self.offsets.len() {
+            return &[];
+        }
+        let start = self.offsets[index];
+        let end = self.offsets[index + 1];
+        &self.tokens[start..end]
+    }
+}
+
+#[derive(Clone, Deserialize)]
+struct TokenTableArtifact {
+    schema_version: u32,
+    tokenizer: TokenizerArtifactMeta,
+    tables: RustTokenTables,
+    decision_spec: DecisionSpecTables,
+}
+
+#[derive(Clone, Deserialize)]
+struct TokenizerArtifactMeta {
+    unk_token_id: Option<i32>,
+}
+
+#[derive(Clone, Deserialize)]
+struct RustTokenTables {
+    dict_open_id: i32,
+    dict_close_id: i32,
+    card_open_id: i32,
+    stack_open_id: i32,
+    stack_close_id: i32,
+    turn_min: i32,
+    turn_max: i32,
+    life_min: i32,
+    life_max: i32,
+    count_min: i32,
+    count_max: i32,
+    step_count: usize,
+    owner_count: usize,
+    structural: SequenceTable,
+    zone_open: SequenceTable,
+    zone_close: SequenceTable,
+    mana_glyph: SequenceTable,
+    turn_step: SequenceTable,
+    life_owner: SequenceTable,
+    count: SequenceTable,
+    card_closer: Vec<i32>,
+    status_tapped: Vec<i32>,
+    status_untapped: Vec<i32>,
+    card_ref: Vec<i32>,
+    dict_entry: Vec<i32>,
+    card_body: SequenceTable,
+    row_to_name: Vec<String>,
+}
+
+#[derive(Clone, Deserialize)]
+struct DecisionSpecTables {
+    spec_open_id: i32,
+    spec_close_id: i32,
+    decision_type_id: i32,
+    legal_attacker_id: i32,
+    legal_blocker_id: i32,
+    legal_target_id: i32,
+    legal_action_id: i32,
+    max_value_open_id: i32,
+    max_value_close_id: i32,
+    player_ref_ids: Vec<i32>,
+    decision_type_name_ids: Vec<i32>,
+    max_value_digits: SequenceTable,
+}
+
+struct TokenTableBundle {
+    tables: RustTokenTables,
+    decision_spec: DecisionSpecTables,
+    name_to_row: HashMap<String, usize>,
+    unk_token_id: Option<i32>,
+}
+
+fn load_token_table_bundle(path: &PathBuf) -> Result<TokenTableBundle> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading token tables {:?}", path))?;
+    let artifact: TokenTableArtifact =
+        sonic_rs::from_slice(&bytes).with_context(|| format!("parsing {:?}", path))?;
+    if artifact.schema_version != 1 {
+        return Err(anyhow!(
+            "unsupported token-table artifact schema_version={}",
+            artifact.schema_version
+        ));
+    }
+    let mut name_to_row = HashMap::with_capacity(artifact.tables.row_to_name.len());
+    for (row, name) in artifact.tables.row_to_name.iter().enumerate() {
+        if row > 0 {
+            name_to_row.insert(name.clone(), row);
+        }
+    }
+    Ok(TokenTableBundle {
+        unk_token_id: artifact.tokenizer.unk_token_id,
+        tables: artifact.tables,
+        decision_spec: artifact.decision_spec,
+        name_to_row,
+    })
+}
+
+struct TokenizedState {
+    token_ids: Vec<i32>,
+    card_ref_positions: Vec<i32>,
+    card_ref_overflow: bool,
+}
+
+struct DecisionSpecState {
+    token_ids: Vec<i32>,
+    decision_type: i32,
+    anchor_positions: Vec<i32>,
+    anchor_kinds: Vec<i32>,
+    anchor_subjects: Vec<i32>,
+    anchor_handles: Vec<i32>,
+    legal_edge_bitmap: Vec<u8>,
+    legal_edge_n_blockers: usize,
+    legal_edge_n_attackers: usize,
+}
+
+const DECISION_PRIORITY: i32 = 0;
+const DECISION_DECLARE_ATTACKERS: i32 = 1;
+const DECISION_DECLARE_BLOCKERS: i32 = 2;
+const DECISION_CHOOSE_TARGETS: i32 = 3;
+const DECISION_MAY: i32 = 4;
+const DECISION_CHOOSE_MODE: i32 = 5;
+const DECISION_CHOOSE_X: i32 = 6;
+const DECISION_NONE: i32 = -1;
+
+const ANCHOR_LEGAL_ATTACKER: i32 = 0;
+const ANCHOR_LEGAL_BLOCKER: i32 = 1;
+const ANCHOR_LEGAL_TARGET: i32 = 2;
+const ANCHOR_LEGAL_ACTION: i32 = 3;
+const ANCHOR_DEFENDER: i32 = 4;
+
+const MAX_CARD_REFS: usize = 256;
+const FRAG_BOS_STATE: usize = 0;
+const FRAG_CLOSE_STATE_EOS: usize = 1;
+const FRAG_CLOSE_SELF: usize = 2;
+const FRAG_CLOSE_OPP: usize = 3;
+const FRAG_CLOSE_OPTION: usize = 4;
+const FRAG_SELF_MANA: usize = 10;
+const FRAG_OPP_MANA: usize = 11;
+
+const ZONE_HAND: usize = 0;
+const ZONE_BATTLEFIELD: usize = 1;
+const ZONE_GRAVEYARD: usize = 2;
+const ZONE_EXILE: usize = 3;
+const ZONE_LIBRARY: usize = 4;
+
+const OWNER_SELF: usize = 0;
+const OWNER_OPP: usize = 1;
+
+struct PlacedCard {
+    row: usize,
+    uuid_idx: i32,
+    tapped_known: bool,
+    tapped: bool,
+}
+
+struct PlacementIndex {
+    cards_by_zone: HashMap<(usize, usize), Vec<PlacedCard>>,
+    row_order: Vec<usize>,
+    row_to_dict_slot: HashMap<usize, usize>,
+    overflow: bool,
+}
+
+struct DirectEmitter<'a> {
+    bundle: &'a TokenTableBundle,
+    out: Vec<i32>,
+    card_ref_positions: Vec<i32>,
+    scalar_owner_open: i8,
+    option_open: bool,
+}
+
+impl<'a> DirectEmitter<'a> {
+    fn new(bundle: &'a TokenTableBundle) -> Self {
+        Self {
+            bundle,
+            out: Vec::with_capacity(2048),
+            card_ref_positions: vec![-1; MAX_CARD_REFS],
+            scalar_owner_open: -1,
+            option_open: false,
+        }
+    }
+
+    fn tables(&self) -> &RustTokenTables {
+        &self.bundle.tables
+    }
+
+    fn write_one(&mut self, token_id: i32) {
+        self.out.push(token_id);
+    }
+
+    fn emit_frag(&mut self, frag: usize) {
+        let span = self.bundle.tables.structural.get(frag);
+        self.out.extend_from_slice(span);
+    }
+
+    fn close_scalar_owner(&mut self) {
+        if self.scalar_owner_open == OWNER_SELF as i8 {
+            self.emit_frag(FRAG_CLOSE_SELF);
+        } else if self.scalar_owner_open == OWNER_OPP as i8 {
+            self.emit_frag(FRAG_CLOSE_OPP);
+        }
+        self.scalar_owner_open = -1;
+    }
+
+    fn close_option(&mut self) {
+        if self.option_open {
+            self.emit_frag(FRAG_CLOSE_OPTION);
+            self.option_open = false;
+        }
+    }
+
+    fn emit_card_ref(&mut self, k: i32) {
+        if k < 0 {
+            return;
+        }
+        let idx = k as usize;
+        if idx >= self.tables().card_ref.len() || idx >= MAX_CARD_REFS {
+            return;
+        }
+        if self.card_ref_positions[idx] < 0 {
+            self.card_ref_positions[idx] = self.out.len() as i32;
+        }
+        self.write_one(self.tables().card_ref[idx]);
+    }
+
+    fn emit(
+        mut self,
+        snapshot: &Value,
+        placement: &PlacementIndex,
+        self_player: Option<&Value>,
+        opp_player: Option<&Value>,
+    ) -> TokenizedState {
+        self.emit_frag(FRAG_BOS_STATE);
+
+        if !placement.row_order.is_empty() {
+            if !placement.row_to_dict_slot.is_empty() {
+                self.write_one(self.tables().dict_open_id);
+                for row in &placement.row_order {
+                    let Some(slot) = placement.row_to_dict_slot.get(row).copied() else {
+                        continue;
+                    };
+                    self.write_one(self.tables().dict_entry[slot]);
+                    self.out
+                        .extend_from_slice(self.bundle.tables.card_body.get(*row));
+                    self.out
+                        .extend_from_slice(self.bundle.tables.card_closer.as_slice());
+                }
+                self.write_one(self.tables().dict_close_id);
+            }
+        }
+
+        self.emit_turn_step(snapshot_turn(snapshot), step_id(snapshot_step(snapshot)));
+
+        for (owner, player) in [(OWNER_SELF, self_player), (OWNER_OPP, opp_player)] {
+            self.emit_life(owner, player_life(player));
+            for (color, amount) in player_mana_pool(player).iter().enumerate() {
+                if *amount > 0 {
+                    self.emit_mana(owner, color, *amount);
+                }
+            }
+        }
+        self.close_scalar_owner();
+
+        for zone in [ZONE_BATTLEFIELD, ZONE_HAND, ZONE_GRAVEYARD] {
+            for owner in [OWNER_SELF, OWNER_OPP] {
+                if zone == ZONE_HAND && owner == OWNER_OPP {
+                    continue;
+                }
+                self.emit_zone(
+                    zone,
+                    owner,
+                    placement
+                        .cards_by_zone
+                        .get(&(zone, owner))
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                    placement,
+                );
+            }
+        }
+        for owner in [OWNER_SELF, OWNER_OPP] {
+            let cards = placement
+                .cards_by_zone
+                .get(&(ZONE_EXILE, owner))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !cards.is_empty() {
+                self.emit_zone(ZONE_EXILE, owner, cards, placement);
+            }
+        }
+        for (owner, player) in [(OWNER_SELF, self_player), (OWNER_OPP, opp_player)] {
+            self.emit_open_zone(ZONE_LIBRARY, owner);
+            self.emit_count(player_library_count(player));
+            self.emit_close_zone(ZONE_LIBRARY, owner);
+        }
+
+        self.close_scalar_owner();
+        self.write_one(self.tables().stack_open_id);
+        self.write_one(self.tables().stack_close_id);
+
+        self.close_scalar_owner();
+        self.close_option();
+        self.emit_frag(FRAG_CLOSE_STATE_EOS);
+
+        TokenizedState {
+            token_ids: self.out,
+            card_ref_positions: self.card_ref_positions,
+            card_ref_overflow: placement.overflow,
+        }
+    }
+
+    fn emit_turn_step(&mut self, turn: i32, step_id: usize) {
+        let t = turn.clamp(self.tables().turn_min, self.tables().turn_max);
+        let idx = ((t - self.tables().turn_min) as usize) * self.tables().step_count + step_id;
+        self.out
+            .extend_from_slice(self.bundle.tables.turn_step.get(idx));
+    }
+
+    fn emit_life(&mut self, owner: usize, life: i32) {
+        self.close_scalar_owner();
+        let clamped = life.clamp(self.tables().life_min, self.tables().life_max);
+        let idx = ((clamped - self.tables().life_min) as usize) * self.tables().owner_count + owner;
+        self.out
+            .extend_from_slice(self.bundle.tables.life_owner.get(idx));
+        self.scalar_owner_open = owner as i8;
+    }
+
+    fn emit_mana(&mut self, owner: usize, color: usize, amount: i32) {
+        if self.scalar_owner_open >= 0 && self.scalar_owner_open != owner as i8 {
+            self.close_scalar_owner();
+        }
+        if self.scalar_owner_open < 0 {
+            self.emit_frag(if owner == OWNER_SELF {
+                FRAG_SELF_MANA
+            } else {
+                FRAG_OPP_MANA
+            });
+            self.scalar_owner_open = owner as i8;
+        }
+        for _ in 0..amount {
+            self.out
+                .extend_from_slice(self.bundle.tables.mana_glyph.get(color));
+        }
+    }
+
+    fn emit_open_zone(&mut self, zone: usize, owner: usize) {
+        self.close_scalar_owner();
+        self.close_option();
+        let idx = zone * self.tables().owner_count + owner;
+        self.out
+            .extend_from_slice(self.bundle.tables.zone_open.get(idx));
+    }
+
+    fn emit_close_zone(&mut self, zone: usize, owner: usize) {
+        self.close_scalar_owner();
+        self.close_option();
+        let idx = zone * self.tables().owner_count + owner;
+        self.out
+            .extend_from_slice(self.bundle.tables.zone_close.get(idx));
+    }
+
+    fn emit_zone(
+        &mut self,
+        zone: usize,
+        owner: usize,
+        cards: &[PlacedCard],
+        placement: &PlacementIndex,
+    ) {
+        self.emit_open_zone(zone, owner);
+        for card in cards {
+            self.emit_placed_card_ref(card, placement);
+        }
+        self.emit_close_zone(zone, owner);
+    }
+
+    fn emit_placed_card_ref(&mut self, card: &PlacedCard, placement: &PlacementIndex) {
+        self.close_scalar_owner();
+        self.emit_card_ref(card.uuid_idx);
+        self.write_one(self.tables().card_open_id);
+        if let Some(slot) = placement.row_to_dict_slot.get(&card.row).copied() {
+            self.write_one(self.tables().dict_entry[slot]);
+        } else if card.row < self.tables().row_to_name.len() {
+            self.out
+                .extend_from_slice(self.bundle.tables.card_body.get(card.row));
+        }
+        if card.tapped_known {
+            if card.tapped {
+                self.out
+                    .extend_from_slice(self.bundle.tables.status_tapped.as_slice());
+            } else {
+                self.out
+                    .extend_from_slice(self.bundle.tables.status_untapped.as_slice());
+            }
+        } else if card.tapped {
+            self.out
+                .extend_from_slice(self.bundle.tables.status_tapped.as_slice());
+        }
+        self.out
+            .extend_from_slice(self.bundle.tables.card_closer.as_slice());
+    }
+
+    fn emit_count(&mut self, amount: i32) {
+        self.close_scalar_owner();
+        let clamped = amount.clamp(self.tables().count_min, self.tables().count_max);
+        let idx = (clamped - self.tables().count_min) as usize;
+        self.out
+            .extend_from_slice(self.bundle.tables.count.get(idx));
+    }
+}
+
+fn emit_tokenized_state(snapshot: &Value, bundle: &TokenTableBundle) -> Result<TokenizedState> {
+    let players = snapshot
+        .get("players")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("snapshot missing players array"))?;
+    let self_player = players.first();
+    let opp_player = players.get(1);
+    let placement = build_placement_index(bundle, self_player, opp_player);
+    Ok(DirectEmitter::new(bundle).emit(snapshot, &placement, self_player, opp_player))
+}
+
+fn emit_decision_spec(snapshot: &Value, bundle: &TokenTableBundle) -> Option<DecisionSpecState> {
+    let pending = snapshot.get("pending")?;
+    let kind = pending.get("kind").and_then(Value::as_str).unwrap_or("");
+    let decision_type = decision_type_for_pending_kind(kind)?;
+    let options = pending
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|arr| &arr[..])
+        .unwrap_or(&[]);
+    let spec = &bundle.decision_spec;
+    let mut out = DecisionSpecState {
+        token_ids: vec![
+            spec.spec_open_id,
+            spec.decision_type_id,
+            *spec
+                .decision_type_name_ids
+                .get(decision_type as usize)
+                .unwrap_or(&0),
+        ],
+        decision_type,
+        anchor_positions: Vec::new(),
+        anchor_kinds: Vec::new(),
+        anchor_subjects: Vec::new(),
+        anchor_handles: Vec::new(),
+        legal_edge_bitmap: Vec::new(),
+        legal_edge_n_blockers: 0,
+        legal_edge_n_attackers: 0,
+    };
+
+    match decision_type {
+        DECISION_PRIORITY => {
+            for (subject_idx, option_idx) in canonical_priority_option_indices(options)
+                .into_iter()
+                .enumerate()
+            {
+                out.emit_anchor(
+                    ANCHOR_LEGAL_ACTION,
+                    subject_idx as i32,
+                    option_idx as i32,
+                    spec.legal_action_id,
+                );
+            }
+        }
+        DECISION_DECLARE_ATTACKERS => {
+            for (idx, _) in options.iter().enumerate() {
+                out.emit_anchor(
+                    ANCHOR_LEGAL_ATTACKER,
+                    idx as i32,
+                    idx as i32,
+                    spec.legal_attacker_id,
+                );
+            }
+            for player_idx in 0..2 {
+                let token = spec.player_ref_ids.get(player_idx).copied().unwrap_or(0);
+                out.emit_anchor(ANCHOR_DEFENDER, player_idx as i32, player_idx as i32, token);
+            }
+        }
+        DECISION_DECLARE_BLOCKERS => {
+            let attacker_order = blocker_attacker_order(options);
+            for (idx, _) in options.iter().enumerate() {
+                out.emit_anchor(
+                    ANCHOR_LEGAL_BLOCKER,
+                    idx as i32,
+                    idx as i32,
+                    spec.legal_blocker_id,
+                );
+            }
+            for (idx, _) in attacker_order.iter().enumerate() {
+                out.emit_anchor(
+                    ANCHOR_LEGAL_ATTACKER,
+                    idx as i32,
+                    idx as i32,
+                    spec.legal_attacker_id,
+                );
+            }
+            out.legal_edge_n_blockers = options.len();
+            out.legal_edge_n_attackers = attacker_order.len();
+            out.legal_edge_bitmap = vec![0; options.len() * attacker_order.len()];
+            let attacker_index = attacker_order
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (id.as_str(), i))
+                .collect::<HashMap<_, _>>();
+            for (blocker_idx, option) in options.iter().enumerate() {
+                for target in value_array_any(option, &["valid_targets"]) {
+                    if let Some(id) = value_str_any(target, &["id"]) {
+                        if let Some(attacker_idx) = attacker_index.get(id) {
+                            out.legal_edge_bitmap
+                                [blocker_idx * attacker_order.len() + *attacker_idx] = 1;
+                        }
+                    }
+                }
+            }
+        }
+        DECISION_CHOOSE_TARGETS => {
+            for (idx, _) in options.iter().enumerate() {
+                out.emit_anchor(
+                    ANCHOR_LEGAL_TARGET,
+                    idx as i32,
+                    idx as i32,
+                    spec.legal_target_id,
+                );
+            }
+        }
+        DECISION_MAY => {}
+        DECISION_CHOOSE_MODE => {
+            out.emit_max_value(options.len() as i32, spec);
+        }
+        DECISION_CHOOSE_X => {
+            let amount = pending
+                .get("amount")
+                .and_then(Value::as_i64)
+                .map(|v| v as i32)
+                .unwrap_or_else(|| options.len().saturating_sub(1) as i32);
+            out.emit_max_value(amount, spec);
+        }
+        _ => {}
+    }
+    out.token_ids.push(spec.spec_close_id);
+    Some(out)
+}
+
+impl DecisionSpecState {
+    fn emit_anchor(&mut self, kind: i32, subject: i32, handle: i32, token_id: i32) {
+        self.anchor_positions.push(self.token_ids.len() as i32);
+        self.anchor_kinds.push(kind);
+        self.anchor_subjects.push(subject);
+        self.anchor_handles.push(handle);
+        self.token_ids.push(token_id);
+    }
+
+    fn emit_max_value(&mut self, value: i32, spec: &DecisionSpecTables) {
+        let clamped = value.max(0) as usize;
+        self.token_ids.push(spec.max_value_open_id);
+        self.token_ids
+            .extend_from_slice(spec.max_value_digits.get(clamped));
+        self.token_ids.push(spec.max_value_close_id);
+    }
+}
+
+fn decision_type_for_pending_kind(kind: &str) -> Option<i32> {
+    match kind {
+        "priority" => Some(DECISION_PRIORITY),
+        "attackers" => Some(DECISION_DECLARE_ATTACKERS),
+        "blockers" => Some(DECISION_DECLARE_BLOCKERS),
+        "permanent" | "cards_from_hand" | "card_from_library" => Some(DECISION_CHOOSE_TARGETS),
+        "may" => Some(DECISION_MAY),
+        "mode" => Some(DECISION_CHOOSE_MODE),
+        "number" => Some(DECISION_CHOOSE_X),
+        _ => None,
+    }
+}
+
+fn blocker_attacker_order(options: &[Value]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for option in options {
+        for target in value_array_any(option, &["valid_targets"]) {
+            if let Some(id) = value_str_any(target, &["id"]) {
+                if seen.insert(id.to_string()) {
+                    out.push(id.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn canonical_priority_option_indices(options: &[Value]) -> Vec<usize> {
+    let mut out = Vec::with_capacity(options.len());
+    let mut seen = HashSet::with_capacity(options.len());
+    for (idx, option) in options.iter().enumerate() {
+        if is_mana_ability_option(option) {
+            continue;
+        }
+        let key = priority_option_key(option);
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(idx);
+    }
+    out
+}
+
+fn is_mana_ability_option(option: &Value) -> bool {
+    let kind = value_str_any(option, &["kind"])
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if kind.contains("mana") {
+        return true;
+    }
+    if kind != "activate" {
+        return false;
+    }
+    let label = value_str_any(option, &["label"])
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    label.contains(" add {")
+        || label.contains(" adds {")
+        || label.contains(": add ")
+        || label.contains(" add mana")
+        || label.contains(" adds mana")
+}
+
+fn priority_option_key(option: &Value) -> String {
+    let kind = value_str_any(option, &["kind"]).unwrap_or("");
+    let card_name = value_str_any(option, &["card_name", "source_name", "name"]).unwrap_or("");
+    if kind.starts_with("play") {
+        return format!("{kind}\t{card_name}");
+    }
+    let label = value_str_any(option, &["label"]).unwrap_or("");
+    format!("{kind}\t{card_name}\t{label}")
+}
+
+fn value_str_any<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    for key in keys {
+        if let Some(s) = value.get(*key).and_then(Value::as_str) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn value_i64_any(value: &Value, keys: &[&str]) -> Option<i64> {
+    for key in keys {
+        if let Some(n) = value.get(*key).and_then(Value::as_i64) {
+            return Some(n);
+        }
+        if let Some(n) = value.get(*key).and_then(Value::as_u64) {
+            return Some(n as i64);
+        }
+    }
+    None
+}
+
+fn value_bool_any(value: &Value, keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        if let Some(b) = value.get(*key).and_then(Value::as_bool) {
+            return Some(b);
+        }
+    }
+    None
+}
+
+fn value_array_any<'a>(value: &'a Value, keys: &[&str]) -> &'a [Value] {
+    for key in keys {
+        if let Some(arr) = value.get(*key).and_then(Value::as_array) {
+            return arr;
+        }
+    }
+    &[]
+}
+
+fn snapshot_turn(snapshot: &Value) -> i32 {
+    value_i64_any(snapshot, &["turn"]).unwrap_or(0) as i32
+}
+
+fn snapshot_step(snapshot: &Value) -> &str {
+    value_str_any(snapshot, &["step"]).unwrap_or("")
+}
+
+fn step_id(raw: &str) -> usize {
+    match raw.to_ascii_uppercase().as_str() {
+        "UNTAP" => 0,
+        "UPKEEP" => 1,
+        "DRAW" => 2,
+        "PRECOMBAT_MAIN" | "PRECOMBAT MAIN" => 3,
+        "BEGIN_COMBAT" | "BEGINNING_OF_COMBAT" | "BEGIN COMBAT" => 4,
+        "DECLARE_ATTACKERS" | "DECLARE ATTACKERS" => 5,
+        "DECLARE_BLOCKERS" | "DECLARE BLOCKERS" => 6,
+        "FIRST_STRIKE_DAMAGE" | "COMBAT_DAMAGE" | "COMBAT DAMAGE" => 7,
+        "END_COMBAT" | "END COMBAT" => 8,
+        "POSTCOMBAT_MAIN" | "POSTCOMBAT MAIN" => 9,
+        "END" | "END_TURN" => 10,
+        "CLEANUP" => 11,
+        _ => 12,
+    }
+}
+
+fn player_life(player: Option<&Value>) -> i32 {
+    player
+        .and_then(|p| value_i64_any(p, &["Life", "life"]))
+        .unwrap_or(0) as i32
+}
+
+fn player_library_count(player: Option<&Value>) -> i32 {
+    player
+        .and_then(|p| value_i64_any(p, &["LibraryCount", "librarySize"]))
+        .unwrap_or(0) as i32
+}
+
+fn player_mana_pool(player: Option<&Value>) -> [i32; 6] {
+    let mut out = [0; 6];
+    let Some(player) = player else {
+        return out;
+    };
+    let Some(pool) = player.get("ManaPool").or_else(|| player.get("manaPool")) else {
+        return out;
+    };
+    if let Some(s) = pool.as_str() {
+        for ch in s.chars() {
+            match ch.to_ascii_uppercase() {
+                'W' => out[0] += 1,
+                'U' => out[1] += 1,
+                'B' => out[2] += 1,
+                'R' => out[3] += 1,
+                'G' => out[4] += 1,
+                'C' => out[5] += 1,
+                _ => {}
+            }
+        }
+        return out;
+    }
+    let keys = ["White", "Blue", "Black", "Red", "Green", "Colorless"];
+    for (idx, key) in keys.iter().enumerate() {
+        let lower = key.to_ascii_lowercase();
+        out[idx] = pool
+            .get(*key)
+            .and_then(Value::as_i64)
+            .or_else(|| pool.get(lower.as_str()).and_then(Value::as_i64))
+            .unwrap_or(0) as i32;
+    }
+    out
+}
+
+fn card_name(card: &Value) -> &str {
+    value_str_any(card, &["Name", "name"]).unwrap_or("")
+}
+
+fn card_id(card: &Value) -> &str {
+    value_str_any(card, &["ID", "id"]).unwrap_or("")
+}
+
+fn build_placement_index(
+    bundle: &TokenTableBundle,
+    self_player: Option<&Value>,
+    opp_player: Option<&Value>,
+) -> PlacementIndex {
+    let mut cards_by_zone: HashMap<(usize, usize), Vec<PlacedCard>> = HashMap::new();
+    let mut rows_seen: HashSet<usize> = HashSet::new();
+    let mut card_id_to_uuid_idx: HashMap<String, i32> = HashMap::new();
+    let mut next_uuid = 0usize;
+    let mut overflow = false;
+
+    let walks = [
+        (
+            ZONE_BATTLEFIELD,
+            OWNER_SELF,
+            value_array_any(
+                self_player.unwrap_or(&NULL_VALUE),
+                &["Battlefield", "battlefield"],
+            ),
+            true,
+        ),
+        (
+            ZONE_BATTLEFIELD,
+            OWNER_OPP,
+            value_array_any(
+                opp_player.unwrap_or(&NULL_VALUE),
+                &["Battlefield", "battlefield"],
+            ),
+            true,
+        ),
+        (
+            ZONE_HAND,
+            OWNER_SELF,
+            value_array_any(self_player.unwrap_or(&NULL_VALUE), &["Hand", "hand"]),
+            false,
+        ),
+        (
+            ZONE_HAND,
+            OWNER_OPP,
+            value_array_any(opp_player.unwrap_or(&NULL_VALUE), &["Hand", "hand"]),
+            false,
+        ),
+        (
+            ZONE_GRAVEYARD,
+            OWNER_SELF,
+            value_array_any(
+                self_player.unwrap_or(&NULL_VALUE),
+                &["Graveyard", "graveyard"],
+            ),
+            false,
+        ),
+        (
+            ZONE_GRAVEYARD,
+            OWNER_OPP,
+            value_array_any(
+                opp_player.unwrap_or(&NULL_VALUE),
+                &["Graveyard", "graveyard"],
+            ),
+            false,
+        ),
+        (
+            ZONE_EXILE,
+            OWNER_SELF,
+            value_array_any(self_player.unwrap_or(&NULL_VALUE), &["Exile", "exile"]),
+            false,
+        ),
+        (
+            ZONE_EXILE,
+            OWNER_OPP,
+            value_array_any(opp_player.unwrap_or(&NULL_VALUE), &["Exile", "exile"]),
+            false,
+        ),
+    ];
+
+    for (zone, owner, raw_cards, is_battlefield) in walks {
+        let mut bucket = Vec::with_capacity(raw_cards.len());
+        for raw in raw_cards {
+            let name = card_name(raw);
+            let cid = card_id(raw);
+            let row = bundle.name_to_row.get(name).copied().unwrap_or(0);
+            let uuid_idx = if cid.is_empty() {
+                -1
+            } else if let Some(idx) = card_id_to_uuid_idx.get(cid) {
+                *idx
+            } else if next_uuid < MAX_CARD_REFS {
+                let idx = next_uuid as i32;
+                next_uuid += 1;
+                card_id_to_uuid_idx.insert(cid.to_string(), idx);
+                idx
+            } else {
+                overflow = true;
+                -1
+            };
+            let tapped_known = is_battlefield;
+            let tapped = value_bool_any(raw, &["Tapped", "tapped"]).unwrap_or(false);
+            bucket.push(PlacedCard {
+                row,
+                uuid_idx,
+                tapped_known,
+                tapped,
+            });
+            if row > 0 {
+                rows_seen.insert(row);
+            }
+        }
+        cards_by_zone.insert((zone, owner), bucket);
+    }
+    let mut row_order = rows_seen.into_iter().collect::<Vec<_>>();
+    row_order.sort_unstable();
+    let mut row_to_dict_slot =
+        HashMap::with_capacity(row_order.len().min(bundle.tables.dict_entry.len()));
+    for row in &row_order {
+        let slot = row_to_dict_slot.len();
+        if slot >= bundle.tables.dict_entry.len() {
+            break;
+        }
+        if bundle
+            .unk_token_id
+            .map(|unk| bundle.tables.dict_entry[slot] == unk)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        row_to_dict_slot.insert(*row, slot);
+    }
+    PlacementIndex {
+        cards_by_zone,
+        row_order,
+        row_to_dict_slot,
+        overflow,
     }
 }
 
@@ -410,13 +1440,14 @@ fn write_arrow_dir(
     rx: mpsc::Receiver<WriterBatch>,
     out_dir: PathBuf,
     shard_target_rows: usize,
+    pretokenized: bool,
 ) -> Result<WriterStats> {
     if shard_target_rows == 0 {
         return Err(anyhow!("--arrow-shard-rows must be greater than zero"));
     }
     std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {:?}", out_dir))?;
     ensure_arrow_output_dir_is_clean(&out_dir)?;
-    let schema = arrow_extracted_schema();
+    let schema = arrow_decision_schema(pretokenized);
     let mut writer = ArrowShardWriter {
         out_dir,
         schema,
@@ -590,40 +1621,100 @@ fn write_arrow_game_index(out_dir: &PathBuf, rows: &[ArrowGameIndexRow]) -> Resu
     std::fs::rename(&tmp, &path).with_context(|| format!("renaming {:?} to {:?}", tmp, path))
 }
 
-fn arrow_extracted_schema() -> SchemaRef {
+fn arrow_decision_schema(pretokenized: bool) -> SchemaRef {
     let mut metadata = HashMap::new();
     metadata.insert(
         "format".to_string(),
         "forge_pretrain_decision_arrow".to_string(),
     );
-    metadata.insert("format_version".to_string(), "1".to_string());
-    metadata.insert("stage".to_string(), "extracted".to_string());
-    Arc::new(Schema::new_with_metadata(
-        vec![
-            Field::new("format_version", DataType::UInt16, false),
-            Field::new("game_id", DataType::Utf8, false),
-            Field::new("archive_member", DataType::Utf8, false),
-            Field::new("kind_id", DataType::UInt8, false),
-            Field::new("candidate_index", DataType::UInt32, false),
-            Field::new("candidate_count", DataType::UInt32, false),
-            Field::new("source_seq", DataType::Int64, false),
-            Field::new("target_seq", DataType::Int64, false),
-            Field::new("perspective_id", DataType::Utf8, false),
-            Field::new("perspective_name", DataType::Utf8, false),
-            Field::new("winner_id", DataType::Utf8, true),
-            Field::new("winner_name", DataType::Utf8, true),
-            Field::new("terminal_sign", DataType::Float32, false),
-            Field::new("snapshot_json", DataType::LargeUtf8, false),
-            Field::new("observed_json", DataType::LargeUtf8, false),
-            Field::new("outcome_players_json", DataType::LargeUtf8, false),
-            Field::new("outcome_extras_json", DataType::LargeUtf8, false),
-        ],
-        metadata,
-    ))
+    metadata.insert(
+        "format_version".to_string(),
+        if pretokenized { "2" } else { "1" }.to_string(),
+    );
+    metadata.insert(
+        "stage".to_string(),
+        if pretokenized {
+            "pretokenized"
+        } else {
+            "extracted"
+        }
+        .to_string(),
+    );
+    let mut fields = vec![
+        Field::new("format_version", DataType::UInt16, false),
+        Field::new("game_id", DataType::Utf8, false),
+        Field::new("archive_member", DataType::Utf8, false),
+        Field::new("kind_id", DataType::UInt8, false),
+        Field::new("candidate_index", DataType::UInt32, false),
+        Field::new("candidate_count", DataType::UInt32, false),
+        Field::new("source_seq", DataType::Int64, false),
+        Field::new("target_seq", DataType::Int64, false),
+        Field::new("perspective_id", DataType::Utf8, false),
+        Field::new("perspective_name", DataType::Utf8, false),
+        Field::new("winner_id", DataType::Utf8, true),
+        Field::new("winner_name", DataType::Utf8, true),
+        Field::new("terminal_sign", DataType::Float32, false),
+        Field::new("snapshot_json", DataType::LargeUtf8, false),
+        Field::new("observed_json", DataType::LargeUtf8, false),
+        Field::new("outcome_players_json", DataType::LargeUtf8, false),
+        Field::new("outcome_extras_json", DataType::LargeUtf8, false),
+    ];
+    if pretokenized {
+        fields.extend([
+            Field::new(
+                "token_ids",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            Field::new("seq_length", DataType::UInt32, false),
+            Field::new(
+                "card_ref_positions",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            Field::new("token_overflow", DataType::Boolean, false),
+            Field::new("card_ref_overflow", DataType::Boolean, false),
+            Field::new(
+                "action_token_ids",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            Field::new("action_seq_length", DataType::UInt32, false),
+            Field::new("decision_type", DataType::Int32, false),
+            Field::new(
+                "pointer_anchor_positions",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            Field::new(
+                "pointer_anchor_kinds",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            Field::new(
+                "pointer_anchor_subjects",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            Field::new(
+                "pointer_anchor_handles",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                false,
+            ),
+            Field::new(
+                "legal_edge_bitmap",
+                DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
+                false,
+            ),
+            Field::new("legal_edge_n_blockers", DataType::UInt32, false),
+            Field::new("legal_edge_n_attackers", DataType::UInt32, false),
+        ]);
+    }
+    Arc::new(Schema::new_with_metadata(fields, metadata))
 }
 
 fn arrow_batch_from_rows(schema: SchemaRef, rows: &[ArrowDecisionRow]) -> Result<RecordBatch> {
-    let columns: Vec<ArrayRef> = vec![
+    let mut columns: Vec<ArrayRef> = vec![
         Arc::new(UInt16Array::from(
             rows.iter().map(|r| r.format_version).collect::<Vec<_>>(),
         )),
@@ -676,6 +1767,107 @@ fn arrow_batch_from_rows(schema: SchemaRef, rows: &[ArrowDecisionRow]) -> Result
             rows.iter().map(|r| r.outcome_extras_json.as_str()),
         )),
     ];
+    if schema.field_with_name("token_ids").is_ok() {
+        let mut token_builder = ListBuilder::new(Int32Builder::new());
+        let mut card_ref_builder = ListBuilder::new(Int32Builder::new());
+        let mut action_builder = ListBuilder::new(Int32Builder::new());
+        let mut anchor_pos_builder = ListBuilder::new(Int32Builder::new());
+        let mut anchor_kind_builder = ListBuilder::new(Int32Builder::new());
+        let mut anchor_subject_builder = ListBuilder::new(Int32Builder::new());
+        let mut anchor_handle_builder = ListBuilder::new(Int32Builder::new());
+        let mut edge_builder = ListBuilder::new(UInt8Builder::new());
+        for row in rows {
+            let token_ids = row
+                .token_ids
+                .as_ref()
+                .ok_or_else(|| anyhow!("pretokenized schema row missing token_ids"))?;
+            token_builder.values().append_slice(token_ids);
+            token_builder.append(true);
+            let card_ref_positions = row
+                .card_ref_positions
+                .as_ref()
+                .ok_or_else(|| anyhow!("pretokenized schema row missing card_ref_positions"))?;
+            card_ref_builder.values().append_slice(card_ref_positions);
+            card_ref_builder.append(true);
+            let action_token_ids = row
+                .action_token_ids
+                .as_ref()
+                .ok_or_else(|| anyhow!("pretokenized schema row missing action_token_ids"))?;
+            action_builder.values().append_slice(action_token_ids);
+            action_builder.append(true);
+            let anchor_positions = row.pointer_anchor_positions.as_ref().ok_or_else(|| {
+                anyhow!("pretokenized schema row missing pointer_anchor_positions")
+            })?;
+            anchor_pos_builder.values().append_slice(anchor_positions);
+            anchor_pos_builder.append(true);
+            let anchor_kinds = row
+                .pointer_anchor_kinds
+                .as_ref()
+                .ok_or_else(|| anyhow!("pretokenized schema row missing pointer_anchor_kinds"))?;
+            anchor_kind_builder.values().append_slice(anchor_kinds);
+            anchor_kind_builder.append(true);
+            let anchor_subjects = row.pointer_anchor_subjects.as_ref().ok_or_else(|| {
+                anyhow!("pretokenized schema row missing pointer_anchor_subjects")
+            })?;
+            anchor_subject_builder
+                .values()
+                .append_slice(anchor_subjects);
+            anchor_subject_builder.append(true);
+            let anchor_handles = row
+                .pointer_anchor_handles
+                .as_ref()
+                .ok_or_else(|| anyhow!("pretokenized schema row missing pointer_anchor_handles"))?;
+            anchor_handle_builder.values().append_slice(anchor_handles);
+            anchor_handle_builder.append(true);
+            let legal_edge_bitmap = row
+                .legal_edge_bitmap
+                .as_ref()
+                .ok_or_else(|| anyhow!("pretokenized schema row missing legal_edge_bitmap"))?;
+            edge_builder.values().append_slice(legal_edge_bitmap);
+            edge_builder.append(true);
+        }
+        columns.extend([
+            Arc::new(token_builder.finish()) as ArrayRef,
+            Arc::new(UInt32Array::from(
+                rows.iter()
+                    .map(|r| r.seq_length.unwrap_or(0))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(card_ref_builder.finish()) as ArrayRef,
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.token_overflow).collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.card_ref_overflow).collect::<Vec<_>>(),
+            )),
+            Arc::new(action_builder.finish()) as ArrayRef,
+            Arc::new(UInt32Array::from(
+                rows.iter()
+                    .map(|r| r.action_seq_length.unwrap_or(0))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int32Array::from(
+                rows.iter()
+                    .map(|r| r.decision_type.unwrap_or(-1))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(anchor_pos_builder.finish()) as ArrayRef,
+            Arc::new(anchor_kind_builder.finish()) as ArrayRef,
+            Arc::new(anchor_subject_builder.finish()) as ArrayRef,
+            Arc::new(anchor_handle_builder.finish()) as ArrayRef,
+            Arc::new(edge_builder.finish()) as ArrayRef,
+            Arc::new(UInt32Array::from(
+                rows.iter()
+                    .map(|r| r.legal_edge_n_blockers.unwrap_or(0))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                rows.iter()
+                    .map(|r| r.legal_edge_n_attackers.unwrap_or(0))
+                    .collect::<Vec<_>>(),
+            )),
+        ]);
+    }
     RecordBatch::try_new(schema, columns).context("building Arrow record batch")
 }
 
@@ -687,13 +1879,14 @@ struct ArrowManifestStats {
     games_written: u64,
     candidates_seen: u64,
     kind_counts: [u64; 5],
+    pretokenized: bool,
 }
 
 fn write_arrow_manifest(out_dir: &PathBuf, stats: &ArrowManifestStats) -> Result<()> {
     let manifest = json!({
         "format": "forge_pretrain_decision_arrow",
-        "format_version": 1,
-        "stage": "extracted",
+        "format_version": if stats.pretokenized { 2 } else { 1 },
+        "stage": if stats.pretokenized { "pretokenized" } else { "extracted" },
         "compression": "zstd",
         "game_index": "game_index.arrow",
         "shards": stats.shards,
@@ -1180,6 +2373,7 @@ fn priority_pending(raw_snapshot: &Value, _perspective_id: &str) -> Option<Value
         .get("playableActions")
         .and_then(Value::as_array)?;
     let mut options: Vec<Value> = Vec::with_capacity(actions.len() + 1);
+    let mut seen_options: HashSet<String> = HashSet::new();
     for (i, act) in actions.iter().enumerate() {
         let Some(obj) = act.as_object() else { continue };
         let kind = obj
@@ -1189,6 +2383,13 @@ fn priority_pending(raw_snapshot: &Value, _perspective_id: &str) -> Option<Value
             .unwrap_or("");
         if kind == "PASS" {
             // Pass is appended unconditionally below.
+            continue;
+        }
+        let description = obj
+            .get(&"description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if is_mana_ability_action(kind, description) {
             continue;
         }
         let opt_kind = match forge_kind_to_option_kind(kind) {
@@ -1213,6 +2414,10 @@ fn priority_pending(raw_snapshot: &Value, _perspective_id: &str) -> Option<Value
         } else {
             ability_id.to_string()
         };
+        let dedupe_key = priority_option_dedupe_key(opt_kind, source_name, label);
+        if !seen_options.insert(dedupe_key) {
+            continue;
+        }
         options.push(json!({
             "id": id,
             "kind": opt_kind,
@@ -1229,6 +2434,13 @@ fn priority_pending(raw_snapshot: &Value, _perspective_id: &str) -> Option<Value
         "player_idx": 0,
         "options": options,
     }))
+}
+
+fn priority_option_dedupe_key(kind: &str, source_name: &str, label: &str) -> String {
+    if kind == "play" {
+        return format!("{kind}\t{source_name}");
+    }
+    format!("{kind}\t{source_name}\t{label}")
 }
 
 fn attackers_pending(
@@ -2776,6 +3988,156 @@ mod tests {
         }
     }
 
+    fn seq_table(rows: Vec<Vec<i32>>) -> SequenceTable {
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
+        let mut tokens = Vec::new();
+        offsets.push(0);
+        for row in rows {
+            tokens.extend(row);
+            offsets.push(tokens.len());
+        }
+        SequenceTable { offsets, tokens }
+    }
+
+    fn fake_token_bundle() -> TokenTableBundle {
+        let mut structural = vec![vec![]; 12];
+        structural[FRAG_BOS_STATE] = vec![1, 2];
+        structural[FRAG_CLOSE_STATE_EOS] = vec![3, 4];
+        structural[FRAG_CLOSE_SELF] = vec![5];
+        structural[FRAG_CLOSE_OPP] = vec![6];
+        structural[5] = vec![70];
+        structural[6] = vec![71];
+        structural[FRAG_SELF_MANA] = vec![72];
+        structural[FRAG_OPP_MANA] = vec![73];
+
+        let zone_rows = vec![vec![80]; 10];
+        let close_rows = vec![vec![81]; 10];
+        let count_rows = (0..=200).map(|i| vec![2000 + i]).collect::<Vec<_>>();
+        let mut name_to_row = HashMap::new();
+        name_to_row.insert("Overflow Card".to_string(), 2);
+
+        TokenTableBundle {
+            unk_token_id: Some(999),
+            name_to_row,
+            decision_spec: DecisionSpecTables {
+                spec_open_id: 31,
+                spec_close_id: 32,
+                decision_type_id: 33,
+                legal_attacker_id: 34,
+                legal_blocker_id: 35,
+                legal_target_id: 36,
+                legal_action_id: 37,
+                max_value_open_id: 38,
+                max_value_close_id: 39,
+                player_ref_ids: vec![40, 41],
+                decision_type_name_ids: vec![42, 43, 44, 45, 46, 47, 48],
+                max_value_digits: seq_table((0..=10).map(|i| vec![60 + i]).collect()),
+            },
+            tables: RustTokenTables {
+                dict_open_id: 7,
+                dict_close_id: 8,
+                card_open_id: 9,
+                stack_open_id: 10,
+                stack_close_id: 11,
+                turn_min: 0,
+                turn_max: 200,
+                life_min: -30,
+                life_max: 300,
+                count_min: 0,
+                count_max: 200,
+                step_count: 13,
+                owner_count: 2,
+                structural: seq_table(structural),
+                zone_open: seq_table(zone_rows),
+                zone_close: seq_table(close_rows),
+                mana_glyph: seq_table(vec![vec![100]; 6]),
+                turn_step: seq_table(vec![vec![300]; 201 * 13]),
+                life_owner: seq_table(vec![vec![400]; 331 * 2]),
+                count: seq_table(count_rows),
+                card_closer: vec![12],
+                status_tapped: vec![13],
+                status_untapped: vec![14],
+                card_ref: (0..MAX_CARD_REFS).map(|i| 5000 + i as i32).collect(),
+                dict_entry: vec![900, 901, 999],
+                card_body: seq_table(vec![vec![], vec![1001], vec![1002]]),
+                row_to_name: vec![
+                    "<unknown>".to_string(),
+                    "Valid Card".to_string(),
+                    "Overflow Card".to_string(),
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn direct_emitter_omits_actions_and_uses_sequence_local_dict_slots() {
+        let bundle = fake_token_bundle();
+        let snapshot = json!({
+            "turn": 1,
+            "step": "Precombat Main",
+            "players": [
+                {
+                    "ID": "p1",
+                    "Life": 20,
+                    "LibraryCount": 40,
+                    "ManaPool": {},
+                    "Hand": [{"ID": "h1", "Name": "Overflow Card"}],
+                    "Battlefield": [],
+                    "Graveyard": [],
+                    "Exile": []
+                },
+                {
+                    "ID": "p2",
+                    "Life": 20,
+                    "LibraryCount": 40,
+                    "ManaPool": {},
+                    "Hand": [],
+                    "Battlefield": [],
+                    "Graveyard": [],
+                    "Exile": []
+                }
+            ],
+            "pending": {
+                "kind": "priority",
+                "options": [{"kind": "play", "card_name": "Overflow Card"}]
+            },
+            "stack": []
+        });
+
+        let out = emit_tokenized_state(&snapshot, &bundle).unwrap();
+
+        assert!(!out.token_ids.contains(&999));
+        assert!(out.token_ids.contains(&900));
+        assert!(out.token_ids.contains(&1002));
+        assert!(!out.token_ids.contains(&70));
+        assert!(!out.token_ids.contains(&71));
+    }
+
+    #[test]
+    fn decision_spec_dedupes_priority_actions_and_skips_mana_abilities() {
+        let bundle = fake_token_bundle();
+        let snapshot = json!({
+            "pending": {
+                "kind": "priority",
+                "options": [
+                    {"kind": "play", "card_name": "Forest", "label": "Play Forest"},
+                    {"kind": "play", "card_name": "Forest", "label": "Play Forest"},
+                    {"kind": "activate", "card_name": "Forest", "label": "Forest - PlayerA adds {G}."},
+                    {"kind": "activate", "card_name": "Jayemdae Tome", "label": "Jayemdae Tome - Draw a card."},
+                    {"kind": "pass", "label": "Pass priority"}
+                ]
+            }
+        });
+
+        let spec = emit_decision_spec(&snapshot, &bundle).unwrap();
+
+        assert_eq!(spec.decision_type, DECISION_PRIORITY);
+        assert_eq!(spec.token_ids, vec![31, 33, 42, 37, 37, 37, 32]);
+        assert_eq!(spec.anchor_kinds, vec![ANCHOR_LEGAL_ACTION; 3]);
+        assert_eq!(spec.anchor_subjects, vec![0, 1, 2]);
+        assert_eq!(spec.anchor_handles, vec![0, 3, 4]);
+    }
+
     #[test]
     fn parses_assigned_attack_list() {
         let (_, defender, attackers) = parse_assigned_attack(
@@ -2958,13 +4320,28 @@ mod tests {
             observed_json: "{\"raw\":\"Pass priority\"}".to_string(),
             outcome_players_json: "[]".to_string(),
             outcome_extras_json: "{}".to_string(),
+            token_ids: None,
+            seq_length: None,
+            card_ref_positions: None,
+            token_overflow: false,
+            card_ref_overflow: false,
+            action_token_ids: None,
+            action_seq_length: None,
+            decision_type: None,
+            pointer_anchor_positions: None,
+            pointer_anchor_kinds: None,
+            pointer_anchor_subjects: None,
+            pointer_anchor_handles: None,
+            legal_edge_bitmap: None,
+            legal_edge_n_blockers: None,
+            legal_edge_n_attackers: None,
         };
 
         let (tx, rx) = mpsc::sync_channel(1);
         tx.send(WriterBatch::ArrowRows(vec![row])).unwrap();
         drop(tx);
 
-        let stats = write_arrow_dir(rx, out_dir.clone(), 1).unwrap();
+        let stats = write_arrow_dir(rx, out_dir.clone(), 1, false).unwrap();
         assert_eq!(stats.records, 1);
         assert_eq!(stats.shards, 1);
 
@@ -3005,6 +4382,109 @@ mod tests {
             .unwrap();
         assert_eq!(index_game_id.value(0), "game-1");
         assert_eq!(row_count.value(0), 1);
+
+        std::fs::remove_dir_all(out_dir).ok();
+    }
+
+    #[test]
+    fn pretokenized_arrow_writer_round_trips_token_columns() {
+        use arrow_array::Array;
+        use arrow_array::{Int32Array, ListArray};
+
+        let out_dir = std::env::temp_dir().join(format!(
+            "forge_extract_pretok_arrow_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut row = ArrowDecisionRow {
+            format_version: FORMAT_VERSION as u16,
+            game_id: "game-1".to_string(),
+            archive_member: "game-1.jsonl.gz".to_string(),
+            kind_id: 0,
+            candidate_index: 0,
+            candidate_count: 1,
+            source_seq: 10,
+            target_seq: 11,
+            perspective_id: "p1".to_string(),
+            perspective_name: "PlayerA".to_string(),
+            winner_id: Some("p1".to_string()),
+            winner_name: Some("PlayerA".to_string()),
+            terminal_sign: 1.0,
+            snapshot_json: "{\"pending\":{\"kind\":\"priority\"}}".to_string(),
+            observed_json: "{\"raw\":\"Pass priority\"}".to_string(),
+            outcome_players_json: "[]".to_string(),
+            outcome_extras_json: "{}".to_string(),
+            token_ids: None,
+            seq_length: None,
+            card_ref_positions: None,
+            token_overflow: false,
+            card_ref_overflow: false,
+            action_token_ids: None,
+            action_seq_length: None,
+            decision_type: None,
+            pointer_anchor_positions: None,
+            pointer_anchor_kinds: None,
+            pointer_anchor_subjects: None,
+            pointer_anchor_handles: None,
+            legal_edge_bitmap: None,
+            legal_edge_n_blockers: None,
+            legal_edge_n_attackers: None,
+        };
+        row.attach_tokenized_state(
+            TokenizedState {
+                token_ids: vec![11, 12, 13],
+                card_ref_positions: {
+                    let mut positions = vec![-1; MAX_CARD_REFS];
+                    positions[4] = 2;
+                    positions
+                },
+                card_ref_overflow: false,
+            },
+            Some(DecisionSpecState {
+                token_ids: vec![31, 33, 42, 37, 32],
+                decision_type: DECISION_PRIORITY,
+                anchor_positions: vec![3],
+                anchor_kinds: vec![ANCHOR_LEGAL_ACTION],
+                anchor_subjects: vec![0],
+                anchor_handles: vec![0],
+                legal_edge_bitmap: Vec::new(),
+                legal_edge_n_blockers: 0,
+                legal_edge_n_attackers: 0,
+            }),
+        );
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        tx.send(WriterBatch::ArrowRows(vec![row])).unwrap();
+        drop(tx);
+
+        let stats = write_arrow_dir(rx, out_dir.clone(), 1, true).unwrap();
+        assert_eq!(stats.records, 1);
+        let file = File::open(out_dir.join("part-000000.arrow")).unwrap();
+        let mut reader = arrow_ipc::reader::FileReader::try_new(file, None).unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(
+            batch.schema().metadata().get("stage").map(String::as_str),
+            Some("pretokenized")
+        );
+        let seq_length = batch
+            .column_by_name("seq_length")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(seq_length.value(0), 3);
+        let token_ids = batch
+            .column_by_name("token_ids")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let token_values = token_ids.value(0);
+        let token_values = token_values.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(token_values.values(), &[11, 12, 13]);
 
         std::fs::remove_dir_all(out_dir).ok();
     }
@@ -3112,7 +4592,7 @@ mod tests {
         tx.send(WriterBatch::ArrowRows(arrow_rows)).unwrap();
         drop(tx);
 
-        let stats = write_arrow_dir(rx, arrow_dir.clone(), 16).unwrap();
+        let stats = write_arrow_dir(rx, arrow_dir.clone(), 16, false).unwrap();
         write_arrow_manifest(
             &arrow_dir,
             &ArrowManifestStats {
@@ -3123,6 +4603,7 @@ mod tests {
                 games_written: 1,
                 candidates_seen: 1,
                 kind_counts: [1, 0, 0, 0, 0],
+                pretokenized: false,
             },
         )
         .unwrap();

@@ -14,6 +14,7 @@ Utility scripts for building data pipelines, evaluating card embeddings, pretrai
 - `compare_reports.py` — Display side-by-side comparison of eval_card_embeddings JSON reports with delta highlighting.
 - `eval_card_embeddings.py` — Evaluate embeddings against triplet/synonym/cluster labels and compute composite scores.
 - `extract_forge_choice_situations.py` — Stream Forge game ZIP logs and write reloadable choice situations as sharded torch snapshots or debug JSONL with token ids, observed choice metadata, and terminal outcome labels.
+- `export_text_encoder_token_tables.py` — Export canonical Python token tables/card cache into a versioned artifact consumed by the Rust Forge extractor.
 - `jsonl_games_to_bin.py` — Convert recorded `*.jsonl.gz` game logs into per-game uint16 `.bin` token streams (one rendered snapshot per decision point) for MLM pretraining; pass `--with-value-labels` to also emit a `<gameId>.json` sidecar (winner_id, players, per-span perspective-signed labels) for value-head pretraining.
 - `inline_blank_bc_parity.py` — Priority-only inline-blank BC smoke gate on fixed JSONL traces or a synthetic fixture.
 - `play_text_rollout.py` — Run smoke-test episodes with RecurrentTextPolicy against the mage engine; can emit priority JSONL traces for the inline-blank BC gate.

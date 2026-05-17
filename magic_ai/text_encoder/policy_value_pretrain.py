@@ -43,12 +43,18 @@ from magic_ai.game_state import GameStateSnapshot, PendingState
 from magic_ai.text_encoder.batch import (
     PackedTextBatch,
     TextEncodedBatch,
+    TextEncodedExample,
     TokenizationContext,
     collate,
     packed_sequence_layout,
     tokenize_snapshots,
 )
-from magic_ai.text_encoder.decision_spec import AnchorKind, DecisionSpec, DecisionType
+from magic_ai.text_encoder.decision_spec import (
+    AnchorKind,
+    DecisionSpec,
+    DecisionType,
+    PointerAnchor,
+)
 from magic_ai.text_encoder.forge_target_encoding import (
     DecoderTarget,
     pending_decision_type,
@@ -72,6 +78,8 @@ ValueTargetMode = Literal["terminal", "gae", "vtrace"]
 ARROW_CORPUS_FORMAT = "forge_pretrain_decision_arrow"
 ARROW_CORPUS_FORMAT_VERSION = 1
 ARROW_EXTRACTED_STAGE = "extracted"
+ARROW_PRETOKENIZED_FORMAT_VERSION = 2
+ARROW_PRETOKENIZED_STAGE = "pretokenized"
 ARROW_GAME_INDEX_FILENAME = "game_index.arrow"
 ARROW_GAME_INDEX_FORMAT = "forge_pretrain_game_index_arrow"
 ARROW_GAME_INDEX_FORMAT_VERSION = 1
@@ -94,6 +102,24 @@ _ARROW_EXTRACTED_COLUMNS = (
     "observed_json",
     "outcome_players_json",
     "outcome_extras_json",
+)
+_ARROW_PRETOKENIZED_COLUMNS = (
+    *_ARROW_EXTRACTED_COLUMNS,
+    "token_ids",
+    "seq_length",
+    "card_ref_positions",
+    "token_overflow",
+    "card_ref_overflow",
+    "action_token_ids",
+    "action_seq_length",
+    "decision_type",
+    "pointer_anchor_positions",
+    "pointer_anchor_kinds",
+    "pointer_anchor_subjects",
+    "pointer_anchor_handles",
+    "legal_edge_bitmap",
+    "legal_edge_n_blockers",
+    "legal_edge_n_attackers",
 )
 
 
@@ -196,6 +222,7 @@ class _DecoderCandidate:
     snapshot: GameStateSnapshot
     target: DecoderTarget
     value_target: float
+    encoded: TextEncodedExample | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +250,20 @@ def _arrow_manifest_path(path: Path) -> Path | None:
     return manifest_path if manifest.get("format") == ARROW_CORPUS_FORMAT else None
 
 
+def _arrow_manifest(path: Path) -> dict[str, Any]:
+    manifest_path = _arrow_manifest_path(path)
+    if manifest_path is None:
+        raise ValueError(f"{path} is not a {ARROW_CORPUS_FORMAT} corpus")
+    manifest = orjson.loads(manifest_path.read_bytes())
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Arrow manifest {manifest_path} must be a JSON object")
+    return cast(dict[str, Any], manifest)
+
+
+def _arrow_corpus_stage(path: Path) -> str:
+    return str(_arrow_manifest(path).get("stage") or "")
+
+
 def _arrow_game_index_path(path: Path) -> Path:
     root = path if path.is_dir() else path.parent
     return root / ARROW_GAME_INDEX_FILENAME
@@ -230,22 +271,26 @@ def _arrow_game_index_path(path: Path) -> Path:
 
 def _arrow_shard_paths(path: Path) -> list[Path]:
     manifest_path = _arrow_manifest_path(path)
-    if manifest_path is None:
-        raise ValueError(f"{path} is not a {ARROW_CORPUS_FORMAT} corpus")
-    manifest = orjson.loads(manifest_path.read_bytes())
+    manifest = _arrow_manifest(path)
     version = int(manifest.get("format_version") or -1)
-    if version != ARROW_CORPUS_FORMAT_VERSION:
+    stage = str(manifest.get("stage") or "")
+    expected_version = (
+        ARROW_PRETOKENIZED_FORMAT_VERSION
+        if stage == ARROW_PRETOKENIZED_STAGE
+        else ARROW_CORPUS_FORMAT_VERSION
+    )
+    if version != expected_version:
         raise ValueError(
             f"unsupported Arrow corpus format_version={version}; "
-            f"expected {ARROW_CORPUS_FORMAT_VERSION}"
+            f"expected {expected_version} for stage={stage!r}"
         )
-    stage = str(manifest.get("stage") or "")
-    if stage != ARROW_EXTRACTED_STAGE:
+    if stage not in (ARROW_EXTRACTED_STAGE, ARROW_PRETOKENIZED_STAGE):
         raise ValueError(
             f"unsupported Arrow corpus stage={stage!r}; "
-            "ForgeChoiceDataset currently consumes the extracted schema"
+            "ForgeChoiceDataset consumes extracted or pretokenized schemas"
         )
 
+    assert manifest_path is not None
     root = manifest_path.parent
     shard_count = int(manifest.get("shards") or 0)
     if shard_count > 0:
@@ -272,9 +317,15 @@ def _validate_arrow_schema(schema: pa.Schema, path: Path) -> None:
     if schema_format is not None and schema_format.decode() != ARROW_CORPUS_FORMAT:
         raise ValueError(f"unsupported Arrow shard format metadata in {path}")
     schema_stage = metadata.get(b"stage")
-    if schema_stage is not None and schema_stage.decode() != ARROW_EXTRACTED_STAGE:
+    stage = schema_stage.decode() if schema_stage is not None else ARROW_EXTRACTED_STAGE
+    if stage not in (ARROW_EXTRACTED_STAGE, ARROW_PRETOKENIZED_STAGE):
         raise ValueError(f"unsupported Arrow shard stage metadata in {path}")
-    missing = [name for name in _ARROW_EXTRACTED_COLUMNS if schema.get_field_index(name) < 0]
+    required = (
+        _ARROW_PRETOKENIZED_COLUMNS
+        if stage == ARROW_PRETOKENIZED_STAGE
+        else _ARROW_EXTRACTED_COLUMNS
+    )
+    missing = [name for name in required if schema.get_field_index(name) < 0]
     if missing:
         raise ValueError(f"Arrow shard {path} missing required columns: {', '.join(missing)}")
 
@@ -300,13 +351,20 @@ def _arrow_json(batch: pa.RecordBatch, column: str, row: int) -> Any:
     return orjson.loads(cast(str, _arrow_scalar(batch, column, row)))
 
 
+def _arrow_i32_list(batch: pa.RecordBatch, column: str, row: int) -> list[int]:
+    value = _arrow_scalar(batch, column, row)
+    if value is None:
+        return []
+    return [int(x) for x in cast(Sequence[Any], value)]
+
+
 def _arrow_record_from_batch(batch: pa.RecordBatch, row: int) -> dict[str, Any]:
     kind_id = int(_arrow_scalar(batch, "kind_id", row))
     try:
         kind = _ARROW_KIND_NAMES[kind_id]
     except IndexError as exc:
         raise ValueError(f"unknown Arrow choice kind_id={kind_id}") from exc
-    return {
+    record = {
         "format": "forge_choice_situation",
         "format_version": int(_arrow_scalar(batch, "format_version", row)),
         "game_id": str(_arrow_scalar(batch, "game_id", row)),
@@ -332,6 +390,27 @@ def _arrow_record_from_batch(batch: pa.RecordBatch, row: int) -> dict[str, Any]:
             "extras": _arrow_json(batch, "outcome_extras_json", row),
         },
     }
+    if batch.schema.get_field_index("token_ids") >= 0:
+        token_ids = _arrow_i32_list(batch, "token_ids", row)
+        state = record["state"]
+        state["token_ids"] = token_ids
+        state["seq_length"] = int(_arrow_scalar(batch, "seq_length", row))
+        state["card_ref_positions"] = _arrow_i32_list(batch, "card_ref_positions", row)
+        state["token_overflow"] = bool(_arrow_scalar(batch, "token_overflow", row))
+        state["card_ref_overflow"] = bool(_arrow_scalar(batch, "card_ref_overflow", row))
+        choice = cast(dict[str, Any], record["choice"])
+        choice["action_token_ids"] = _arrow_i32_list(batch, "action_token_ids", row)
+        choice["action_seq_length"] = int(_arrow_scalar(batch, "action_seq_length", row))
+        choice["decision_type"] = int(_arrow_scalar(batch, "decision_type", row))
+        choice["pointer_anchor_positions"] = _arrow_i32_list(batch, "pointer_anchor_positions", row)
+        choice["pointer_anchor_kinds"] = _arrow_i32_list(batch, "pointer_anchor_kinds", row)
+        choice["pointer_anchor_subjects"] = _arrow_i32_list(batch, "pointer_anchor_subjects", row)
+        choice["pointer_anchor_handles"] = _arrow_i32_list(batch, "pointer_anchor_handles", row)
+        choice["legal_edge_bitmap"] = _arrow_i32_list(batch, "legal_edge_bitmap", row)
+        choice["legal_edge_n_blockers"] = int(_arrow_scalar(batch, "legal_edge_n_blockers", row))
+        choice["legal_edge_n_attackers"] = int(_arrow_scalar(batch, "legal_edge_n_attackers", row))
+        record["stage"] = ARROW_PRETOKENIZED_STAGE
+    return record
 
 
 class _ArrowBatchCache:
@@ -722,6 +801,75 @@ def _value_target(record: dict[str, Any], cfg: ForgePolicyValueConfig) -> float:
     return float(sign * (cfg.gamma**remaining))
 
 
+def _pretokenized_example(record: dict[str, Any]) -> TextEncodedExample | None:
+    state = record.get("state") or {}
+    token_ids_raw = state.get("token_ids")
+    if token_ids_raw is None:
+        return None
+    if bool(state.get("token_overflow")):
+        return None
+    token_ids = [int(t) for t in cast(Sequence[Any], token_ids_raw)]
+    seq_length = int(state.get("seq_length") or len(token_ids))
+    if seq_length != len(token_ids) or seq_length <= 0:
+        return None
+    positions_raw = state.get("card_ref_positions") or []
+    card_ref_positions = {
+        k: int(pos)
+        for k, pos in enumerate(cast(Sequence[Any], positions_raw))
+        if 0 <= int(pos) < seq_length
+    }
+    return TextEncodedExample(
+        token_ids=token_ids,
+        attention_mask=[1] * seq_length,
+        card_ref_positions=card_ref_positions,
+    )
+
+
+def _pretokenized_spec(record: dict[str, Any]) -> DecisionSpec | None:
+    choice = record.get("choice") or {}
+    token_ids_raw = choice.get("action_token_ids")
+    if token_ids_raw is None:
+        return None
+    spec_tokens = [int(t) for t in cast(Sequence[Any], token_ids_raw)]
+    seq_length = int(choice.get("action_seq_length") or len(spec_tokens))
+    if seq_length != len(spec_tokens) or seq_length <= 0:
+        return None
+    decision_type_raw = int(choice.get("decision_type", -1))
+    if decision_type_raw < 0:
+        return None
+
+    positions = [int(v) for v in cast(Sequence[Any], choice.get("pointer_anchor_positions") or [])]
+    kinds = [int(v) for v in cast(Sequence[Any], choice.get("pointer_anchor_kinds") or [])]
+    subjects = [int(v) for v in cast(Sequence[Any], choice.get("pointer_anchor_subjects") or [])]
+    handles = [int(v) for v in cast(Sequence[Any], choice.get("pointer_anchor_handles") or [])]
+    anchor_count = min(len(positions), len(kinds), len(subjects), len(handles))
+    anchors = [
+        PointerAnchor(
+            kind=AnchorKind(kinds[i]),
+            token_position=positions[i],
+            subject_index=subjects[i],
+            handle=handles[i],
+        )
+        for i in range(anchor_count)
+    ]
+
+    legal_edge_bitmap = None
+    n_blockers = int(choice.get("legal_edge_n_blockers") or 0)
+    n_attackers = int(choice.get("legal_edge_n_attackers") or 0)
+    edge_raw = choice.get("legal_edge_bitmap") or []
+    if n_blockers > 0 and n_attackers > 0:
+        edge = np.asarray([bool(v) for v in cast(Sequence[Any], edge_raw)], dtype=np.bool_)
+        if edge.size == n_blockers * n_attackers:
+            legal_edge_bitmap = edge.reshape(n_blockers, n_attackers)
+
+    return DecisionSpec(
+        decision_type=DecisionType(decision_type_raw),
+        spec_tokens=spec_tokens,
+        anchors=anchors,
+        legal_edge_bitmap=legal_edge_bitmap,
+    )
+
+
 class ForgeChoiceDataset:
     def __init__(
         self,
@@ -831,6 +979,7 @@ class ForgeChoiceDataset:
             snapshot=cast(GameStateSnapshot, snapshot),
             target=target,
             value_target=_value_target(record, self.cfg),
+            encoded=_pretokenized_example(record),
         )
 
     def _prepare_decoder(self, record: dict[str, Any]) -> _PreparedDecoderExample | None:
@@ -841,31 +990,68 @@ class ForgeChoiceDataset:
         self, records: Sequence[dict[str, Any]]
     ) -> list[_PreparedDecoderExample]:
         candidates: list[_DecoderCandidate] = []
-        rendered_rows = []
+        state_rows: list[Any] = []
         specs: list[DecisionSpec] = []
         for record in records:
             candidate = self._decoder_candidate(record)
             if candidate is None:
                 continue
             try:
-                rendered = self._snapshot_renderer.render(candidate.snapshot)
-                spec = self._spec_renderer.render(candidate.snapshot, card_refs=rendered.card_refs)
-            except RenderError, RuntimeError, KeyError, TypeError, ValueError, NotImplementedError:
+                if candidate.encoded is None:
+                    rendered = self._snapshot_renderer.render(candidate.snapshot)
+                    encoded = None
+                    card_refs = rendered.card_refs
+                else:
+                    rendered = None
+                    encoded = candidate.encoded
+                    card_refs = {}
+                spec = _pretokenized_spec(record)
+                if spec is None:
+                    spec = self._spec_renderer.render(candidate.snapshot, card_refs=card_refs)
+            except (
+                RenderError,
+                RuntimeError,
+                KeyError,
+                TypeError,
+                ValueError,
+                NotImplementedError,
+            ):
                 continue
             candidates.append(candidate)
-            rendered_rows.append(rendered)
+            state_rows.append(rendered if rendered is not None else encoded)
             specs.append(spec)
 
         if not candidates:
             return []
-        try:
-            encoded_rows = tokenize_snapshots(
-                rendered_rows,
-                self.tokenizer,
-                context=self._tokenization_context,
-            )
-        except RenderError, RuntimeError, KeyError, TypeError, ValueError, NotImplementedError:
-            return []
+        if all(isinstance(row, TextEncodedExample) for row in state_rows):
+            encoded_rows = cast(list[TextEncodedExample], state_rows)
+        else:
+            rendered_indices = [
+                i for i, row in enumerate(state_rows) if not isinstance(row, TextEncodedExample)
+            ]
+            try:
+                encoded_rendered = tokenize_snapshots(
+                    [state_rows[i] for i in rendered_indices],
+                    self.tokenizer,
+                    context=self._tokenization_context,
+                )
+            except (
+                RenderError,
+                RuntimeError,
+                KeyError,
+                TypeError,
+                ValueError,
+                NotImplementedError,
+            ):
+                return []
+            encoded_rows = []
+            rendered_cursor = 0
+            for row in state_rows:
+                if isinstance(row, TextEncodedExample):
+                    encoded_rows.append(row)
+                else:
+                    encoded_rows.append(encoded_rendered[rendered_cursor])
+                    rendered_cursor += 1
 
         return [
             _PreparedDecoderExample(

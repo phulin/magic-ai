@@ -27,9 +27,9 @@ drive both pretraining phases.
 Layout matches the live native Go encoder (``mage-go/cmd/pylib/
 direct_token_emitter.go``) with ``dedupCardBodies=true``: a single
 ``<dict>...</dict>`` block at the top of the snapshot lists each unique card
-body via ``<dict-entry:R>``, and each placement on the battlefield / hand /
-graveyard / exile is emitted as ``<card-ref:K><card><dict-entry:R>[<tap>]
-</card>`` referencing that body. Token-id sequences come from the same
+body via ``<dict-entry:D>``, and each placement on the battlefield / hand /
+graveyard / exile is emitted as ``<card-ref:K><card><dict-entry:D>[<tap>]
+</card>`` referencing that sequence-local dictionary slot. Token-id sequences come from the same
 ``magic_ai.text_encoder.token_tables.build_token_tables`` tables the live
 path registers with libmage, so the offline ``.bin`` is byte-for-byte
 compatible with what the encoder sees during rollouts.
@@ -295,7 +295,7 @@ class _PlacedCard:
 
 
 class _DirectEmitter:
-    """Python port of ``direct_token_emitter.go`` with ``dedupCardBodies=True``."""
+    """Python port of ``direct_token_emitter.go`` with sequence-local body dedup."""
 
     def __init__(self, tables: TokenTables, name_to_row: dict[str, int]) -> None:
         self.tables = tables
@@ -353,11 +353,16 @@ class _DirectEmitter:
         self._emit_frag(Frag.BOS_STATE)
 
         # <dict> ... </dict>
-        if row_order:
+        row_to_dict_slot = {
+            row: slot for slot, row in enumerate(row_order[: len(self.tables.dict_entry)])
+        }
+        if row_to_dict_slot:
             self._write_one(self.tables.dict_open_id)
             for row in row_order:
-                if 0 <= row < len(self.tables.dict_entry):
-                    self._write_one(self.tables.dict_entry[row])
+                slot = row_to_dict_slot.get(row)
+                if slot is None:
+                    continue
+                self._write_one(self.tables.dict_entry[slot])
                 if 0 <= row < len(self.tables.card_body):
                     self._write(self.tables.card_body[row])
                 self._write(self.tables.card_closer)
@@ -386,11 +391,21 @@ class _DirectEmitter:
             for owner in (_OWNER_SELF, _OWNER_OPP):
                 if zone == _ZONE_HAND and owner == _OWNER_OPP:
                     continue  # fog of war
-                self._emit_zone(zone, owner, cards_by_zone.get((zone, owner), []))
+                self._emit_zone(
+                    zone,
+                    owner,
+                    cards_by_zone.get((zone, owner), []),
+                    row_to_dict_slot=row_to_dict_slot,
+                )
         for owner in (_OWNER_SELF, _OWNER_OPP):
             cards = cards_by_zone.get((_ZONE_EXILE, owner), [])
             if cards:
-                self._emit_zone(_ZONE_EXILE, owner, cards)
+                self._emit_zone(
+                    _ZONE_EXILE,
+                    owner,
+                    cards,
+                    row_to_dict_slot=row_to_dict_slot,
+                )
         for owner, lib in ((_OWNER_SELF, self_lib), (_OWNER_OPP, opp_lib)):
             self._emit_open_zone(_ZONE_LIBRARY, owner)
             self._emit_count(lib)
@@ -444,19 +459,31 @@ class _DirectEmitter:
         if span is not None:
             self._write(span)
 
-    def _emit_zone(self, zone: int, owner: int, cards: list[_PlacedCard]) -> None:
+    def _emit_zone(
+        self,
+        zone: int,
+        owner: int,
+        cards: list[_PlacedCard],
+        *,
+        row_to_dict_slot: dict[int, int],
+    ) -> None:
         self._emit_open_zone(zone, owner)
         for card in cards:
-            self._emit_place_card_ref(card)
+            self._emit_place_card_ref(card, row_to_dict_slot=row_to_dict_slot)
         self._emit_close_zone(zone, owner)
 
-    def _emit_place_card_ref(self, card: _PlacedCard) -> None:
+    def _emit_place_card_ref(
+        self, card: _PlacedCard, *, row_to_dict_slot: dict[int, int] | None = None
+    ) -> None:
         self._close_scalar_owner()
         if 0 <= card.uuid_idx < min(MAX_CARD_REFS, len(self.tables.card_ref)):
             self._write_one(self.tables.card_ref[card.uuid_idx])
         self._write_one(self.tables.card_open_id)
-        if 0 <= card.row < len(self.tables.dict_entry):
-            self._write_one(self.tables.dict_entry[card.row])
+        slot = (row_to_dict_slot or {}).get(card.row)
+        if slot is not None and 0 <= slot < len(self.tables.dict_entry):
+            self._write_one(self.tables.dict_entry[slot])
+        elif 0 <= card.row < len(self.tables.card_body):
+            self._write(self.tables.card_body[card.row])
         self._emit_status(card)
         self._write(self.tables.card_closer)
 

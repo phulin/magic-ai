@@ -5,7 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import torch
 from magic_ai.text_encoder.card_cache import build_card_cache
+from magic_ai.text_encoder.native_assembler import _localize_dict_entries
 from magic_ai.text_encoder.native_token_tables import (
     LOOKUP_ABILITY,
     LOOKUP_ACTION_VERB,
@@ -19,6 +21,7 @@ from magic_ai.text_encoder.native_token_tables import (
     LOOKUP_TURN_STEP,
     LOOKUP_ZONE_CLOSE,
     LOOKUP_ZONE_OPEN,
+    active_packed,
     native_lookup,
     native_summary,
     register_native_token_tables,
@@ -160,6 +163,39 @@ def test_card_body_round_trip(registered_tables) -> None:
     for row in (0, 1, 100, 1000, len(registered_tables.card_body) - 1):
         if 0 <= row < len(registered_tables.card_body):
             assert native_lookup(LOOKUP_CARD_BODY, row) == registered_tables.card_body[row]
+
+
+def test_native_dict_entries_are_rewritten_to_sequence_local(registered_tables) -> None:
+    packed = active_packed()
+    assert packed is not None
+    ids = packed.dict_entry_ids
+    assert ids.numel() > 480
+
+    token_ids = torch.tensor(
+        [
+            123,
+            int(ids[479]),
+            456,
+            int(ids[3]),
+            int(ids[479]),
+            int(ids[3]),
+        ],
+        dtype=torch.int32,
+    )
+    _localize_dict_entries(
+        token_ids,
+        torch.tensor([token_ids.numel()], dtype=torch.int32),
+        batch_size=1,
+    )
+
+    assert token_ids.tolist() == [
+        123,
+        int(ids[0]),
+        456,
+        int(ids[1]),
+        int(ids[0]),
+        int(ids[1]),
+    ]
 
 
 def test_card_name_round_trip(registered_tables) -> None:

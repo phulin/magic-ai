@@ -18,7 +18,7 @@ from enum import IntEnum
 from transformers import PreTrainedTokenizerFast
 
 from magic_ai.text_encoder.card_cache import CardTokenCache
-from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS
+from magic_ai.text_encoder.tokenizer import MAX_CARD_REFS, MAX_DICT_ENTRIES
 
 # ---------------------------------------------------------------------------
 # Closed vocabulary constants mirrored by mage-go.
@@ -155,6 +155,8 @@ class TokenTables:
     ``card_body[row]`` -> body tokens with trailing CARD_CLOSER stripped.
     ``card_name[row]`` -> tokens for the row's display name.
     ``card_ref[K]`` -> single-id list for ``<card-ref:K>``.
+    ``dict_entry[D]`` -> single-id ``<dict-entry:D>`` for a sequence-local
+    dictionary slot, not a persistent card-row ID.
     """
 
     # Single-id specials.
@@ -200,8 +202,9 @@ class TokenTables:
     card_ref: list[int] = field(default_factory=list)
     card_body: list[list[int]] = field(default_factory=list)
     card_name: list[list[int]] = field(default_factory=list)
-    # v2 card-body dedup: dict_entry[row] -> single-id ``<dict-entry:row>``.
-    # Aligned with ``card_body`` (one entry per cache row).
+    # v2 card-body dedup: dict_entry[D] -> single-id ``<dict-entry:D>``.
+    # D is a sequence-local dictionary slot; the assembler maps cache rows to
+    # slots independently per example.
     dict_entry: list[int] = field(default_factory=list)
 
     # Bounds (echoed for downstream consumers / FFI).
@@ -353,6 +356,7 @@ def build_token_tables(
 
     # card-ref single-id table.
     tables.card_ref = [_single(tokenizer, f"<card-ref:{k}>") for k in range(MAX_CARD_REFS)]
+    tables.dict_entry = [_single(tokenizer, f"<dict-entry:{d}>") for d in range(MAX_DICT_ENTRIES)]
 
     # Per-row card body (trailing " </card>" stripped) and display-name tokens.
     if cache is not None:
@@ -361,14 +365,12 @@ def build_token_tables(
         body_offsets = cache.offsets
         tables.card_body = []
         tables.card_name = []
-        tables.dict_entry = []
         for row in range(num_rows):
             start = int(body_offsets[row])
             end = int(body_offsets[row + 1])
             body = body_tokens_buf[start:end].tolist()
             tables.card_body.append(_strip_card_closer(body, card_closer))
             tables.card_name.append(_encode(tokenizer, cache.row_to_name[row]))
-            tables.dict_entry.append(_single(tokenizer, f"<dict-entry:{row}>"))
 
     return tables
 

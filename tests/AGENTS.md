@@ -36,4 +36,5 @@ Comprehensive test suite covering text encoding (rendering, tokenization, assemb
 - `test_text_rollout.py` — Smoke tests for cache/emitter/assembler/policy pipeline against live mage engine.
 - `test_text_encoder_parity.py` — Parity between Python batch encoder and single-item reference implementations.
 - `test_text_token_tables.py` — Parity test: precomputed token lists match live tokenizer output for each table entry.
+- `test_token_table_export.py` — Tests the versioned token-table export artifact and cache/tokenizer fingerprints for Rust consumers.
 - `test_train.py` — Integration tests for training script: slot/text backend setup, checkpoint loading, opponent pool, transcript snapshots.
