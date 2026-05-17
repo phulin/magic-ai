@@ -205,6 +205,10 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("--out is required unless --emit-state-json is set"))?
         .clone();
     let pretokenized = token_tables.is_some();
+    if matches!(args.output_format, OutputFormat::Arrow) {
+        std::fs::create_dir_all(&out_path).with_context(|| format!("creating {:?}", out_path))?;
+        ensure_arrow_output_dir_is_clean(&out_path)?;
+    }
 
     // Enumerate members up-front (cheap; zip central directory only).
     let members: Vec<String> = {
